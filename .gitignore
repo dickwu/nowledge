@@ -1,0 +1,5 @@
+target/
+.omx/
+.env
+*.log
+scripts/

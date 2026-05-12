@@ -1,0 +1,32 @@
+[package]
+name = "nowledge"
+version = "0.6.0"
+edition = "2021"
+description = "ContextFS-style State/History RAG service with per-user Meilisearch event indexes"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json", "macros"] }
+chrono = { version = "0.4", features = ["clock", "serde"] }
+hex = "0.4"
+hmac = "0.12"
+meilisearch-sdk = "0.33.0"
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "gzip", "brotli"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+validator = { version = "0.20", features = ["derive"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
