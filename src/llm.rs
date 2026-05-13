@@ -180,7 +180,7 @@ pub fn llm_client_from_config(config: &Config) -> Box<dyn LlmClient> {
     }
 }
 
-fn read_codex_auth_token(path: &str) -> Option<String> {
+pub fn read_codex_auth_token(path: &str) -> Option<String> {
     let path = Path::new(path);
     let content = std::fs::read_to_string(path).ok()?;
     let json = serde_json::from_str::<Value>(&content).ok()?;

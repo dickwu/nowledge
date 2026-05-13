@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::{
     extract::{Path, Query, State},
@@ -17,7 +17,7 @@ use crate::{
     meili::MeiliAdmin,
     models::*,
     store::Store,
-    util::{redact_secrets, require_string},
+    util::{redact_secrets, redact_string, require_string},
 };
 
 #[derive(Clone)]
@@ -25,6 +25,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub store: Store,
     pub meili: MeiliAdmin,
+    runtime_codex_auth_path: Arc<RwLock<Option<String>>>,
 }
 
 impl AppState {
@@ -33,11 +34,23 @@ impl AppState {
             store: Store::new(&config),
             meili: MeiliAdmin::from_config(&config),
             config,
+            runtime_codex_auth_path: Arc::new(RwLock::new(None)),
         }
     }
 
     pub fn tenant_id(&self) -> &str {
         &self.config.tenant_id
+    }
+
+    fn effective_config(&self) -> Config {
+        let mut config = (*self.config).clone();
+        if let Ok(path) = self.runtime_codex_auth_path.read() {
+            if let Some(path) = path.clone() {
+                config.llm_provider = "codex_auth".to_string();
+                config.codex_auth_path = Some(path);
+            }
+        }
+        config
     }
 }
 
@@ -301,11 +314,12 @@ async fn get_user_event(
     Path((owner_user_id, event_id)): Path<(String, String)>,
 ) -> Result<Json<HistoryEvent>, ApiError> {
     user.require_owner_access(&owner_user_id)?;
-    Ok(Json(state.store.get_event(
-        state.tenant_id(),
-        &owner_user_id,
-        &event_id,
-    )?))
+    Ok(Json(
+        state
+            .store
+            .get_event_async(state.tenant_id(), &owner_user_id, &event_id)
+            .await?,
+    ))
 }
 
 async fn user_timeline(
@@ -381,11 +395,12 @@ async fn get_event_alias(
 ) -> Result<Json<HistoryEvent>, ApiError> {
     let owner = require_string(query.owner_user_id, "owner_user_id")?;
     user.require_owner_access(&owner)?;
-    Ok(Json(state.store.get_event(
-        state.tenant_id(),
-        &owner,
-        &event_id,
-    )?))
+    Ok(Json(
+        state
+            .store
+            .get_event_async(state.tenant_id(), &owner, &event_id)
+            .await?,
+    ))
 }
 
 async fn timeline_alias(
@@ -549,7 +564,7 @@ async fn apply_snapshot(
     Json(req): Json<ApplySnapshotRequest>,
 ) -> Result<Json<ApplySnapshotResponse>, ApiError> {
     if let Some(snapshot_id) = req.snapshot_id.as_deref() {
-        let owner = state.store.snapshot_owner(snapshot_id)?;
+        let owner = state.store.snapshot_owner_async(snapshot_id).await?;
         user.require_owner_access(&owner)?;
     }
     Ok(Json(
@@ -561,10 +576,16 @@ async fn apply_snapshot(
 }
 
 async fn current_structured(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
+    Query(mut query): Query<OwnerQuery>,
 ) -> Result<Json<CurrentStructuredStateResponse>, ApiError> {
-    Ok(Json(state.store.current_structured_state()?))
+    user.apply_owner_default(&mut query.owner_user_id)?;
+    Ok(Json(state.store.current_structured_state(
+        state.tenant_id(),
+        query.owner_user_id.as_deref(),
+        user.principal.is_admin(),
+    )?))
 }
 
 async fn create_snapshot(
@@ -586,9 +607,9 @@ async fn get_snapshot(
     State(state): State<AppState>,
     Path(snapshot_id): Path<String>,
 ) -> Result<Json<StructuredSnapshot>, ApiError> {
-    let owner = state.store.snapshot_owner(&snapshot_id)?;
+    let owner = state.store.snapshot_owner_async(&snapshot_id).await?;
     user.require_owner_access(&owner)?;
-    Ok(Json(state.store.get_snapshot(&snapshot_id)?))
+    Ok(Json(state.store.get_snapshot_async(&snapshot_id).await?))
 }
 
 async fn bulk_rows(
@@ -597,7 +618,7 @@ async fn bulk_rows(
     Path(snapshot_id): Path<String>,
     Json(req): Json<BulkStructuredRowsRequest>,
 ) -> Result<Json<BulkStructuredRowsResponse>, ApiError> {
-    let owner = state.store.snapshot_owner(&snapshot_id)?;
+    let owner = state.store.snapshot_owner_async(&snapshot_id).await?;
     user.require_owner_access(&owner)?;
     Ok(Json(
         state
@@ -612,9 +633,9 @@ async fn list_rows(
     State(state): State<AppState>,
     Path(snapshot_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let owner = state.store.snapshot_owner(&snapshot_id)?;
+    let owner = state.store.snapshot_owner_async(&snapshot_id).await?;
     user.require_owner_access(&owner)?;
-    Ok(Json(state.store.list_rows(&snapshot_id)?))
+    Ok(Json(state.store.list_rows_async(&snapshot_id).await?))
 }
 
 async fn insight_events(_user: UserGuard, Path(insight_id): Path<String>) -> Json<Value> {
@@ -622,50 +643,94 @@ async fn insight_events(_user: UserGuard, Path(insight_id): Path<String>) -> Jso
 }
 
 async fn fs_ls(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Query(query): Query<FsQuery>,
+    Query(mut query): Query<FsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let _ = query.owner_user_id;
-    Ok(Json(state.store.fs_ls(query.uri.as_deref())?))
+    user.apply_owner_default(&mut query.owner_user_id)?;
+    Ok(Json(state.store.fs_ls(
+        state.tenant_id(),
+        query.uri.as_deref(),
+        query.owner_user_id.as_deref(),
+        user.principal.is_admin(),
+    )?))
 }
 
 async fn fs_tree(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Query(query): Query<FsQuery>,
+    Query(mut query): Query<FsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let _ = query.owner_user_id;
-    Ok(Json(
-        state.store.fs_tree(query.uri.as_deref(), query.depth)?,
-    ))
+    user.apply_owner_default(&mut query.owner_user_id)?;
+    Ok(Json(state.store.fs_tree(
+        state.tenant_id(),
+        query.uri.as_deref(),
+        query.depth,
+        query.owner_user_id.as_deref(),
+        user.principal.is_admin(),
+    )?))
 }
 
 async fn fs_read(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Query(query): Query<FsQuery>,
+    Query(mut query): Query<FsQuery>,
 ) -> Result<Json<ContextNode>, ApiError> {
+    user.apply_owner_default(&mut query.owner_user_id)?;
     let uri = require_string(query.uri, "uri")?;
-    Ok(Json(state.store.fs_read(&uri)?))
+    Ok(Json(
+        state
+            .store
+            .fs_read_async(
+                state.tenant_id(),
+                &uri,
+                query.owner_user_id.as_deref(),
+                user.principal.is_admin(),
+            )
+            .await?,
+    ))
 }
 
 async fn fs_abstract(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Query(query): Query<FsQuery>,
+    Query(mut query): Query<FsQuery>,
 ) -> Result<Json<ContextNode>, ApiError> {
+    user.apply_owner_default(&mut query.owner_user_id)?;
     let uri = require_string(query.uri, "uri")?;
-    Ok(Json(state.store.fs_layer(&uri, 0)?))
+    Ok(Json(
+        state
+            .store
+            .fs_layer_async(
+                state.tenant_id(),
+                &uri,
+                0,
+                query.owner_user_id.as_deref(),
+                user.principal.is_admin(),
+            )
+            .await?,
+    ))
 }
 
 async fn fs_overview(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Query(query): Query<FsQuery>,
+    Query(mut query): Query<FsQuery>,
 ) -> Result<Json<ContextNode>, ApiError> {
+    user.apply_owner_default(&mut query.owner_user_id)?;
     let uri = require_string(query.uri, "uri")?;
-    Ok(Json(state.store.fs_layer(&uri, 1)?))
+    Ok(Json(
+        state
+            .store
+            .fs_layer_async(
+                state.tenant_id(),
+                &uri,
+                1,
+                query.owner_user_id.as_deref(),
+                user.principal.is_admin(),
+            )
+            .await?,
+    ))
 }
 
 async fn context_search(
@@ -684,11 +749,24 @@ async fn context_search(
 }
 
 async fn context_reveal(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Json(req): Json<ContextRevealRequest>,
 ) -> Result<Json<ContextRevealResponse>, ApiError> {
-    Ok(Json(state.store.reveal_context(req)?))
+    let owner = req
+        .trace_id
+        .as_ref()
+        .and_then(|trace_id| state.store.trace_owner_id(trace_id).ok().flatten());
+    if let Some(owner) = &owner {
+        user.require_owner_access(owner)?;
+    }
+    let owner_scope = owner.or_else(|| user.principal.owner_user_id.clone());
+    Ok(Json(state.store.reveal_context(
+        state.tenant_id(),
+        req,
+        owner_scope.as_deref(),
+        user.principal.is_admin(),
+    )?))
 }
 
 async fn rag_answer(
@@ -697,9 +775,7 @@ async fn rag_answer(
     Json(mut req): Json<RagAnswerRequest>,
 ) -> Result<Json<RagAnswerResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
-    Ok(Json(
-        state.store.answer_rag_async(state.tenant_id(), req).await?,
-    ))
+    Ok(Json(answer_rag_with_llm(&state, req).await?))
 }
 
 async fn rag_stream(
@@ -716,11 +792,8 @@ async fn rag_debug(
     Json(mut req): Json<RagAnswerRequest>,
 ) -> Result<Json<Value>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
-    let answer = state
-        .store
-        .answer_rag_async(state.tenant_id(), req.clone())
-        .await?;
-    let trace = state.store.get_trace(&answer.trace_id)?;
+    let answer = answer_rag_with_llm(&state, req.clone()).await?;
+    let trace = state.store.get_trace_async(&answer.trace_id).await?;
     Ok(Json(json!({
         "answer": answer,
         "trace": trace,
@@ -745,11 +818,12 @@ async fn add_session_message(
 ) -> Result<Json<Value>, ApiError> {
     let owner = state.store.session_owner_id(&session_id)?;
     user.require_owner_access(&owner)?;
-    Ok(Json(state.store.add_session_message(
-        state.tenant_id(),
-        &session_id,
-        req,
-    )?))
+    Ok(Json(
+        state
+            .store
+            .add_session_message_async(state.tenant_id(), &session_id, req)
+            .await?,
+    ))
 }
 
 async fn commit_session(
@@ -769,7 +843,8 @@ async fn commit_session(
 }
 
 async fn llm_status(State(state): State<AppState>) -> Json<LlmStatusResponse> {
-    let status = llm_client_from_config(&state.config).status().await;
+    let config = state.effective_config();
+    let status = llm_client_from_config(&config).status().await;
     Json(LlmStatusResponse {
         provider: status.provider,
         model: status.model,
@@ -783,8 +858,6 @@ async fn import_codex_auth(
     State(state): State<AppState>,
     Json(req): Json<ImportCodexAuthRequest>,
 ) -> Result<Json<ImportCodexAuthResponse>, ApiError> {
-    let _ = req.codex_auth_path;
-    let _ = req.store_imported_token;
     if !state.config.allow_codex_auth_import {
         return Ok(Json(ImportCodexAuthResponse {
             status: "disabled".to_string(),
@@ -792,10 +865,35 @@ async fn import_codex_auth(
             test_ok: false,
         }));
     }
+    let path = req
+        .codex_auth_path
+        .clone()
+        .or_else(|| state.config.codex_auth_path.clone())
+        .ok_or_else(|| ApiError::bad_request("codex_auth_path is required"))?;
+    let token = crate::llm::read_codex_auth_token(&path).ok_or_else(|| {
+        ApiError::Unauthorized("Codex auth token could not be imported".to_string())
+    })?;
+    if let Ok(mut runtime_path) = state.runtime_codex_auth_path.write() {
+        *runtime_path = Some(path.clone());
+    }
+    let mut test_ok = false;
+    if req.test_after_import {
+        let mut config = (*state.config).clone();
+        config.llm_provider = "codex_auth".to_string();
+        config.codex_auth_path = Some(path.clone());
+        let client = llm_client_from_config(&config);
+        test_ok = client
+            .complete_text(LlmRequest {
+                prompt: "ping".to_string(),
+            })
+            .await
+            .is_ok();
+    }
+    let _ = (token, req.store_imported_token);
     Ok(Json(ImportCodexAuthResponse {
         status: "imported_in_memory".to_string(),
-        auth_source: "codex_auth".to_string(),
-        test_ok: req.test_after_import,
+        auth_source: redact_string(&format!("codex_auth:{path}"), &[]),
+        test_ok,
     }))
 }
 
@@ -804,7 +902,8 @@ async fn llm_test(
     State(state): State<AppState>,
     Json(req): Json<LlmTestRequest>,
 ) -> Result<Json<LlmTestResponse>, ApiError> {
-    let client = llm_client_from_config(&state.config);
+    let config = state.effective_config();
+    let client = llm_client_from_config(&config);
     let status = client.status().await;
     let response = client
         .complete_text(LlmRequest {
@@ -824,7 +923,7 @@ async fn get_trace(
     State(state): State<AppState>,
     Path(trace_id): Path<String>,
 ) -> Result<Json<TraceRecord>, ApiError> {
-    Ok(Json(state.store.get_trace(&trace_id)?))
+    Ok(Json(state.store.get_trace_async(&trace_id).await?))
 }
 
 async fn debug_meili_search(
@@ -851,10 +950,7 @@ async fn prompt_preview(
     State(state): State<AppState>,
     Json(req): Json<RagAnswerRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let answer = state
-        .store
-        .answer_rag_async(state.tenant_id(), req.clone())
-        .await?;
+    let answer = answer_rag_with_llm(&state, req.clone()).await?;
     let prompt = build_prompt(&req.question.unwrap_or_default(), &answer.citations);
     Ok(Json(redact_for_state(
         &state,
@@ -864,6 +960,43 @@ async fn prompt_preview(
             "citations": answer.citations
         }),
     )))
+}
+
+async fn answer_rag_with_llm(
+    state: &AppState,
+    req: RagAnswerRequest,
+) -> Result<RagAnswerResponse, ApiError> {
+    let mut answer = state
+        .store
+        .answer_rag_async(state.tenant_id(), req.clone())
+        .await?;
+    let config = state.effective_config();
+    if config.llm_provider != "none" {
+        let client = llm_client_from_config(&config);
+        let status = client.status().await;
+        let prompt = build_prompt(&req.question.unwrap_or_default(), &answer.citations);
+        let prompt = redact_string(
+            &prompt,
+            &[
+                config.openai_api_key.clone().unwrap_or_default(),
+                config
+                    .codex_auth_path
+                    .as_deref()
+                    .and_then(crate::llm::read_codex_auth_token)
+                    .unwrap_or_default(),
+            ],
+        );
+        let llm = client.complete_text(LlmRequest { prompt }).await?;
+        answer.answer = llm.text;
+        answer.usage = json!({
+            "provider": status.provider,
+            "model": status.model,
+            "latency_ms": llm.latency_ms,
+            "backend": state.store.backend_name(),
+            "grounded": true
+        });
+    }
+    Ok(answer)
 }
 
 fn build_prompt(question: &str, citations: &[Citation]) -> String {

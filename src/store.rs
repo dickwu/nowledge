@@ -96,20 +96,54 @@ impl Store {
     ) -> Result<HistoryEventResponse, ApiError> {
         let mut response = self.append_event(tenant_id, path_owner_user_id, req)?;
         if !response.duplicate {
-            let index = self.get_user_index(tenant_id, &response.event.owner_user_id)?;
-            let _ = self
-                .repository
-                .ensure_user_event_index(&index.index)
-                .await?;
-            response.meili_task_uid = self.repository.append_event(&response.event).await?;
-            let nodes =
-                self.context_nodes_for_index(&response.routing.personal_context_index_uid)?;
-            let _ = self
-                .repository
-                .upsert_context_nodes(&response.routing.personal_context_index_uid, &nodes)
-                .await?;
+            response.meili_task_uid = self.persist_event_to_repository(&response.event).await?;
         }
         Ok(response)
+    }
+
+    async fn persist_event_to_repository(
+        &self,
+        event: &HistoryEvent,
+    ) -> Result<Option<String>, ApiError> {
+        self.ensure_user_indexes_for_owner(&event.tenant_id, &event.owner_user_id)
+            .await?;
+        let task_uid = self.repository.append_event(event).await?;
+        let routing = self
+            .resolver
+            .resolve(&event.tenant_id, &event.owner_user_id, false, true)?;
+        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
+        let _ = self
+            .repository
+            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
+            .await?;
+        Ok(task_uid)
+    }
+
+    async fn ensure_user_indexes_for_owner(
+        &self,
+        tenant_id: &str,
+        owner_user_id: &str,
+    ) -> Result<(), ApiError> {
+        let index = self.get_user_index(tenant_id, owner_user_id)?;
+        let _ = self
+            .repository
+            .ensure_user_event_index(&index.index)
+            .await?;
+        Ok(())
+    }
+
+    async fn persist_history_event_by_id(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<String>, ApiError> {
+        let event = {
+            let data = self.read()?;
+            data.event_by_id
+                .get(event_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("history event not found"))?
+        };
+        self.persist_event_to_repository(&event).await
     }
 
     pub async fn append_bulk_events_async(
@@ -193,9 +227,14 @@ impl Store {
             self.resolver
                 .resolve(tenant_id, &response.item.owner_user_id, false, true)?;
         let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
+        self.ensure_user_indexes_for_owner(tenant_id, &response.item.owner_user_id)
+            .await?;
         let _ = self
             .repository
             .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
+            .await?;
+        let _ = self
+            .persist_history_event_by_id(&response.history_event_id)
             .await?;
         Ok(response)
     }
@@ -212,9 +251,14 @@ impl Store {
             self.resolver
                 .resolve(tenant_id, &response.item.owner_user_id, false, true)?;
         let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
+        self.ensure_user_indexes_for_owner(tenant_id, &response.item.owner_user_id)
+            .await?;
         let _ = self
             .repository
             .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
+            .await?;
+        let _ = self
+            .persist_history_event_by_id(&response.history_event_id)
             .await?;
         Ok(response)
     }
@@ -229,9 +273,14 @@ impl Store {
             self.resolver
                 .resolve(tenant_id, &response.insight.owner_user_id, false, true)?;
         let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
+        self.ensure_user_indexes_for_owner(tenant_id, &response.insight.owner_user_id)
+            .await?;
         let _ = self
             .repository
             .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
+            .await?;
+        let _ = self
+            .persist_history_event_by_id(&response.history_event_id)
             .await?;
         Ok(response)
     }
@@ -247,9 +296,14 @@ impl Store {
             self.resolver
                 .resolve(tenant_id, &response.insight.owner_user_id, false, true)?;
         let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
+        self.ensure_user_indexes_for_owner(tenant_id, &response.insight.owner_user_id)
+            .await?;
         let _ = self
             .repository
             .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
+            .await?;
+        let _ = self
+            .persist_history_event_by_id(&response.history_event_id)
             .await?;
         Ok(response)
     }
@@ -266,6 +320,9 @@ impl Store {
         }
         if let Some(revision) = self.source_revision(source_id, &response.revision_id)? {
             let _ = self.repository.upsert_source_revision(&revision).await?;
+        }
+        if let Some(history_event_id) = &response.history_event_id {
+            let _ = self.persist_history_event_by_id(history_event_id).await?;
         }
         Ok(response)
     }
@@ -289,6 +346,9 @@ impl Store {
             .repository
             .upsert_context_nodes("rag_company_context", &nodes)
             .await?;
+        if let Some(history_event_id) = &response.history_event_id {
+            let _ = self.persist_history_event_by_id(history_event_id).await?;
+        }
         Ok(response)
     }
 
@@ -301,6 +361,9 @@ impl Store {
         let _ = self
             .repository
             .upsert_structured_snapshot(&response.snapshot)
+            .await?;
+        let _ = self
+            .persist_history_event_by_id(&response.history_event_id)
             .await?;
         Ok(response)
     }
@@ -320,6 +383,9 @@ impl Store {
                 .upsert_structured_snapshot(&snapshot)
                 .await?;
         }
+        let _ = self
+            .persist_history_event_by_id(&response.history_event_id)
+            .await?;
         Ok(response)
     }
 
@@ -340,10 +406,20 @@ impl Store {
             .resolver
             .resolve(tenant_id, &snapshot.owner_user_id, false, true)?;
         let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
+        self.ensure_user_indexes_for_owner(tenant_id, &snapshot.owner_user_id)
+            .await?;
         let _ = self
             .repository
             .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
             .await?;
+        if let Some(event_id) = self.latest_event_id_for_entity(
+            &snapshot.owner_user_id,
+            "structured.snapshot.applied",
+            "structured_snapshot",
+            &response.snapshot_id,
+        )? {
+            let _ = self.persist_history_event_by_id(&event_id).await?;
+        }
         Ok(response)
     }
 
@@ -443,12 +519,35 @@ impl Store {
     ) -> Result<SessionCommitResponse, ApiError> {
         let response = self.commit_session(tenant_id, session_id, req)?;
         if let Some(uri) = &response.archive_uri {
-            let node = self.fs_read(uri)?;
+            let owner = self.session_owner_id(session_id)?;
+            let node = self.fs_read(tenant_id, uri, Some(&owner), false)?;
             let index_uid = node.index_uid.clone();
+            self.ensure_user_indexes_for_owner(tenant_id, &owner)
+                .await?;
             let _ = self
                 .repository
                 .upsert_context_nodes(&index_uid, &[node])
                 .await?;
+        }
+        for event_id in &response.history_event_ids {
+            let _ = self.persist_history_event_by_id(event_id).await?;
+        }
+        Ok(response)
+    }
+
+    pub async fn add_session_message_async(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        req: SessionMessageRequest,
+    ) -> Result<Value, ApiError> {
+        let response = self.add_session_message(tenant_id, session_id, req)?;
+        if let Some(event_id) = response
+            .get("history_event_id")
+            .and_then(Value::as_str)
+            .filter(|event_id| !event_id.is_empty())
+        {
+            let _ = self.persist_history_event_by_id(event_id).await?;
         }
         Ok(response)
     }
@@ -462,6 +561,117 @@ impl Store {
             return Ok(raw);
         }
         self.debug_meili_search(index_uid, query)
+    }
+
+    pub async fn get_event_async(
+        &self,
+        tenant_id: &str,
+        owner_user_id: &str,
+        event_id: &str,
+    ) -> Result<HistoryEvent, ApiError> {
+        if let Ok(event) = self.get_event(tenant_id, owner_user_id, event_id) {
+            return Ok(event);
+        }
+        let routing = self
+            .resolver
+            .resolve(tenant_id, owner_user_id, false, true)?;
+        if let Some(event) = self.repository.get_event(&routing, event_id).await? {
+            return Ok(event);
+        }
+        Err(ApiError::not_found("history event not found"))
+    }
+
+    pub async fn get_snapshot_async(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<StructuredSnapshot, ApiError> {
+        if let Ok(snapshot) = self.get_snapshot(snapshot_id) {
+            return Ok(snapshot);
+        }
+        if let Some(snapshot) = self.repository.get_snapshot(snapshot_id).await? {
+            return Ok(snapshot);
+        }
+        Err(ApiError::not_found("snapshot not found"))
+    }
+
+    pub async fn snapshot_owner_async(&self, snapshot_id: &str) -> Result<String, ApiError> {
+        if let Ok(owner) = self.snapshot_owner(snapshot_id) {
+            return Ok(owner);
+        }
+        self.repository
+            .get_snapshot(snapshot_id)
+            .await?
+            .map(|snapshot| snapshot.owner_user_id)
+            .ok_or_else(|| ApiError::not_found("snapshot not found"))
+    }
+
+    pub async fn list_rows_async(&self, snapshot_id: &str) -> Result<Value, ApiError> {
+        let memory_rows = {
+            let data = self.read()?;
+            data.rows_by_snapshot.get(snapshot_id).cloned()
+        };
+        if let Some(rows) = memory_rows {
+            return Ok(json!({ "snapshot_id": snapshot_id, "rows": rows }));
+        }
+        if let Some(rows) = self.repository.list_rows(snapshot_id).await? {
+            return Ok(json!({ "snapshot_id": snapshot_id, "rows": rows }));
+        }
+        Ok(json!({ "snapshot_id": snapshot_id, "rows": [] }))
+    }
+
+    pub async fn get_trace_async(&self, trace_id: &str) -> Result<TraceRecord, ApiError> {
+        if let Ok(trace) = self.get_trace(trace_id) {
+            return Ok(trace);
+        }
+        if let Some(trace) = self.repository.get_trace(trace_id).await? {
+            return Ok(trace);
+        }
+        Err(ApiError::not_found("trace not found"))
+    }
+
+    pub async fn fs_read_async(
+        &self,
+        tenant_id: &str,
+        uri: &str,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<ContextNode, ApiError> {
+        if let Ok(node) = self.fs_read(tenant_id, uri, owner_user_id, include_all_private) {
+            return Ok(node);
+        }
+        if !include_all_private {
+            if let Some(node) = self
+                .repository
+                .read_context_node(tenant_id, owner_user_id, uri, None, &self.resolver)
+                .await?
+            {
+                return Ok(node);
+            }
+        }
+        Err(ApiError::not_found("context uri not found"))
+    }
+
+    pub async fn fs_layer_async(
+        &self,
+        tenant_id: &str,
+        uri: &str,
+        layer: u8,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<ContextNode, ApiError> {
+        if let Ok(node) = self.fs_layer(tenant_id, uri, layer, owner_user_id, include_all_private) {
+            return Ok(node);
+        }
+        if !include_all_private {
+            if let Some(node) = self
+                .repository
+                .read_context_node(tenant_id, owner_user_id, uri, Some(layer), &self.resolver)
+                .await?
+            {
+                return Ok(node);
+            }
+        }
+        Err(ApiError::not_found("context layer not found"))
     }
 
     pub fn ensure_user_index(
@@ -478,18 +688,15 @@ impl Store {
             req.schema_version.unwrap_or(EVENT_INDEX_SCHEMA_VERSION),
         )?;
 
-        let mut task_uids = Vec::new();
-        if req.force_reapply_settings {
-            task_uids.push(format!("settings-{}", routing.settings_hash));
-        }
-        if req.create_personal_context_index {
-            task_uids.push(format!("context-{}", routing.owner_user_id_hash));
-        }
+        let _ = (
+            req.force_reapply_settings,
+            req.create_personal_context_index,
+        );
 
         Ok(UserEventIndexResponse {
             index,
             routing,
-            meili_task_uids: task_uids,
+            meili_task_uids: Vec::new(),
         })
     }
 
@@ -829,6 +1036,27 @@ impl Store {
             .and_then(|events| events.iter().find(|event| event.id == event_id))
             .cloned()
             .ok_or_else(|| ApiError::not_found("history event not found"))
+    }
+
+    fn latest_event_id_for_entity(
+        &self,
+        owner_user_id: &str,
+        event_type: &str,
+        entity_type: &str,
+        entity_id: &str,
+    ) -> Result<Option<String>, ApiError> {
+        let data = self.read()?;
+        Ok(data
+            .event_by_id
+            .values()
+            .filter(|event| {
+                event.owner_user_id == owner_user_id
+                    && event.event_type == event_type
+                    && event.entity_type == entity_type
+                    && event.entity_id == entity_id
+            })
+            .max_by_key(|event| event.observed_at)
+            .map(|event| event.id.clone()))
     }
 
     pub fn timeline(
@@ -1345,11 +1573,24 @@ impl Store {
             .or_default()
             .push(revision.clone());
 
+        let revision_id = revision.id.clone();
+        drop(data);
+
+        let history = self.append_internal_event(
+            tenant_id,
+            "company",
+            "company_doc.revision_created",
+            "company_doc_revision",
+            &revision_id,
+            format!("Company document revision created for {source_id}"),
+            json!({ "source_id": source_id, "revision_id": revision_id.clone() }),
+        )?;
+
         Ok(CreateRevisionResponse {
             source_id: source_id.to_string(),
-            revision_id: revision.id,
+            revision_id,
             status: "staged".to_string(),
-            history_event_id: None,
+            history_event_id: Some(history.event.id),
             ingest_job_id: if req.ingest {
                 Some(new_id("ingest"))
             } else {
@@ -1394,11 +1635,23 @@ impl Store {
         let context_uris =
             self.write_company_revision_context_locked(&mut data, tenant_id, &revision);
 
+        drop(data);
+
+        let history = self.append_internal_event(
+            tenant_id,
+            "company",
+            "company_doc.revision_activated",
+            "company_doc_revision",
+            revision_id,
+            format!("Company document revision activated for {source_id}"),
+            json!({ "source_id": source_id, "revision_id": revision_id }),
+        )?;
+
         Ok(ActivateRevisionResponse {
             source_id: source_id.to_string(),
             active_revision_id: revision_id.to_string(),
             previous_revision_id,
-            history_event_id: None,
+            history_event_id: Some(history.event.id),
             context_uris,
         })
     }
@@ -1655,11 +1908,19 @@ impl Store {
 
         let stats = deterministic_stats(&rows, &prior_rows_by_period);
         let summary_id = new_id("summary");
+        let insight_candidate_id = (req.llm_mode != "none").then(|| new_id("candidate"));
         let context_uri = format!(
             "ctx://user/structured/{}/snapshots/{}/trend/.overview",
             sanitize_slug(dataset_key),
             sanitize_slug(&snapshot.period_key)
         );
+        let llm_summary = (req.llm_mode != "none").then(|| {
+            format!(
+                "LLM trend summary for {dataset_key} {} over {} rows.",
+                snapshot.period_key,
+                rows.len()
+            )
+        });
         let summary = json!({
             "id": summary_id,
             "snapshot_id": snapshot_id,
@@ -1668,6 +1929,8 @@ impl Store {
             "stats": stats,
             "analysis_window": req.analysis_window.unwrap_or_else(|| "last_4_periods".to_string()),
             "llm_mode": req.llm_mode,
+            "llm_summary": llm_summary,
+            "insight_candidate_ids": insight_candidate_id.iter().collect::<Vec<_>>(),
             "context_uri": context_uri
         });
 
@@ -1700,33 +1963,79 @@ impl Store {
         }
         drop(data);
 
+        let history = self.append_internal_event(
+            tenant_id,
+            &snapshot.owner_user_id,
+            "structured.snapshot.applied",
+            "structured_snapshot",
+            &snapshot_id,
+            format!("Structured snapshot {} applied", snapshot.period_key),
+            json!({
+                "dataset_key": dataset_key,
+                "summary_id": summary["id"].as_str().unwrap(),
+                "llm_mode": summary["llm_mode"]
+            }),
+        )?;
+        let _history_event_id = history.event.id;
+
         Ok(ApplySnapshotResponse {
             snapshot_id,
             summary_ids: vec![summary["id"].as_str().unwrap().to_string()],
             state_item_ids: Vec::new(),
-            insight_candidate_ids: Vec::new(),
+            insight_candidate_ids: insight_candidate_id.into_iter().collect(),
             context_uris: vec![context_uri],
             job_id: new_id("job"),
         })
     }
 
-    pub fn current_structured_state(&self) -> Result<CurrentStructuredStateResponse, ApiError> {
+    pub fn current_structured_state(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<CurrentStructuredStateResponse, ApiError> {
         let data = self.read()?;
+        let private_allowed = |owner: &str| include_all_private || owner_user_id == Some(owner);
         Ok(CurrentStructuredStateResponse {
             items: data
                 .state_items
                 .values()
-                .filter(|item| item.state_type == "structured_summary")
+                .filter(|item| {
+                    item.tenant_id == tenant_id
+                        && item.state_type == "structured_summary"
+                        && private_allowed(&item.owner_user_id)
+                })
                 .cloned()
                 .collect(),
-            summaries: data.structured_summaries.values().cloned().collect(),
+            summaries: data
+                .structured_summaries
+                .values()
+                .filter(|summary| {
+                    summary
+                        .get("owner_user_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(private_allowed)
+                })
+                .cloned()
+                .collect(),
         })
     }
 
-    pub fn fs_ls(&self, uri: Option<&str>) -> Result<Value, ApiError> {
+    pub fn fs_ls(
+        &self,
+        tenant_id: &str,
+        uri: Option<&str>,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<Value, ApiError> {
         let data = self.read()?;
         let prefix = uri.unwrap_or("ctx://");
-        let nodes = self.all_context_nodes_locked(&data);
+        let nodes = self.context_scope_for_acl_locked(
+            &data,
+            tenant_id,
+            owner_user_id,
+            include_all_private,
+        )?;
         let mut children: Vec<_> = nodes
             .into_iter()
             .filter(|node| node.status == "active")
@@ -1744,24 +2053,44 @@ impl Store {
         Ok(json!({ "uri": prefix, "children": children }))
     }
 
-    pub fn fs_tree(&self, uri: Option<&str>, depth: Option<usize>) -> Result<Value, ApiError> {
-        let mut tree = self.fs_ls(uri)?;
+    pub fn fs_tree(
+        &self,
+        tenant_id: &str,
+        uri: Option<&str>,
+        depth: Option<usize>,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<Value, ApiError> {
+        let mut tree = self.fs_ls(tenant_id, uri, owner_user_id, include_all_private)?;
         tree["depth"] = json!(depth.unwrap_or(2));
         Ok(tree)
     }
 
-    pub fn fs_read(&self, uri: &str) -> Result<ContextNode, ApiError> {
+    pub fn fs_read(
+        &self,
+        tenant_id: &str,
+        uri: &str,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<ContextNode, ApiError> {
         let data = self.read()?;
-        self.all_context_nodes_locked(&data)
+        self.context_scope_for_acl_locked(&data, tenant_id, owner_user_id, include_all_private)?
             .into_iter()
             .find(|node| node.uri == uri && node.status == "active")
             .ok_or_else(|| ApiError::not_found("context uri not found"))
     }
 
-    pub fn fs_layer(&self, uri: &str, layer: u8) -> Result<ContextNode, ApiError> {
+    pub fn fs_layer(
+        &self,
+        tenant_id: &str,
+        uri: &str,
+        layer: u8,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<ContextNode, ApiError> {
         let target = strip_layer_suffix(uri);
         let data = self.read()?;
-        self.all_context_nodes_locked(&data)
+        self.context_scope_for_acl_locked(&data, tenant_id, owner_user_id, include_all_private)?
             .into_iter()
             .find(|node| {
                 strip_layer_suffix(&node.uri) == target
@@ -1873,7 +2202,10 @@ impl Store {
 
     pub fn reveal_context(
         &self,
+        tenant_id: &str,
         req: ContextRevealRequest,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
     ) -> Result<ContextRevealResponse, ApiError> {
         let layer = req.next_layer.unwrap_or(1);
         let uri = if let Some(uri) = req.uri {
@@ -1887,7 +2219,7 @@ impl Store {
         } else {
             return Err(ApiError::bad_request("uri or trace_id is required"));
         };
-        let node = self.fs_layer(&uri, layer)?;
+        let node = self.fs_layer(tenant_id, &uri, layer, owner_user_id, include_all_private)?;
         Ok(ContextRevealResponse {
             uri: node.uri,
             layer: node.layer,
@@ -2070,6 +2402,14 @@ impl Store {
         data.traces
             .get(trace_id)
             .cloned()
+            .ok_or_else(|| ApiError::not_found("trace not found"))
+    }
+
+    pub fn trace_owner_id(&self, trace_id: &str) -> Result<Option<String>, ApiError> {
+        let data = self.read()?;
+        data.traces
+            .get(trace_id)
+            .map(|trace| trace.owner_user_id.clone())
             .ok_or_else(|| ApiError::not_found("trace not found"))
     }
 
@@ -2608,6 +2948,23 @@ impl Store {
             );
         }
         Ok(nodes)
+    }
+
+    fn context_scope_for_acl_locked(
+        &self,
+        data: &StoreData,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<Vec<ContextNode>, ApiError> {
+        if include_all_private && owner_user_id.is_none() {
+            return Ok(self
+                .all_context_nodes_locked(data)
+                .into_iter()
+                .filter(|node| node.tenant_id == tenant_id || node.tenant_id == "default")
+                .collect());
+        }
+        self.context_scope_locked(data, tenant_id, owner_user_id)
     }
 
     fn all_context_nodes_locked(&self, data: &StoreData) -> Vec<ContextNode> {

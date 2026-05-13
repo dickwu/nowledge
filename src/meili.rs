@@ -373,19 +373,19 @@ pub fn settings_for(uid: &str) -> Value {
     if uid.contains("context") {
         json!({
             "searchableAttributes": ["title", "body", "uri"],
-            "filterableAttributes": ["tenant_id", "owner_user_id", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id"],
+            "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id"],
             "sortableAttributes": ["updated_at", "layer"]
         })
     } else if uid.contains("events") {
         json!({
             "searchableAttributes": ["text", "event_type", "entity_type", "entity_id", "tags"],
-            "filterableAttributes": ["tenant_id", "owner_user_id_hash", "event_type", "entity_type", "entity_id", "privacy", "occurred_at", "observed_at"],
+            "filterableAttributes": ["id", "tenant_id", "owner_user_id_hash", "event_type", "entity_type", "entity_id", "privacy", "occurred_at", "observed_at"],
             "sortableAttributes": ["occurred_at", "observed_at"]
         })
     } else {
         json!({
             "searchableAttributes": ["title", "statement", "text", "content", "id"],
-            "filterableAttributes": ["tenant_id", "owner_user_id", "status", "privacy", "source_id", "revision_id"],
+            "filterableAttributes": ["id", "tenant_id", "owner_user_id", "snapshot_id", "dataset_key", "status", "privacy", "source_id", "revision_id"],
             "sortableAttributes": ["created_at", "updated_at", "occurred_at"]
         })
     }

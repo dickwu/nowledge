@@ -75,6 +75,28 @@ pub trait KnowledgeRepository: Send + Sync {
         resolver: &EventIndexResolver,
     ) -> Result<Option<RepositoryContextSearch>, ApiError>;
 
+    async fn get_event(
+        &self,
+        routing: &EventIndexRouting,
+        event_id: &str,
+    ) -> Result<Option<HistoryEvent>, ApiError>;
+
+    async fn read_context_node(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        uri: &str,
+        layer: Option<u8>,
+        resolver: &EventIndexResolver,
+    ) -> Result<Option<ContextNode>, ApiError>;
+
+    async fn get_trace(&self, trace_id: &str) -> Result<Option<TraceRecord>, ApiError>;
+
+    async fn get_snapshot(&self, snapshot_id: &str)
+        -> Result<Option<StructuredSnapshot>, ApiError>;
+
+    async fn list_rows(&self, snapshot_id: &str) -> Result<Option<Vec<Value>>, ApiError>;
+
     async fn debug_search(&self, index_uid: &str, query: &str) -> Result<Option<Value>, ApiError>;
 }
 
@@ -163,6 +185,40 @@ impl KnowledgeRepository for MemoryRepository {
         _limit: usize,
         _resolver: &EventIndexResolver,
     ) -> Result<Option<RepositoryContextSearch>, ApiError> {
+        Ok(None)
+    }
+
+    async fn get_event(
+        &self,
+        _routing: &EventIndexRouting,
+        _event_id: &str,
+    ) -> Result<Option<HistoryEvent>, ApiError> {
+        Ok(None)
+    }
+
+    async fn read_context_node(
+        &self,
+        _tenant_id: &str,
+        _owner_user_id: Option<&str>,
+        _uri: &str,
+        _layer: Option<u8>,
+        _resolver: &EventIndexResolver,
+    ) -> Result<Option<ContextNode>, ApiError> {
+        Ok(None)
+    }
+
+    async fn get_trace(&self, _trace_id: &str) -> Result<Option<TraceRecord>, ApiError> {
+        Ok(None)
+    }
+
+    async fn get_snapshot(
+        &self,
+        _snapshot_id: &str,
+    ) -> Result<Option<StructuredSnapshot>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_rows(&self, _snapshot_id: &str) -> Result<Option<Vec<Value>>, ApiError> {
         Ok(None)
     }
 
@@ -467,6 +523,128 @@ impl KnowledgeRepository for MeiliRepository {
             nodes: all_nodes,
             stages,
         }))
+    }
+
+    async fn get_event(
+        &self,
+        routing: &EventIndexRouting,
+        event_id: &str,
+    ) -> Result<Option<HistoryEvent>, ApiError> {
+        let response: SearchResponse<HistoryEvent> = self
+            .admin
+            .search(
+                &routing.event_index_uid,
+                json!({
+                    "q": "",
+                    "limit": 1,
+                    "filter": format!(
+                        "id = {} AND owner_user_id_hash = {}",
+                        meili_string(event_id)?,
+                        meili_string(&routing.owner_user_id_hash)?
+                    )
+                }),
+            )
+            .await?;
+        Ok(response.hits.into_iter().next())
+    }
+
+    async fn read_context_node(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        uri: &str,
+        layer: Option<u8>,
+        resolver: &EventIndexResolver,
+    ) -> Result<Option<ContextNode>, ApiError> {
+        let target = strip_context_layer_suffix(uri);
+        let mut indexes = vec![("rag_company_context".to_string(), None)];
+        if let Some(owner) = owner_user_id {
+            let routing = resolver.resolve(tenant_id, owner, false, true)?;
+            indexes.push((routing.personal_context_index_uid, Some(owner)));
+        }
+
+        for (index_uid, owner) in indexes {
+            let mut filters = vec![
+                format!("tenant_id = {}", meili_string(tenant_id)?),
+                "status = \"active\"".to_string(),
+            ];
+            if let Some(layer) = layer {
+                filters.push(format!("layer = {layer}"));
+            }
+            if let Some(owner) = owner {
+                filters.push(format!("owner_user_id = {}", meili_string(owner)?));
+                filters.push("privacy = \"private\"".to_string());
+            } else {
+                filters.push("privacy = \"company\"".to_string());
+            }
+            let response: SearchResponse<ContextNode> = self
+                .admin
+                .search(
+                    &index_uid,
+                    json!({
+                        "q": target,
+                        "limit": 20,
+                        "filter": filters.join(" AND ")
+                    }),
+                )
+                .await?;
+            if let Some(node) = response
+                .hits
+                .into_iter()
+                .find(|node| node.uri == uri || strip_context_layer_suffix(&node.uri) == target)
+            {
+                return Ok(Some(node));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn get_trace(&self, trace_id: &str) -> Result<Option<TraceRecord>, ApiError> {
+        let response: SearchResponse<TraceRecord> = self
+            .admin
+            .search(
+                "rag_traces",
+                json!({
+                    "q": "",
+                    "limit": 1,
+                    "filter": format!("id = {}", meili_string(trace_id)?)
+                }),
+            )
+            .await?;
+        Ok(response.hits.into_iter().next())
+    }
+
+    async fn get_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<Option<StructuredSnapshot>, ApiError> {
+        let response: SearchResponse<StructuredSnapshot> = self
+            .admin
+            .search(
+                "rag_structured_snapshots",
+                json!({
+                    "q": "",
+                    "limit": 1,
+                    "filter": format!("id = {}", meili_string(snapshot_id)?)
+                }),
+            )
+            .await?;
+        Ok(response.hits.into_iter().next())
+    }
+
+    async fn list_rows(&self, snapshot_id: &str) -> Result<Option<Vec<Value>>, ApiError> {
+        let response: SearchResponse<Value> = self
+            .admin
+            .search(
+                "rag_structured_rows",
+                json!({
+                    "q": "",
+                    "limit": 1000,
+                    "filter": format!("snapshot_id = {}", meili_string(snapshot_id)?)
+                }),
+            )
+            .await?;
+        Ok(Some(response.hits))
     }
 
     async fn debug_search(&self, index_uid: &str, query: &str) -> Result<Option<Value>, ApiError> {

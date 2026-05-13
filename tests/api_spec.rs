@@ -22,11 +22,27 @@ fn authed_app() -> Router {
             roles: vec!["user".to_string()],
         },
         nowledge::config::AuthUserConfig {
+            token: "u2-token".to_string(),
+            owner_user_id: Some("u2".to_string()),
+            roles: vec!["user".to_string()],
+        },
+        nowledge::config::AuthUserConfig {
             token: "admin-token".to_string(),
             owner_user_id: None,
             roles: vec!["admin".to_string()],
         },
     ];
+    build_router(AppState::new(Arc::new(config)))
+}
+
+fn codex_import_app() -> Router {
+    let mut config = Config::test();
+    config.allow_codex_auth_import = true;
+    config.auth_users = vec![nowledge::config::AuthUserConfig {
+        token: "admin-token".to_string(),
+        owner_user_id: None,
+        roles: vec!["admin".to_string()],
+    }];
     build_router(AppState::new(Arc::new(config)))
 }
 
@@ -80,6 +96,14 @@ fn event_body(owner: &str, entity: &str, text: &str) -> Value {
         "text": text,
         "privacy": "private"
     })
+}
+
+fn query_encode(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace(':', "%3A")
+        .replace('/', "%2F")
+        .replace(' ', "%20")
 }
 
 #[tokio::test]
@@ -390,6 +414,100 @@ async fn authenticated_user_is_bound_to_owner_user_id() {
 }
 
 #[tokio::test]
+async fn contextfs_private_acl_and_company_readability() {
+    let app = authed_app();
+
+    let (status, event) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/history/users/u1/events",
+        event_body("u1", "acl-note", "acl-private-keyword belongs to u1"),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{event}");
+
+    let (status, search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "acl-private-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    let private_uri = search["hits"][0]["uri"].as_str().unwrap();
+
+    let (status, own_read) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/fs/read?uri={}", query_encode(private_uri)),
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{own_read}");
+
+    let (status, cross_read) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/fs/read?uri={}", query_encode(private_uri)),
+        Value::Null,
+        Some("u2-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{cross_read}");
+
+    let (status, cross_reveal) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/reveal",
+        json!({ "uri": private_uri, "next_layer": 1 }),
+        Some("u2-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{cross_reveal}");
+
+    let (status, revision) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/state/company-docs/company-handbook/revisions",
+        json!({
+            "title": "Company Handbook",
+            "source_uri": "https://example.test/company/handbook",
+            "content": "company-visible-keyword is available to every employee.",
+            "checksum": "company-1"
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{revision}");
+    let revision_id = revision["revision_id"].as_str().unwrap();
+
+    let (status, activated) = call_with_token(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/state/company-docs/company-handbook/revisions/{revision_id}/activate"),
+        json!({ "reason": "test" }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{activated}");
+    let company_uri = activated["context_uris"][0].as_str().unwrap();
+
+    let (status, company_read) = call_with_token(
+        app,
+        Method::GET,
+        &format!("/v1/fs/read?uri={}", query_encode(company_uri)),
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{company_read}");
+    assert_eq!(company_read["privacy"], "company");
+}
+
+#[tokio::test]
 async fn structured_apply_snapshot_reports_weekly_trends() {
     let app = app();
 
@@ -454,6 +572,68 @@ async fn structured_apply_snapshot_reports_weekly_trends() {
 }
 
 #[tokio::test]
+async fn current_structured_is_owner_bound_for_users() {
+    let app = authed_app();
+
+    for (owner, token, score) in [("u1", "u1-token", 3.0), ("u2", "u2-token", 9.0)] {
+        let (status, snapshot) = call_with_token(
+            app.clone(),
+            Method::POST,
+            "/v1/history/structured/snapshots",
+            json!({
+                "dataset_key": "weekly-status",
+                "owner_user_id": owner,
+                "period_key": format!("2026-W20-{owner}"),
+                "period_start": "2026-05-11T00:00:00Z",
+                "period_end": "2026-05-17T23:59:59Z",
+                "granularity": "weekly",
+                "source_ref": { "kind": "test", "id": owner }
+            }),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{snapshot}");
+        let snapshot_id = snapshot["snapshot"]["id"].as_str().unwrap();
+
+        let (status, rows) = call_with_token(
+            app.clone(),
+            Method::POST,
+            &format!("/v1/history/structured/snapshots/{snapshot_id}/rows:bulk"),
+            json!({ "rows": [{ "id": format!("row-{owner}"), "stress_score": score }] }),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+
+        let (status, applied) = call_with_token(
+            app.clone(),
+            Method::POST,
+            "/v1/state/structured/datasets/weekly-status/apply-snapshot",
+            json!({ "snapshot_id": snapshot_id, "materialize_context": true }),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+    }
+
+    let (status, current) = call_with_token(
+        app,
+        Method::GET,
+        "/v1/state/structured/current",
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{current}");
+    let summaries = current["summaries"].as_array().unwrap();
+    assert!(!summaries.is_empty());
+    assert!(summaries
+        .iter()
+        .all(|summary| summary["owner_user_id"] == "u1"));
+    assert!(!current.to_string().contains("\"owner_user_id\":\"u2\""));
+}
+
+#[tokio::test]
 async fn llm_mock_provider_test_is_token_safe() {
     let app = mock_llm_app();
     let (status, body) = call(
@@ -467,4 +647,57 @@ async fn llm_mock_provider_test_is_token_safe() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["model"], "mock-model");
     assert!(body["sample"].as_str().unwrap().contains("mock summary"));
+}
+
+#[tokio::test]
+async fn rag_answer_uses_mock_llm_provider() {
+    let app = mock_llm_app();
+    let (status, event) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/history/users/u1/events",
+        event_body("u1", "rag-note", "rag-grounding-keyword from context"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{event}");
+
+    let (status, answer) = call(
+        app,
+        Method::POST,
+        "/v1/rag/answer",
+        json!({
+            "owner_user_id": "u1",
+            "question": "What does rag-grounding-keyword say?"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert!(answer["answer"].as_str().unwrap().contains("mock summary"));
+    assert_ne!(answer["usage"]["provider"], "none");
+}
+
+#[tokio::test]
+async fn codex_auth_import_is_token_safe() {
+    let app = codex_import_app();
+    let token = "codex-secret-token-should-not-leak";
+    let path =
+        std::env::temp_dir().join(format!("nowledge-codex-auth-{}.json", uuid::Uuid::now_v7()));
+    std::fs::write(&path, json!({ "token": token }).to_string()).unwrap();
+
+    let (status, body) = call_with_token(
+        app,
+        Method::POST,
+        "/v1/llm/auth/import-codex",
+        json!({
+            "codex_auth_path": path.to_string_lossy(),
+            "store_imported_token": false,
+            "test_after_import": false
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "imported_in_memory");
+    assert!(!body.to_string().contains(token));
 }

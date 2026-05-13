@@ -68,6 +68,11 @@ async fn meili_backend_creates_dynamic_user_indexes_and_searches_events() {
         .unwrap()
         .contains(&owner));
     assert!(!ensured["meili_task_uids"].as_array().unwrap().is_empty());
+    assert!(ensured["meili_task_uids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|uid| uid.as_str().unwrap().chars().all(|c| c.is_ascii_digit())));
 
     let text = format!("meili-only-keyword-{}", uuid::Uuid::now_v7());
     let (status, event) = call(
@@ -90,6 +95,11 @@ async fn meili_backend_creates_dynamic_user_indexes_and_searches_events() {
     .await;
     assert_eq!(status, StatusCode::OK, "{event}");
     assert!(event["meili_task_uid"].as_str().is_some());
+    assert!(event["meili_task_uid"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .all(|c| c.is_ascii_digit()));
 
     let (status, search) = call(
         app,
@@ -100,4 +110,48 @@ async fn meili_backend_creates_dynamic_user_indexes_and_searches_events() {
     .await;
     assert_eq!(status, StatusCode::OK, "{search}");
     assert_eq!(search["hits"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn meili_backend_indexes_internal_state_events() {
+    let Some(app) = meili_app() else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+
+    let (status, bootstrap) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/bootstrap",
+        json!({ "reset": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bootstrap}");
+
+    let owner = format!("u-{}", uuid::Uuid::now_v7());
+    let fact_key = format!("state-{}", uuid::Uuid::now_v7());
+    let (status, state) = call(
+        app.clone(),
+        Method::PUT,
+        &format!("/v1/state/profile/facts/{fact_key}"),
+        json!({
+            "owner_user_id": owner,
+            "state_type": "preference",
+            "title": "Meili state event",
+            "statement": "state changed should be indexed in Meili"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{state}");
+
+    let (status, history) = call(
+        app,
+        Method::POST,
+        &format!("/v1/history/users/{owner}/search"),
+        json!({ "event_types": ["state.changed"], "limit": 10 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(history["hits"][0]["event_type"], "state.changed");
 }
