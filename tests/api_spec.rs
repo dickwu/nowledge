@@ -112,6 +112,19 @@ async fn user_history_events_are_index_isolated() {
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     assert!(!uid1.contains("u1"));
 
+    let (status, index) = call(
+        app.clone(),
+        Method::GET,
+        "/v1/history/users/u1/event-index",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{index}");
+    let registry_id = index["index"]["id"].as_str().unwrap();
+    assert!(registry_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+
     let (status, search) = call(
         app.clone(),
         Method::POST,

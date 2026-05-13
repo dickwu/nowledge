@@ -537,10 +537,11 @@ impl Store {
         for owner in owners {
             if req.dry_run {
                 let routing = self.resolver.resolve(tenant_id, &owner, false, true)?;
+                let tenant_hash = self.resolver.tenant_hash(tenant_id);
                 indexes.push(UserEventIndex {
-                    id: format!("{}:{}", routing.tenant_id, routing.owner_user_id_hash),
+                    id: user_event_index_id(&tenant_hash, &routing.owner_user_id_hash),
                     tenant_id: routing.tenant_id.clone(),
-                    tenant_hash: self.resolver.tenant_hash(tenant_id),
+                    tenant_hash,
                     owner_user_id_hash: routing.owner_user_id_hash,
                     event_index_uid: routing.event_index_uid,
                     personal_context_index_uid: routing.personal_context_index_uid,
@@ -2255,10 +2256,11 @@ impl Store {
             .resolve(tenant_id, owner_user_id, !existed, existed)?;
 
         if !existed {
+            let tenant_hash = self.resolver.tenant_hash(tenant_id);
             let index = UserEventIndex {
-                id: format!("{}:{}", tenant_id, routing.owner_user_id_hash),
+                id: user_event_index_id(&tenant_hash, &routing.owner_user_id_hash),
                 tenant_id: tenant_id.to_string(),
-                tenant_hash: self.resolver.tenant_hash(tenant_id),
+                tenant_hash,
                 owner_user_id_hash: routing.owner_user_id_hash.clone(),
                 event_index_uid: routing.event_index_uid.clone(),
                 personal_context_index_uid: routing.personal_context_index_uid.clone(),
@@ -2704,6 +2706,10 @@ fn token_similarity(a: &str, b: &str) -> f32 {
     let intersection = left.intersection(&right).count() as f32;
     let union = left.union(&right).count() as f32;
     intersection / union
+}
+
+fn user_event_index_id(tenant_hash: &str, owner_user_id_hash: &str) -> String {
+    format!("uei__t_{tenant_hash}__u_{owner_user_id_hash}")
 }
 
 fn deterministic_stats(rows: &[Value], prior_rows_by_period: &[(String, Vec<Value>)]) -> Value {
