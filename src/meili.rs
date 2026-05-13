@@ -25,6 +25,9 @@ pub const FIXED_INDEXES: &[&str] = &[
     "rag_traces",
 ];
 
+const MEILI_TASK_WAIT_ATTEMPTS: usize = 600;
+const MEILI_TASK_WAIT_INTERVAL_MS: u64 = 100;
+
 #[derive(Debug, Clone)]
 pub struct MeiliAdmin {
     url: Option<String>,
@@ -333,7 +336,7 @@ impl MeiliAdmin {
         let Some(url) = &self.url else {
             return Ok(());
         };
-        for _ in 0..80 {
+        for _ in 0..MEILI_TASK_WAIT_ATTEMPTS {
             let response = self
                 .client
                 .get(format!("{}/tasks/{}", url.trim_end_matches('/'), task_uid))
@@ -355,7 +358,7 @@ impl MeiliAdmin {
                         "Meilisearch task {task_uid} did not succeed: {body}"
                     )));
                 }
-                _ => sleep(Duration::from_millis(50)).await,
+                _ => sleep(Duration::from_millis(MEILI_TASK_WAIT_INTERVAL_MS)).await,
             }
         }
         Err(ApiError::Upstream(format!(
