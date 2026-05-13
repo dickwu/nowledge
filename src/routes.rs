@@ -13,6 +13,7 @@ use crate::{
     auth::{AdminGuard, UserGuard},
     config::Config,
     error::ApiError,
+    llm::{llm_client_from_config, LlmRequest},
     meili::MeiliAdmin,
     models::*,
     store::Store,
@@ -179,6 +180,7 @@ async fn readyz(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "status": "ready",
         "meili": if state.config.meili_url.is_some() { "configured" } else { "memory" },
+        "store_backend": state.store.backend_name(),
         "llm": state.config.llm_provider
     }))
 }
@@ -198,27 +200,35 @@ async fn bootstrap(
 }
 
 async fn ensure_user_event_index(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(owner_user_id): Path<String>,
     Json(req): Json<EnsureUserEventIndexRequest>,
 ) -> Result<Json<UserEventIndexResponse>, ApiError> {
-    Ok(Json(state.store.ensure_user_index(
-        state.tenant_id(),
-        &owner_user_id,
-        req,
-    )?))
-}
-
-async fn get_user_event_index(
-    _user: UserGuard,
-    State(state): State<AppState>,
-    Path(owner_user_id): Path<String>,
-) -> Result<Json<UserEventIndexResponse>, ApiError> {
+    user.require_owner_access(&owner_user_id)?;
     Ok(Json(
         state
             .store
-            .get_user_index(state.tenant_id(), &owner_user_id)?,
+            .ensure_user_index_async(state.tenant_id(), &owner_user_id, req)
+            .await?,
+    ))
+}
+
+async fn get_user_event_index(
+    user: UserGuard,
+    State(state): State<AppState>,
+    Path(owner_user_id): Path<String>,
+) -> Result<Json<UserEventIndexResponse>, ApiError> {
+    user.require_owner_access(&owner_user_id)?;
+    Ok(Json(
+        state
+            .store
+            .ensure_user_index_async(
+                state.tenant_id(),
+                &owner_user_id,
+                EnsureUserEventIndexRequest::default(),
+            )
+            .await?,
     ))
 }
 
@@ -240,50 +250,57 @@ async fn reconcile_user_event_indexes(
 }
 
 async fn append_user_event(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(owner_user_id): Path<String>,
     Json(req): Json<AppendHistoryEventRequest>,
 ) -> Result<Json<HistoryEventResponse>, ApiError> {
-    Ok(Json(state.store.append_event(
-        state.tenant_id(),
-        Some(&owner_user_id),
-        req,
-    )?))
+    user.require_owner_access(&owner_user_id)?;
+    Ok(Json(
+        state
+            .store
+            .append_event_async(state.tenant_id(), Some(&owner_user_id), req)
+            .await?,
+    ))
 }
 
 async fn append_user_events_bulk(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(owner_user_id): Path<String>,
     Json(req): Json<BulkHistoryEventsRequest>,
 ) -> Result<Json<BulkHistoryEventsResponse>, ApiError> {
-    Ok(Json(state.store.append_bulk_events(
-        state.tenant_id(),
-        Some(&owner_user_id),
-        req,
-    )?))
+    user.require_owner_access(&owner_user_id)?;
+    Ok(Json(
+        state
+            .store
+            .append_bulk_events_async(state.tenant_id(), Some(&owner_user_id), req)
+            .await?,
+    ))
 }
 
 async fn search_user_events(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(owner_user_id): Path<String>,
     Json(mut req): Json<HistorySearchRequest>,
 ) -> Result<Json<HistorySearchResponse>, ApiError> {
+    user.require_owner_access(&owner_user_id)?;
     req.owner_user_id = Some(owner_user_id.clone());
-    Ok(Json(state.store.search_events(
-        state.tenant_id(),
-        Some(&owner_user_id),
-        req,
-    )?))
+    Ok(Json(
+        state
+            .store
+            .search_events_async(state.tenant_id(), Some(&owner_user_id), req)
+            .await?,
+    ))
 }
 
 async fn get_user_event(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path((owner_user_id, event_id)): Path<(String, String)>,
 ) -> Result<Json<HistoryEvent>, ApiError> {
+    user.require_owner_access(&owner_user_id)?;
     Ok(Json(state.store.get_event(
         state.tenant_id(),
         &owner_user_id,
@@ -292,11 +309,12 @@ async fn get_user_event(
 }
 
 async fn user_timeline(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(owner_user_id): Path<String>,
     Json(req): Json<TimelineQueryRequest>,
 ) -> Result<Json<TimelineResponse>, ApiError> {
+    user.require_owner_access(&owner_user_id)?;
     Ok(Json(state.store.timeline(
         state.tenant_id(),
         Some(&owner_user_id),
@@ -305,48 +323,64 @@ async fn user_timeline(
 }
 
 async fn append_event_alias(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<AppendHistoryEventRequest>,
+    Json(mut req): Json<AppendHistoryEventRequest>,
 ) -> Result<Json<HistoryEventResponse>, ApiError> {
-    Ok(Json(state.store.append_event(
-        state.tenant_id(),
-        None,
-        req,
-    )?))
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    Ok(Json(
+        state
+            .store
+            .append_event_async(state.tenant_id(), None, req)
+            .await?,
+    ))
 }
 
 async fn append_events_bulk_alias(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<BulkHistoryEventsRequest>,
+    Json(mut req): Json<BulkHistoryEventsRequest>,
 ) -> Result<Json<BulkHistoryEventsResponse>, ApiError> {
-    Ok(Json(state.store.append_bulk_events(
-        state.tenant_id(),
-        None,
-        req,
-    )?))
+    if let Some(first) = req.events.first_mut() {
+        user.apply_owner_default(&mut first.owner_user_id)?;
+    }
+    if let Some(owner) = req
+        .events
+        .first()
+        .and_then(|event| event.owner_user_id.clone())
+    {
+        user.require_owner_access(&owner)?;
+    }
+    Ok(Json(
+        state
+            .store
+            .append_bulk_events_async(state.tenant_id(), None, req)
+            .await?,
+    ))
 }
 
 async fn search_events_alias(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<HistorySearchRequest>,
+    Json(mut req): Json<HistorySearchRequest>,
 ) -> Result<Json<HistorySearchResponse>, ApiError> {
-    Ok(Json(state.store.search_events(
-        state.tenant_id(),
-        None,
-        req,
-    )?))
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    Ok(Json(
+        state
+            .store
+            .search_events_async(state.tenant_id(), None, req)
+            .await?,
+    ))
 }
 
 async fn get_event_alias(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(event_id): Path<String>,
     Query(query): Query<OwnerQuery>,
 ) -> Result<Json<HistoryEvent>, ApiError> {
     let owner = require_string(query.owner_user_id, "owner_user_id")?;
+    user.require_owner_access(&owner)?;
     Ok(Json(state.store.get_event(
         state.tenant_id(),
         &owner,
@@ -355,45 +389,51 @@ async fn get_event_alias(
 }
 
 async fn timeline_alias(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<TimelineQueryRequest>,
+    Json(mut req): Json<TimelineQueryRequest>,
 ) -> Result<Json<TimelineResponse>, ApiError> {
+    user.apply_owner_default(&mut req.owner_user_id)?;
     Ok(Json(state.store.timeline(state.tenant_id(), None, req)?))
 }
 
 async fn upsert_state_fact(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(fact_key): Path<String>,
-    Json(req): Json<UpsertStateFactRequest>,
+    Json(mut req): Json<UpsertStateFactRequest>,
 ) -> Result<Json<StateItemResponse>, ApiError> {
-    Ok(Json(state.store.upsert_state_fact(
-        state.tenant_id(),
-        &fact_key,
-        req,
-    )?))
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    Ok(Json(
+        state
+            .store
+            .upsert_state_fact_async(state.tenant_id(), &fact_key, req)
+            .await?,
+    ))
 }
 
 async fn patch_state_fact(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(fact_key): Path<String>,
-    Json(req): Json<PatchStateFactRequest>,
+    Json(mut req): Json<PatchStateFactRequest>,
 ) -> Result<Json<StateItemResponse>, ApiError> {
-    Ok(Json(state.store.patch_state_fact(
-        state.tenant_id(),
-        &fact_key,
-        req,
-    )?))
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    Ok(Json(
+        state
+            .store
+            .patch_state_fact_async(state.tenant_id(), &fact_key, req)
+            .await?,
+    ))
 }
 
 async fn get_state_fact(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(fact_key): Path<String>,
-    Query(query): Query<OwnerQuery>,
+    Query(mut query): Query<OwnerQuery>,
 ) -> Result<Json<StateItemResponse>, ApiError> {
+    user.apply_owner_default(&mut query.owner_user_id)?;
     Ok(Json(state.store.get_state_fact(
         state.tenant_id(),
         &fact_key,
@@ -402,39 +442,50 @@ async fn get_state_fact(
 }
 
 async fn search_state(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<StateSearchRequest>,
+    Json(mut req): Json<StateSearchRequest>,
 ) -> Result<Json<StateSearchResponse>, ApiError> {
+    user.apply_owner_default(&mut req.owner_user_id)?;
     Ok(Json(state.store.search_state(state.tenant_id(), req)?))
 }
 
 async fn upsert_insight(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<InsightUpsertRequest>,
+    Json(mut req): Json<InsightUpsertRequest>,
 ) -> Result<Json<InsightResponse>, ApiError> {
-    Ok(Json(state.store.upsert_insight(state.tenant_id(), req)?))
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    Ok(Json(
+        state
+            .store
+            .upsert_insight_async(state.tenant_id(), req)
+            .await?,
+    ))
 }
 
 async fn patch_insight(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(insight_id): Path<String>,
     Json(req): Json<InsightPatchRequest>,
 ) -> Result<Json<InsightResponse>, ApiError> {
-    Ok(Json(state.store.patch_insight(
-        state.tenant_id(),
-        &insight_id,
-        req,
-    )?))
+    let owner = state.store.insight_owner(&insight_id)?;
+    user.require_owner_access(&owner)?;
+    Ok(Json(
+        state
+            .store
+            .patch_insight_async(state.tenant_id(), &insight_id, req)
+            .await?,
+    ))
 }
 
 async fn search_insights(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<InsightSearchRequest>,
+    Json(mut req): Json<InsightSearchRequest>,
 ) -> Result<Json<InsightSearchResponse>, ApiError> {
+    user.apply_owner_default(&mut req.owner_user_id)?;
     Ok(Json(state.store.search_insights(req)?))
 }
 
@@ -452,11 +503,12 @@ async fn create_revision(
     Path(source_id): Path<String>,
     Json(req): Json<CreateRevisionRequest>,
 ) -> Result<Json<CreateRevisionResponse>, ApiError> {
-    Ok(Json(state.store.create_revision(
-        state.tenant_id(),
-        &source_id,
-        req,
-    )?))
+    Ok(Json(
+        state
+            .store
+            .create_revision_async(state.tenant_id(), &source_id, req)
+            .await?,
+    ))
 }
 
 async fn activate_revision(
@@ -465,11 +517,12 @@ async fn activate_revision(
     Path((source_id, revision_id)): Path<(String, String)>,
     Json(req): Json<ActivateRevisionRequest>,
 ) -> Result<Json<ActivateRevisionResponse>, ApiError> {
-    Ok(Json(state.store.activate_revision(
-        &source_id,
-        &revision_id,
-        req,
-    )?))
+    Ok(Json(
+        state
+            .store
+            .activate_revision_async(state.tenant_id(), &source_id, &revision_id, req)
+            .await?,
+    ))
 }
 
 async fn list_revisions(
@@ -490,16 +543,21 @@ async fn upsert_dataset(
 }
 
 async fn apply_snapshot(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(dataset_key): Path<String>,
     Json(req): Json<ApplySnapshotRequest>,
 ) -> Result<Json<ApplySnapshotResponse>, ApiError> {
-    Ok(Json(state.store.apply_snapshot(
-        state.tenant_id(),
-        &dataset_key,
-        req,
-    )?))
+    if let Some(snapshot_id) = req.snapshot_id.as_deref() {
+        let owner = state.store.snapshot_owner(snapshot_id)?;
+        user.require_owner_access(&owner)?;
+    }
+    Ok(Json(
+        state
+            .store
+            .apply_snapshot_async(state.tenant_id(), &dataset_key, req)
+            .await?,
+    ))
 }
 
 async fn current_structured(
@@ -510,39 +568,52 @@ async fn current_structured(
 }
 
 async fn create_snapshot(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<CreateStructuredSnapshotRequest>,
+    Json(mut req): Json<CreateStructuredSnapshotRequest>,
 ) -> Result<Json<StructuredSnapshotResponse>, ApiError> {
-    Ok(Json(state.store.create_snapshot(state.tenant_id(), req)?))
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    Ok(Json(
+        state
+            .store
+            .create_snapshot_async(state.tenant_id(), req)
+            .await?,
+    ))
 }
 
 async fn get_snapshot(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(snapshot_id): Path<String>,
 ) -> Result<Json<StructuredSnapshot>, ApiError> {
+    let owner = state.store.snapshot_owner(&snapshot_id)?;
+    user.require_owner_access(&owner)?;
     Ok(Json(state.store.get_snapshot(&snapshot_id)?))
 }
 
 async fn bulk_rows(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(snapshot_id): Path<String>,
     Json(req): Json<BulkStructuredRowsRequest>,
 ) -> Result<Json<BulkStructuredRowsResponse>, ApiError> {
-    Ok(Json(state.store.bulk_rows(
-        state.tenant_id(),
-        &snapshot_id,
-        req,
-    )?))
+    let owner = state.store.snapshot_owner(&snapshot_id)?;
+    user.require_owner_access(&owner)?;
+    Ok(Json(
+        state
+            .store
+            .bulk_rows_async(state.tenant_id(), &snapshot_id, req)
+            .await?,
+    ))
 }
 
 async fn list_rows(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(snapshot_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    let owner = state.store.snapshot_owner(&snapshot_id)?;
+    user.require_owner_access(&owner)?;
     Ok(Json(state.store.list_rows(&snapshot_id)?))
 }
 
@@ -598,12 +669,17 @@ async fn fs_overview(
 }
 
 async fn context_search(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<ContextSearchRequest>,
+    Json(mut req): Json<ContextSearchRequest>,
 ) -> Result<Json<ContextSearchResponse>, ApiError> {
+    user.apply_owner_default(&mut req.owner_user_id)?;
     Ok(Json(
-        state.store.search_context(state.tenant_id(), req)?.response,
+        state
+            .store
+            .search_context_async(state.tenant_id(), req)
+            .await?
+            .response,
     ))
 }
 
@@ -616,11 +692,14 @@ async fn context_reveal(
 }
 
 async fn rag_answer(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<RagAnswerRequest>,
+    Json(mut req): Json<RagAnswerRequest>,
 ) -> Result<Json<RagAnswerResponse>, ApiError> {
-    Ok(Json(state.store.answer_rag(state.tenant_id(), req)?))
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    Ok(Json(
+        state.store.answer_rag_async(state.tenant_id(), req).await?,
+    ))
 }
 
 async fn rag_stream(
@@ -632,11 +711,15 @@ async fn rag_stream(
 }
 
 async fn rag_debug(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<RagAnswerRequest>,
+    Json(mut req): Json<RagAnswerRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let answer = state.store.answer_rag(state.tenant_id(), req.clone())?;
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    let answer = state
+        .store
+        .answer_rag_async(state.tenant_id(), req.clone())
+        .await?;
     let trace = state.store.get_trace(&answer.trace_id)?;
     Ok(Json(json!({
         "answer": answer,
@@ -646,19 +729,22 @@ async fn rag_debug(
 }
 
 async fn create_session(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
-    Json(req): Json<SessionCreateRequest>,
+    Json(mut req): Json<SessionCreateRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
+    user.apply_owner_default(&mut req.owner_user_id)?;
     Ok(Json(state.store.create_session(req)?))
 }
 
 async fn add_session_message(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Json(req): Json<SessionMessageRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let owner = state.store.session_owner_id(&session_id)?;
+    user.require_owner_access(&owner)?;
     Ok(Json(state.store.add_session_message(
         state.tenant_id(),
         &session_id,
@@ -667,33 +753,28 @@ async fn add_session_message(
 }
 
 async fn commit_session(
-    _user: UserGuard,
+    user: UserGuard,
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     Json(req): Json<SessionCommitRequest>,
 ) -> Result<Json<SessionCommitResponse>, ApiError> {
-    Ok(Json(state.store.commit_session(
-        state.tenant_id(),
-        &session_id,
-        req,
-    )?))
+    let owner = state.store.session_owner_id(&session_id)?;
+    user.require_owner_access(&owner)?;
+    Ok(Json(
+        state
+            .store
+            .commit_session_async(state.tenant_id(), &session_id, req)
+            .await?,
+    ))
 }
 
 async fn llm_status(State(state): State<AppState>) -> Json<LlmStatusResponse> {
+    let status = llm_client_from_config(&state.config).status().await;
     Json(LlmStatusResponse {
-        provider: state.config.llm_provider.clone(),
-        model: state
-            .config
-            .llm_model
-            .clone()
-            .unwrap_or_else(|| "none".to_string()),
-        auth_source: if state.config.llm_provider == "codex_auth" {
-            "codex_auth"
-        } else {
-            "none"
-        }
-        .to_string(),
-        healthy: state.config.llm_provider == "none" || state.config.llm_model.is_some(),
+        provider: status.provider,
+        model: status.model,
+        auth_source: status.auth_source,
+        healthy: status.healthy,
     })
 }
 
@@ -722,29 +803,24 @@ async fn llm_test(
     _admin: AdminGuard,
     State(state): State<AppState>,
     Json(req): Json<LlmTestRequest>,
-) -> Json<LlmTestResponse> {
-    Json(LlmTestResponse {
-        ok: state.config.llm_provider == "none",
-        model: state
-            .config
-            .llm_model
-            .clone()
-            .unwrap_or_else(|| "none".to_string()),
-        latency_ms: 0,
-        sample: req
-            .prompt
-            .map(|prompt| {
-                format!(
-                    "provider=none echo: {}",
-                    prompt.chars().take(80).collect::<String>()
-                )
-            })
-            .unwrap_or_else(|| "provider=none".to_string()),
-    })
+) -> Result<Json<LlmTestResponse>, ApiError> {
+    let client = llm_client_from_config(&state.config);
+    let status = client.status().await;
+    let response = client
+        .complete_text(LlmRequest {
+            prompt: req.prompt.unwrap_or_else(|| "ping".to_string()),
+        })
+        .await?;
+    Ok(Json(LlmTestResponse {
+        ok: true,
+        model: status.model,
+        latency_ms: response.latency_ms,
+        sample: response.text,
+    }))
 }
 
 async fn get_trace(
-    _user: UserGuard,
+    _admin: AdminGuard,
     State(state): State<AppState>,
     Path(trace_id): Path<String>,
 ) -> Result<Json<TraceRecord>, ApiError> {
@@ -763,7 +839,10 @@ async fn debug_meili_search(
         "index_uid",
     )?;
     let query = req.get("query").and_then(Value::as_str).unwrap_or("");
-    let raw = state.store.debug_meili_search(&index_uid, query)?;
+    let raw = state
+        .store
+        .debug_meili_search_async(&index_uid, query)
+        .await?;
     Ok(Json(redact_for_state(&state, raw)))
 }
 
@@ -772,7 +851,10 @@ async fn prompt_preview(
     State(state): State<AppState>,
     Json(req): Json<RagAnswerRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let answer = state.store.answer_rag(state.tenant_id(), req.clone())?;
+    let answer = state
+        .store
+        .answer_rag_async(state.tenant_id(), req.clone())
+        .await?;
     let prompt = build_prompt(&req.question.unwrap_or_default(), &answer.citations);
     Ok(Json(redact_for_state(
         &state,
@@ -802,6 +884,9 @@ fn redact_for_state(state: &AppState, value: Value) -> Value {
         secrets.push(token.clone());
     }
     if let Some(key) = &state.config.meili_api_key {
+        secrets.push(key.clone());
+    }
+    if let Some(key) = &state.config.openai_api_key {
         secrets.push(key.clone());
     }
     redact_secrets(&value, &secrets)

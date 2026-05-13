@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
@@ -9,6 +10,7 @@ use crate::{
     config::Config,
     error::ApiError,
     models::*,
+    repository::{repository_from_config, KnowledgeRepository},
     resolver::{EventIndexResolver, EVENT_INDEX_SCHEMA_VERSION, EVENT_SETTINGS_HASH},
     util::{
         ancestor_uris, hmac_hex, new_id, now, require_string, sanitize_slug, text_score,
@@ -20,6 +22,7 @@ use crate::{
 pub struct Store {
     inner: Arc<RwLock<StoreData>>,
     resolver: EventIndexResolver,
+    repository: Arc<dyn KnowledgeRepository>,
 }
 
 #[derive(Default)]
@@ -58,11 +61,402 @@ impl Store {
         Self {
             inner: Arc::new(RwLock::new(StoreData::default())),
             resolver: EventIndexResolver::new(config.index_hash_secret.clone()),
+            repository: repository_from_config(config),
         }
     }
 
     pub fn resolver(&self) -> &EventIndexResolver {
         &self.resolver
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        self.repository.backend_name()
+    }
+
+    pub async fn ensure_user_index_async(
+        &self,
+        tenant_id: &str,
+        owner_user_id: &str,
+        req: EnsureUserEventIndexRequest,
+    ) -> Result<UserEventIndexResponse, ApiError> {
+        let mut response = self.ensure_user_index(tenant_id, owner_user_id, req)?;
+        let task_uids = self
+            .repository
+            .ensure_user_event_index(&response.index)
+            .await?;
+        response.meili_task_uids.extend(task_uids);
+        Ok(response)
+    }
+
+    pub async fn append_event_async(
+        &self,
+        tenant_id: &str,
+        path_owner_user_id: Option<&str>,
+        req: AppendHistoryEventRequest,
+    ) -> Result<HistoryEventResponse, ApiError> {
+        let mut response = self.append_event(tenant_id, path_owner_user_id, req)?;
+        if !response.duplicate {
+            response.meili_task_uid = self.repository.append_event(&response.event).await?;
+            let nodes =
+                self.context_nodes_for_index(&response.routing.personal_context_index_uid)?;
+            let _ = self
+                .repository
+                .upsert_context_nodes(&response.routing.personal_context_index_uid, &nodes)
+                .await?;
+        }
+        Ok(response)
+    }
+
+    pub async fn append_bulk_events_async(
+        &self,
+        tenant_id: &str,
+        path_owner_user_id: Option<&str>,
+        req: BulkHistoryEventsRequest,
+    ) -> Result<BulkHistoryEventsResponse, ApiError> {
+        if req.events.is_empty() {
+            return Err(ApiError::bad_request("events must not be empty"));
+        }
+
+        let owner = self
+            .owner_from_path_or_body(path_owner_user_id, req.events[0].owner_user_id.as_deref())?;
+        let mut inserted = 0;
+        let mut duplicates = 0;
+        let mut event_ids = Vec::new();
+        let mut routing = None;
+        let mut last_task = None;
+
+        for mut event in req.events {
+            if event
+                .owner_user_id
+                .as_deref()
+                .is_some_and(|body_owner| body_owner != owner)
+            {
+                return Err(ApiError::bad_request(
+                    "all bulk events must match the path owner_user_id",
+                ));
+            }
+            event.owner_user_id = Some(owner.clone());
+            let response = self
+                .append_event_async(tenant_id, Some(&owner), event)
+                .await?;
+            if response.duplicate {
+                duplicates += 1;
+            } else {
+                inserted += 1;
+            }
+            event_ids.push(response.event.id);
+            routing = Some(response.routing);
+            last_task = response.meili_task_uid;
+        }
+
+        Ok(BulkHistoryEventsResponse {
+            inserted,
+            duplicates,
+            event_ids,
+            materialization_job_ids: Vec::new(),
+            routing: routing.expect("bulk events are non-empty"),
+            meili_task_uid: last_task,
+        })
+    }
+
+    pub async fn search_events_async(
+        &self,
+        tenant_id: &str,
+        path_owner_user_id: Option<&str>,
+        req: HistorySearchRequest,
+    ) -> Result<HistorySearchResponse, ApiError> {
+        let owner_user_id =
+            self.owner_from_path_or_body(path_owner_user_id, req.owner_user_id.as_deref())?;
+        let routing = self
+            .resolver
+            .resolve(tenant_id, &owner_user_id, false, true)?;
+        if let Some(hits) = self.repository.search_user_events(&routing, &req).await? {
+            return Ok(HistorySearchResponse { hits, routing });
+        }
+        self.search_events(tenant_id, path_owner_user_id, req)
+    }
+
+    pub async fn upsert_state_fact_async(
+        &self,
+        tenant_id: &str,
+        fact_key: &str,
+        req: UpsertStateFactRequest,
+    ) -> Result<StateItemResponse, ApiError> {
+        let response = self.upsert_state_fact(tenant_id, fact_key, req)?;
+        let _ = self.repository.upsert_state_item(&response.item).await?;
+        let routing =
+            self.resolver
+                .resolve(tenant_id, &response.item.owner_user_id, false, true)?;
+        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
+        let _ = self
+            .repository
+            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn patch_state_fact_async(
+        &self,
+        tenant_id: &str,
+        fact_key: &str,
+        req: PatchStateFactRequest,
+    ) -> Result<StateItemResponse, ApiError> {
+        let response = self.patch_state_fact(tenant_id, fact_key, req)?;
+        let _ = self.repository.upsert_state_item(&response.item).await?;
+        let routing =
+            self.resolver
+                .resolve(tenant_id, &response.item.owner_user_id, false, true)?;
+        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
+        let _ = self
+            .repository
+            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn upsert_insight_async(
+        &self,
+        tenant_id: &str,
+        req: InsightUpsertRequest,
+    ) -> Result<InsightResponse, ApiError> {
+        let response = self.upsert_insight(tenant_id, req)?;
+        let routing =
+            self.resolver
+                .resolve(tenant_id, &response.insight.owner_user_id, false, true)?;
+        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
+        let _ = self
+            .repository
+            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn patch_insight_async(
+        &self,
+        tenant_id: &str,
+        insight_id: &str,
+        req: InsightPatchRequest,
+    ) -> Result<InsightResponse, ApiError> {
+        let response = self.patch_insight(tenant_id, insight_id, req)?;
+        let routing =
+            self.resolver
+                .resolve(tenant_id, &response.insight.owner_user_id, false, true)?;
+        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
+        let _ = self
+            .repository
+            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn create_revision_async(
+        &self,
+        tenant_id: &str,
+        source_id: &str,
+        req: CreateRevisionRequest,
+    ) -> Result<CreateRevisionResponse, ApiError> {
+        let response = self.create_revision(tenant_id, source_id, req)?;
+        if let Some(source) = self.company_source(source_id)? {
+            let _ = self.repository.upsert_company_source(&source).await?;
+        }
+        if let Some(revision) = self.source_revision(source_id, &response.revision_id)? {
+            let _ = self.repository.upsert_source_revision(&revision).await?;
+        }
+        Ok(response)
+    }
+
+    pub async fn activate_revision_async(
+        &self,
+        tenant_id: &str,
+        source_id: &str,
+        revision_id: &str,
+        req: ActivateRevisionRequest,
+    ) -> Result<ActivateRevisionResponse, ApiError> {
+        let response = self.activate_revision(tenant_id, source_id, revision_id, req)?;
+        if let Some(source) = self.company_source(source_id)? {
+            let _ = self.repository.upsert_company_source(&source).await?;
+        }
+        if let Some(revision) = self.source_revision(source_id, revision_id)? {
+            let _ = self.repository.upsert_source_revision(&revision).await?;
+        }
+        let nodes = self.context_nodes_for_index("rag_company_context")?;
+        let _ = self
+            .repository
+            .upsert_context_nodes("rag_company_context", &nodes)
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn create_snapshot_async(
+        &self,
+        tenant_id: &str,
+        req: CreateStructuredSnapshotRequest,
+    ) -> Result<StructuredSnapshotResponse, ApiError> {
+        let response = self.create_snapshot(tenant_id, req)?;
+        let _ = self
+            .repository
+            .upsert_structured_snapshot(&response.snapshot)
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn bulk_rows_async(
+        &self,
+        tenant_id: &str,
+        snapshot_id: &str,
+        req: BulkStructuredRowsRequest,
+    ) -> Result<BulkStructuredRowsResponse, ApiError> {
+        let response = self.bulk_rows(tenant_id, snapshot_id, req)?;
+        let rows = self.snapshot_rows(snapshot_id)?;
+        let _ = self.repository.upsert_structured_rows(&rows).await?;
+        if let Some(snapshot) = self.snapshot(snapshot_id)? {
+            let _ = self
+                .repository
+                .upsert_structured_snapshot(&snapshot)
+                .await?;
+        }
+        Ok(response)
+    }
+
+    pub async fn apply_snapshot_async(
+        &self,
+        tenant_id: &str,
+        dataset_key: &str,
+        req: ApplySnapshotRequest,
+    ) -> Result<ApplySnapshotResponse, ApiError> {
+        let response = self.apply_snapshot(tenant_id, dataset_key, req)?;
+        for summary in self.structured_summaries(&response.summary_ids)? {
+            let _ = self.repository.upsert_structured_summary(&summary).await?;
+        }
+        let snapshot = self
+            .snapshot(&response.snapshot_id)?
+            .ok_or_else(|| ApiError::not_found("snapshot not found"))?;
+        let routing = self
+            .resolver
+            .resolve(tenant_id, &snapshot.owner_user_id, false, true)?;
+        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
+        let _ = self
+            .repository
+            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
+            .await?;
+        Ok(response)
+    }
+
+    pub async fn search_context_async(
+        &self,
+        tenant_id: &str,
+        req: ContextSearchRequest,
+    ) -> Result<ContextSearchOutcome, ApiError> {
+        let query = require_string(req.query.clone(), "query")?;
+        let owner_user_id = req
+            .owner_user_id
+            .clone()
+            .or_else(|| owner_from_filters(&req.filters).map(ToString::to_string));
+        let limit = req.limit.max(1);
+        if let Some(result) = self
+            .repository
+            .search_context(
+                tenant_id,
+                owner_user_id.as_deref(),
+                &query,
+                &req.mode,
+                limit,
+                &self.resolver,
+            )
+            .await?
+        {
+            let hits = result
+                .nodes
+                .iter()
+                .map(|node| ContextHit {
+                    uri: node.uri.clone(),
+                    title: node.title.clone(),
+                    layer: node.layer,
+                    score: text_score(&format!("{} {}", node.title, node.body), &query),
+                    source_id: node.source_id.clone(),
+                    revision_id: node.revision_id.clone(),
+                    snippet: truncate_chars(&node.body, 240),
+                })
+                .collect::<Vec<_>>();
+            let trace = TraceRecord {
+                id: new_id("trace"),
+                tenant_id: tenant_id.to_string(),
+                owner_user_id,
+                query,
+                mode: req.mode,
+                stages: result.stages.clone(),
+                context_uris: hits.iter().map(|hit| hit.uri.clone()).collect(),
+                created_at: now(),
+            };
+            let response = ContextSearchResponse {
+                trace_id: trace.id.clone(),
+                hits,
+                stages: result.stages,
+            };
+            self.insert_trace(trace.clone())?;
+            let _ = self.repository.upsert_trace(&trace).await?;
+            return Ok(ContextSearchOutcome {
+                response,
+                trace,
+                nodes: result.nodes,
+            });
+        }
+        self.search_context(tenant_id, req)
+    }
+
+    pub async fn answer_rag_async(
+        &self,
+        tenant_id: &str,
+        req: RagAnswerRequest,
+    ) -> Result<RagAnswerResponse, ApiError> {
+        let question = require_string(req.question.clone(), "question")?;
+        let owner_user_id = req.owner_user_id.clone().or_else(|| {
+            req.session_id
+                .as_ref()
+                .and_then(|session_id| self.session_owner(session_id).ok().flatten())
+        });
+        let outcome = self
+            .search_context_async(
+                tenant_id,
+                ContextSearchRequest {
+                    query: Some(question),
+                    mode: req.mode,
+                    owner_user_id,
+                    debug: req.debug,
+                    ..ContextSearchRequest::default()
+                },
+            )
+            .await?;
+        Ok(self.answer_from_context(outcome))
+    }
+
+    pub async fn commit_session_async(
+        &self,
+        tenant_id: &str,
+        session_id: &str,
+        req: SessionCommitRequest,
+    ) -> Result<SessionCommitResponse, ApiError> {
+        let response = self.commit_session(tenant_id, session_id, req)?;
+        if let Some(uri) = &response.archive_uri {
+            let node = self.fs_read(uri)?;
+            let index_uid = node.index_uid.clone();
+            let _ = self
+                .repository
+                .upsert_context_nodes(&index_uid, &[node])
+                .await?;
+        }
+        Ok(response)
+    }
+
+    pub async fn debug_meili_search_async(
+        &self,
+        index_uid: &str,
+        query: &str,
+    ) -> Result<Value, ApiError> {
+        if let Some(raw) = self.repository.debug_search(index_uid, query).await? {
+            return Ok(raw);
+        }
+        self.debug_meili_search(index_uid, query)
     }
 
     pub fn ensure_user_index(
@@ -109,7 +503,7 @@ impl Store {
     pub fn list_user_indexes(&self) -> Result<ListUserEventIndexesResponse, ApiError> {
         let data = self.read()?;
         let mut indexes: Vec<_> = data.user_indexes.values().cloned().collect();
-        indexes.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        indexes.sort_by_key(|index| index.created_at);
         Ok(ListUserEventIndexesResponse {
             indexes,
             next_cursor: None,
@@ -274,6 +668,7 @@ impl Store {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append_internal_event(
         &self,
         tenant_id: &str,
@@ -407,7 +802,7 @@ impl Store {
             })
             .collect();
 
-        hits.sort_by(|a, b| b.occurred_at.cmp(&a.occurred_at));
+        hits.sort_by_key(|event| Reverse(event.occurred_at));
         hits.truncate(req.limit.max(1));
 
         Ok(HistorySearchResponse { hits, routing })
@@ -446,7 +841,7 @@ impl Store {
             ..HistorySearchRequest::default()
         };
         let mut events = self.search_events(tenant_id, None, search)?.hits;
-        events.sort_by(|a, b| a.occurred_at.cmp(&b.occurred_at));
+        events.sort_by_key(|event| event.occurred_at);
         Ok(TimelineResponse { events })
     }
 
@@ -651,7 +1046,7 @@ impl Store {
             })
             .cloned()
             .collect();
-        hits.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        hits.sort_by_key(|item| Reverse(item.updated_at));
         hits.truncate(req.limit.max(1));
         Ok(StateSearchResponse { hits })
     }
@@ -710,7 +1105,13 @@ impl Store {
         let routing = self
             .resolver
             .resolve(tenant_id, &owner_user_id, false, true)?;
-        self.write_insight_context_locked(&mut data, &routing, &insight, req.evidence_text.clone());
+        self.write_insight_context_locked(
+            &mut data,
+            tenant_id,
+            &routing,
+            &insight,
+            req.evidence_text.clone(),
+        );
         drop(data);
 
         let history = self.append_internal_event(
@@ -762,7 +1163,7 @@ impl Store {
             let insight = insight.clone();
             let owner = insight.owner_user_id.clone();
             let routing = self.resolver.resolve(tenant_id, &owner, false, true)?;
-            self.write_insight_context_locked(&mut data, &routing, &insight, None);
+            self.write_insight_context_locked(&mut data, tenant_id, &routing, &insight, None);
             (insight, owner)
         };
 
@@ -812,7 +1213,7 @@ impl Store {
             })
             .cloned()
             .collect();
-        hits.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        hits.sort_by_key(|insight| Reverse(insight.updated_at));
         hits.truncate(req.limit.max(1));
         Ok(InsightSearchResponse { hits })
     }
@@ -953,6 +1354,7 @@ impl Store {
 
     pub fn activate_revision(
         &self,
+        tenant_id: &str,
         source_id: &str,
         revision_id: &str,
         _req: ActivateRevisionRequest,
@@ -983,7 +1385,8 @@ impl Store {
                 node.status = "superseded".to_string();
             }
         }
-        let context_uris = self.write_company_revision_context_locked(&mut data, &revision);
+        let context_uris =
+            self.write_company_revision_context_locked(&mut data, tenant_id, &revision);
 
         Ok(ActivateRevisionResponse {
             source_id: source_id.to_string(),
@@ -1115,7 +1518,7 @@ impl Store {
         let mut invalid = 0;
         let mut row_ids = Vec::new();
         let mut rows_to_add = Vec::new();
-        for row in req.rows {
+        for mut row in req.rows {
             if !row.is_object() {
                 invalid += 1;
                 continue;
@@ -1134,6 +1537,16 @@ impl Store {
             if data.row_idempotency.contains(&key) {
                 duplicates += 1;
             } else {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.entry("id".to_string())
+                        .or_insert_with(|| Value::String(row_id.clone()));
+                    obj.entry("snapshot_id".to_string())
+                        .or_insert_with(|| Value::String(snapshot_id.to_string()));
+                    obj.entry("tenant_id".to_string())
+                        .or_insert_with(|| Value::String(tenant_id.to_string()));
+                    obj.entry("owner_user_id".to_string())
+                        .or_insert_with(|| Value::String(owner_user_id.clone()));
+                }
                 data.row_idempotency.insert(key);
                 rows_to_add.push(row);
                 row_ids.push(row_id);
@@ -1189,18 +1602,44 @@ impl Store {
         req: ApplySnapshotRequest,
     ) -> Result<ApplySnapshotResponse, ApiError> {
         let snapshot_id = require_string(req.snapshot_id, "snapshot_id")?;
-        let (snapshot, rows) = {
+        let (snapshot, rows, prior_rows_by_period) = {
             let data = self.read()?;
-            (
-                data.snapshots
-                    .get(&snapshot_id)
-                    .cloned()
-                    .ok_or_else(|| ApiError::not_found("snapshot not found"))?,
-                data.rows_by_snapshot
-                    .get(&snapshot_id)
-                    .cloned()
-                    .unwrap_or_default(),
-            )
+            let snapshot = data
+                .snapshots
+                .get(&snapshot_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("snapshot not found"))?;
+            let rows = data
+                .rows_by_snapshot
+                .get(&snapshot_id)
+                .cloned()
+                .unwrap_or_default();
+            let mut prior_snapshots = data
+                .snapshots
+                .values()
+                .filter(|candidate| {
+                    candidate.id != snapshot.id
+                        && candidate.dataset_key == snapshot.dataset_key
+                        && candidate.owner_user_id == snapshot.owner_user_id
+                        && candidate.period_start < snapshot.period_start
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            prior_snapshots.sort_by_key(|snapshot| Reverse(snapshot.period_start));
+            let prior_rows_by_period = prior_snapshots
+                .into_iter()
+                .take(4)
+                .map(|prior| {
+                    (
+                        prior.period_key,
+                        data.rows_by_snapshot
+                            .get(&prior.id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (snapshot, rows, prior_rows_by_period)
         };
         if snapshot.dataset_key != dataset_key {
             return Err(ApiError::bad_request(
@@ -1208,7 +1647,7 @@ impl Store {
             ));
         }
 
-        let stats = deterministic_stats(&rows);
+        let stats = deterministic_stats(&rows, &prior_rows_by_period);
         let summary_id = new_id("summary");
         let context_uri = format!(
             "ctx://user/structured/{}/snapshots/{}/trend/.overview",
@@ -1221,6 +1660,8 @@ impl Store {
             "dataset_key": dataset_key,
             "owner_user_id": snapshot.owner_user_id,
             "stats": stats,
+            "analysis_window": req.analysis_window.unwrap_or_else(|| "last_4_periods".to_string()),
+            "llm_mode": req.llm_mode,
             "context_uri": context_uri
         });
 
@@ -1479,43 +1920,7 @@ impl Store {
                 ..ContextSearchRequest::default()
             },
         )?;
-        let citations: Vec<_> = outcome
-            .response
-            .hits
-            .iter()
-            .take(5)
-            .map(|hit| Citation {
-                uri: hit.uri.clone(),
-                source_id: hit.source_id.clone(),
-                revision_id: hit.revision_id.clone(),
-                title: hit.title.clone(),
-                quote: hit.snippet.clone(),
-                score: hit.score,
-            })
-            .collect();
-        let answer = if citations.is_empty() {
-            "I do not have enough indexed context to answer that yet.".to_string()
-        } else {
-            format!(
-                "Based on staged ContextFS retrieval, the strongest matching context is: {}",
-                citations
-                    .iter()
-                    .map(|c| c.quote.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        };
-
-        Ok(RagAnswerResponse {
-            answer_id: new_id("answer"),
-            trace_id: outcome.response.trace_id,
-            answer,
-            citations,
-            usage: json!({
-                "provider": "none",
-                "stages": ["L0", "L1", "L2"]
-            }),
-        })
+        Ok(self.answer_from_context(outcome))
     }
 
     pub fn create_session(&self, req: SessionCreateRequest) -> Result<SessionResponse, ApiError> {
@@ -1687,6 +2092,135 @@ impl Store {
         Ok(json!({ "index_uid": index_uid, "hits": hits }))
     }
 
+    pub fn insight_owner(&self, insight_id: &str) -> Result<String, ApiError> {
+        let data = self.read()?;
+        data.insights
+            .get(insight_id)
+            .map(|insight| insight.owner_user_id.clone())
+            .ok_or_else(|| ApiError::not_found("insight not found"))
+    }
+
+    pub fn snapshot_owner(&self, snapshot_id: &str) -> Result<String, ApiError> {
+        let data = self.read()?;
+        data.snapshots
+            .get(snapshot_id)
+            .map(|snapshot| snapshot.owner_user_id.clone())
+            .ok_or_else(|| ApiError::not_found("snapshot not found"))
+    }
+
+    pub fn session_owner_id(&self, session_id: &str) -> Result<String, ApiError> {
+        self.session_owner(session_id)?
+            .ok_or_else(|| ApiError::not_found("session not found"))
+    }
+
+    fn answer_from_context(&self, outcome: ContextSearchOutcome) -> RagAnswerResponse {
+        let citations: Vec<_> = outcome
+            .response
+            .hits
+            .iter()
+            .take(5)
+            .map(|hit| Citation {
+                uri: hit.uri.clone(),
+                source_id: hit.source_id.clone(),
+                revision_id: hit.revision_id.clone(),
+                title: hit.title.clone(),
+                quote: hit.snippet.clone(),
+                score: hit.score,
+            })
+            .collect();
+        let answer = if citations.is_empty() {
+            "I do not have enough indexed context to answer that yet.".to_string()
+        } else {
+            format!(
+                "Based on staged ContextFS retrieval, the strongest matching context is: {}",
+                citations
+                    .iter()
+                    .map(|c| c.quote.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+
+        RagAnswerResponse {
+            answer_id: new_id("answer"),
+            trace_id: outcome.response.trace_id,
+            answer,
+            citations,
+            usage: json!({
+                "provider": "none",
+                "backend": self.backend_name(),
+                "stages": ["L0", "L1", "L2"]
+            }),
+        }
+    }
+
+    fn context_nodes_for_index(&self, index_uid: &str) -> Result<Vec<ContextNode>, ApiError> {
+        let data = self.read()?;
+        if index_uid == "rag_company_context" {
+            return Ok(data.company_context.clone());
+        }
+        Ok(data
+            .personal_context
+            .get(index_uid)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn company_source(&self, source_id: &str) -> Result<Option<CompanySource>, ApiError> {
+        let data = self.read()?;
+        Ok(data.sources.get(source_id).cloned())
+    }
+
+    fn source_revision(
+        &self,
+        source_id: &str,
+        revision_id: &str,
+    ) -> Result<Option<SourceRevision>, ApiError> {
+        let data = self.read()?;
+        Ok(data.source_revisions.get(source_id).and_then(|revisions| {
+            revisions
+                .iter()
+                .find(|revision| revision.id == revision_id)
+                .cloned()
+        }))
+    }
+
+    fn snapshot(&self, snapshot_id: &str) -> Result<Option<StructuredSnapshot>, ApiError> {
+        let data = self.read()?;
+        Ok(data.snapshots.get(snapshot_id).cloned())
+    }
+
+    fn snapshot_rows(&self, snapshot_id: &str) -> Result<Vec<Value>, ApiError> {
+        let data = self.read()?;
+        Ok(data
+            .rows_by_snapshot
+            .get(snapshot_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn structured_summaries(&self, summary_ids: &[String]) -> Result<Vec<Value>, ApiError> {
+        let data = self.read()?;
+        Ok(summary_ids
+            .iter()
+            .filter_map(|id| data.structured_summaries.get(id).cloned())
+            .collect())
+    }
+
+    fn session_owner(&self, session_id: &str) -> Result<Option<String>, ApiError> {
+        let data = self.read()?;
+        Ok(data
+            .sessions
+            .get(session_id)
+            .map(|session| session.owner_user_id.clone()))
+    }
+
+    fn insert_trace(&self, trace: TraceRecord) -> Result<(), ApiError> {
+        let mut data = self.write()?;
+        data.traces.insert(trace.id.clone(), trace);
+        Ok(())
+    }
+
     fn owner_from_path_or_body(
         &self,
         path_owner_user_id: Option<&str>,
@@ -1803,6 +2337,7 @@ impl Store {
                 &abstract_body,
                 "personal",
                 &routing.personal_context_index_uid,
+                &event.tenant_id,
                 Some(event.owner_user_id.clone()),
                 None,
                 None,
@@ -1814,6 +2349,7 @@ impl Store {
                 &overview_body,
                 "personal",
                 &routing.personal_context_index_uid,
+                &event.tenant_id,
                 Some(event.owner_user_id.clone()),
                 None,
                 None,
@@ -1825,6 +2361,7 @@ impl Store {
                 &event.text,
                 "personal",
                 &routing.personal_context_index_uid,
+                &event.tenant_id,
                 Some(event.owner_user_id.clone()),
                 None,
                 None,
@@ -1854,6 +2391,7 @@ impl Store {
                 &truncate_chars(&body, 500),
                 "personal",
                 &routing.personal_context_index_uid,
+                &item.tenant_id,
                 Some(item.owner_user_id.clone()),
                 None,
                 None,
@@ -1865,6 +2403,7 @@ impl Store {
                 &json!({ "state": item }).to_string(),
                 "personal",
                 &routing.personal_context_index_uid,
+                &item.tenant_id,
                 Some(item.owner_user_id.clone()),
                 None,
                 None,
@@ -1881,6 +2420,7 @@ impl Store {
     fn write_insight_context_locked(
         &self,
         data: &mut StoreData,
+        tenant_id: &str,
         routing: &EventIndexRouting,
         insight: &InsightRecord,
         evidence_text: Option<String>,
@@ -1894,6 +2434,7 @@ impl Store {
                 &truncate_chars(&insight.statement, 500),
                 "personal",
                 &routing.personal_context_index_uid,
+                tenant_id,
                 Some(insight.owner_user_id.clone()),
                 None,
                 None,
@@ -1905,6 +2446,7 @@ impl Store {
                 &json!({ "insight": insight, "evidence": evidence_text }).to_string(),
                 "personal",
                 &routing.personal_context_index_uid,
+                tenant_id,
                 Some(insight.owner_user_id.clone()),
                 None,
                 None,
@@ -1921,6 +2463,7 @@ impl Store {
     fn write_company_revision_context_locked(
         &self,
         data: &mut StoreData,
+        tenant_id: &str,
         revision: &SourceRevision,
     ) -> Vec<String> {
         let base = format!(
@@ -1936,6 +2479,7 @@ impl Store {
                 &truncate_chars(&revision.content, 500),
                 "company",
                 "rag_company_context",
+                tenant_id,
                 None,
                 Some(revision.source_id.clone()),
                 Some(revision.id.clone()),
@@ -1947,6 +2491,7 @@ impl Store {
                 &truncate_chars(&revision.content, 2000),
                 "company",
                 "rag_company_context",
+                tenant_id,
                 None,
                 Some(revision.source_id.clone()),
                 Some(revision.id.clone()),
@@ -1958,6 +2503,7 @@ impl Store {
                 &revision.content,
                 "company",
                 "rag_company_context",
+                tenant_id,
                 None,
                 Some(revision.source_id.clone()),
                 Some(revision.id.clone()),
@@ -1968,6 +2514,7 @@ impl Store {
         uris
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn context_node(
         &self,
         uri: &str,
@@ -1976,6 +2523,7 @@ impl Store {
         body: &str,
         index_kind: &str,
         index_uid: &str,
+        tenant_id: &str,
         owner_user_id: Option<String>,
         source_id: Option<String>,
         revision_id: Option<String>,
@@ -1985,7 +2533,7 @@ impl Store {
             title: title.to_string(),
             layer,
             body: body.to_string(),
-            tenant_id: "default".to_string(),
+            tenant_id: tenant_id.to_string(),
             owner_user_id,
             index_uid: index_uid.to_string(),
             index_kind: index_kind.to_string(),
@@ -2153,7 +2701,7 @@ fn token_similarity(a: &str, b: &str) -> f32 {
     intersection / union
 }
 
-fn deterministic_stats(rows: &[Value]) -> Value {
+fn deterministic_stats(rows: &[Value], prior_rows_by_period: &[(String, Vec<Value>)]) -> Value {
     let mut numeric: HashMap<String, Vec<f64>> = HashMap::new();
     for row in rows {
         if let Some(obj) = row.as_object() {
@@ -2164,6 +2712,10 @@ fn deterministic_stats(rows: &[Value]) -> Value {
             }
         }
     }
+    let prior_stats = prior_rows_by_period
+        .iter()
+        .map(|(period_key, rows)| (period_key.clone(), numeric_means(rows)))
+        .collect::<Vec<_>>();
     let metrics = numeric
         .into_iter()
         .map(|(key, values)| {
@@ -2172,20 +2724,86 @@ fn deterministic_stats(rows: &[Value]) -> Value {
             let mean = if count == 0 { 0.0 } else { sum / count as f64 };
             let min = values.iter().copied().fold(f64::INFINITY, f64::min);
             let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let previous_mean = prior_stats
+                .first()
+                .and_then(|(_, means)| means.get(&key))
+                .copied();
+            let recent_values = prior_stats
+                .iter()
+                .filter_map(|(_, means)| means.get(&key).copied())
+                .collect::<Vec<_>>();
+            let recent_4_mean = mean_of(&recent_values);
+            let delta_vs_previous = previous_mean.map(|previous| mean - previous);
+            let delta_vs_recent_4 = recent_4_mean.map(|recent| mean - recent);
+            let trend_direction = trend_direction(delta_vs_recent_4.or(delta_vs_previous));
+            let anomaly = recent_4_mean
+                .map(|recent| {
+                    let baseline = recent.abs().max(1.0);
+                    ((mean - recent).abs() / baseline) >= 0.35
+                })
+                .unwrap_or(false);
             json!({
                 "metric": key,
                 "count": count,
                 "mean": mean,
                 "min": min,
                 "max": max,
-                "slope": simple_slope(&values)
+                "slope": simple_slope(&values),
+                "previous_mean": previous_mean,
+                "delta_vs_previous": delta_vs_previous,
+                "recent_4_mean": recent_4_mean,
+                "delta_vs_recent_4": delta_vs_recent_4,
+                "trend_direction": trend_direction,
+                "anomaly": anomaly
             })
         })
         .collect::<Vec<_>>();
     json!({
         "row_count": rows.len(),
+        "prior_period_count": prior_rows_by_period.len(),
+        "prior_periods": prior_rows_by_period
+            .iter()
+            .map(|(period_key, rows)| json!({
+                "period_key": period_key,
+                "row_count": rows.len()
+            }))
+            .collect::<Vec<_>>(),
         "metrics": metrics
     })
+}
+
+fn numeric_means(rows: &[Value]) -> HashMap<String, f64> {
+    let mut numeric: HashMap<String, Vec<f64>> = HashMap::new();
+    for row in rows {
+        if let Some(obj) = row.as_object() {
+            for (key, value) in obj {
+                if let Some(number) = value.as_f64() {
+                    numeric.entry(key.clone()).or_default().push(number);
+                }
+            }
+        }
+    }
+    numeric
+        .into_iter()
+        .filter_map(|(key, values)| mean_of(&values).map(|mean| (key, mean)))
+        .collect()
+}
+
+fn mean_of(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
+fn trend_direction(delta: Option<f64>) -> &'static str {
+    match delta {
+        Some(delta) if delta > 0.05 => "up",
+        Some(delta) if delta < -0.05 => "down",
+        Some(_) => "flat",
+        None => "unknown",
+    }
 }
 
 fn simple_slope(values: &[f64]) -> f64 {

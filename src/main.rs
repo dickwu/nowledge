@@ -15,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Arc::new(Config::from_env());
+    config.validate_startup()?;
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()
         .context("invalid bind address")?;

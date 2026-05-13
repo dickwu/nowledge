@@ -38,21 +38,40 @@ RAG_HOST=127.0.0.1
 RAG_PORT=14242
 RAG_TENANT_ID=default
 RAG_INDEX_HASH_SECRET=change-me
+RAG_STORE_BACKEND=memory
 RAG_BEARER_TOKEN=optional-user-token
 RAG_ADMIN_TOKEN=optional-admin-token
+RAG_AUTH_USERS=owner-user-id:user-token:user
+RAG_RUN_MODE=development
+RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true
 RAG_MEILI_URL=http://127.0.0.1:7700
 RAG_MEILI_API_KEY=optional-meili-key
+RAG_MEILI_WAIT_FOR_TASKS=false
 RAG_LLM_PROVIDER=none
 RAG_LLM_MODEL=none
+RAG_OPENAI_API_KEY=optional-openai-key
+RAG_CODEX_AUTH_PATH=optional-explicit-codex-auth-json
 RAG_ALLOW_CODEX_AUTH_IMPORT=false
 ```
+
+Use `RAG_STORE_BACKEND=meili` with `RAG_MEILI_URL` to mirror core writes to
+Meilisearch and search per-user event indexes through Meilisearch. Production
+mode requires configured auth unless `RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true` is
+set explicitly.
 
 ## Verify
 
 ```sh
 cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo check
 cargo test
+```
+
+Optional Meilisearch integration tests run when `RAG_TEST_MEILI_URL` is set:
+
+```sh
+RAG_TEST_MEILI_URL=http://127.0.0.1:7700 cargo test --test meili_integration
 ```
 
 The regression tests cover the v0.6 hard constraints around per-user event

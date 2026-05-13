@@ -13,13 +13,49 @@ fn app() -> Router {
     build_router(AppState::new(Arc::new(Config::test())))
 }
 
+fn authed_app() -> Router {
+    let mut config = Config::test();
+    config.auth_users = vec![
+        nowledge::config::AuthUserConfig {
+            token: "u1-token".to_string(),
+            owner_user_id: Some("u1".to_string()),
+            roles: vec!["user".to_string()],
+        },
+        nowledge::config::AuthUserConfig {
+            token: "admin-token".to_string(),
+            owner_user_id: None,
+            roles: vec!["admin".to_string()],
+        },
+    ];
+    build_router(AppState::new(Arc::new(config)))
+}
+
+fn mock_llm_app() -> Router {
+    let mut config = Config::test();
+    config.llm_provider = "mock".to_string();
+    config.llm_model = Some("mock-model".to_string());
+    build_router(AppState::new(Arc::new(config)))
+}
+
 async fn call(app: Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
-    let request = Request::builder()
+    call_with_token(app, method, uri, body, None).await
+}
+
+async fn call_with_token(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    token: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
         .method(method)
         .uri(uri)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
+        .header(CONTENT_TYPE, "application/json");
+    if let Some(token) = token {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    let request = builder.body(Body::from(body.to_string())).unwrap();
     let response = app.oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -293,4 +329,129 @@ async fn prompt_preview_redacts_tokens() {
     assert_eq!(status, StatusCode::OK, "{preview}");
     assert!(!preview.to_string().contains("sk-test-secret"));
     assert!(preview.to_string().contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn authenticated_user_is_bound_to_owner_user_id() {
+    let app = authed_app();
+
+    let (status, body) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/history/users/u2/events",
+        event_body("u2", "n1", "cross-owner"),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/history/events",
+        json!({
+            "event_type": "note.created",
+            "entity_type": "note",
+            "entity_id": "n2",
+            "occurred_at": "2026-05-12T00:00:00Z",
+            "observed_at": "2026-05-12T00:01:00Z",
+            "source_kind": "test",
+            "source_ref": { "kind": "test", "id": "n2" },
+            "text": "owner defaulted from token"
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["event"]["owner_user_id"], "u1");
+
+    let (status, body) = call_with_token(
+        app,
+        Method::POST,
+        "/v1/history/users/u2/events",
+        event_body("u2", "n3", "admin cross-owner"),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn structured_apply_snapshot_reports_weekly_trends() {
+    let app = app();
+
+    let mut snapshot_ids = Vec::new();
+    for (period, score) in [("2026-W18", 4.0), ("2026-W19", 8.0)] {
+        let (status, snapshot) = call(
+            app.clone(),
+            Method::POST,
+            "/v1/history/structured/snapshots",
+            json!({
+                "dataset_key": "weekly-status",
+                "owner_user_id": "u1",
+                "period_key": period,
+                "period_start": if period == "2026-W18" { "2026-04-27T00:00:00Z" } else { "2026-05-04T00:00:00Z" },
+                "period_end": if period == "2026-W18" { "2026-05-03T23:59:59Z" } else { "2026-05-10T23:59:59Z" },
+                "granularity": "weekly",
+                "source_ref": { "kind": "test", "id": period }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{snapshot}");
+        let snapshot_id = snapshot["snapshot"]["id"].as_str().unwrap().to_string();
+        let (status, rows) = call(
+            app.clone(),
+            Method::POST,
+            &format!("/v1/history/structured/snapshots/{snapshot_id}/rows:bulk"),
+            json!({ "rows": [{ "id": format!("row-{period}"), "stress_score": score }] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+        snapshot_ids.push(snapshot_id);
+    }
+
+    let latest = snapshot_ids.last().unwrap();
+    let (status, applied) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/state/structured/datasets/weekly-status/apply-snapshot",
+        json!({ "snapshot_id": latest, "materialize_context": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+
+    let (status, current) = call(
+        app,
+        Method::GET,
+        "/v1/state/structured/current",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{current}");
+    let metrics = current["summaries"][0]["stats"]["metrics"]
+        .as_array()
+        .unwrap();
+    let stress = metrics
+        .iter()
+        .find(|metric| metric["metric"] == "stress_score")
+        .unwrap();
+    assert_eq!(stress["previous_mean"], 4.0);
+    assert_eq!(stress["delta_vs_previous"], 4.0);
+    assert_eq!(stress["trend_direction"], "up");
+}
+
+#[tokio::test]
+async fn llm_mock_provider_test_is_token_safe() {
+    let app = mock_llm_app();
+    let (status, body) = call(
+        app,
+        Method::POST,
+        "/v1/llm/test",
+        json!({ "prompt": "summarize without real provider" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["model"], "mock-model");
+    assert!(body["sample"].as_str().unwrap().contains("mock summary"));
 }

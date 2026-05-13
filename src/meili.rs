@@ -1,6 +1,7 @@
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::time::{sleep, Duration};
 
 use crate::{config::Config, error::ApiError};
 
@@ -34,6 +35,15 @@ pub struct BootstrapResult {
     pub indexes: Vec<String>,
     pub tasks: Vec<Value>,
     pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+pub struct SearchResponse<T> {
+    #[serde(default)]
+    pub hits: Vec<T>,
+    #[serde(rename = "processingTimeMs", default)]
+    pub processing_time_ms: u64,
 }
 
 impl MeiliAdmin {
@@ -100,9 +110,201 @@ impl MeiliAdmin {
         })
     }
 
-    async fn apply_settings(&self, uid: &str) -> Result<(), ApiError> {
+    pub fn configured(&self) -> bool {
+        self.url.is_some()
+    }
+
+    pub async fn ensure_index(
+        &self,
+        uid: &str,
+        primary_key: &str,
+        apply_settings: bool,
+    ) -> Result<Vec<String>, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(Vec::new());
+        };
+        let response = self
+            .client
+            .post(format!("{}/indexes", url.trim_end_matches('/')))
+            .headers(self.headers()?)
+            .json(&json!({ "uid": uid, "primaryKey": primary_key }))
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+
+        let mut task_uids = Vec::new();
+        if response.status().is_success() || response.status().as_u16() == 409 {
+            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+            if let Some(uid) = task_uid(&body) {
+                task_uids.push(uid);
+            }
+            if apply_settings {
+                if let Some(uid) = self.apply_settings(uid).await? {
+                    task_uids.push(uid);
+                }
+            }
+            Ok(task_uids)
+        } else {
+            Err(ApiError::Upstream(format!(
+                "failed to create Meilisearch index {uid}: {}",
+                response.status()
+            )))
+        }
+    }
+
+    pub async fn add_documents<T: Serialize + ?Sized>(
+        &self,
+        index_uid: &str,
+        documents: &T,
+    ) -> Result<Option<String>, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(None);
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{}/indexes/{}/documents",
+                url.trim_end_matches('/'),
+                index_uid
+            ))
+            .headers(self.headers()?)
+            .json(documents)
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+
+        if response.status().is_success() {
+            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+            Ok(task_uid(&body))
+        } else {
+            Err(ApiError::Upstream(format!(
+                "failed to add Meilisearch documents into {index_uid}: {}",
+                response.status()
+            )))
+        }
+    }
+
+    pub async fn search<T: DeserializeOwned>(
+        &self,
+        index_uid: &str,
+        body: Value,
+    ) -> Result<SearchResponse<T>, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(SearchResponse {
+                hits: Vec::new(),
+                processing_time_ms: 0,
+            });
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{}/indexes/{}/search",
+                url.trim_end_matches('/'),
+                index_uid
+            ))
+            .headers(self.headers()?)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+
+        if response.status().as_u16() == 404 {
+            return Ok(SearchResponse {
+                hits: Vec::new(),
+                processing_time_ms: 0,
+            });
+        }
+
+        if response.status().is_success() {
+            response
+                .json::<SearchResponse<T>>()
+                .await
+                .map_err(|e| ApiError::Upstream(e.to_string()))
+        } else {
+            Err(ApiError::Upstream(format!(
+                "failed to search Meilisearch index {index_uid}: {}",
+                response.status()
+            )))
+        }
+    }
+
+    pub async fn search_value(&self, index_uid: &str, body: Value) -> Result<Value, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(json!({ "hits": [] }));
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{}/indexes/{}/search",
+                url.trim_end_matches('/'),
+                index_uid
+            ))
+            .headers(self.headers()?)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+
+        if response.status().as_u16() == 404 {
+            return Ok(json!({ "hits": [] }));
+        }
+        if response.status().is_success() {
+            response
+                .json::<Value>()
+                .await
+                .map_err(|e| ApiError::Upstream(e.to_string()))
+        } else {
+            Err(ApiError::Upstream(format!(
+                "failed to search Meilisearch index {index_uid}: {}",
+                response.status()
+            )))
+        }
+    }
+
+    pub async fn wait_for_task(&self, task_uid: &str) -> Result<(), ApiError> {
         let Some(url) = &self.url else {
             return Ok(());
+        };
+        for _ in 0..80 {
+            let response = self
+                .client
+                .get(format!("{}/tasks/{}", url.trim_end_matches('/'), task_uid))
+                .headers(self.headers()?)
+                .send()
+                .await
+                .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            if !response.status().is_success() {
+                return Err(ApiError::Upstream(format!(
+                    "failed to read Meilisearch task {task_uid}: {}",
+                    response.status()
+                )));
+            }
+            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+            match body.get("status").and_then(Value::as_str) {
+                Some("succeeded") => return Ok(()),
+                Some("failed") | Some("canceled") => {
+                    return Err(ApiError::Upstream(format!(
+                        "Meilisearch task {task_uid} did not succeed: {body}"
+                    )));
+                }
+                _ => sleep(Duration::from_millis(50)).await,
+            }
+        }
+        Err(ApiError::Upstream(format!(
+            "timed out waiting for Meilisearch task {task_uid}"
+        )))
+    }
+
+    pub async fn wait_for_tasks(&self, task_uids: &[String]) -> Result<(), ApiError> {
+        for task_uid in task_uids {
+            self.wait_for_task(task_uid).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn apply_settings(&self, uid: &str) -> Result<Option<String>, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(None);
         };
         let settings = settings_for(uid);
         let response = self
@@ -119,7 +321,8 @@ impl MeiliAdmin {
             .map_err(|e| ApiError::Upstream(e.to_string()))?;
 
         if response.status().is_success() {
-            Ok(())
+            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+            Ok(task_uid(&body))
         } else {
             Err(ApiError::Upstream(format!(
                 "failed to apply Meilisearch settings for {uid}: {}",
@@ -140,6 +343,21 @@ impl MeiliAdmin {
         }
         Ok(headers)
     }
+}
+
+pub fn task_uid(value: &Value) -> Option<String> {
+    value
+        .get("taskUid")
+        .or_else(|| value.get("uid"))
+        .and_then(Value::as_u64)
+        .map(|uid| uid.to_string())
+        .or_else(|| {
+            value
+                .get("taskUid")
+                .or_else(|| value.get("uid"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
 }
 
 pub fn settings_for(uid: &str) -> Value {
