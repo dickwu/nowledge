@@ -6,7 +6,10 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use reqwest::{header::HeaderMap, StatusCode};
+use reqwest::{
+    header::{HeaderMap, ACCEPT},
+    StatusCode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::time::timeout;
@@ -30,6 +33,20 @@ pub struct LlmRuntimeStatus {
     pub model: String,
     pub auth_source: String,
     pub healthy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexAuthTokenKind {
+    OpenAiApiKey,
+    CodexOauth,
+    Other,
+}
+
+#[derive(Clone)]
+pub struct CodexAuthCredentials {
+    pub token: String,
+    pub account_id: Option<String>,
+    pub token_kind: CodexAuthTokenKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -148,6 +165,15 @@ pub struct OpenAiResponsesClient {
     client: reqwest::Client,
 }
 
+#[derive(Clone)]
+pub struct CodexResponsesClient {
+    model: String,
+    auth_source: String,
+    credentials: Option<CodexAuthCredentials>,
+    base_url: String,
+    client: reqwest::Client,
+}
+
 #[async_trait]
 impl LlmClient for OpenAiResponsesClient {
     async fn status(&self) -> LlmRuntimeStatus {
@@ -165,36 +191,135 @@ impl LlmClient for OpenAiResponsesClient {
             .as_deref()
             .ok_or_else(|| ApiError::Unauthorized("LLM API key is not configured".to_string()))?;
         let started = Instant::now();
-        let response = self
-            .client
-            .post("https://api.openai.com/v1/responses")
-            .bearer_auth(api_key)
-            .json(&json!({
-                "model": self.model,
-                "input": request.prompt,
-                "store": false
-            }))
-            .send()
-            .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(ApiError::Upstream(format!(
-                "OpenAI Responses API request failed: {}",
-                response.status()
-            )));
-        }
-
-        let body = response
-            .json::<Value>()
-            .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+        let body =
+            complete_openai_responses(&self.client, &self.model, api_key, &request.prompt).await?;
         Ok(LlmTextResponse {
             text: extract_response_text(&body)
                 .unwrap_or_else(|| "LLM response did not contain output text".to_string()),
             latency_ms: started.elapsed().as_millis() as u64,
         })
     }
+}
+
+#[async_trait]
+impl LlmClient for CodexResponsesClient {
+    async fn status(&self) -> LlmRuntimeStatus {
+        LlmRuntimeStatus {
+            provider: "codex_auth".to_string(),
+            model: self.model.clone(),
+            auth_source: self.auth_source.clone(),
+            healthy: self.credentials.is_some(),
+        }
+    }
+
+    async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, ApiError> {
+        let credentials = self.credentials.as_ref().ok_or_else(|| {
+            ApiError::Unauthorized("Codex auth token is not configured".to_string())
+        })?;
+
+        if credentials.token_kind == CodexAuthTokenKind::OpenAiApiKey {
+            let started = Instant::now();
+            let body = complete_openai_responses(
+                &self.client,
+                &self.model,
+                &credentials.token,
+                &request.prompt,
+            )
+            .await?;
+            return Ok(LlmTextResponse {
+                text: extract_response_text(&body)
+                    .unwrap_or_else(|| "LLM response did not contain output text".to_string()),
+                latency_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+
+        let started = Instant::now();
+        let endpoint = codex_responses_endpoint(&self.base_url);
+        let mut builder = self
+            .client
+            .post(endpoint)
+            .bearer_auth(&credentials.token)
+            .header(ACCEPT, "text/event-stream")
+            .json(&codex_responses_payload(&self.model, &request.prompt));
+        if let Some(account_id) = credentials.account_id.as_deref() {
+            builder = builder.header("ChatGPT-Account-Id", account_id);
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+        if !status.is_success() {
+            let message = extract_error_message(&body).unwrap_or_else(|| status.to_string());
+            return Err(ApiError::Upstream(format!(
+                "Codex Responses API request failed: {status}: {message}"
+            )));
+        }
+
+        Ok(LlmTextResponse {
+            text: extract_codex_sse_text(&body)
+                .unwrap_or_else(|| "LLM response did not contain output text".to_string()),
+            latency_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+async fn complete_openai_responses(
+    client: &reqwest::Client,
+    model: &str,
+    api_key: &str,
+    prompt: &str,
+) -> Result<Value, ApiError> {
+    let response = client
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": model,
+            "input": prompt,
+            "store": false
+        }))
+        .send()
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let message = extract_error_message(&body).unwrap_or_else(|| status.to_string());
+        return Err(ApiError::Upstream(format!(
+            "OpenAI Responses API request failed: {status}: {message}"
+        )));
+    }
+
+    response
+        .json::<Value>()
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))
+}
+
+fn codex_responses_payload(model: &str, prompt: &str) -> Value {
+    json!({
+        "model": model,
+        "instructions": "Answer the user request directly. When context is supplied, stay grounded in that context.",
+        "input": [{
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": prompt
+            }]
+        }],
+        "store": false,
+        "stream": true
+    })
+}
+
+fn codex_responses_endpoint(base_url: &str) -> String {
+    format!("{}/responses", base_url.trim_end_matches('/'))
 }
 
 pub fn llm_client_from_config(config: &Config) -> Box<dyn LlmClient> {
@@ -211,17 +336,17 @@ pub fn llm_client_from_config(config: &Config) -> Box<dyn LlmClient> {
             api_key: config.openai_api_key.clone(),
             client: reqwest::Client::new(),
         }),
-        "codex_auth" => Box::new(OpenAiResponsesClient {
-            provider: "codex_auth".to_string(),
+        "codex_auth" => Box::new(CodexResponsesClient {
             model,
             auth_source: config
                 .codex_auth_path
                 .clone()
                 .unwrap_or_else(|| "explicit_path_missing".to_string()),
-            api_key: config
+            credentials: config
                 .codex_auth_path
                 .as_deref()
-                .and_then(read_codex_auth_token),
+                .and_then(read_codex_auth_credentials),
+            base_url: config.codex_base_url.clone(),
             client: reqwest::Client::new(),
         }),
         _ => Box::new(NoneLlmClient {
@@ -366,10 +491,14 @@ async fn probe_now(config: &Config) -> LlmHealthProbeResult {
             let Some(path) = config.codex_auth_path.as_deref() else {
                 return auth_failure_probe(provider, model, "Codex auth path is not configured");
             };
-            let Some(api_key) = read_codex_auth_token(path) else {
+            let Some(credentials) = read_codex_auth_credentials(path) else {
                 return auth_failure_probe(provider, model, "Codex auth token could not be read");
             };
-            probe_openai_responses(config, provider, model, &api_key).await
+            if credentials.token_kind == CodexAuthTokenKind::OpenAiApiKey {
+                probe_openai_responses(config, provider, model, &credentials.token).await
+            } else {
+                probe_codex_responses(config, provider, model, &credentials).await
+            }
         }
         _ => unhealthy_probe(
             provider,
@@ -424,6 +553,77 @@ async fn probe_openai_responses(
     if status.is_success() {
         return ok_probe_with_latency(provider, model, rate_limits, latency_ms);
     }
+    classify_http_probe(
+        config,
+        provider,
+        model,
+        status,
+        rate_limits,
+        body,
+        latency_ms,
+    )
+}
+
+async fn probe_codex_responses(
+    config: &Config,
+    provider: String,
+    model: String,
+    credentials: &CodexAuthCredentials,
+) -> LlmHealthProbeResult {
+    let started = Instant::now();
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(codex_responses_endpoint(&config.codex_base_url))
+        .bearer_auth(&credentials.token)
+        .header(ACCEPT, "text/event-stream")
+        .json(&codex_responses_payload(&model, "Reply with exactly: ok"));
+    if let Some(account_id) = credentials.account_id.as_deref() {
+        request = request.header("ChatGPT-Account-Id", account_id);
+    }
+
+    let sent = timeout(
+        Duration::from_millis(config.health_llm_timeout_ms),
+        request.send(),
+    )
+    .await;
+
+    let response = match sent {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => {
+            return degraded_probe(
+                provider,
+                model,
+                "server_error",
+                &format!("LLM probe request failed: {err}"),
+            )
+        }
+        Err(_) => return degraded_probe(provider, model, "timeout", "LLM probe timed out"),
+    };
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let rate_limits = rate_limits_from_headers(&headers);
+    let body = response.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        if extract_codex_sse_text(&body).is_some() {
+            return ok_probe_with_latency(provider, model, rate_limits, latency_ms);
+        }
+        return probe_result(ProbeResultInput {
+            provider,
+            model,
+            status: "unhealthy",
+            can_call: false,
+            auth_valid: true,
+            quota_state: "unknown",
+            rate_limit_state: "unknown",
+            error_kind: Some("request_failed"),
+            message: Some("Codex Responses API returned no output text".to_string()),
+            rate_limits,
+            latency_ms,
+        });
+    }
+
     classify_http_probe(
         config,
         provider,
@@ -733,43 +933,91 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 fn extract_error_message(body: &str) -> Option<String> {
-    let value = serde_json::from_str::<Value>(body).ok()?;
-    let error = value.get("error")?;
-    error
-        .get("message")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("code").and_then(Value::as_str))
-        .or_else(|| error.get("type").and_then(Value::as_str))
-        .map(ToString::to_string)
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if let Some(error) = value.get("error") {
+            if let Some(message) = error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.get("code").and_then(Value::as_str))
+                .or_else(|| error.get("type").and_then(Value::as_str))
+            {
+                return Some(message.to_string());
+            }
+        }
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(240).collect())
+    }
 }
 
 pub fn read_codex_auth_token(path: &str) -> Option<String> {
+    read_codex_auth_credentials(path).map(|credentials| credentials.token)
+}
+
+pub fn read_codex_auth_credentials(path: &str) -> Option<CodexAuthCredentials> {
     let path = Path::new(path);
     let content = std::fs::read_to_string(path).ok()?;
     let json = serde_json::from_str::<Value>(&content).ok()?;
-    [
+    let account_id = json
+        .get("tokens")
+        .and_then(|tokens| tokens.get("account_id"))
+        .and_then(Value::as_str)
+        .or_else(|| json.get("account_id").and_then(Value::as_str))
+        .map(ToString::to_string);
+
+    let top_level_keys = [
         "api_key",
         "openai_api_key",
         "OPENAI_API_KEY",
         "access_token",
         "token",
-    ]
-    .iter()
-    .find_map(|key| json.get(*key).and_then(Value::as_str))
-    .or_else(|| {
-        json.get("tokens").and_then(|tokens| {
-            [
-                "api_key",
-                "openai_api_key",
-                "OPENAI_API_KEY",
-                "access_token",
-                "token",
-            ]
-            .iter()
-            .find_map(|key| tokens.get(*key).and_then(Value::as_str))
+    ];
+    if let Some(credentials) = top_level_keys.iter().find_map(|key| {
+        json.get(*key)
+            .and_then(Value::as_str)
+            .map(|token| credentials_from_token(key, token, account_id.clone()))
+    }) {
+        return Some(credentials);
+    }
+
+    json.get("tokens").and_then(|tokens| {
+        top_level_keys.iter().find_map(|key| {
+            tokens
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(|token| credentials_from_token(key, token, account_id.clone()))
         })
     })
-    .map(ToString::to_string)
+}
+
+fn credentials_from_token(
+    key: &str,
+    token: &str,
+    account_id: Option<String>,
+) -> CodexAuthCredentials {
+    CodexAuthCredentials {
+        token: token.to_string(),
+        account_id,
+        token_kind: codex_token_kind(key, token),
+    }
+}
+
+fn codex_token_kind(key: &str, token: &str) -> CodexAuthTokenKind {
+    let normalized_key = key.to_ascii_lowercase();
+    if normalized_key.contains("api_key") || token.starts_with("sk-") {
+        CodexAuthTokenKind::OpenAiApiKey
+    } else if normalized_key == "access_token" || looks_like_jwt(token) {
+        CodexAuthTokenKind::CodexOauth
+    } else {
+        CodexAuthTokenKind::Other
+    }
+}
+
+fn looks_like_jwt(token: &str) -> bool {
+    token.split('.').count() == 3
 }
 
 fn extract_response_text(value: &Value) -> Option<String> {
@@ -791,5 +1039,95 @@ fn extract_response_text(value: &Value) -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+fn extract_codex_sse_text(body: &str) -> Option<String> {
+    let mut deltas = String::new();
+    let mut done_text: Option<String> = None;
+    let mut completed_text: Option<String> = None;
+
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    deltas.push_str(delta);
+                }
+            }
+            Some("response.output_text.done") => {
+                if let Some(text) = value.get("text").and_then(Value::as_str) {
+                    done_text = Some(text.to_string());
+                }
+            }
+            Some("response.completed") => {
+                completed_text = value.get("response").and_then(extract_response_text);
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(text) = done_text.filter(|text| !text.is_empty()) {
+        Some(text)
+    } else if !deltas.is_empty() {
+        Some(deltas)
+    } else {
+        completed_text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_sse_text_prefers_done_text() {
+        let body = format!(
+            "event: response.output_text.delta\ndata: {}\n\nevent: response.output_text.done\ndata: {}\n\n",
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "partial"
+            }),
+            json!({
+                "type": "response.output_text.done",
+                "text": "final"
+            })
+        );
+
+        assert_eq!(extract_codex_sse_text(&body).as_deref(), Some("final"));
+    }
+
+    #[test]
+    fn codex_auth_credentials_include_account_id_and_oauth_kind() {
+        let path = std::env::temp_dir().join(format!(
+            "nowledge-codex-credentials-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(
+            &path,
+            json!({
+                "tokens": {
+                    "access_token": "header.payload.signature",
+                    "account_id": "acct-test"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let credentials = read_codex_auth_credentials(&path.to_string_lossy()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(credentials.token, "header.payload.signature");
+        assert_eq!(credentials.account_id.as_deref(), Some("acct-test"));
+        assert_eq!(credentials.token_kind, CodexAuthTokenKind::CodexOauth);
     }
 }

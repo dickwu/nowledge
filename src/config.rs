@@ -17,6 +17,7 @@ pub struct Config {
     pub llm_model: Option<String>,
     pub openai_api_key: Option<String>,
     pub codex_auth_path: Option<String>,
+    pub codex_base_url: String,
     pub allow_codex_auth_import: bool,
     pub health_llm_enabled: bool,
     pub health_llm_probe_interval_seconds: u64,
@@ -74,6 +75,9 @@ impl Config {
             codex_auth_path: std::env::var("RAG_CODEX_AUTH_PATH")
                 .or_else(|_| std::env::var("CODEX_AUTH_PATH"))
                 .ok(),
+            codex_base_url: std::env::var("RAG_CODEX_BASE_URL")
+                .or_else(|_| std::env::var("OPENVIKING_CODEX_BASE_URL"))
+                .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".to_string()),
             allow_codex_auth_import: std::env::var("RAG_ALLOW_CODEX_AUTH_IMPORT")
                 .map(|v| truthy(&v))
                 .unwrap_or(false),
@@ -151,6 +155,7 @@ impl Config {
             llm_model: Some("none".to_string()),
             openai_api_key: None,
             codex_auth_path: None,
+            codex_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             allow_codex_auth_import: false,
             health_llm_enabled: true,
             health_llm_probe_interval_seconds: 30,
