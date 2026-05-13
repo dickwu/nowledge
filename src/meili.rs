@@ -82,24 +82,8 @@ impl MeiliAdmin {
                 }
             }
 
-            let response = self
-                .client
-                .post(format!("{}/indexes", url.trim_end_matches('/')))
-                .headers(self.headers()?)
-                .json(&json!({ "uid": uid, "primaryKey": "id" }))
-                .send()
-                .await
-                .map_err(|e| ApiError::Upstream(e.to_string()))?;
-
-            if response.status().is_success() || response.status().as_u16() == 409 {
-                let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-                tasks.push(body);
-                self.apply_settings(uid).await?;
-            } else {
-                return Err(ApiError::Upstream(format!(
-                    "failed to create Meilisearch index {uid}: {}",
-                    response.status()
-                )));
+            for task_uid in self.ensure_index(uid, "id", true).await? {
+                tasks.push(json!({ "taskUid": task_uid }));
             }
         }
 
@@ -123,30 +107,55 @@ impl MeiliAdmin {
         let Some(url) = &self.url else {
             return Ok(Vec::new());
         };
-        let response = self
-            .client
-            .post(format!("{}/indexes", url.trim_end_matches('/')))
-            .headers(self.headers()?)
-            .json(&json!({ "uid": uid, "primaryKey": primary_key }))
-            .send()
-            .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
 
         let mut task_uids = Vec::new();
-        if response.status().is_success() || response.status().as_u16() == 409 {
+        if !self.index_exists(uid).await? {
+            let response = self
+                .client
+                .post(format!("{}/indexes", url.trim_end_matches('/')))
+                .headers(self.headers()?)
+                .json(&json!({ "uid": uid, "primaryKey": primary_key }))
+                .send()
+                .await
+                .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            if !response.status().is_success() {
+                return Err(ApiError::Upstream(format!(
+                    "failed to create Meilisearch index {uid}: {}",
+                    response.status()
+                )));
+            }
             let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
             if let Some(uid) = task_uid(&body) {
                 task_uids.push(uid);
             }
-            if apply_settings {
-                if let Some(uid) = self.apply_settings(uid).await? {
-                    task_uids.push(uid);
-                }
+        }
+
+        if apply_settings {
+            if let Some(uid) = self.apply_settings(uid).await? {
+                task_uids.push(uid);
             }
-            Ok(task_uids)
+        }
+        Ok(task_uids)
+    }
+
+    async fn index_exists(&self, uid: &str) -> Result<bool, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(false);
+        };
+        let response = self
+            .client
+            .get(format!("{}/indexes/{}", url.trim_end_matches('/'), uid))
+            .headers(self.headers()?)
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+        if response.status().is_success() {
+            Ok(true)
+        } else if response.status().as_u16() == 404 {
+            Ok(false)
         } else {
             Err(ApiError::Upstream(format!(
-                "failed to create Meilisearch index {uid}: {}",
+                "failed to inspect Meilisearch index {uid}: {}",
                 response.status()
             )))
         }

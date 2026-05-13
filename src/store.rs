@@ -96,6 +96,11 @@ impl Store {
     ) -> Result<HistoryEventResponse, ApiError> {
         let mut response = self.append_event(tenant_id, path_owner_user_id, req)?;
         if !response.duplicate {
+            let index = self.get_user_index(tenant_id, &response.event.owner_user_id)?;
+            let _ = self
+                .repository
+                .ensure_user_event_index(&index.index)
+                .await?;
             response.meili_task_uid = self.repository.append_event(&response.event).await?;
             let nodes =
                 self.context_nodes_for_index(&response.routing.personal_context_index_uid)?;
