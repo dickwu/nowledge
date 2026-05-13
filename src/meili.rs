@@ -1,7 +1,9 @@
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::time::{sleep, Duration};
+use std::time::Instant;
+
+use tokio::time::{sleep, timeout, Duration};
 
 use crate::{config::Config, error::ApiError};
 
@@ -96,6 +98,63 @@ impl MeiliAdmin {
 
     pub fn configured(&self) -> bool {
         self.url.is_some()
+    }
+
+    pub async fn health_status(&self) -> Value {
+        let Some(url) = &self.url else {
+            return json!({
+                "status": "memory",
+                "healthy": true,
+                "configured": false,
+                "latency_ms": 0
+            });
+        };
+        let started = Instant::now();
+        let request = self
+            .client
+            .get(format!("{}/health", url.trim_end_matches('/')))
+            .headers(match self.headers() {
+                Ok(headers) => headers,
+                Err(err) => {
+                    return json!({
+                        "status": "unhealthy",
+                        "healthy": false,
+                        "configured": true,
+                        "error": err.to_string(),
+                        "latency_ms": started.elapsed().as_millis() as u64
+                    })
+                }
+            });
+        let response = timeout(Duration::from_secs(2), request.send()).await;
+        match response {
+            Ok(Ok(response)) if response.status().is_success() => json!({
+                "status": "ok",
+                "healthy": true,
+                "configured": true,
+                "latency_ms": started.elapsed().as_millis() as u64
+            }),
+            Ok(Ok(response)) => json!({
+                "status": "unhealthy",
+                "healthy": false,
+                "configured": true,
+                "http_status": response.status().as_u16(),
+                "latency_ms": started.elapsed().as_millis() as u64
+            }),
+            Ok(Err(err)) => json!({
+                "status": "unhealthy",
+                "healthy": false,
+                "configured": true,
+                "error": err.to_string(),
+                "latency_ms": started.elapsed().as_millis() as u64
+            }),
+            Err(_) => json!({
+                "status": "unhealthy",
+                "healthy": false,
+                "configured": true,
+                "error": "Meilisearch health check timed out",
+                "latency_ms": started.elapsed().as_millis() as u64
+            }),
+        }
     }
 
     pub async fn ensure_index(

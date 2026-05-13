@@ -1,7 +1,9 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
     routing::{get, patch, post, put},
     Json, Router,
 };
@@ -13,7 +15,7 @@ use crate::{
     auth::{AdminGuard, UserGuard},
     config::Config,
     error::ApiError,
-    llm::{llm_client_from_config, LlmRequest},
+    llm::{llm_client_from_config, LlmHealthProbe, LlmHealthProbeResult, LlmRequest},
     meili::MeiliAdmin,
     models::*,
     store::Store,
@@ -25,7 +27,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub store: Store,
     pub meili: MeiliAdmin,
-    runtime_codex_auth_path: Arc<RwLock<Option<String>>>,
+    pub llm_health: LlmHealthProbe,
 }
 
 impl AppState {
@@ -33,8 +35,8 @@ impl AppState {
         Self {
             store: Store::new(&config),
             meili: MeiliAdmin::from_config(&config),
+            llm_health: LlmHealthProbe::new(),
             config,
-            runtime_codex_auth_path: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -43,14 +45,7 @@ impl AppState {
     }
 
     fn effective_config(&self) -> Config {
-        let mut config = (*self.config).clone();
-        if let Ok(path) = self.runtime_codex_auth_path.read() {
-            if let Some(path) = path.clone() {
-                config.llm_provider = "codex_auth".to_string();
-                config.codex_auth_path = Some(path);
-            }
-        }
-        config
+        (*self.config).clone()
     }
 }
 
@@ -68,8 +63,10 @@ struct FsQuery {
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        .route("/livez", get(livez))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/v1/usage", get(usage))
         .route("/v1/admin/bootstrap", post(bootstrap))
         .route(
             "/v1/state/profile/facts/{fact_key}",
@@ -174,7 +171,6 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/sessions/{session_id}/commit", post(commit_session))
         .route("/v1/llm/status", get(llm_status))
-        .route("/v1/llm/auth/import-codex", post(import_codex_auth))
         .route("/v1/llm/test", post(llm_test))
         .route("/v1/debug/traces/{trace_id}", get(get_trace))
         .route("/v1/debug/meili/search", post(debug_meili_search))
@@ -185,17 +181,152 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> Json<Value> {
+async fn livez() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn readyz(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "status": "ready",
-        "meili": if state.config.meili_url.is_some() { "configured" } else { "memory" },
+async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    operational_health(state).await
+}
+
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    operational_health(state).await
+}
+
+async fn operational_health(state: AppState) -> impl IntoResponse {
+    let config = state.effective_config();
+    let meili = state.meili.health_status().await;
+    let llm = state.llm_health.check(&config).await;
+    let usage = compact_usage_summary(
+        state
+            .store
+            .usage_snapshot(state.tenant_id(), None, true)
+            .unwrap_or_else(|err| json!({ "error": err.to_string() })),
+    );
+    let meili_healthy = meili
+        .get("healthy")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let llm_unhealthy = llm.status == "unhealthy"
+        || llm.quota_state == "exhausted"
+        || (!llm.auth_valid && config.health_require_llm);
+    let degraded = llm.status == "degraded" || llm.stale;
+    let ready = meili_healthy && !llm_unhealthy;
+    let status = if !ready {
+        "unhealthy"
+    } else if degraded {
+        "degraded"
+    } else {
+        "ok"
+    };
+    let body = json!({
+        "status": status,
+        "ready": ready,
         "store_backend": state.store.backend_name(),
-        "llm": state.config.llm_provider
-    }))
+        "meilisearch": meili,
+        "llm": llm_health_json(&llm),
+        "usage": usage
+    });
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(body),
+    )
+}
+
+fn llm_health_json(llm: &LlmHealthProbeResult) -> Value {
+    json!({
+        "provider": &llm.provider,
+        "model": &llm.model,
+        "status": &llm.status,
+        "can_call": llm.can_call,
+        "auth_valid": llm.auth_valid,
+        "quota_state": &llm.quota_state,
+        "rate_limit_state": &llm.rate_limit_state,
+        "rate_limits": &llm.rate_limits,
+        "checked_at": llm.checked_at,
+        "latency_ms": llm.latency_ms,
+        "stale": llm.stale,
+        "age_seconds": llm.age_seconds,
+        "consecutive_failures": llm.consecutive_failures,
+        "error_kind": &llm.error_kind,
+        "message": &llm.message
+    })
+}
+
+fn compact_usage_summary(usage: Value) -> Value {
+    let providers = usage.get("providers").cloned().unwrap_or_else(|| json!({}));
+    json!({
+        "generated_at": usage.get("generated_at").cloned().unwrap_or(Value::Null),
+        "history_events": providers.get("history_events").cloned().unwrap_or(Value::Null),
+        "contextfs": providers.get("contextfs").cloned().unwrap_or(Value::Null),
+        "rag": providers.get("rag").cloned().unwrap_or(Value::Null),
+        "structured_data": providers.get("structured_data").cloned().unwrap_or(Value::Null),
+        "sessions": providers.get("sessions").cloned().unwrap_or(Value::Null)
+    })
+}
+
+async fn usage(
+    user: UserGuard,
+    State(state): State<AppState>,
+    Query(mut query): Query<OwnerQuery>,
+) -> Result<Json<Value>, ApiError> {
+    user.apply_owner_default(&mut query.owner_user_id)?;
+    if !user.principal.is_admin() && user.principal.owner_user_id.is_none() {
+        return Err(ApiError::forbidden(
+            "owner-bound auth is required for usage",
+        ));
+    }
+    let include_global = user.principal.is_admin() && query.owner_user_id.is_none();
+    if !include_global && query.owner_user_id.is_none() {
+        return Err(ApiError::forbidden(
+            "owner_user_id is required for non-admin usage",
+        ));
+    }
+    let config = state.effective_config();
+    let llm =
+        state
+            .llm_health
+            .cached(&config)
+            .unwrap_or_else(|| crate::llm::LlmHealthProbeResult {
+                provider: config.llm_provider.clone(),
+                model: config
+                    .llm_model
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string()),
+                status: "unknown".to_string(),
+                can_call: false,
+                auth_valid: false,
+                quota_state: "unknown".to_string(),
+                rate_limit_state: "unknown".to_string(),
+                checked_at: chrono::Utc::now(),
+                latency_ms: 0,
+                stale: true,
+                age_seconds: 0,
+                consecutive_failures: 0,
+                rate_limits: crate::llm::RateLimitSnapshot::default(),
+                error_kind: Some("not_probed".to_string()),
+                message: Some("LLM health has not been probed yet".to_string()),
+            });
+    let mut snapshot = state.store.usage_snapshot(
+        state.tenant_id(),
+        query.owner_user_id.as_deref(),
+        include_global,
+    )?;
+    if let Some(providers) = snapshot.get_mut("providers").and_then(Value::as_object_mut) {
+        providers.insert(
+            "meilisearch".to_string(),
+            json!({
+                "configured": state.meili.configured(),
+                "store_backend": state.store.backend_name()
+            }),
+        );
+        providers.insert("llm".to_string(), llm_health_json(&llm));
+    }
+    Ok(Json(snapshot))
 }
 
 async fn bootstrap(
@@ -851,50 +982,6 @@ async fn llm_status(State(state): State<AppState>) -> Json<LlmStatusResponse> {
         auth_source: status.auth_source,
         healthy: status.healthy,
     })
-}
-
-async fn import_codex_auth(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Json(req): Json<ImportCodexAuthRequest>,
-) -> Result<Json<ImportCodexAuthResponse>, ApiError> {
-    if !state.config.allow_codex_auth_import {
-        return Ok(Json(ImportCodexAuthResponse {
-            status: "disabled".to_string(),
-            auth_source: "none".to_string(),
-            test_ok: false,
-        }));
-    }
-    let path = req
-        .codex_auth_path
-        .clone()
-        .or_else(|| state.config.codex_auth_path.clone())
-        .ok_or_else(|| ApiError::bad_request("codex_auth_path is required"))?;
-    let token = crate::llm::read_codex_auth_token(&path).ok_or_else(|| {
-        ApiError::Unauthorized("Codex auth token could not be imported".to_string())
-    })?;
-    if let Ok(mut runtime_path) = state.runtime_codex_auth_path.write() {
-        *runtime_path = Some(path.clone());
-    }
-    let mut test_ok = false;
-    if req.test_after_import {
-        let mut config = (*state.config).clone();
-        config.llm_provider = "codex_auth".to_string();
-        config.codex_auth_path = Some(path.clone());
-        let client = llm_client_from_config(&config);
-        test_ok = client
-            .complete_text(LlmRequest {
-                prompt: "ping".to_string(),
-            })
-            .await
-            .is_ok();
-    }
-    let _ = (token, req.store_imported_token);
-    Ok(Json(ImportCodexAuthResponse {
-        status: "imported_in_memory".to_string(),
-        auth_source: redact_string(&format!("codex_auth:{path}"), &[]),
-        test_ok,
-    }))
 }
 
 async fn llm_test(

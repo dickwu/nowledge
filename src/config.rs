@@ -18,6 +18,14 @@ pub struct Config {
     pub openai_api_key: Option<String>,
     pub codex_auth_path: Option<String>,
     pub allow_codex_auth_import: bool,
+    pub health_llm_enabled: bool,
+    pub health_llm_probe_interval_seconds: u64,
+    pub health_llm_probe_ttl_seconds: u64,
+    pub health_llm_max_stale_seconds: u64,
+    pub health_llm_timeout_ms: u64,
+    pub health_require_llm: bool,
+    pub health_llm_failure_threshold: u32,
+    pub health_llm_rate_limit_unhealthy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +77,37 @@ impl Config {
             allow_codex_auth_import: std::env::var("RAG_ALLOW_CODEX_AUTH_IMPORT")
                 .map(|v| truthy(&v))
                 .unwrap_or(false),
+            health_llm_enabled: std::env::var("RAG_HEALTH_LLM_ENABLED")
+                .map(|v| truthy(&v))
+                .unwrap_or(true),
+            health_llm_probe_interval_seconds: std::env::var(
+                "RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS",
+            )
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+            health_llm_probe_ttl_seconds: std::env::var("RAG_HEALTH_LLM_PROBE_TTL_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            health_llm_max_stale_seconds: std::env::var("RAG_HEALTH_LLM_MAX_STALE_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120),
+            health_llm_timeout_ms: std::env::var("RAG_HEALTH_LLM_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000),
+            health_require_llm: std::env::var("RAG_HEALTH_REQUIRE_LLM")
+                .map(|v| truthy(&v))
+                .unwrap_or(true),
+            health_llm_failure_threshold: std::env::var("RAG_HEALTH_LLM_FAILURE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
+            health_llm_rate_limit_unhealthy: std::env::var("RAG_HEALTH_LLM_RATE_LIMIT_UNHEALTHY")
+                .map(|v| truthy(&v))
+                .unwrap_or(false),
         }
     }
 
@@ -113,6 +152,14 @@ impl Config {
             openai_api_key: None,
             codex_auth_path: None,
             allow_codex_auth_import: false,
+            health_llm_enabled: true,
+            health_llm_probe_interval_seconds: 30,
+            health_llm_probe_ttl_seconds: 60,
+            health_llm_max_stale_seconds: 120,
+            health_llm_timeout_ms: 10_000,
+            health_require_llm: true,
+            health_llm_failure_threshold: 3,
+            health_llm_rate_limit_unhealthy: false,
         }
     }
 }

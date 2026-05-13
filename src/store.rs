@@ -73,6 +73,157 @@ impl Store {
         self.repository.backend_name()
     }
 
+    pub fn usage_snapshot(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        include_global: bool,
+    ) -> Result<Value, ApiError> {
+        let owner_hash = owner_user_id.map(|owner| self.resolver.user_hash(owner));
+        let personal_context_index_uid = owner_user_id
+            .map(|owner| {
+                self.resolver
+                    .resolve(tenant_id, owner, false, true)
+                    .map(|routing| routing.personal_context_index_uid)
+            })
+            .transpose()?;
+        let data = self.read()?;
+        let owner_matches =
+            |owner: &str| include_global || owner_user_id.is_some_and(|target| target == owner);
+        let tenant_matches = |value: &str| value == tenant_id || value == "default";
+
+        let event_count = data
+            .event_by_id
+            .values()
+            .filter(|event| event.tenant_id == tenant_id && owner_matches(&event.owner_user_id))
+            .count();
+        let event_index_count = data
+            .user_indexes
+            .values()
+            .filter(|index| index.tenant_id == tenant_id)
+            .filter(|index| {
+                include_global
+                    || owner_hash
+                        .as_deref()
+                        .is_some_and(|hash| hash == index.owner_user_id_hash)
+            })
+            .count();
+        let company_nodes = data
+            .company_context
+            .iter()
+            .filter(|node| tenant_matches(&node.tenant_id) && node.status == "active")
+            .count();
+        let private_nodes = if include_global {
+            data.personal_context
+                .values()
+                .flatten()
+                .filter(|node| tenant_matches(&node.tenant_id) && node.status == "active")
+                .count()
+        } else {
+            personal_context_index_uid
+                .as_deref()
+                .and_then(|uid| data.personal_context.get(uid))
+                .map(|nodes| {
+                    nodes
+                        .iter()
+                        .filter(|node| tenant_matches(&node.tenant_id) && node.status == "active")
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let snapshot_ids = data
+            .snapshots
+            .values()
+            .filter(|snapshot| owner_matches(&snapshot.owner_user_id))
+            .map(|snapshot| snapshot.id.clone())
+            .collect::<HashSet<_>>();
+        let snapshot_count = snapshot_ids.len();
+        let row_count = data
+            .rows_by_snapshot
+            .iter()
+            .filter(|(snapshot_id, _)| include_global || snapshot_ids.contains(*snapshot_id))
+            .map(|(_, rows)| rows.len())
+            .sum::<usize>();
+        let summary_count = data
+            .structured_summaries
+            .values()
+            .filter(|summary| {
+                summary
+                    .get("owner_user_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(owner_matches)
+            })
+            .count();
+        let structured_state_count = data
+            .state_items
+            .values()
+            .filter(|item| {
+                item.tenant_id == tenant_id
+                    && item.state_type == "structured_summary"
+                    && owner_matches(&item.owner_user_id)
+            })
+            .count();
+        let trace_count = data
+            .traces
+            .values()
+            .filter(|trace| trace.tenant_id == tenant_id)
+            .filter(|trace| {
+                include_global
+                    || trace
+                        .owner_user_id
+                        .as_deref()
+                        .is_some_and(|owner| owner_user_id == Some(owner))
+            })
+            .count();
+        let sessions = data
+            .sessions
+            .values()
+            .filter(|session| owner_matches(&session.owner_user_id))
+            .collect::<Vec<_>>();
+        let message_count = sessions
+            .iter()
+            .map(|session| session.messages.len())
+            .sum::<usize>();
+
+        Ok(json!({
+            "generated_at": now(),
+            "scope": {
+                "tenant_id": tenant_id,
+                "owner_user_id": owner_user_id,
+                "global": include_global
+            },
+            "providers": {
+                "nowledge_api": {
+                    "store_backend": self.backend_name(),
+                    "run_scope": if include_global { "global" } else { "owner" }
+                },
+                "history_events": {
+                    "event_count": event_count,
+                    "user_event_index_count": event_index_count
+                },
+                "contextfs": {
+                    "company_context_node_count": company_nodes,
+                    "private_context_node_count": private_nodes,
+                    "context_node_count": company_nodes + private_nodes
+                },
+                "rag": {
+                    "trace_count": trace_count
+                },
+                "structured_data": {
+                    "dataset_count": data.datasets.len(),
+                    "snapshot_count": snapshot_count,
+                    "row_count": row_count,
+                    "summary_count": summary_count,
+                    "structured_state_item_count": structured_state_count
+                },
+                "sessions": {
+                    "session_count": sessions.len(),
+                    "message_count": message_count
+                }
+            }
+        }))
+    }
+
     pub async fn ensure_user_index_async(
         &self,
         tenant_id: &str,

@@ -46,6 +46,30 @@ fn codex_import_app() -> Router {
     build_router(AppState::new(Arc::new(config)))
 }
 
+fn llm_health_app(provider: &str) -> Router {
+    let mut config = Config::test();
+    config.llm_provider = provider.to_string();
+    config.llm_model = Some("health-model".to_string());
+    build_router(AppState::new(Arc::new(config)))
+}
+
+fn bearer_user_app() -> Router {
+    let mut config = Config::test();
+    config.bearer_token = Some("user-token".to_string());
+    config.admin_token = Some("admin-token".to_string());
+    build_router(AppState::new(Arc::new(config)))
+}
+
+fn stale_llm_health_app() -> Router {
+    let mut config = Config::test();
+    config.llm_provider = "mock".to_string();
+    config.llm_model = Some("health-model".to_string());
+    config.health_llm_probe_interval_seconds = 999;
+    config.health_llm_probe_ttl_seconds = 0;
+    config.health_llm_max_stale_seconds = 0;
+    build_router(AppState::new(Arc::new(config)))
+}
+
 fn mock_llm_app() -> Router {
     let mut config = Config::test();
     config.llm_provider = "mock".to_string();
@@ -78,7 +102,8 @@ async fn call_with_token(
     let value = if bytes.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(&bytes).unwrap()
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }))
     };
     (status, value)
 }
@@ -200,6 +225,76 @@ async fn user_history_events_are_index_isolated() {
     .await;
     assert_eq!(status, StatusCode::OK, "{company_debug}");
     assert_eq!(company_debug["hits"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn livez_is_minimal_process_liveness() {
+    let app = llm_health_app("mock");
+    let (status, body) = call(app, Method::GET, "/livez", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "status": "ok" }));
+    assert!(body.get("llm").is_none());
+    assert!(body.get("usage").is_none());
+}
+
+#[tokio::test]
+async fn healthz_includes_llm_health_and_usage() {
+    let app = llm_health_app("mock");
+    let (status, body) = call(app, Method::GET, "/healthz", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["llm"]["provider"], "mock");
+    assert_eq!(body["llm"]["auth_valid"], true);
+    assert_eq!(body["llm"]["quota_state"], "available");
+    assert!(body.get("usage").is_some());
+    assert!(body["usage"].get("history_events").is_some());
+}
+
+#[tokio::test]
+async fn llm_auth_failure_makes_health_unhealthy() {
+    let app = llm_health_app("mock_auth_failure");
+    let (status, body) = call(app, Method::GET, "/healthz", Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["ready"], false);
+    assert_eq!(body["status"], "unhealthy");
+    assert_eq!(body["llm"]["auth_valid"], false);
+    assert_eq!(body["llm"]["error_kind"], "auth_failed");
+}
+
+#[tokio::test]
+async fn llm_quota_exhaustion_makes_health_unhealthy() {
+    let app = llm_health_app("mock_quota_exhausted");
+    let (status, body) = call(app, Method::GET, "/healthz", Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["ready"], false);
+    assert_eq!(body["status"], "unhealthy");
+    assert_eq!(body["llm"]["quota_state"], "exhausted");
+}
+
+#[tokio::test]
+async fn llm_short_rate_limit_is_degraded_by_default() {
+    let app = llm_health_app("mock_rate_limited");
+    let (status, body) = call(app, Method::GET, "/healthz", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["llm"]["rate_limit_state"], "limited");
+    assert_eq!(body["llm"]["rate_limits"]["remaining_requests"], "0");
+}
+
+#[tokio::test]
+async fn stale_llm_probe_beyond_max_stale_makes_health_unhealthy() {
+    let app = stale_llm_health_app();
+    let (status, first) = call(app.clone(), Method::GET, "/healthz", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let (status, body) = call(app, Method::GET, "/readyz", Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["status"], "unhealthy");
+    assert_eq!(body["ready"], false);
+    assert_eq!(body["llm"]["stale"], true);
+    assert_eq!(body["llm"]["error_kind"], "stale_probe");
 }
 
 #[tokio::test]
@@ -634,6 +729,77 @@ async fn current_structured_is_owner_bound_for_users() {
 }
 
 #[tokio::test]
+async fn usage_returns_full_provider_snapshots_and_owner_scope() {
+    let app = authed_app();
+    for (owner, token, text) in [
+        ("u1", "u1-token", "u1 scoped usage signal"),
+        ("u2", "u2-token", "u2 scoped usage signal"),
+    ] {
+        let (status, body) = call_with_token(
+            app.clone(),
+            Method::POST,
+            &format!("/v1/history/users/{owner}/events"),
+            event_body(owner, &format!("usage-{owner}"), text),
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let (status, owner_usage) = call_with_token(
+        app.clone(),
+        Method::GET,
+        "/v1/usage",
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{owner_usage}");
+    assert_eq!(owner_usage["scope"]["owner_user_id"], "u1");
+    assert_eq!(owner_usage["scope"]["global"], false);
+    let providers = owner_usage["providers"].as_object().unwrap();
+    for provider in [
+        "nowledge_api",
+        "meilisearch",
+        "llm",
+        "rag",
+        "history_events",
+        "contextfs",
+        "structured_data",
+        "sessions",
+    ] {
+        assert!(providers.contains_key(provider), "missing {provider}");
+    }
+    assert_eq!(owner_usage["providers"]["history_events"]["event_count"], 1);
+
+    let (status, admin_usage) = call_with_token(
+        app,
+        Method::GET,
+        "/v1/usage",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{admin_usage}");
+    assert_eq!(admin_usage["scope"]["global"], true);
+    assert_eq!(admin_usage["providers"]["history_events"]["event_count"], 2);
+}
+
+#[tokio::test]
+async fn usage_rejects_unbound_non_admin_owner_selection() {
+    let app = bearer_user_app();
+    let (status, body) = call_with_token(
+        app,
+        Method::GET,
+        "/v1/usage?owner_user_id=u1",
+        Value::Null,
+        Some("user-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
 async fn llm_mock_provider_test_is_token_safe() {
     let app = mock_llm_app();
     let (status, body) = call(
@@ -677,7 +843,7 @@ async fn rag_answer_uses_mock_llm_provider() {
 }
 
 #[tokio::test]
-async fn codex_auth_import_is_token_safe() {
+async fn codex_auth_import_route_is_not_exposed_or_token_safe() {
     let app = codex_import_app();
     let token = "codex-secret-token-should-not-leak";
     let path =
@@ -697,7 +863,6 @@ async fn codex_auth_import_is_token_safe() {
     )
     .await;
     let _ = std::fs::remove_file(&path);
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["status"], "imported_in_memory");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(!body.to_string().contains(token));
 }
