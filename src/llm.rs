@@ -747,10 +747,29 @@ pub fn read_codex_auth_token(path: &str) -> Option<String> {
     let path = Path::new(path);
     let content = std::fs::read_to_string(path).ok()?;
     let json = serde_json::from_str::<Value>(&content).ok()?;
-    ["api_key", "openai_api_key", "access_token", "token"]
-        .iter()
-        .find_map(|key| json.get(*key).and_then(Value::as_str))
-        .map(ToString::to_string)
+    [
+        "api_key",
+        "openai_api_key",
+        "OPENAI_API_KEY",
+        "access_token",
+        "token",
+    ]
+    .iter()
+    .find_map(|key| json.get(*key).and_then(Value::as_str))
+    .or_else(|| {
+        json.get("tokens").and_then(|tokens| {
+            [
+                "api_key",
+                "openai_api_key",
+                "OPENAI_API_KEY",
+                "access_token",
+                "token",
+            ]
+            .iter()
+            .find_map(|key| tokens.get(*key).and_then(Value::as_str))
+        })
+    })
+    .map(ToString::to_string)
 }
 
 fn extract_response_text(value: &Value) -> Option<String> {

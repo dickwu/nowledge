@@ -866,3 +866,24 @@ async fn codex_auth_import_route_is_not_exposed_or_token_safe() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(!body.to_string().contains(token));
 }
+
+#[tokio::test]
+async fn codex_auth_reader_accepts_cli_openai_api_key_shape() {
+    let token = "sk-codex-cli-shape-token";
+    let path =
+        std::env::temp_dir().join(format!("nowledge-codex-auth-{}.json", uuid::Uuid::now_v7()));
+    std::fs::write(
+        &path,
+        json!({
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": token,
+            "tokens": { "access_token": "nested-token" }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let read = nowledge::llm::read_codex_auth_token(&path.to_string_lossy());
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(read.as_deref(), Some(token));
+}
