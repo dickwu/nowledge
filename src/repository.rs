@@ -59,6 +59,8 @@ pub trait KnowledgeRepository: Send + Sync {
 
     async fn upsert_trace(&self, trace: &TraceRecord) -> Result<Option<String>, ApiError>;
 
+    async fn upsert_links(&self, links: &[KnowledgeLink]) -> Result<Option<String>, ApiError>;
+
     async fn search_user_events(
         &self,
         routing: &EventIndexRouting,
@@ -165,6 +167,10 @@ impl KnowledgeRepository for MemoryRepository {
     }
 
     async fn upsert_trace(&self, _trace: &TraceRecord) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_links(&self, _links: &[KnowledgeLink]) -> Result<Option<String>, ApiError> {
         Ok(None)
     }
 
@@ -380,6 +386,14 @@ impl KnowledgeRepository for MeiliRepository {
     async fn upsert_trace(&self, trace: &TraceRecord) -> Result<Option<String>, ApiError> {
         self.upsert_values("rag_traces", &[to_document(trace, &trace.id)?])
             .await
+    }
+
+    async fn upsert_links(&self, links: &[KnowledgeLink]) -> Result<Option<String>, ApiError> {
+        let documents = links
+            .iter()
+            .map(|link| to_document(link, &link.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.upsert_values("rag_links", &documents).await
     }
 
     async fn search_user_events(

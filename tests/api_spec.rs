@@ -77,6 +77,15 @@ fn mock_llm_app() -> Router {
     build_router(AppState::new(Arc::new(config)))
 }
 
+fn analysis_llm_app() -> Router {
+    let mut config = Config::test();
+    config.llm_provider = "none".to_string();
+    config.llm_model = Some("main-rag-model".to_string());
+    config.analysis_llm_provider = "mock".to_string();
+    config.analysis_llm_model = Some("gpt-5.3-codex-spark".to_string());
+    build_router(AppState::new(Arc::new(config)))
+}
+
 async fn call(app: Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
     call_with_token(app, method, uri, body, None).await
 }
@@ -763,6 +772,7 @@ async fn usage_returns_full_provider_snapshots_and_owner_scope() {
         "meilisearch",
         "llm",
         "rag",
+        "link_graph",
         "history_events",
         "contextfs",
         "structured_data",
@@ -840,6 +850,245 @@ async fn rag_answer_uses_mock_llm_provider() {
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert!(answer["answer"].as_str().unwrap().contains("mock summary"));
     assert_ne!(answer["usage"]["provider"], "none");
+}
+
+#[tokio::test]
+async fn link_graph_records_bidirectional_backlinks_and_owner_scope() {
+    let app = authed_app();
+    for (entity, text) in [
+        ("link-a", "alpha-link-a customer onboarding note"),
+        ("link-b", "alpha-link-b onboarding risk note"),
+    ] {
+        let (status, event) = call_with_token(
+            app.clone(),
+            Method::POST,
+            "/v1/history/users/u1/events",
+            event_body("u1", entity, text),
+            Some("u1-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{event}");
+    }
+
+    let (status, source_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "alpha-link-a", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{source_search}");
+    let source_uri = source_search["hits"][0]["uri"].as_str().unwrap();
+
+    let (status, target_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "alpha-link-b", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{target_search}");
+    let target_uri = target_search["hits"][0]["uri"].as_str().unwrap();
+
+    let (status, created) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/links",
+        json!({
+            "source_uri": source_uri,
+            "target_uri": target_uri,
+            "relation": "supports",
+            "rationale": "manual backlink regression"
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    assert_eq!(created["decision"], "created");
+    assert!(created.get("history_event_id").is_some());
+    let canonical_source = created["link"]["source_uri"].as_str().unwrap();
+    let canonical_target = created["link"]["target_uri"].as_str().unwrap();
+    assert!(!canonical_source.ends_with("/.abstract"));
+
+    let (status, backlinks) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/links/search",
+        json!({ "uri": target_uri, "direction": "backlinks" }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{backlinks}");
+    assert_eq!(backlinks["backlinks"].as_array().unwrap().len(), 1);
+    assert_eq!(backlinks["backlinks"][0]["source_uri"], canonical_source);
+
+    let (status, outbound) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/links/search",
+        json!({ "uri": source_uri, "direction": "outbound" }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{outbound}");
+    assert_eq!(outbound["outbound"].as_array().unwrap().len(), 1);
+    assert_eq!(outbound["outbound"][0]["target_uri"], canonical_target);
+
+    let (status, cross_owner) = call_with_token(
+        app,
+        Method::POST,
+        "/v1/links/search",
+        json!({ "query": "manual backlink regression" }),
+        Some("u2-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cross_owner}");
+    assert_eq!(cross_owner["links"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn analysis_api_uses_independent_model_and_materializes_links_and_insights() {
+    let app = analysis_llm_app();
+    for (entity, text) in [
+        (
+            "analysis-a",
+            "analysis-key launch plan depends on API readiness",
+        ),
+        (
+            "analysis-b",
+            "analysis-key API readiness depends on support staffing",
+        ),
+    ] {
+        let (status, event) = call(
+            app.clone(),
+            Method::POST,
+            "/v1/history/users/u1/events",
+            event_body("u1", entity, text),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{event}");
+    }
+
+    let (status, analysis) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/analysis/insights",
+        json!({
+            "owner_user_id": "u1",
+            "query": "analysis-key API readiness",
+            "create_links": true,
+            "upsert_insights": true,
+            "context_limit": 8
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{analysis}");
+    assert_eq!(analysis["usage"]["provider"], "mock");
+    assert_eq!(analysis["usage"]["model"], "gpt-5.3-codex-spark");
+    assert!(!analysis["link_candidates"].as_array().unwrap().is_empty());
+    assert!(!analysis["created_links"].as_array().unwrap().is_empty());
+    assert!(!analysis["insights"].as_array().unwrap().is_empty());
+
+    let (status, links) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/links/search",
+        json!({ "owner_user_id": "u1", "query": "analysis-key API readiness" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{links}");
+    assert!(!links["links"].as_array().unwrap().is_empty());
+
+    let (status, insights) = call(
+        app,
+        Method::POST,
+        "/v1/state/insights/search",
+        json!({ "owner_user_id": "u1", "query": "analysis-key API readiness" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{insights}");
+    assert!(!insights["hits"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn history_event_analysis_is_constrained_to_same_event_index() {
+    let app = analysis_llm_app();
+    let (status, selected) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/history/users/u1/events",
+        event_body(
+            "u1",
+            "history-scope-a",
+            "same-index-insight selected user one event",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{selected}");
+    let selected_id = selected["event"]["id"].as_str().unwrap();
+    let u1_index = selected["event"]["event_index_uid"].as_str().unwrap();
+
+    let (status, related) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/history/users/u1/events",
+        event_body(
+            "u1",
+            "history-scope-b",
+            "same-index-insight related user one event",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{related}");
+
+    let (status, cross_owner) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/history/users/u2/events",
+        event_body(
+            "u2",
+            "history-scope-c",
+            "same-index-insight cross-index-secret user two event",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cross_owner}");
+    let u2_index = cross_owner["event"]["event_index_uid"].as_str().unwrap();
+    assert_ne!(u1_index, u2_index);
+
+    let (status, analysis) = call(
+        app,
+        Method::POST,
+        "/v1/analysis/insights",
+        json!({
+            "owner_user_id": "u1",
+            "history_event_id": selected_id,
+            "query": "same-index-insight",
+            "create_links": true,
+            "upsert_insights": true,
+            "context_limit": 8
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{analysis}");
+    assert_eq!(analysis["history_event_id"], selected_id);
+    assert_eq!(analysis["event_index_uid"], u1_index);
+    assert_eq!(analysis["usage"]["history_scope"]["mode"], "same_index");
+    assert_eq!(
+        analysis["usage"]["history_scope"]["event_index_uid"],
+        u1_index
+    );
+    assert!(!analysis["context_hits"].as_array().unwrap().is_empty());
+    assert!(analysis["context_hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|hit| hit["uri"].as_str().unwrap().contains("/history/")));
+    let rendered = analysis.to_string();
+    assert!(!rendered.contains("cross-index-secret"));
+    assert!(!rendered.contains(u2_index));
 }
 
 #[tokio::test]

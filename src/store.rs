@@ -47,6 +47,8 @@ struct StoreData {
     structured_summaries: HashMap<String, Value>,
     sessions: HashMap<String, SessionRecord>,
     traces: HashMap<String, TraceRecord>,
+    links: HashMap<String, KnowledgeLink>,
+    link_idempotency: HashMap<(String, String), String>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +177,20 @@ impl Store {
                         .is_some_and(|owner| owner_user_id == Some(owner))
             })
             .count();
+        let link_count = data
+            .links
+            .values()
+            .filter(|link| link.tenant_id == tenant_id)
+            .filter(|link| {
+                if include_global {
+                    true
+                } else {
+                    link.owner_user_id
+                        .as_deref()
+                        .is_none_or(|owner| owner_user_id == Some(owner))
+                }
+            })
+            .count();
         let sessions = data
             .sessions
             .values()
@@ -208,6 +224,9 @@ impl Store {
                 },
                 "rag": {
                     "trace_count": trace_count
+                },
+                "link_graph": {
+                    "link_count": link_count
                 },
                 "structured_data": {
                     "dataset_count": data.datasets.len(),
@@ -456,6 +475,22 @@ impl Store {
         let _ = self
             .persist_history_event_by_id(&response.history_event_id)
             .await?;
+        Ok(response)
+    }
+
+    pub async fn upsert_link_async(
+        &self,
+        tenant_id: &str,
+        req: LinkUpsertRequest,
+    ) -> Result<LinkResponse, ApiError> {
+        let response = self.upsert_link(tenant_id, req)?;
+        let _ = self
+            .repository
+            .upsert_links(std::slice::from_ref(&response.link))
+            .await?;
+        if let Some(history_event_id) = &response.history_event_id {
+            let _ = self.persist_history_event_by_id(history_event_id).await?;
+        }
         Ok(response)
     }
 
@@ -1601,6 +1636,204 @@ impl Store {
         hits.sort_by_key(|insight| Reverse(insight.updated_at));
         hits.truncate(req.limit.max(1));
         Ok(InsightSearchResponse { hits })
+    }
+
+    pub fn upsert_link(
+        &self,
+        tenant_id: &str,
+        req: LinkUpsertRequest,
+    ) -> Result<LinkResponse, ApiError> {
+        let source_uri = canonical_link_uri(&require_string(req.source_uri, "source_uri")?);
+        let target_uri = canonical_link_uri(&require_string(req.target_uri, "target_uri")?);
+        if source_uri == target_uri {
+            return Err(ApiError::bad_request(
+                "source_uri and target_uri must refer to different context nodes",
+            ));
+        }
+        let relation = normalize_relation(&req.relation);
+        let now = now();
+        let owner_scope = req.owner_user_id.clone().unwrap_or_default();
+        let idempotency_hash = req
+            .idempotency_key
+            .as_deref()
+            .map(|key| self.resolver.idempotency_hash(key));
+        let natural_key = link_natural_key(
+            tenant_id,
+            req.owner_user_id.as_deref(),
+            &source_uri,
+            &target_uri,
+            &relation,
+        );
+
+        let (link, decision) = {
+            let mut data = self.write()?;
+            if let Some(hash) = &idempotency_hash {
+                if let Some(existing_id) = data
+                    .link_idempotency
+                    .get(&(owner_scope.clone(), hash.clone()))
+                    .cloned()
+                {
+                    if let Some(link) = data.links.get(&existing_id).cloned() {
+                        return Ok(LinkResponse {
+                            link,
+                            decision: "duplicate".to_string(),
+                            history_event_id: None,
+                        });
+                    }
+                }
+            }
+
+            let existing_id = data
+                .links
+                .values()
+                .find(|link| {
+                    link_natural_key(
+                        &link.tenant_id,
+                        link.owner_user_id.as_deref(),
+                        &link.source_uri,
+                        &link.target_uri,
+                        &link.relation,
+                    ) == natural_key
+                })
+                .map(|link| link.id.clone());
+
+            let (id, created_at, decision) = if let Some(existing_id) = existing_id {
+                let created_at = data
+                    .links
+                    .get(&existing_id)
+                    .map(|link| link.created_at)
+                    .unwrap_or(now);
+                (existing_id, created_at, "updated".to_string())
+            } else {
+                (new_id("link"), now, "created".to_string())
+            };
+
+            let link = KnowledgeLink {
+                id: id.clone(),
+                tenant_id: tenant_id.to_string(),
+                owner_user_id: req.owner_user_id.clone(),
+                source_uri,
+                target_uri,
+                source_title: req.source_title,
+                target_title: req.target_title,
+                relation,
+                rationale: req.rationale,
+                evidence_text: req.evidence_text,
+                confidence: req.confidence,
+                created_by: req.created_by,
+                status: "active".to_string(),
+                tags: req.tags,
+                created_at,
+                updated_at: now,
+            };
+            if let Some(hash) = idempotency_hash {
+                data.link_idempotency
+                    .insert((owner_scope, hash), id.clone());
+            }
+            data.links.insert(id, link.clone());
+            (link, decision)
+        };
+
+        let history_event_id = if let Some(owner_user_id) = link.owner_user_id.as_deref() {
+            Some(
+                self.append_internal_event(
+                    tenant_id,
+                    owner_user_id,
+                    "link.upserted",
+                    "knowledge_link",
+                    &link.id,
+                    format!(
+                        "Link {} {} {}",
+                        &link.source_uri, &link.relation, &link.target_uri
+                    ),
+                    json!({
+                        "link_id": &link.id,
+                        "source_uri": &link.source_uri,
+                        "target_uri": &link.target_uri,
+                        "relation": &link.relation,
+                        "decision": &decision
+                    }),
+                )?
+                .event
+                .id,
+            )
+        } else {
+            None
+        };
+
+        Ok(LinkResponse {
+            link,
+            decision,
+            history_event_id,
+        })
+    }
+
+    pub fn search_links(
+        &self,
+        tenant_id: &str,
+        req: LinkSearchRequest,
+        include_all_private: bool,
+    ) -> Result<LinkSearchResponse, ApiError> {
+        let target_uri = req.uri.as_deref().map(canonical_link_uri);
+        let limit = req.limit.max(1);
+        let data = self.read()?;
+        let mut links = data
+            .links
+            .values()
+            .filter(|link| link.tenant_id == tenant_id)
+            .filter(|link| {
+                if let Some(owner) = req.owner_user_id.as_deref() {
+                    link.owner_user_id.as_deref().is_none()
+                        || link.owner_user_id.as_deref() == Some(owner)
+                } else {
+                    include_all_private || link.owner_user_id.is_none()
+                }
+            })
+            .filter(|link| req.status.is_empty() || link.status == req.status)
+            .filter(|link| req.relations.is_empty() || req.relations.contains(&link.relation))
+            .filter(|link| {
+                target_uri
+                    .as_ref()
+                    .is_none_or(|uri| match req.direction.as_str() {
+                        "outbound" => &link.source_uri == uri,
+                        "backlinks" | "backlink" => &link.target_uri == uri,
+                        _ => &link.source_uri == uri || &link.target_uri == uri,
+                    })
+            })
+            .filter(|link| {
+                req.query
+                    .as_deref()
+                    .map(|query| text_score(&link_search_text(link), query) > 0.0)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        links.sort_by_key(|link| Reverse(link.updated_at));
+        links.truncate(limit);
+
+        let (outbound, backlinks) = if let Some(uri) = target_uri {
+            let mut outbound = links
+                .iter()
+                .filter(|link| link.source_uri == uri)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut backlinks = links
+                .iter()
+                .filter(|link| link.target_uri == uri)
+                .cloned()
+                .collect::<Vec<_>>();
+            outbound.sort_by_key(|link| Reverse(link.updated_at));
+            backlinks.sort_by_key(|link| Reverse(link.updated_at));
+            (outbound, backlinks)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        Ok(LinkSearchResponse {
+            links,
+            outbound,
+            backlinks,
+        })
     }
 
     pub fn preflight_company_doc(
@@ -3186,6 +3419,49 @@ fn strip_layer_suffix(uri: &str) -> String {
         .or_else(|| uri.strip_suffix("/chunks/0001"))
         .unwrap_or(uri)
         .to_string()
+}
+
+fn canonical_link_uri(uri: &str) -> String {
+    strip_layer_suffix(uri.trim())
+}
+
+fn normalize_relation(relation: &str) -> String {
+    let relation = relation.trim();
+    if relation.is_empty() {
+        "related".to_string()
+    } else {
+        sanitize_slug(relation)
+    }
+}
+
+fn link_natural_key(
+    tenant_id: &str,
+    owner_user_id: Option<&str>,
+    source_uri: &str,
+    target_uri: &str,
+    relation: &str,
+) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        tenant_id,
+        owner_user_id.unwrap_or(""),
+        source_uri,
+        target_uri,
+        relation
+    )
+}
+
+fn link_search_text(link: &KnowledgeLink) -> String {
+    format!(
+        "{} {} {} {} {} {} {}",
+        link.source_uri,
+        link.target_uri,
+        link.source_title.as_deref().unwrap_or_default(),
+        link.target_title.as_deref().unwrap_or_default(),
+        link.relation,
+        link.rationale.as_deref().unwrap_or_default(),
+        link.tags.join(" ")
+    )
 }
 
 fn owner_from_filters(filters: &Value) -> Option<&str> {

@@ -19,6 +19,9 @@ specs.
 - Company document preflight, revisions, and activation.
 - Structured dataset snapshots, idempotent row ingestion, and deterministic
   numeric summary calculation.
+- Obsidian-style bidirectional knowledge links with backlink/outbound search.
+- Independent analysis API that can use a separate LLM provider/model to create
+  links and insight records from ingested context.
 - Insight, session, RAG answer/debug, LLM status, and debug route surfaces.
 - Meilisearch bootstrap hooks with in-memory persistence for local development
   and tests.
@@ -49,6 +52,8 @@ RAG_MEILI_API_KEY=optional-meili-key
 RAG_MEILI_WAIT_FOR_TASKS=false
 RAG_LLM_PROVIDER=none
 RAG_LLM_MODEL=none
+RAG_ANALYSIS_LLM_PROVIDER=none
+RAG_ANALYSIS_LLM_MODEL=gpt-5.3-codex-spark
 RAG_OPENAI_API_KEY=optional-openai-key
 RAG_CODEX_AUTH_PATH=optional-explicit-codex-auth-json
 RAG_ALLOW_CODEX_AUTH_IMPORT=false
@@ -76,6 +81,20 @@ Health endpoints split process liveness from operational readiness:
 - `GET /readyz` uses the same readiness decision as `/healthz`.
 - `GET /v1/usage` returns owner-scoped provider snapshots for ordinary users and
   global provider snapshots for admins.
+
+Link and analysis surfaces:
+
+- `POST /v1/links` creates or updates a directed knowledge link between two
+  ContextFS URIs. Link search treats the stored edge as bidirectional for
+  navigation.
+- `POST /v1/links/search` searches links by text, relation, URI, outbound edge,
+  or backlink.
+- `POST /v1/analysis/insights` searches ingested context, includes existing
+  links as evidence, and can materialize new links plus insight records. It uses
+  `RAG_ANALYSIS_LLM_PROVIDER` / `RAG_ANALYSIS_LLM_MODEL`, so analysis can run on
+  a different model from `/v1/rag/answer`. When `history_event_id` is supplied,
+  the caller must also provide or be bound to `owner_user_id`; analysis evidence
+  is then constrained to that owner's same history event index.
 
 ## Verify
 

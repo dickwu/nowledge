@@ -19,6 +19,7 @@ pub const FIXED_INDEXES: &[&str] = &[
     "rag_structured_rows",
     "rag_structured_summaries",
     "rag_insights",
+    "rag_links",
     "rag_sessions",
     "rag_memory_diffs",
     "rag_feedback",
@@ -443,6 +444,12 @@ pub fn settings_for(uid: &str) -> Value {
             "searchableAttributes": ["text", "event_type", "entity_type", "entity_id", "tags"],
             "filterableAttributes": ["id", "tenant_id", "owner_user_id_hash", "event_type", "entity_type", "entity_id", "privacy", "occurred_at", "observed_at"],
             "sortableAttributes": ["occurred_at", "observed_at"]
+        })
+    } else if uid.contains("links") {
+        json!({
+            "searchableAttributes": ["source_uri", "target_uri", "source_title", "target_title", "relation", "rationale", "evidence_text", "tags"],
+            "filterableAttributes": ["id", "tenant_id", "owner_user_id", "source_uri", "target_uri", "relation", "status", "created_by"],
+            "sortableAttributes": ["created_at", "updated_at"]
         })
     } else {
         json!({

@@ -15,6 +15,8 @@ pub struct Config {
     pub meili_wait_for_tasks: bool,
     pub llm_provider: String,
     pub llm_model: Option<String>,
+    pub analysis_llm_provider: String,
+    pub analysis_llm_model: Option<String>,
     pub openai_api_key: Option<String>,
     pub codex_auth_path: Option<String>,
     pub codex_base_url: String,
@@ -69,6 +71,12 @@ impl Config {
                 .unwrap_or(false),
             llm_provider: std::env::var("RAG_LLM_PROVIDER").unwrap_or_else(|_| "none".to_string()),
             llm_model: std::env::var("RAG_LLM_MODEL").ok(),
+            analysis_llm_provider: std::env::var("RAG_ANALYSIS_LLM_PROVIDER").unwrap_or_else(
+                |_| std::env::var("RAG_LLM_PROVIDER").unwrap_or_else(|_| "none".to_string()),
+            ),
+            analysis_llm_model: std::env::var("RAG_ANALYSIS_LLM_MODEL")
+                .ok()
+                .or_else(|| std::env::var("RAG_LLM_MODEL").ok()),
             openai_api_key: std::env::var("RAG_OPENAI_API_KEY")
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .ok(),
@@ -115,6 +123,13 @@ impl Config {
         }
     }
 
+    pub fn analysis_llm_config(&self) -> Self {
+        let mut config = self.clone();
+        config.llm_provider = self.analysis_llm_provider.clone();
+        config.llm_model = self.analysis_llm_model.clone();
+        config
+    }
+
     pub fn validate_startup(&self) -> anyhow::Result<()> {
         if self.store_backend == "meili" && self.meili_url.is_none() {
             anyhow::bail!("RAG_STORE_BACKEND=meili requires RAG_MEILI_URL");
@@ -153,6 +168,8 @@ impl Config {
             meili_wait_for_tasks: true,
             llm_provider: "none".to_string(),
             llm_model: Some("none".to_string()),
+            analysis_llm_provider: "none".to_string(),
+            analysis_llm_model: Some("none".to_string()),
             openai_api_key: None,
             codex_auth_path: None,
             codex_base_url: "https://chatgpt.com/backend-api/codex".to_string(),

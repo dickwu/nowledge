@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     extract::{Path, Query, State},
@@ -19,7 +19,9 @@ use crate::{
     meili::MeiliAdmin,
     models::*,
     store::Store,
-    util::{redact_secrets, redact_string, require_string},
+    util::{
+        redact_secrets, redact_string, require_string, sanitize_slug, text_score, truncate_chars,
+    },
 };
 
 #[derive(Clone)]
@@ -87,6 +89,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/state/insights", post(upsert_insight))
         .route("/v1/state/insights/{insight_id}", patch(patch_insight))
         .route("/v1/state/insights/search", post(search_insights))
+        .route("/v1/links", post(upsert_link))
+        .route("/v1/links/search", post(search_links))
+        .route("/v1/analysis/insights", post(analyze_insights))
         .route("/v1/state/company-docs/preflight", post(preflight_doc))
         .route(
             "/v1/state/company-docs/{source_id}/revisions",
@@ -264,6 +269,7 @@ fn compact_usage_summary(usage: Value) -> Value {
         "history_events": providers.get("history_events").cloned().unwrap_or(Value::Null),
         "contextfs": providers.get("contextfs").cloned().unwrap_or(Value::Null),
         "rag": providers.get("rag").cloned().unwrap_or(Value::Null),
+        "link_graph": providers.get("link_graph").cloned().unwrap_or(Value::Null),
         "structured_data": providers.get("structured_data").cloned().unwrap_or(Value::Null),
         "sessions": providers.get("sessions").cloned().unwrap_or(Value::Null)
     })
@@ -633,6 +639,49 @@ async fn search_insights(
 ) -> Result<Json<InsightSearchResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
     Ok(Json(state.store.search_insights(req)?))
+}
+
+async fn upsert_link(
+    user: UserGuard,
+    State(state): State<AppState>,
+    Json(mut req): Json<LinkUpsertRequest>,
+) -> Result<Json<LinkResponse>, ApiError> {
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    require_owner_for_write(&user, req.owner_user_id.as_deref())?;
+    Ok(Json(
+        state
+            .store
+            .upsert_link_async(state.tenant_id(), req)
+            .await?,
+    ))
+}
+
+async fn search_links(
+    user: UserGuard,
+    State(state): State<AppState>,
+    Json(mut req): Json<LinkSearchRequest>,
+) -> Result<Json<LinkSearchResponse>, ApiError> {
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    Ok(Json(state.store.search_links(
+        state.tenant_id(),
+        req,
+        user.principal.is_admin(),
+    )?))
+}
+
+async fn analyze_insights(
+    user: UserGuard,
+    State(state): State<AppState>,
+    Json(mut req): Json<AnalysisInsightRequest>,
+) -> Result<Json<AnalysisInsightResponse>, ApiError> {
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    require_owner_for_write(&user, req.owner_user_id.as_deref())?;
+    if req.history_event_id.is_some() && req.owner_user_id.is_none() {
+        return Err(ApiError::bad_request(
+            "owner_user_id is required for history_event_id analysis",
+        ));
+    }
+    Ok(Json(run_analysis_insights(&state, req).await?))
 }
 
 async fn preflight_doc(
@@ -1086,6 +1135,292 @@ async fn answer_rag_with_llm(
     Ok(answer)
 }
 
+async fn run_analysis_insights(
+    state: &AppState,
+    req: AnalysisInsightRequest,
+) -> Result<AnalysisInsightResponse, ApiError> {
+    let query = require_string(req.query.clone(), "query")?;
+    let owner_user_id = req.owner_user_id.clone();
+    let (context_hits, existing_links, event_index_uid, seed_uris) =
+        if let Some(history_event_id) = req.history_event_id.as_deref() {
+            let owner = owner_user_id.as_deref().ok_or_else(|| {
+                ApiError::bad_request("owner_user_id is required for history_event_id analysis")
+            })?;
+            let scope = history_analysis_scope(
+                state,
+                owner,
+                history_event_id,
+                &query,
+                req.context_limit,
+                req.link_limit,
+            )
+            .await?;
+            (
+                scope.context_hits,
+                scope.existing_links,
+                Some(scope.event_index_uid),
+                scope.seed_uris,
+            )
+        } else {
+            let context = state
+                .store
+                .search_context_async(
+                    state.tenant_id(),
+                    ContextSearchRequest {
+                        query: Some(query.clone()),
+                        owner_user_id: owner_user_id.clone(),
+                        limit: req.context_limit.max(2),
+                        debug: req.debug,
+                        ..ContextSearchRequest::default()
+                    },
+                )
+                .await?;
+            let existing_links = state
+                .store
+                .search_links(
+                    state.tenant_id(),
+                    LinkSearchRequest {
+                        owner_user_id: owner_user_id.clone(),
+                        query: Some(query.clone()),
+                        limit: req.link_limit,
+                        ..LinkSearchRequest::default()
+                    },
+                    true,
+                )?
+                .links;
+            (
+                context.response.hits.clone(),
+                existing_links,
+                None,
+                req.seed_uris.clone(),
+            )
+        };
+
+    let prompt = build_analysis_prompt(&query, &context_hits, &existing_links, &seed_uris);
+    let analysis_config = state.config.analysis_llm_config();
+    let client = llm_client_from_config(&analysis_config);
+    let status = client.status().await;
+    let mut usage = json!({
+        "provider": status.provider,
+        "model": status.model,
+        "backend": state.store.backend_name(),
+        "grounded": true
+    });
+    if let Some(uid) = &event_index_uid {
+        usage["history_scope"] = json!({
+            "mode": "same_index",
+            "event_index_uid": uid
+        });
+    }
+
+    let mut draft = deterministic_analysis_draft(&query, &context_hits);
+    if analysis_config.llm_provider != "none" {
+        let prompt = redact_string(
+            &prompt,
+            &[
+                analysis_config.openai_api_key.clone().unwrap_or_default(),
+                analysis_config
+                    .codex_auth_path
+                    .as_deref()
+                    .and_then(crate::llm::read_codex_auth_token)
+                    .unwrap_or_default(),
+            ],
+        );
+        let llm = client.complete_text(LlmRequest { prompt }).await?;
+        if let Some(parsed) = parse_analysis_draft(&llm.text) {
+            draft = merge_analysis_drafts(parsed, draft);
+        }
+        usage["latency_ms"] = json!(llm.latency_ms);
+        usage["raw_response_preview"] = json!(truncate_for_json(&llm.text, 500));
+    }
+
+    let title_by_uri = context_hits
+        .iter()
+        .map(|hit| (canonical_analysis_uri(&hit.uri), hit.title.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut created_links = Vec::new();
+    if req.create_links {
+        for candidate in &draft.links {
+            let response = state
+                .store
+                .upsert_link_async(
+                    state.tenant_id(),
+                    LinkUpsertRequest {
+                        owner_user_id: owner_user_id.clone(),
+                        source_uri: Some(candidate.source_uri.clone()),
+                        target_uri: Some(candidate.target_uri.clone()),
+                        source_title: title_by_uri
+                            .get(&canonical_analysis_uri(&candidate.source_uri))
+                            .cloned(),
+                        target_title: title_by_uri
+                            .get(&canonical_analysis_uri(&candidate.target_uri))
+                            .cloned(),
+                        relation: candidate.relation.clone(),
+                        rationale: candidate.rationale.clone(),
+                        evidence_text: Some(query.clone()),
+                        confidence: candidate.confidence,
+                        created_by: "analysis_api".to_string(),
+                        tags: vec!["analysis".to_string()],
+                        idempotency_key: Some(format!(
+                            "analysis:{}:{}:{}:{}",
+                            query, candidate.source_uri, candidate.relation, candidate.target_uri
+                        )),
+                    },
+                )
+                .await?;
+            created_links.push(response.link);
+        }
+    }
+
+    let mut insights = Vec::new();
+    if req.upsert_insights {
+        for candidate in &draft.insights {
+            let response = state
+                .store
+                .upsert_insight_async(
+                    state.tenant_id(),
+                    InsightUpsertRequest {
+                        owner_user_id: owner_user_id.clone(),
+                        insight_type: Some(candidate.insight_type.clone()),
+                        title: Some(candidate.title.clone()),
+                        statement: Some(candidate.statement.clone()),
+                        evidence_text: Some(query.clone()),
+                        source_refs: candidate
+                            .source_uris
+                            .iter()
+                            .map(|uri| SourceRef {
+                                kind: "context_uri".to_string(),
+                                id: uri.clone(),
+                                uri: Some(uri.clone()),
+                                meta: None,
+                            })
+                            .collect(),
+                        confidence: candidate.confidence,
+                        salience: candidate.salience,
+                        privacy: "private".to_string(),
+                        merge_policy: "merge".to_string(),
+                        idempotency_key: Some(format!("analysis:{}:{}", query, candidate.title)),
+                    },
+                )
+                .await?;
+            insights.push(response.insight);
+        }
+    }
+
+    Ok(AnalysisInsightResponse {
+        analysis_id: crate::util::new_id("analysis"),
+        query,
+        history_event_id: req.history_event_id,
+        event_index_uid,
+        context_hits,
+        existing_links,
+        link_candidates: draft.links,
+        insight_candidates: draft.insights,
+        created_links,
+        insights,
+        usage,
+        prompt: req.debug.then_some(prompt),
+    })
+}
+
+struct HistoryAnalysisScope {
+    context_hits: Vec<ContextHit>,
+    existing_links: Vec<KnowledgeLink>,
+    event_index_uid: String,
+    seed_uris: Vec<String>,
+}
+
+async fn history_analysis_scope(
+    state: &AppState,
+    owner_user_id: &str,
+    history_event_id: &str,
+    query: &str,
+    context_limit: usize,
+    link_limit: usize,
+) -> Result<HistoryAnalysisScope, ApiError> {
+    let selected = state
+        .store
+        .get_event_async(state.tenant_id(), owner_user_id, history_event_id)
+        .await?;
+    let same_index = state
+        .store
+        .search_events_async(
+            state.tenant_id(),
+            Some(owner_user_id),
+            HistorySearchRequest {
+                owner_user_id: Some(owner_user_id.to_string()),
+                query: Some(query.to_string()),
+                limit: context_limit.max(2),
+                ..HistorySearchRequest::default()
+            },
+        )
+        .await?;
+
+    let mut events = vec![selected.clone()];
+    for event in same_index.hits {
+        if event.id != selected.id && event.event_index_uid == selected.event_index_uid {
+            events.push(event);
+        }
+    }
+    events.truncate(context_limit.max(1));
+
+    let context_hits = events
+        .iter()
+        .map(|event| history_event_context_hit(event, query))
+        .collect::<Vec<_>>();
+    let allowed_uris = context_hits
+        .iter()
+        .map(|hit| canonical_analysis_uri(&hit.uri))
+        .collect::<HashSet<_>>();
+    let existing_links = state
+        .store
+        .search_links(
+            state.tenant_id(),
+            LinkSearchRequest {
+                owner_user_id: Some(owner_user_id.to_string()),
+                limit: link_limit.max(1),
+                ..LinkSearchRequest::default()
+            },
+            true,
+        )?
+        .links
+        .into_iter()
+        .filter(|link| {
+            allowed_uris.contains(&canonical_analysis_uri(&link.source_uri))
+                || allowed_uris.contains(&canonical_analysis_uri(&link.target_uri))
+        })
+        .collect::<Vec<_>>();
+    let seed_uris = context_hits
+        .iter()
+        .map(|hit| canonical_analysis_uri(&hit.uri))
+        .collect::<Vec<_>>();
+
+    Ok(HistoryAnalysisScope {
+        context_hits,
+        existing_links,
+        event_index_uid: selected.event_index_uid,
+        seed_uris,
+    })
+}
+
+fn history_event_context_hit(event: &HistoryEvent, query: &str) -> ContextHit {
+    let uri = format!(
+        "ctx://user/history/{}/{}/detail",
+        sanitize_slug(&event.event_type),
+        sanitize_slug(&event.id)
+    );
+    let title = format!("{} {}", event.event_type, event.entity_id);
+    ContextHit {
+        uri,
+        title,
+        layer: 2,
+        score: text_score(&event.text, query),
+        source_id: Some(event.id.clone()),
+        revision_id: None,
+        snippet: truncate_chars(&event.text, 240),
+    }
+}
+
 fn build_prompt(question: &str, citations: &[Citation]) -> String {
     let context = citations
         .iter()
@@ -1093,6 +1428,155 @@ fn build_prompt(question: &str, citations: &[Citation]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("Question:\n{question}\n\nContextFS staged context:\n{context}")
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AnalysisDraft {
+    #[serde(default)]
+    links: Vec<LinkCandidate>,
+    #[serde(default)]
+    insights: Vec<InsightCandidate>,
+}
+
+fn build_analysis_prompt(
+    query: &str,
+    hits: &[ContextHit],
+    links: &[KnowledgeLink],
+    seed_uris: &[String],
+) -> String {
+    let context = hits
+        .iter()
+        .map(|hit| {
+            format!(
+                "- uri: {}\n  title: {}\n  snippet: {}",
+                hit.uri, hit.title, hit.snippet
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let existing_links = links
+        .iter()
+        .map(|link| {
+            format!(
+                "- {} --{}--> {} ({})",
+                link.source_uri,
+                link.relation,
+                link.target_uri,
+                link.rationale.as_deref().unwrap_or("no rationale")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Analyze ingested Nowledge context and propose Obsidian-style bidirectional associations plus durable insights.\n\
+Return strict JSON with this shape: {{\"links\":[{{\"source_uri\":\"ctx://...\",\"target_uri\":\"ctx://...\",\"relation\":\"related\",\"rationale\":\"why\",\"confidence\":0.7}}],\"insights\":[{{\"insight_type\":\"analysis\",\"title\":\"short title\",\"statement\":\"grounded statement\",\"confidence\":0.7,\"salience\":0.5,\"source_uris\":[\"ctx://...\"]}}]}}.\n\
+Query: {query}\n\
+Seed URIs: {seed_uris:?}\n\
+Context hits:\n{context}\n\
+Existing links:\n{existing_links}"
+    )
+}
+
+fn deterministic_analysis_draft(query: &str, hits: &[ContextHit]) -> AnalysisDraft {
+    let distinct = distinct_canonical_hits(hits);
+    let mut links = Vec::new();
+    if distinct.len() >= 2 {
+        links.push(LinkCandidate {
+            source_uri: canonical_analysis_uri(&distinct[0].uri),
+            target_uri: canonical_analysis_uri(&distinct[1].uri),
+            relation: "related".to_string(),
+            rationale: Some(format!(
+                "Both ingested contexts match the analysis query: {query}"
+            )),
+            confidence: 0.65,
+        });
+    }
+
+    let insights = distinct.first().map_or_else(Vec::new, |hit| {
+        vec![InsightCandidate {
+            insight_type: "analysis".to_string(),
+            title: format!("Insight for {query}"),
+            statement: format!(
+                "The query '{query}' is grounded by ingested context '{}'.",
+                hit.title
+            ),
+            confidence: 0.65,
+            salience: 0.5,
+            source_uris: distinct
+                .iter()
+                .take(3)
+                .map(|hit| canonical_analysis_uri(&hit.uri))
+                .collect(),
+        }]
+    });
+
+    AnalysisDraft { links, insights }
+}
+
+fn distinct_canonical_hits(hits: &[ContextHit]) -> Vec<ContextHit> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for hit in hits {
+        if seen.insert(canonical_analysis_uri(&hit.uri)) {
+            out.push(hit.clone());
+        }
+    }
+    out
+}
+
+fn parse_analysis_draft(text: &str) -> Option<AnalysisDraft> {
+    serde_json::from_str::<AnalysisDraft>(text)
+        .ok()
+        .or_else(|| {
+            let start = text.find('{')?;
+            let end = text.rfind('}')?;
+            serde_json::from_str::<AnalysisDraft>(&text[start..=end]).ok()
+        })
+        .filter(|draft| !draft.links.is_empty() || !draft.insights.is_empty())
+}
+
+fn merge_analysis_drafts(primary: AnalysisDraft, fallback: AnalysisDraft) -> AnalysisDraft {
+    AnalysisDraft {
+        links: if primary.links.is_empty() {
+            fallback.links
+        } else {
+            primary.links
+        },
+        insights: if primary.insights.is_empty() {
+            fallback.insights
+        } else {
+            primary.insights
+        },
+    }
+}
+
+fn canonical_analysis_uri(uri: &str) -> String {
+    uri.trim()
+        .strip_suffix("/.abstract")
+        .or_else(|| uri.trim().strip_suffix("/.overview"))
+        .or_else(|| uri.trim().strip_suffix("/detail"))
+        .or_else(|| uri.trim().strip_suffix("/chunks/0001"))
+        .unwrap_or_else(|| uri.trim())
+        .to_string()
+}
+
+fn truncate_for_json(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(max.saturating_sub(3)).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn require_owner_for_write(user: &UserGuard, owner_user_id: Option<&str>) -> Result<(), ApiError> {
+    if user.principal.is_admin() || owner_user_id.is_some() {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "owner_user_id is required for non-admin writes",
+        ))
+    }
 }
 
 fn redact_for_state(state: &AppState, value: Value) -> Value {

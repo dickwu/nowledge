@@ -1,0 +1,415 @@
+[
+  {
+    "method": "GET",
+    "path": "/healthz",
+    "handler": "healthz",
+    "group": "Health",
+    "file": "api/get_healthz.md"
+  },
+  {
+    "method": "GET",
+    "path": "/livez",
+    "handler": "livez",
+    "group": "Health",
+    "file": "api/get_livez.md"
+  },
+  {
+    "method": "GET",
+    "path": "/readyz",
+    "handler": "readyz",
+    "group": "Health",
+    "file": "api/get_readyz.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/admin/bootstrap",
+    "handler": "bootstrap",
+    "group": "Admin",
+    "file": "api/post_v1_admin_bootstrap.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/admin/history/user-event-indexes",
+    "handler": "list_user_event_indexes",
+    "group": "Admin",
+    "file": "api/get_v1_admin_history_user_event_indexes.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/admin/history/user-event-indexes:reconcile",
+    "handler": "reconcile_user_event_indexes",
+    "group": "Admin",
+    "file": "api/post_v1_admin_history_user_event_indexes_reconcile.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/analysis/insights",
+    "handler": "analyze_insights",
+    "group": "Analysis",
+    "file": "api/post_v1_analysis_insights.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/context/reveal",
+    "handler": "context_reveal",
+    "group": "Context",
+    "file": "api/post_v1_context_reveal.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/context/search",
+    "handler": "context_search",
+    "group": "Context",
+    "file": "api/post_v1_context_search.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/debug/meili/search",
+    "handler": "debug_meili_search",
+    "group": "Debug",
+    "file": "api/post_v1_debug_meili_search.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/debug/prompt/preview",
+    "handler": "prompt_preview",
+    "group": "Debug",
+    "file": "api/post_v1_debug_prompt_preview.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/debug/traces/{trace_id}",
+    "handler": "get_trace",
+    "group": "Debug",
+    "file": "api/get_v1_debug_traces_trace_id.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/fs/abstract",
+    "handler": "fs_abstract",
+    "group": "Context FS",
+    "file": "api/get_v1_fs_abstract.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/fs/ls",
+    "handler": "fs_ls",
+    "group": "Context FS",
+    "file": "api/get_v1_fs_ls.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/fs/overview",
+    "handler": "fs_overview",
+    "group": "Context FS",
+    "file": "api/get_v1_fs_overview.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/fs/read",
+    "handler": "fs_read",
+    "group": "Context FS",
+    "file": "api/get_v1_fs_read.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/fs/tree",
+    "handler": "fs_tree",
+    "group": "Context FS",
+    "file": "api/get_v1_fs_tree.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/history/company-docs/{source_id}/revisions",
+    "handler": "list_revisions",
+    "group": "Company Docs",
+    "file": "api/get_v1_history_company_docs_source_id_revisions.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/history/events",
+    "handler": "append_event_alias",
+    "group": "History Alias",
+    "file": "api/post_v1_history_events.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/history/events/{event_id}",
+    "handler": "get_event_alias",
+    "group": "History Alias",
+    "file": "api/get_v1_history_events_event_id.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/history/events:bulk",
+    "handler": "append_events_bulk_alias",
+    "group": "History Alias",
+    "file": "api/post_v1_history_events_bulk.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/history/insights/{insight_id}/events",
+    "handler": "insight_events",
+    "group": "Insights",
+    "file": "api/get_v1_history_insights_insight_id_events.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/history/search",
+    "handler": "search_events_alias",
+    "group": "History Alias",
+    "file": "api/post_v1_history_search.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/history/structured/snapshots",
+    "handler": "create_snapshot",
+    "group": "Structured History",
+    "file": "api/post_v1_history_structured_snapshots.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/history/structured/snapshots/{snapshot_id}",
+    "handler": "get_snapshot",
+    "group": "Structured History",
+    "file": "api/get_v1_history_structured_snapshots_snapshot_id.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/history/structured/snapshots/{snapshot_id}/rows",
+    "handler": "list_rows",
+    "group": "Structured History",
+    "file": "api/get_v1_history_structured_snapshots_snapshot_id_rows.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/history/structured/snapshots/{snapshot_id}/rows:bulk",
+    "handler": "bulk_rows",
+    "group": "Structured History",
+    "file": "api/post_v1_history_structured_snapshots_snapshot_id_rows_bulk.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/history/timeline",
+    "handler": "timeline_alias",
+    "group": "History Alias",
+    "file": "api/post_v1_history_timeline.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/history/users/{owner_user_id}/event-index",
+    "handler": "get_user_event_index",
+    "group": "History User Indexes",
+    "file": "api/get_v1_history_users_owner_user_id_event_index.md"
+  },
+  {
+    "method": "PUT",
+    "path": "/v1/history/users/{owner_user_id}/event-index",
+    "handler": "ensure_user_event_index",
+    "group": "History User Indexes",
+    "file": "api/put_v1_history_users_owner_user_id_event_index.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/history/users/{owner_user_id}/events",
+    "handler": "append_user_event",
+    "group": "History Events",
+    "file": "api/post_v1_history_users_owner_user_id_events.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/history/users/{owner_user_id}/events/{event_id}",
+    "handler": "get_user_event",
+    "group": "History Events",
+    "file": "api/get_v1_history_users_owner_user_id_events_event_id.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/history/users/{owner_user_id}/events:bulk",
+    "handler": "append_user_events_bulk",
+    "group": "History Events",
+    "file": "api/post_v1_history_users_owner_user_id_events_bulk.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/history/users/{owner_user_id}/search",
+    "handler": "search_user_events",
+    "group": "History Events",
+    "file": "api/post_v1_history_users_owner_user_id_search.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/history/users/{owner_user_id}/timeline",
+    "handler": "user_timeline",
+    "group": "History Events",
+    "file": "api/post_v1_history_users_owner_user_id_timeline.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/links",
+    "handler": "upsert_link",
+    "group": "Links",
+    "file": "api/post_v1_links.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/links/search",
+    "handler": "search_links",
+    "group": "Links",
+    "file": "api/post_v1_links_search.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/llm/status",
+    "handler": "llm_status",
+    "group": "LLM",
+    "file": "api/get_v1_llm_status.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/llm/test",
+    "handler": "llm_test",
+    "group": "LLM",
+    "file": "api/post_v1_llm_test.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/rag/answer",
+    "handler": "rag_answer",
+    "group": "RAG",
+    "file": "api/post_v1_rag_answer.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/rag/debug",
+    "handler": "rag_debug",
+    "group": "RAG",
+    "file": "api/post_v1_rag_debug.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/rag/stream",
+    "handler": "rag_stream",
+    "group": "RAG",
+    "file": "api/post_v1_rag_stream.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/sessions",
+    "handler": "create_session",
+    "group": "Sessions",
+    "file": "api/post_v1_sessions.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/sessions/{session_id}/commit",
+    "handler": "commit_session",
+    "group": "Sessions",
+    "file": "api/post_v1_sessions_session_id_commit.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/sessions/{session_id}/messages",
+    "handler": "add_session_message",
+    "group": "Sessions",
+    "file": "api/post_v1_sessions_session_id_messages.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/state/company-docs/preflight",
+    "handler": "preflight_doc",
+    "group": "Company Docs",
+    "file": "api/post_v1_state_company_docs_preflight.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/state/company-docs/{source_id}/revisions",
+    "handler": "create_revision",
+    "group": "Company Docs",
+    "file": "api/post_v1_state_company_docs_source_id_revisions.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/state/company-docs/{source_id}/revisions/{revision_id}/activate",
+    "handler": "activate_revision",
+    "group": "Company Docs",
+    "file": "api/post_v1_state_company_docs_source_id_revisions_revision_id_activate.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/state/insights",
+    "handler": "upsert_insight",
+    "group": "Insights",
+    "file": "api/post_v1_state_insights.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/state/insights/search",
+    "handler": "search_insights",
+    "group": "Insights",
+    "file": "api/post_v1_state_insights_search.md"
+  },
+  {
+    "method": "PATCH",
+    "path": "/v1/state/insights/{insight_id}",
+    "handler": "patch_insight",
+    "group": "Insights",
+    "file": "api/patch_v1_state_insights_insight_id.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/state/profile/facts/{fact_key}",
+    "handler": "get_state_fact",
+    "group": "State",
+    "file": "api/get_v1_state_profile_facts_fact_key.md"
+  },
+  {
+    "method": "PATCH",
+    "path": "/v1/state/profile/facts/{fact_key}",
+    "handler": "patch_state_fact",
+    "group": "State",
+    "file": "api/patch_v1_state_profile_facts_fact_key.md"
+  },
+  {
+    "method": "PUT",
+    "path": "/v1/state/profile/facts/{fact_key}",
+    "handler": "upsert_state_fact",
+    "group": "State",
+    "file": "api/put_v1_state_profile_facts_fact_key.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/state/search",
+    "handler": "search_state",
+    "group": "State",
+    "file": "api/post_v1_state_search.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/state/structured/current",
+    "handler": "current_structured",
+    "group": "Structured State",
+    "file": "api/get_v1_state_structured_current.md"
+  },
+  {
+    "method": "PUT",
+    "path": "/v1/state/structured/datasets/{dataset_key}",
+    "handler": "upsert_dataset",
+    "group": "Structured State",
+    "file": "api/put_v1_state_structured_datasets_dataset_key.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/state/structured/datasets/{dataset_key}/apply-snapshot",
+    "handler": "apply_snapshot",
+    "group": "Structured State",
+    "file": "api/post_v1_state_structured_datasets_dataset_key_apply_snapshot.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/usage",
+    "handler": "usage",
+    "group": "Usage",
+    "file": "api/get_v1_usage.md"
+  }
+]
