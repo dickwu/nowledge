@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod fragmenter;
 pub mod llm;
 pub mod meili;
 pub mod models;

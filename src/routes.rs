@@ -166,6 +166,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/fs/overview", get(fs_overview))
         .route("/v1/context/search", post(context_search))
         .route("/v1/context/reveal", post(context_reveal))
+        .route("/v1/context/traceback", post(context_traceback))
         .route("/v1/rag/answer", post(rag_answer))
         .route("/v1/rag/stream", post(rag_stream))
         .route("/v1/rag/debug", post(rag_debug))
@@ -949,6 +950,19 @@ async fn context_reveal(
     )?))
 }
 
+async fn context_traceback(
+    user: UserGuard,
+    State(state): State<AppState>,
+    Json(mut req): Json<ContextTracebackRequest>,
+) -> Result<Json<ContextTracebackResponse>, ApiError> {
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    Ok(Json(state.store.traceback(
+        state.tenant_id(),
+        req,
+        user.principal.is_admin(),
+    )?))
+}
+
 async fn rag_answer(
     user: UserGuard,
     State(state): State<AppState>,
@@ -1415,8 +1429,14 @@ fn history_event_context_hit(event: &HistoryEvent, query: &str) -> ContextHit {
         title,
         layer: 2,
         score: text_score(&event.text, query),
+        node_kind: Some("fragment".to_string()),
+        retrieval_role: Some("fragment".to_string()),
         source_id: Some(event.id.clone()),
         revision_id: None,
+        source_document_uri: None,
+        fragment_index: None,
+        char_start: None,
+        char_end: None,
         snippet: truncate_chars(&event.text, 240),
     }
 }

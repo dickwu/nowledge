@@ -246,9 +246,32 @@ pub struct UpsertStateFactRequest {
     pub valid_to: Option<DateTime<Utc>>,
     #[serde(default)]
     pub source_refs: Vec<SourceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<StateDocumentPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_policy: Option<FragmentPolicy>,
     #[serde(default = "default_merge_policy")]
     pub merge_policy: String,
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StateDocumentPayload {
+    pub content: Option<String>,
+    pub content_type: Option<String>,
+    pub source_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_policy: Option<FragmentPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FragmentPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_size_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_chunk_chars: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -633,6 +656,8 @@ pub struct ActivateRevisionResponse {
     pub previous_revision_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_event_id: Option<String>,
+    pub source_document_uri: String,
+    pub fragment_uris: Vec<String>,
     pub context_uris: Vec<String>,
 }
 
@@ -709,10 +734,49 @@ pub struct ContextHit {
     pub layer: u8,
     pub score: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_document_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub char_start: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub char_end: Option<usize>,
     pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextTracebackRequest {
+    pub uri: Option<String>,
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextTracebackResponse {
+    pub fragment_uri: String,
+    pub fragment_title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_estimate: Option<usize>,
+    pub source_document_uri: String,
+    pub source_id: String,
+    pub revision_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub char_start: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub char_end: Option<usize>,
+    pub source_title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -858,6 +922,26 @@ pub struct ContextNode {
     pub index_uid: String,
     pub index_kind: String,
     pub ancestor_uris: Vec<String>,
+    #[serde(default = "default_node_kind")]
+    pub node_kind: String,
+    #[serde(default = "default_retrieval_role")]
+    pub retrieval_role: String,
+    #[serde(default = "default_true")]
+    pub retrieval_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_document_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub char_start: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub char_end: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_estimate: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -866,6 +950,27 @@ pub struct ContextNode {
     pub status: String,
     #[serde(default = "default_privacy")]
     pub privacy: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceDocument {
+    pub id: String,
+    pub tenant_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_user_id: Option<String>,
+    pub source_kind: String,
+    pub source_id: String,
+    pub revision_id: String,
+    pub uri: String,
+    pub title: String,
+    pub content: String,
+    pub checksum: String,
+    #[serde(default = "default_active")]
+    pub status: String,
+    #[serde(default)]
+    pub retrieval_enabled: bool,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -920,6 +1025,14 @@ pub fn default_limit() -> usize {
 
 pub fn default_true() -> bool {
     true
+}
+
+pub fn default_node_kind() -> String {
+    "abstract".to_string()
+}
+
+pub fn default_retrieval_role() -> String {
+    "overview".to_string()
 }
 
 pub fn default_privacy() -> String {

@@ -38,7 +38,7 @@ Schema: `AnalysisInsightResponse`
 | query | string | Analysis query. |
 | history_event_id | string? | Selected history event id when same-index mode was used. |
 | event_index_uid | string? | Owner event index UID used for same-index history analysis. |
-| context_hits | ContextHit[] | Context or history hits used as evidence. |
+| context_hits | ContextHit[] | Context fragments or history hits used as evidence. |
 | existing_links | KnowledgeLink[] | Existing links included in the analysis prompt. |
 | link_candidates | LinkCandidate[] | Proposed links from deterministic or LLM analysis. |
 | insight_candidates | InsightCandidate[] | Proposed insights from deterministic or LLM analysis. |
@@ -52,6 +52,7 @@ Schema: `AnalysisInsightResponse`
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 - history_event_id analysis requires owner_user_id after auth defaults are applied.
+- Non-history context evidence uses the same default fragment-only context search as /v1/context/search.
 
 ## Internal Logic Call Graph
 ```mermaid
@@ -61,7 +62,7 @@ flowchart TD
   n2["require_owner_for_write enforces owner scope"]
   n3["require_string validates query"]
   n4["If history_event_id exists, history_analysis_scope loads selected event and same-owner same-index hits"]
-  n5["Otherwise Store.search_context_async and Store.search_links collect evidence"]
+  n5["Otherwise Store.search_context_async collects fragment evidence and Store.search_links collects links"]
   n6["build_analysis_prompt constructs grounded prompt"]
   n7["analysis_llm_config selects analysis-specific provider/model"]
   n8["deterministic or LLM draft yields link and insight candidates"]

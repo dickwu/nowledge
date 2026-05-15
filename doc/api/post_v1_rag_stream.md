@@ -1,7 +1,7 @@
 # POST /v1/rag/stream
 
 ## Summary
-Streaming-compatible alias that currently returns the same JSON response as /v1/rag/answer.
+Streaming-compatible alias that currently returns the same JSON response as /v1/rag/answer, using active fragment retrieval.
 
 ## Handler
 - Rust handler: `rag_stream`
@@ -19,7 +19,7 @@ Schema: `RagAnswerRequest`
 
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| question | string | optional | Question to answer. |
+| question | string | required | Question to answer. |
 | mode | string | optional, default auto | Retrieval mode selector. |
 | session_id | string | optional | Session to associate with the answer. |
 | owner_user_id | string | optional, auth default may apply | Owner scope. |
@@ -33,12 +33,23 @@ Schema: `RagAnswerResponse`
 | answer_id | string | Answer id. |
 | trace_id | string | Retrieval trace id. |
 | answer | string | Generated or store-provided answer. |
-| citations | Citation[] | Grounding citations. |
+| citations | Citation[] | Grounding citations from retrieval fragments. |
 | usage | object | LLM/backend usage metadata. |
+
+### Citation Fields
+| Field | Type | Description |
+| --- | --- | --- |
+| uri | string | Fragment context URI used as evidence. |
+| source_id | string? | Source identifier when the fragment came from a source document. |
+| revision_id | string? | Source revision identifier when present. |
+| title | string | Fragment title. |
+| quote | string | Quoted fragment text used for grounding. |
+| score | number | Retrieval score. |
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Default RAG retrieval searches only active fragments; source documents are not directly searched.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph
@@ -46,7 +57,7 @@ Schema: `RagAnswerResponse`
 flowchart TD
   n0["UserGuard authenticates caller"]
   n1["rag_stream delegates to rag_answer"]
-  n2["rag_answer executes retrieval and optional LLM completion"]
+  n2["rag_answer executes fragment retrieval and optional LLM completion"]
   n3["Return answer response"]
   n0 --> n1
   n1 --> n2

@@ -1,7 +1,7 @@
 # GET /v1/fs/ls
 
 ## Summary
-List context filesystem entries at or near a URI.
+List visible context filesystem entries at or near a URI.
 
 ## Handler
 - Rust handler: `fs_ls`
@@ -26,7 +26,16 @@ Schema: `JsonValue`
 
 | Field | Type | Description |
 | --- | --- | --- |
-| ... | object or array | Endpoint-specific JSON returned by the store or debug helper. |
+| uri | string | Listed URI prefix. |
+| children | object[] | Visible child context entries. |
+
+### Child Entry Fields
+| Field | Type | Description |
+| --- | --- | --- |
+| uri | string | Child context URI. |
+| title | string | Child title. |
+| layer | integer | Context layer. |
+| index_kind | string | Context scope, such as `company` or `personal`. |
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.

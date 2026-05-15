@@ -13,6 +13,7 @@ pub const FIXED_INDEXES: &[&str] = &[
     "rag_user_event_indexes",
     "rag_sources",
     "rag_source_revisions",
+    "rag_source_documents",
     "rag_doc_candidates",
     "rag_structured_datasets",
     "rag_structured_snapshots",
@@ -436,8 +437,14 @@ pub fn settings_for(uid: &str) -> Value {
     if uid.contains("context") {
         json!({
             "searchableAttributes": ["title", "body", "uri"],
-            "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id"],
+            "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id", "node_kind", "retrieval_role", "retrieval_enabled", "parent_uri", "source_document_uri", "fragment_index"],
             "sortableAttributes": ["updated_at", "layer"]
+        })
+    } else if uid == "rag_source_documents" {
+        json!({
+            "searchableAttributes": ["title", "source_id", "revision_id", "uri"],
+            "filterableAttributes": ["id", "tenant_id", "owner_user_id", "source_kind", "source_id", "revision_id", "uri", "status", "retrieval_enabled"],
+            "sortableAttributes": ["created_at", "updated_at"]
         })
     } else if uid.contains("events") {
         json!({

@@ -2,9 +2,17 @@
 
 This directory contains one standalone English document for every HTTP API registered in `src/routes.rs::build_router`.
 
-Total documented APIs: 59.
+Total documented APIs: 60.
 
 Each endpoint file includes request parameters, response fields, access rules, and a Mermaid internal logic call graph.
+
+## Retrieval and Source Documents
+
+Long documents are stored as non-retrieval `SourceDocument` records and fragmented into active `ContextNode` fragments. Default context search and RAG retrieval only search active fragments with `retrieval_enabled=true`, `retrieval_role=fragment`, and `status=active`; raw source documents are kept out of default retrieval.
+
+Use `POST /v1/context/traceback` or explicit `GET /v1/fs/read` with normal ACL checks to trace a fragment back to its full source document.
+
+`ContextNode.node_kind` is one of `source_doc`, `fragment`, `abstract`, or `overview`. `ContextNode.retrieval_role` is one of `none`, `fragment`, or `overview`. Source documents are stored in `rag_source_documents` with `retrieval_enabled=false` by default.
 
 ## Endpoint Index
 
@@ -19,6 +27,7 @@ Each endpoint file includes request parameters, response fields, access rules, a
 | `POST` | `/v1/analysis/insights` | `analyze_insights` | [api/post_v1_analysis_insights.md](api/post_v1_analysis_insights.md) |
 | `POST` | `/v1/context/reveal` | `context_reveal` | [api/post_v1_context_reveal.md](api/post_v1_context_reveal.md) |
 | `POST` | `/v1/context/search` | `context_search` | [api/post_v1_context_search.md](api/post_v1_context_search.md) |
+| `POST` | `/v1/context/traceback` | `context_traceback` | [api/post_v1_context_traceback.md](api/post_v1_context_traceback.md) |
 | `POST` | `/v1/debug/meili/search` | `debug_meili_search` | [api/post_v1_debug_meili_search.md](api/post_v1_debug_meili_search.md) |
 | `POST` | `/v1/debug/prompt/preview` | `prompt_preview` | [api/post_v1_debug_prompt_preview.md](api/post_v1_debug_prompt_preview.md) |
 | `GET` | `/v1/debug/traces/{trace_id}` | `get_trace` | [api/get_v1_debug_traces_trace_id.md](api/get_v1_debug_traces_trace_id.md) |

@@ -1,7 +1,7 @@
 # GET /v1/fs/tree
 
 ## Summary
-Return a context filesystem tree.
+Return a visible context filesystem tree.
 
 ## Handler
 - Rust handler: `fs_tree`
@@ -26,7 +26,17 @@ Schema: `JsonValue`
 
 | Field | Type | Description |
 | --- | --- | --- |
-| ... | object or array | Endpoint-specific JSON returned by the store or debug helper. |
+| uri | string | Tree root URI prefix. |
+| depth | integer | Requested or default traversal depth. |
+| children | object[] | Visible child context entries. |
+
+### Child Entry Fields
+| Field | Type | Description |
+| --- | --- | --- |
+| uri | string | Child context URI. |
+| title | string | Child title. |
+| layer | integer | Context layer. |
+| index_kind | string | Context scope, such as `company` or `personal`. |
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.

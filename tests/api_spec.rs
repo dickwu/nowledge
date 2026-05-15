@@ -422,6 +422,183 @@ async fn company_doc_preflight_prefers_revision_for_similar_docs() {
 }
 
 #[tokio::test]
+async fn company_doc_fragments_traceback_and_update_supersedes_old_content() {
+    let app = authed_app();
+    let source_id = "fragment-handbook";
+    let v1_content = format!(
+        "# Fragment Handbook\n\n{}\n\n## Legacy\n\n{}",
+        "fragment-alpha-keyword describes active company guidance. ".repeat(35),
+        "legacy-retention-keyword should disappear after update. ".repeat(35)
+    );
+
+    let (status, revision) = call_with_token(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/state/company-docs/{source_id}/revisions"),
+        json!({
+            "title": "Fragment Handbook",
+            "source_uri": "https://example.test/company/fragments",
+            "content": v1_content,
+            "checksum": "company-fragment-v1"
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{revision}");
+    let revision_id = revision["revision_id"].as_str().unwrap();
+
+    let (status, activated) = call_with_token(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/state/company-docs/{source_id}/revisions/{revision_id}/activate"),
+        json!({ "reason": "initial" }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{activated}");
+    let source_document_uri = activated["source_document_uri"].as_str().unwrap();
+    let fragment_uris = activated["fragment_uris"].as_array().unwrap();
+    assert!(fragment_uris.len() > 1, "{activated}");
+
+    let (status, source_doc) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/fs/read?uri={}", query_encode(source_document_uri)),
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{source_doc}");
+    assert_eq!(source_doc["node_kind"], "source_doc");
+    assert_eq!(source_doc["retrieval_enabled"], false);
+    assert!(source_doc["body"]
+        .as_str()
+        .unwrap()
+        .contains("legacy-retention-keyword"));
+
+    let (status, search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "fragment-alpha-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    let first_hit = &search["hits"][0];
+    let fragment_uri = first_hit["uri"].as_str().unwrap();
+    assert_eq!(first_hit["node_kind"], "fragment");
+    assert_ne!(fragment_uri, source_document_uri);
+    assert!(search["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|hit| hit["node_kind"] == "fragment" && hit["uri"] != source_document_uri));
+    assert!(fragment_uris
+        .iter()
+        .any(|uri| uri.as_str() == Some(fragment_uri)));
+
+    let (status, traceback) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/traceback",
+        json!({ "uri": fragment_uri }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{traceback}");
+    assert_eq!(traceback["source_document_uri"], source_document_uri);
+    assert_eq!(traceback["source_id"], source_id);
+
+    let (status, old_link) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/links/search",
+        json!({ "uri": fragment_uri, "direction": "outbound", "relations": ["part_of"], "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{old_link}");
+    assert_eq!(old_link["outbound"].as_array().unwrap().len(), 1);
+
+    let v2_content = format!(
+        "# Fragment Handbook\n\n{}",
+        "new-fragment-keyword replaces the legacy wording. ".repeat(60)
+    );
+    let (status, revision) = call_with_token(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/state/company-docs/{source_id}/revisions"),
+        json!({
+            "title": "Fragment Handbook",
+            "source_uri": "https://example.test/company/fragments",
+            "content": v2_content,
+            "checksum": "company-fragment-v2"
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{revision}");
+    let revision_id = revision["revision_id"].as_str().unwrap();
+
+    let (status, activated_v2) = call_with_token(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/state/company-docs/{source_id}/revisions/{revision_id}/activate"),
+        json!({ "reason": "update" }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{activated_v2}");
+
+    let (status, old_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "legacy-retention-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{old_search}");
+    assert_eq!(old_search["hits"].as_array().unwrap().len(), 0);
+
+    let (status, new_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "new-fragment-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{new_search}");
+    assert_eq!(new_search["hits"][0]["node_kind"], "fragment");
+
+    let (status, old_read) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/fs/read?uri={}", query_encode(fragment_uri)),
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{old_read}");
+
+    let (status, old_link_after_update) = call_with_token(
+        app,
+        Method::POST,
+        "/v1/links/search",
+        json!({ "uri": fragment_uri, "direction": "outbound", "relations": ["part_of"], "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{old_link_after_update}");
+    assert_eq!(
+        old_link_after_update["outbound"].as_array().unwrap().len(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn structured_rows_are_idempotent_by_row_id() {
     let app = app();
 
@@ -609,6 +786,105 @@ async fn contextfs_private_acl_and_company_readability() {
     .await;
     assert_eq!(status, StatusCode::OK, "{company_read}");
     assert_eq!(company_read["privacy"], "company");
+}
+
+#[tokio::test]
+async fn state_fact_document_creates_personal_fragments_and_enforces_traceback_acl() {
+    let app = authed_app();
+    let content = format!(
+        "# Personal Status\n\n{}",
+        "personal-fragment-keyword records detailed private status evidence. ".repeat(50)
+    );
+
+    let (status, state) = call_with_token(
+        app.clone(),
+        Method::PUT,
+        "/v1/state/profile/facts/status-doc",
+        json!({
+            "state_type": "status",
+            "title": "Status summary",
+            "statement": "Current status summary only.",
+            "document": {
+                "content": content,
+                "content_type": "text/markdown",
+                "source_uri": "https://example.test/personal/status"
+            }
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{state}");
+    assert_eq!(state["item"]["statement"], "Current status summary only.");
+    assert!(!state["item"]["statement"]
+        .as_str()
+        .unwrap()
+        .contains("personal-fragment-keyword"));
+    let source_ref = &state["item"]["source_refs"][0];
+    let source_document_uri = source_ref["meta"]["source_document_uri"].as_str().unwrap();
+    assert!(
+        source_ref["meta"]["fragment_uris"]
+            .as_array()
+            .unwrap()
+            .len()
+            > 1
+    );
+
+    let (status, search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "personal-fragment-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    let fragment_uri = search["hits"][0]["uri"].as_str().unwrap();
+    assert_eq!(search["hits"][0]["node_kind"], "fragment");
+    assert_eq!(
+        search["hits"][0]["source_document_uri"].as_str().unwrap(),
+        source_document_uri
+    );
+
+    let (status, traceback) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/traceback",
+        json!({ "uri": fragment_uri }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{traceback}");
+    assert_eq!(traceback["source_document_uri"], source_document_uri);
+
+    let (status, cross_traceback) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/traceback",
+        json!({ "uri": fragment_uri }),
+        Some("u2-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{cross_traceback}");
+
+    let (status, cross_read) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/fs/read?uri={}", query_encode(source_document_uri)),
+        Value::Null,
+        Some("u2-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{cross_read}");
+
+    let (status, admin_traceback) = call_with_token(
+        app,
+        Method::POST,
+        "/v1/context/traceback",
+        json!({ "uri": fragment_uri }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{admin_traceback}");
 }
 
 #[tokio::test]

@@ -14,7 +14,7 @@ None.
 ## Query Parameters
 | Name | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| uri | string | optional except read/abstract/overview | Context URI to list from or read. |
+| uri | string | required | Context URI whose overview layer should be read. |
 | depth | integer | optional | Tree traversal depth for /v1/fs/tree. |
 | owner_user_id | string | optional | Owner scope. Owner-bound auth can supply a default. |
 
@@ -22,11 +22,19 @@ None.
 No JSON body.
 
 ## Response
-Schema: `JsonValue`
+Schema: `ContextNode`
 
 | Field | Type | Description |
 | --- | --- | --- |
-| ... | object or array | Endpoint-specific JSON returned by the store or debug helper. |
+| uri | string | Overview context URI. |
+| title | string | Node title. |
+| layer | integer | Always 1 for this endpoint. |
+| body | string | Overview content. |
+| node_kind | string | `overview`. |
+| retrieval_role | string | Usually `overview`. |
+| retrieval_enabled | boolean | Whether this node participates in default retrieval. |
+| source_document_uri | string? | Full source document URI when the overview belongs to a source-backed context item. |
+| status | string | Node status. |
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
@@ -41,7 +49,7 @@ flowchart TD
   n1["apply_owner_default fills owner query when possible"]
   n2["require_string validates uri"]
   n3["Store.fs_layer_async reads layer 1"]
-  n4["Return ContextNode JSON"]
+  n4["Return overview ContextNode JSON"]
   n0 --> n1
   n1 --> n2
   n2 --> n3

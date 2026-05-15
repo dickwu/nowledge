@@ -155,3 +155,61 @@ async fn meili_backend_indexes_internal_state_events() {
     assert_eq!(history["hits"].as_array().unwrap().len(), 1);
     assert_eq!(history["hits"][0]["event_type"], "state.changed");
 }
+
+#[tokio::test]
+async fn meili_backend_context_search_retrieves_fragments_only() {
+    let Some(app) = meili_app() else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+
+    let (status, bootstrap) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/bootstrap",
+        json!({ "reset": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bootstrap}");
+
+    let owner = format!("u-{}", uuid::Uuid::now_v7());
+    let fact_key = format!("doc-{}", uuid::Uuid::now_v7());
+    let keyword = format!("meili-fragment-keyword-{}", uuid::Uuid::now_v7());
+    let content = format!("# Meili Source\n\n{}", format!("{keyword} ").repeat(180));
+    let (status, state) = call(
+        app.clone(),
+        Method::PUT,
+        &format!("/v1/state/profile/facts/{fact_key}"),
+        json!({
+            "owner_user_id": owner,
+            "state_type": "status",
+            "title": "Meili source document",
+            "statement": "Short current-state summary",
+            "document": {
+                "content": content,
+                "content_type": "text/markdown",
+                "source_uri": "https://example.test/meili/source"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{state}");
+    let source_document_uri = state["item"]["source_refs"][0]["meta"]["source_document_uri"]
+        .as_str()
+        .unwrap();
+
+    let (status, search) = call(
+        app,
+        Method::POST,
+        "/v1/context/search",
+        json!({ "owner_user_id": owner, "query": keyword, "limit": 5 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert!(!search["hits"].as_array().unwrap().is_empty(), "{search}");
+    assert!(search["hits"].as_array().unwrap().iter().all(|hit| {
+        hit["node_kind"] == "fragment"
+            && hit["retrieval_role"] == "fragment"
+            && hit["uri"].as_str() != Some(source_document_uri)
+    }));
+}

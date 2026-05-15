@@ -1,7 +1,7 @@
 # POST /v1/state/company-docs/{source_id}/revisions
 
 ## Summary
-Create a company document revision and optionally ingest it into context storage.
+Create a staged company document revision and optionally schedule ingest work. Retrieval fragments are materialized when a revision is activated.
 
 ## Handler
 - Rust handler: `create_revision`
@@ -27,7 +27,7 @@ Schema: `CreateRevisionRequest`
 | content | string | optional | Revision body content. |
 | checksum | string | optional | Content checksum. |
 | change_note | string | optional | Human-readable reason for the revision. |
-| ingest | boolean | optional, default true | Whether to ingest the content into context storage. |
+| ingest | boolean | optional, default true | Whether to return an ingest job id. Source document and fragment materialization happen on activation. |
 | force_create | boolean | optional, default false | Create a revision even if dedupe checks find a match. |
 | idempotency_key | string | optional | Client deduplication key. |
 
@@ -45,6 +45,7 @@ Schema: `CreateRevisionResponse`
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Use the activate endpoint to store the full `SourceDocument`, create retrieval fragments, and supersede older fragments for the same source.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph

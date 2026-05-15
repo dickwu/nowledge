@@ -64,6 +64,13 @@
   },
   {
     "method": "POST",
+    "path": "/v1/context/traceback",
+    "handler": "context_traceback",
+    "group": "Context",
+    "file": "api/post_v1_context_traceback.md"
+  },
+  {
+    "method": "POST",
     "path": "/v1/debug/meili/search",
     "handler": "debug_meili_search",
     "group": "Debug",

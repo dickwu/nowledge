@@ -3,6 +3,8 @@
 ## Summary
 Patch mutable fields on a profile/state fact.
 
+Document payloads are accepted only by `PUT /v1/state/profile/facts/{fact_key}`. Patching updates the current fact fields; it does not replace source documents or regenerate fragments.
+
 ## Handler
 - Rust handler: `patch_state_fact`
 - Route registration: `src/routes.rs::build_router`

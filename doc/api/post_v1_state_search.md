@@ -3,6 +3,8 @@
 ## Summary
 Search current state facts by query, type, owner, status, and limit.
 
+State search returns current state summaries. Full document payloads ingested with facts are stored as source documents and searched through their context fragments, not as oversized state statements.
+
 ## Handler
 - Rust handler: `search_state`
 - Route registration: `src/routes.rs::build_router`

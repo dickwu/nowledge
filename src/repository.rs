@@ -48,6 +48,11 @@ pub trait KnowledgeRepository: Send + Sync {
         revision: &SourceRevision,
     ) -> Result<Option<String>, ApiError>;
 
+    async fn upsert_source_documents(
+        &self,
+        documents: &[SourceDocument],
+    ) -> Result<Option<String>, ApiError>;
+
     async fn upsert_structured_snapshot(
         &self,
         snapshot: &StructuredSnapshot,
@@ -91,6 +96,13 @@ pub trait KnowledgeRepository: Send + Sync {
         layer: Option<u8>,
         resolver: &EventIndexResolver,
     ) -> Result<Option<ContextNode>, ApiError>;
+
+    async fn read_source_document(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        uri: &str,
+    ) -> Result<Option<SourceDocument>, ApiError>;
 
     async fn get_trace(&self, trace_id: &str) -> Result<Option<TraceRecord>, ApiError>;
 
@@ -144,6 +156,13 @@ impl KnowledgeRepository for MemoryRepository {
     async fn upsert_source_revision(
         &self,
         _revision: &SourceRevision,
+    ) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_source_documents(
+        &self,
+        _documents: &[SourceDocument],
     ) -> Result<Option<String>, ApiError> {
         Ok(None)
     }
@@ -210,6 +229,15 @@ impl KnowledgeRepository for MemoryRepository {
         _layer: Option<u8>,
         _resolver: &EventIndexResolver,
     ) -> Result<Option<ContextNode>, ApiError> {
+        Ok(None)
+    }
+
+    async fn read_source_document(
+        &self,
+        _tenant_id: &str,
+        _owner_user_id: Option<&str>,
+        _uri: &str,
+    ) -> Result<Option<SourceDocument>, ApiError> {
         Ok(None)
     }
 
@@ -348,6 +376,17 @@ impl KnowledgeRepository for MeiliRepository {
         .await
     }
 
+    async fn upsert_source_documents(
+        &self,
+        documents: &[SourceDocument],
+    ) -> Result<Option<String>, ApiError> {
+        let documents = documents
+            .iter()
+            .map(|document| to_document(document, &document.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.upsert_values("rag_source_documents", &documents).await
+    }
+
     async fn upsert_structured_snapshot(
         &self,
         snapshot: &StructuredSnapshot,
@@ -455,70 +494,42 @@ impl KnowledgeRepository for MeiliRepository {
         resolver: &EventIndexResolver,
     ) -> Result<Option<RepositoryContextSearch>, ApiError> {
         let mut stages = Vec::new();
-        let mut l0_nodes = Vec::new();
         let mut all_nodes = Vec::new();
 
-        for layer in [0_u8, 1, 2] {
-            let mut layer_nodes = Vec::new();
-            let company_filter = context_filter(tenant_id, None, layer)?;
-            let company = self
-                .search_context_index("rag_company_context", query, &company_filter, limit)
-                .await?;
-            stages.push(context_stage(
-                &format!("l{layer}_company"),
-                "rag_company_context",
-                query,
-                &company_filter,
-                company.processing_time_ms,
-                &company.hits,
-            ));
-            layer_nodes.extend(company.hits);
+        let company_filter = context_filter(tenant_id, None)?;
+        let company = self
+            .search_context_index("rag_company_context", query, &company_filter, limit)
+            .await?;
+        stages.push(context_stage(
+            "fragments_company",
+            "rag_company_context",
+            query,
+            &company_filter,
+            company.processing_time_ms,
+            &company.hits,
+        ));
+        all_nodes.extend(company.hits);
 
-            if let Some(owner) = owner_user_id {
-                let routing = resolver.resolve(tenant_id, owner, false, true)?;
-                let personal_filter = context_filter(tenant_id, Some(owner), layer)?;
-                let personal = self
-                    .search_context_index(
-                        &routing.personal_context_index_uid,
-                        query,
-                        &personal_filter,
-                        limit,
-                    )
-                    .await?;
-                stages.push(context_stage(
-                    &format!("l{layer}_personal"),
+        if let Some(owner) = owner_user_id {
+            let routing = resolver.resolve(tenant_id, owner, false, true)?;
+            let personal_filter = context_filter(tenant_id, Some(owner))?;
+            let personal = self
+                .search_context_index(
                     &routing.personal_context_index_uid,
                     query,
                     &personal_filter,
-                    personal.processing_time_ms,
-                    &personal.hits,
-                ));
-                layer_nodes.extend(personal.hits);
-            }
-
-            layer_nodes.sort_by(|a, b| {
-                text_score(&format!("{} {}", b.title, b.body), query)
-                    .partial_cmp(&text_score(&format!("{} {}", a.title, a.body), query))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            layer_nodes.truncate(limit);
-            if layer == 0 {
-                l0_nodes = layer_nodes.clone();
-            }
-            all_nodes.extend(layer_nodes);
-        }
-
-        if !l0_nodes.is_empty() {
-            let bases = l0_nodes
-                .iter()
-                .map(|node| strip_context_layer_suffix(&node.uri))
-                .collect::<Vec<_>>();
-            all_nodes.retain(|node| {
-                node.layer == 0
-                    || bases
-                        .iter()
-                        .any(|base| strip_context_layer_suffix(&node.uri) == *base)
-            });
+                    limit,
+                )
+                .await?;
+            stages.push(context_stage(
+                "fragments_personal",
+                &routing.personal_context_index_uid,
+                query,
+                &personal_filter,
+                personal.processing_time_ms,
+                &personal.hits,
+            ));
+            all_nodes.extend(personal.hits);
         }
 
         all_nodes.sort_by(|a, b| {
@@ -611,6 +622,39 @@ impl KnowledgeRepository for MeiliRepository {
             }
         }
         Ok(None)
+    }
+
+    async fn read_source_document(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        uri: &str,
+    ) -> Result<Option<SourceDocument>, ApiError> {
+        let mut filters = vec![
+            format!("tenant_id = {}", meili_string(tenant_id)?),
+            format!("uri = {}", meili_string(uri)?),
+            "status = \"active\"".to_string(),
+        ];
+        if let Some(owner) = owner_user_id {
+            filters.push(format!(
+                "(owner_user_id = {} OR owner_user_id IS NULL)",
+                meili_string(owner)?
+            ));
+        } else {
+            filters.push("owner_user_id IS NULL".to_string());
+        }
+        let response: SearchResponse<SourceDocument> = self
+            .admin
+            .search(
+                "rag_source_documents",
+                json!({
+                    "q": "",
+                    "limit": 1,
+                    "filter": filters.join(" AND ")
+                }),
+            )
+            .await?;
+        Ok(response.hits.into_iter().next())
     }
 
     async fn get_trace(&self, trace_id: &str) -> Result<Option<TraceRecord>, ApiError> {
@@ -734,15 +778,12 @@ fn meili_string_array(values: &[String]) -> Result<String, ApiError> {
     serde_json::to_string(values).map_err(|e| ApiError::Internal(e.to_string()))
 }
 
-fn context_filter(
-    tenant_id: &str,
-    owner_user_id: Option<&str>,
-    layer: u8,
-) -> Result<String, ApiError> {
+fn context_filter(tenant_id: &str, owner_user_id: Option<&str>) -> Result<String, ApiError> {
     let mut filters = vec![
         format!("tenant_id = {}", meili_string(tenant_id)?),
-        format!("layer = {layer}"),
         "status = \"active\"".to_string(),
+        "retrieval_enabled = true".to_string(),
+        "retrieval_role = \"fragment\"".to_string(),
     ];
     if let Some(owner) = owner_user_id {
         filters.push(format!("owner_user_id = {}", meili_string(owner)?));

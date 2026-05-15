@@ -1,7 +1,7 @@
 # POST /v1/rag/debug
 
 ## Summary
-Return a RAG answer plus its trace and prompt preview for debugging.
+Return a fragment-grounded RAG answer plus its trace and prompt preview for debugging.
 
 ## Handler
 - Rust handler: `rag_debug`
@@ -19,7 +19,7 @@ Schema: `RagAnswerRequest`
 
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| question | string | optional | Question to answer. |
+| question | string | required | Question to answer. |
 | mode | string | optional, default auto | Retrieval mode selector. |
 | session_id | string | optional | Session to associate with the answer. |
 | owner_user_id | string | optional, auth default may apply | Owner scope. |
@@ -30,11 +30,14 @@ Schema: `JsonValue`
 
 | Field | Type | Description |
 | --- | --- | --- |
-| ... | object or array | Endpoint-specific JSON returned by the store or debug helper. |
+| answer | RagAnswerResponse | Fragment-grounded answer payload. |
+| trace | TraceRecord | Retrieval trace used for the answer. |
+| prompt | string | Grounded prompt preview built from fragment citations. |
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Debug output is based on the same default fragment-only RAG retrieval as /v1/rag/answer.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph
@@ -42,7 +45,7 @@ Schema: `JsonValue`
 flowchart TD
   n0["UserGuard authenticates caller"]
   n1["apply_owner_default fills owner_user_id when possible"]
-  n2["answer_rag_with_llm builds answer"]
+  n2["answer_rag_with_llm builds answer from fragment citations"]
   n3["Store.get_trace_async loads trace"]
   n4["build_prompt reconstructs grounded prompt"]
   n5["Return answer, trace, and prompt"]

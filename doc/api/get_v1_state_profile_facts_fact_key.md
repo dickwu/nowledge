@@ -31,6 +31,9 @@ Schema: `StateItemResponse`
 | context_uri | string | Context URI for the fact. |
 | decision | string | Store merge/upsert decision. |
 
+### StateItem Source References
+Document-backed facts may include a `source_document` entry in `item.source_refs`. That entry points to the stored source document URI and may include generated fragment URIs in its metadata.
+
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.

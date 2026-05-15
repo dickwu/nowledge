@@ -3,6 +3,8 @@
 ## Summary
 Reveal deeper content for a context URI, optionally deriving owner scope from a trace.
 
+For fragments produced from source documents, use `/v1/context/traceback` to identify the full source document; reveal remains a layered context-node read.
+
 ## Handler
 - Rust handler: `context_reveal`
 - Route registration: `src/routes.rs::build_router`

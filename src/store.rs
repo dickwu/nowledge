@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use crate::{
     config::Config,
     error::ApiError,
+    fragmenter::{DocumentFragment, DocumentFragmenter},
     models::*,
     repository::{repository_from_config, KnowledgeRepository},
     resolver::{EventIndexResolver, EVENT_INDEX_SCHEMA_VERSION, EVENT_SETTINGS_HASH},
@@ -38,6 +39,7 @@ struct StoreData {
     insight_idempotency: HashMap<(String, String), String>,
     sources: HashMap<String, CompanySource>,
     source_revisions: HashMap<String, Vec<SourceRevision>>,
+    source_documents: HashMap<String, SourceDocument>,
     preflight_decisions: HashMap<String, CompanyDocPreflightResponse>,
     datasets: HashMap<String, DatasetRecord>,
     snapshots: HashMap<String, StructuredSnapshot>,
@@ -56,6 +58,13 @@ pub struct ContextSearchOutcome {
     pub response: ContextSearchResponse,
     pub trace: TraceRecord,
     pub nodes: Vec<ContextNode>,
+}
+
+#[derive(Debug, Clone)]
+struct DocumentIngestResult {
+    source_id: String,
+    source_document_uri: String,
+    fragment_uris: Vec<String>,
 }
 
 impl Store {
@@ -403,6 +412,14 @@ impl Store {
             .repository
             .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
             .await?;
+        let source_documents =
+            self.source_documents_for_scope(tenant_id, Some(&response.item.owner_user_id))?;
+        let _ = self
+            .repository
+            .upsert_source_documents(&source_documents)
+            .await?;
+        let links = self.links_for_tenant(tenant_id)?;
+        let _ = self.repository.upsert_links(&links).await?;
         let _ = self
             .persist_history_event_by_id(&response.history_event_id)
             .await?;
@@ -532,6 +549,13 @@ impl Store {
             .repository
             .upsert_context_nodes("rag_company_context", &nodes)
             .await?;
+        let source_documents = self.source_documents_for_scope(tenant_id, None)?;
+        let _ = self
+            .repository
+            .upsert_source_documents(&source_documents)
+            .await?;
+        let links = self.links_for_tenant(tenant_id)?;
+        let _ = self.repository.upsert_links(&links).await?;
         if let Some(history_event_id) = &response.history_event_id {
             let _ = self.persist_history_event_by_id(history_event_id).await?;
         }
@@ -635,15 +659,7 @@ impl Store {
             let hits = result
                 .nodes
                 .iter()
-                .map(|node| ContextHit {
-                    uri: node.uri.clone(),
-                    title: node.title.clone(),
-                    layer: node.layer,
-                    score: text_score(&format!("{} {}", node.title, node.body), &query),
-                    source_id: node.source_id.clone(),
-                    revision_id: node.revision_id.clone(),
-                    snippet: truncate_chars(&node.body, 240),
-                })
+                .map(|node| context_hit_from_node(node, &query))
                 .collect::<Vec<_>>();
             let trace = TraceRecord {
                 id: new_id("trace"),
@@ -832,6 +848,13 @@ impl Store {
                 .await?
             {
                 return Ok(node);
+            }
+            if let Some(source_document) = self
+                .repository
+                .read_source_document(tenant_id, owner_user_id, uri)
+                .await?
+            {
+                return Ok(source_document_context_node(source_document));
             }
         }
         Err(ApiError::not_found("context uri not found"))
@@ -1274,6 +1297,14 @@ impl Store {
         let owner_user_id = require_string(req.owner_user_id, "owner_user_id")?;
         let state_type = require_string(req.state_type, "state_type")?;
         let statement = require_string(req.statement, "statement")?;
+        let value = req.value;
+        let confidence = req.confidence;
+        let salience = req.salience;
+        let valid_from = req.valid_from;
+        let valid_to = req.valid_to;
+        let document = req.document.clone();
+        let fragment_policy = req.fragment_policy.clone();
+        let mut source_refs = req.source_refs.clone();
         let title = req
             .title
             .unwrap_or_else(|| fact_key.replace(['-', '_'], " "));
@@ -1292,17 +1323,53 @@ impl Store {
         let (item, decision) = {
             let mut data = self.write()?;
             let existing = data.state_items.get(&key).cloned();
+            let next_version = existing
+                .as_ref()
+                .map(|item| item.current_version + 1)
+                .unwrap_or(1);
+            let routing = self
+                .resolver
+                .resolve(tenant_id, &owner_user_id, false, true)?;
+            if let Some(document) = document.as_ref() {
+                let policy = document
+                    .fragment_policy
+                    .as_ref()
+                    .or(fragment_policy.as_ref());
+                let ingest = self.write_state_document_context_locked(
+                    &mut data,
+                    tenant_id,
+                    &routing,
+                    &owner_user_id,
+                    &state_type,
+                    fact_key,
+                    next_version,
+                    &title,
+                    document,
+                    policy,
+                )?;
+                source_refs.push(SourceRef {
+                    kind: "source_document".to_string(),
+                    id: ingest.source_id,
+                    uri: Some(ingest.source_document_uri.clone()),
+                    meta: Some(json!({
+                        "source_document_uri": ingest.source_document_uri,
+                        "fragment_uris": ingest.fragment_uris,
+                        "content_type": document.content_type.clone(),
+                        "source_uri": document.source_uri.clone()
+                    })),
+                });
+            }
             let item = if let Some(mut item) = existing {
                 item.title = title;
                 item.statement = statement;
-                item.value = req.value;
-                item.confidence = req.confidence;
-                item.salience = req.salience;
-                item.valid_from = req.valid_from;
-                item.valid_to = req.valid_to;
-                item.source_refs = req.source_refs.clone();
+                item.value = value;
+                item.confidence = confidence;
+                item.salience = salience;
+                item.valid_from = valid_from;
+                item.valid_to = valid_to;
+                item.source_refs = source_refs.clone();
                 item.status = "active".to_string();
-                item.current_version += 1;
+                item.current_version = next_version;
                 item.updated_at = now;
                 item
             } else {
@@ -1314,15 +1381,15 @@ impl Store {
                     natural_key: fact_key.to_string(),
                     title,
                     statement,
-                    value: req.value,
+                    value,
                     status: "active".to_string(),
-                    confidence: req.confidence,
-                    salience: req.salience,
-                    valid_from: req.valid_from,
-                    valid_to: req.valid_to,
-                    source_refs: req.source_refs.clone(),
+                    confidence,
+                    salience,
+                    valid_from,
+                    valid_to,
+                    source_refs,
                     context_uri: context_uri.clone(),
-                    current_version: 1,
+                    current_version: next_version,
                     supersedes: Vec::new(),
                     created_at: now,
                     updated_at: now,
@@ -1335,9 +1402,6 @@ impl Store {
             }
             .to_string();
             data.state_items.insert(key, item.clone());
-            let routing = self
-                .resolver
-                .resolve(tenant_id, &owner_user_id, false, true)?;
             self.write_state_context_locked(&mut data, &routing, &item);
             (item, decision)
         };
@@ -2011,13 +2075,7 @@ impl Store {
         source.source_uri = revision.source_uri.clone();
         source.canonical_key = sanitize_slug(&revision.title);
 
-        for node in &mut data.company_context {
-            if node.source_id.as_deref() == Some(source_id) {
-                node.status = "superseded".to_string();
-            }
-        }
-        let context_uris =
-            self.write_company_revision_context_locked(&mut data, tenant_id, &revision);
+        let ingest = self.write_company_revision_context_locked(&mut data, tenant_id, &revision);
 
         drop(data);
 
@@ -2036,7 +2094,9 @@ impl Store {
             active_revision_id: revision_id.to_string(),
             previous_revision_id,
             history_event_id: Some(history.event.id),
-            context_uris,
+            source_document_uri: ingest.source_document_uri,
+            fragment_uris: ingest.fragment_uris.clone(),
+            context_uris: ingest.fragment_uris,
         })
     }
 
@@ -2338,6 +2398,16 @@ impl Store {
                     index_uid: routing.personal_context_index_uid,
                     index_kind: "personal".to_string(),
                     ancestor_uris: ancestor_uris(&context_uri),
+                    node_kind: "overview".to_string(),
+                    retrieval_role: "overview".to_string(),
+                    retrieval_enabled: false,
+                    parent_uri: None,
+                    source_document_uri: None,
+                    fragment_index: None,
+                    char_start: None,
+                    char_end: None,
+                    token_estimate: None,
+                    checksum: None,
                     source_id: None,
                     revision_id: None,
                     status: "active".to_string(),
@@ -2458,10 +2528,22 @@ impl Store {
         include_all_private: bool,
     ) -> Result<ContextNode, ApiError> {
         let data = self.read()?;
-        self.context_scope_for_acl_locked(&data, tenant_id, owner_user_id, include_all_private)?
+        if let Some(node) = self
+            .context_scope_for_acl_locked(&data, tenant_id, owner_user_id, include_all_private)?
             .into_iter()
             .find(|node| node.uri == uri && node.status == "active")
-            .ok_or_else(|| ApiError::not_found("context uri not found"))
+        {
+            return Ok(node);
+        }
+        self.source_document_for_acl_locked(
+            &data,
+            tenant_id,
+            uri,
+            owner_user_id,
+            include_all_private,
+        )
+        .map(source_document_context_node)
+        .ok_or_else(|| ApiError::not_found("context uri not found"))
     }
 
     pub fn fs_layer(
@@ -2484,6 +2566,66 @@ impl Store {
             .ok_or_else(|| ApiError::not_found("context layer not found"))
     }
 
+    pub fn traceback(
+        &self,
+        tenant_id: &str,
+        req: ContextTracebackRequest,
+        include_all_private: bool,
+    ) -> Result<ContextTracebackResponse, ApiError> {
+        let uri = require_string(req.uri, "uri")?;
+        let owner_user_id = req.owner_user_id.as_deref();
+        let data = self.read()?;
+        let fragment = self
+            .context_scope_for_acl_locked(&data, tenant_id, owner_user_id, include_all_private)?
+            .into_iter()
+            .find(|node| node.uri == uri && node.status == "active")
+            .ok_or_else(|| ApiError::not_found("fragment uri not found"))?;
+        if fragment.node_kind != "fragment" {
+            return Err(ApiError::bad_request(
+                "traceback uri must identify a fragment",
+            ));
+        }
+
+        let part_of = data
+            .links
+            .values()
+            .find(|link| {
+                link.tenant_id == tenant_id
+                    && link.status == "active"
+                    && link.relation == "part_of"
+                    && link.source_uri == fragment.uri
+            })
+            .cloned();
+        let source_document_uri = fragment
+            .source_document_uri
+            .clone()
+            .or_else(|| part_of.map(|link| link.target_uri))
+            .ok_or_else(|| ApiError::not_found("source document link not found"))?;
+        let source_document = self
+            .source_document_for_acl_locked(
+                &data,
+                tenant_id,
+                &source_document_uri,
+                owner_user_id,
+                include_all_private,
+            )
+            .ok_or_else(|| ApiError::not_found("source document not found"))?;
+
+        Ok(ContextTracebackResponse {
+            fragment_uri: fragment.uri,
+            fragment_title: fragment.title,
+            fragment_index: fragment.fragment_index,
+            checksum: fragment.checksum,
+            token_estimate: fragment.token_estimate,
+            source_document_uri: source_document.uri,
+            source_id: source_document.source_id,
+            revision_id: source_document.revision_id,
+            char_start: fragment.char_start,
+            char_end: fragment.char_end,
+            source_title: source_document.title,
+        })
+    }
+
     pub fn search_context(
         &self,
         tenant_id: &str,
@@ -2497,67 +2639,30 @@ impl Store {
         let data = self.read()?;
         let nodes = self.context_scope_locked(&data, tenant_id, owner_user_id.as_deref())?;
 
-        let mut l0 = rank_nodes(
+        let fragments = rank_nodes(
             nodes
                 .iter()
-                .filter(|node| node.layer == 0 && node.status == "active")
-                .cloned(),
-            &query,
-            limit,
-        );
-        if l0.is_empty() {
-            l0 = rank_nodes(
-                nodes.iter().filter(|node| node.status == "active").cloned(),
-                &query,
-                limit,
-            );
-        }
-        let bases: HashSet<String> = l0
-            .iter()
-            .map(|(node, _)| strip_layer_suffix(&node.uri))
-            .collect();
-        let l1 = rank_nodes(
-            nodes
-                .iter()
-                .filter(|node| node.layer == 1 && bases.contains(&strip_layer_suffix(&node.uri)))
-                .cloned(),
-            &query,
-            limit,
-        );
-        let l2 = rank_nodes(
-            nodes
-                .iter()
-                .filter(|node| node.layer == 2 && bases.contains(&strip_layer_suffix(&node.uri)))
+                .filter(|node| retrieval_candidate(node))
                 .cloned(),
             &query,
             limit,
         );
         drop(data);
 
-        let selected_nodes: Vec<_> = l0
+        let selected_nodes: Vec<_> = fragments
             .iter()
-            .chain(l1.iter())
-            .chain(l2.iter())
             .map(|(node, _)| node.clone())
             .take(limit)
             .collect();
         let hits: Vec<_> = selected_nodes
             .iter()
-            .map(|node| ContextHit {
-                uri: node.uri.clone(),
-                title: node.title.clone(),
-                layer: node.layer,
-                score: text_score(&format!("{} {}", node.title, node.body), &query),
-                source_id: node.source_id.clone(),
-                revision_id: node.revision_id.clone(),
-                snippet: truncate_chars(&node.body, 240),
-            })
+            .map(|node| context_hit_from_node(node, &query))
             .collect();
-        let stages = vec![
-            stage_value("L0", &l0, owner_user_id.as_deref()),
-            stage_value("L1", &l1, owner_user_id.as_deref()),
-            stage_value("L2", &l2, owner_user_id.as_deref()),
-        ];
+        let stages = vec![stage_value(
+            "fragments",
+            &fragments,
+            owner_user_id.as_deref(),
+        )];
         let trace = TraceRecord {
             id: new_id("trace"),
             tenant_id: tenant_id.to_string(),
@@ -2747,6 +2852,16 @@ impl Store {
                     index_uid: routing.personal_context_index_uid,
                     index_kind: "personal".to_string(),
                     ancestor_uris: ancestor_uris(&uri),
+                    node_kind: "source_doc".to_string(),
+                    retrieval_role: "none".to_string(),
+                    retrieval_enabled: false,
+                    parent_uri: None,
+                    source_document_uri: None,
+                    fragment_index: None,
+                    char_start: None,
+                    char_end: None,
+                    token_estimate: None,
+                    checksum: None,
                     source_id: None,
                     revision_id: None,
                     status: "active".to_string(),
@@ -2879,7 +2994,7 @@ impl Store {
             usage: json!({
                 "provider": "none",
                 "backend": self.backend_name(),
-                "stages": ["L0", "L1", "L2"]
+                "stages": ["fragments"]
             }),
         }
     }
@@ -2913,6 +3028,31 @@ impl Store {
                 .find(|revision| revision.id == revision_id)
                 .cloned()
         }))
+    }
+
+    fn source_documents_for_scope(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+    ) -> Result<Vec<SourceDocument>, ApiError> {
+        let data = self.read()?;
+        Ok(data
+            .source_documents
+            .values()
+            .filter(|document| document.tenant_id == tenant_id)
+            .filter(|document| document.owner_user_id.as_deref() == owner_user_id)
+            .cloned()
+            .collect())
+    }
+
+    fn links_for_tenant(&self, tenant_id: &str) -> Result<Vec<KnowledgeLink>, ApiError> {
+        let data = self.read()?;
+        Ok(data
+            .links
+            .values()
+            .filter(|link| link.tenant_id == tenant_id)
+            .cloned()
+            .collect())
     }
 
     fn snapshot(&self, snapshot_id: &str) -> Result<Option<StructuredSnapshot>, ApiError> {
@@ -3196,53 +3336,211 @@ impl Store {
         data: &mut StoreData,
         tenant_id: &str,
         revision: &SourceRevision,
-    ) -> Vec<String> {
-        let base = format!(
-            "ctx://company/docs/{}/{}",
+    ) -> DocumentIngestResult {
+        let source_document_uri = format!(
+            "ctx://company/docs/{}/source/{}",
             sanitize_slug(&revision.source_id),
-            sanitize_slug(&revision.title)
+            sanitize_slug(&revision.id)
         );
-        let nodes = vec![
-            self.context_node(
-                &format!("{base}/.abstract"),
-                &revision.title,
-                0,
-                &truncate_chars(&revision.content, 500),
-                "company",
-                "rag_company_context",
+        self.write_source_document_fragments_locked(
+            data,
+            tenant_id,
+            None,
+            "company_doc",
+            &revision.source_id,
+            &revision.id,
+            &source_document_uri,
+            &revision.title,
+            &revision.content,
+            &revision.checksum,
+            "company",
+            "rag_company_context",
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_state_document_context_locked(
+        &self,
+        data: &mut StoreData,
+        tenant_id: &str,
+        routing: &EventIndexRouting,
+        owner_user_id: &str,
+        state_type: &str,
+        fact_key: &str,
+        version: u32,
+        title: &str,
+        document: &StateDocumentPayload,
+        policy: Option<&FragmentPolicy>,
+    ) -> Result<DocumentIngestResult, ApiError> {
+        let content = require_string(document.content.clone(), "document.content")?;
+        let source_id = format!(
+            "state:{}:{}:{}",
+            sanitize_slug(owner_user_id),
+            sanitize_slug(state_type),
+            sanitize_slug(fact_key)
+        );
+        let revision_id = format!("v{version}");
+        let checksum = hmac_hex(
+            tenant_id.as_bytes(),
+            "state-document",
+            &format!("{source_id}:{revision_id}:{content}"),
+            32,
+        );
+        let source_document_uri = format!(
+            "ctx://user/state/{}/{}/source/{}",
+            sanitize_slug(state_type),
+            sanitize_slug(fact_key),
+            sanitize_slug(&revision_id)
+        );
+        Ok(self.write_source_document_fragments_locked(
+            data,
+            tenant_id,
+            Some(owner_user_id.to_string()),
+            "state_doc",
+            &source_id,
+            &revision_id,
+            &source_document_uri,
+            title,
+            &content,
+            &checksum,
+            "personal",
+            &routing.personal_context_index_uid,
+            policy,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_source_document_fragments_locked(
+        &self,
+        data: &mut StoreData,
+        tenant_id: &str,
+        owner_user_id: Option<String>,
+        source_kind: &str,
+        source_id: &str,
+        revision_id: &str,
+        source_document_uri: &str,
+        title: &str,
+        content: &str,
+        checksum: &str,
+        index_kind: &str,
+        index_uid: &str,
+        policy: Option<&FragmentPolicy>,
+    ) -> DocumentIngestResult {
+        self.supersede_source_artifacts_locked(
+            data,
+            tenant_id,
+            owner_user_id.as_deref(),
+            source_id,
+        );
+
+        let now = now();
+        let source_document_id =
+            source_document_id(tenant_id, owner_user_id.as_deref(), source_id, revision_id);
+        let created_at = data
+            .source_documents
+            .get(source_document_uri)
+            .map(|document| document.created_at)
+            .unwrap_or(now);
+        let source_document = SourceDocument {
+            id: source_document_id,
+            tenant_id: tenant_id.to_string(),
+            owner_user_id: owner_user_id.clone(),
+            source_kind: source_kind.to_string(),
+            source_id: source_id.to_string(),
+            revision_id: revision_id.to_string(),
+            uri: source_document_uri.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            checksum: checksum.to_string(),
+            status: "active".to_string(),
+            retrieval_enabled: false,
+            created_at,
+            updated_at: now,
+        };
+        data.source_documents
+            .insert(source_document.uri.clone(), source_document);
+
+        let fragmenter = DocumentFragmenter::from_policy(policy);
+        let fragments = fragmenter.fragment(content);
+        let fragment_uris = fragments
+            .iter()
+            .map(|fragment| {
+                format!(
+                    "{source_document_uri}/fragments/{:04}",
+                    fragment.fragment_index + 1
+                )
+            })
+            .collect::<Vec<_>>();
+        let nodes = fragments
+            .iter()
+            .zip(fragment_uris.iter())
+            .map(|(fragment, uri)| {
+                self.fragment_context_node(
+                    uri,
+                    title,
+                    index_kind,
+                    index_uid,
+                    tenant_id,
+                    owner_user_id.clone(),
+                    source_id,
+                    revision_id,
+                    source_document_uri,
+                    fragment,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if index_kind == "company" {
+            upsert_context_nodes(&mut data.company_context, nodes);
+        } else {
+            upsert_context_nodes(
+                data.personal_context
+                    .entry(index_uid.to_string())
+                    .or_default(),
+                nodes,
+            );
+        }
+
+        for (fragment_uri, fragment) in fragment_uris.iter().zip(fragments.iter()) {
+            let id = part_of_link_id(
                 tenant_id,
-                None,
-                Some(revision.source_id.clone()),
-                Some(revision.id.clone()),
-            ),
-            self.context_node(
-                &format!("{base}/.overview"),
-                &revision.title,
-                1,
-                &truncate_chars(&revision.content, 2000),
-                "company",
-                "rag_company_context",
-                tenant_id,
-                None,
-                Some(revision.source_id.clone()),
-                Some(revision.id.clone()),
-            ),
-            self.context_node(
-                &format!("{base}/chunks/0001"),
-                &revision.title,
-                2,
-                &revision.content,
-                "company",
-                "rag_company_context",
-                tenant_id,
-                None,
-                Some(revision.source_id.clone()),
-                Some(revision.id.clone()),
-            ),
-        ];
-        let uris = nodes.iter().map(|node| node.uri.clone()).collect();
-        upsert_context_nodes(&mut data.company_context, nodes);
-        uris
+                owner_user_id.as_deref(),
+                fragment_uri,
+                source_document_uri,
+            );
+            data.links.insert(
+                id.clone(),
+                KnowledgeLink {
+                    id,
+                    tenant_id: tenant_id.to_string(),
+                    owner_user_id: owner_user_id.clone(),
+                    source_uri: fragment_uri.clone(),
+                    target_uri: source_document_uri.to_string(),
+                    source_title: Some(format!(
+                        "{} fragment {}",
+                        title,
+                        fragment.fragment_index + 1
+                    )),
+                    target_title: Some(title.to_string()),
+                    relation: "part_of".to_string(),
+                    rationale: Some("fragment generated from source document".to_string()),
+                    evidence_text: None,
+                    confidence: 1.0,
+                    created_by: "system_fragmenter".to_string(),
+                    status: "active".to_string(),
+                    tags: vec![source_kind.to_string()],
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+        }
+
+        DocumentIngestResult {
+            source_id: source_id.to_string(),
+            source_document_uri: source_document_uri.to_string(),
+            fragment_uris,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3269,6 +3567,16 @@ impl Store {
             index_uid: index_uid.to_string(),
             index_kind: index_kind.to_string(),
             ancestor_uris: ancestor_uris(uri),
+            node_kind: node_kind_for_layer(layer).to_string(),
+            retrieval_role: retrieval_role_for_layer(layer).to_string(),
+            retrieval_enabled: layer == 2,
+            parent_uri: None,
+            source_document_uri: None,
+            fragment_index: None,
+            char_start: None,
+            char_end: None,
+            token_estimate: None,
+            checksum: None,
             source_id,
             revision_id,
             status: "active".to_string(),
@@ -3279,6 +3587,45 @@ impl Store {
             },
             updated_at: now(),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fragment_context_node(
+        &self,
+        uri: &str,
+        title: &str,
+        index_kind: &str,
+        index_uid: &str,
+        tenant_id: &str,
+        owner_user_id: Option<String>,
+        source_id: &str,
+        revision_id: &str,
+        source_document_uri: &str,
+        fragment: &DocumentFragment,
+    ) -> ContextNode {
+        let mut node = self.context_node(
+            uri,
+            &format!("{} fragment {}", title, fragment.fragment_index + 1),
+            2,
+            &fragment.content,
+            index_kind,
+            index_uid,
+            tenant_id,
+            owner_user_id,
+            Some(source_id.to_string()),
+            Some(revision_id.to_string()),
+        );
+        node.node_kind = "fragment".to_string();
+        node.retrieval_role = "fragment".to_string();
+        node.retrieval_enabled = true;
+        node.parent_uri = Some(source_document_uri.to_string());
+        node.source_document_uri = Some(source_document_uri.to_string());
+        node.fragment_index = Some(fragment.fragment_index);
+        node.char_start = Some(fragment.char_start);
+        node.char_end = Some(fragment.char_end);
+        node.token_estimate = Some(fragment.token_estimate);
+        node.checksum = Some(fragment.checksum.clone());
+        node
     }
 
     fn resolve_state_key(
@@ -3351,6 +3698,99 @@ impl Store {
         self.context_scope_locked(data, tenant_id, owner_user_id)
     }
 
+    fn source_document_for_acl_locked(
+        &self,
+        data: &StoreData,
+        tenant_id: &str,
+        uri: &str,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Option<SourceDocument> {
+        data.source_documents
+            .get(uri)
+            .filter(|document| document.status == "active")
+            .filter(|document| document.tenant_id == tenant_id || document.tenant_id == "default")
+            .filter(|document| {
+                if include_all_private {
+                    true
+                } else if let Some(owner) = owner_user_id {
+                    document.owner_user_id.as_deref().is_none()
+                        || document.owner_user_id.as_deref() == Some(owner)
+                } else {
+                    document.owner_user_id.is_none()
+                }
+            })
+            .cloned()
+    }
+
+    fn supersede_source_artifacts_locked(
+        &self,
+        data: &mut StoreData,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        source_id: &str,
+    ) {
+        let superseded_source_document_uris = data
+            .source_documents
+            .values()
+            .filter(|document| {
+                document.tenant_id == tenant_id
+                    && document.owner_user_id.as_deref() == owner_user_id
+                    && document.source_id == source_id
+                    && document.status == "active"
+            })
+            .map(|document| document.uri.clone())
+            .collect::<HashSet<_>>();
+
+        for document in data.source_documents.values_mut() {
+            if document.tenant_id == tenant_id
+                && document.owner_user_id.as_deref() == owner_user_id
+                && document.source_id == source_id
+                && document.status == "active"
+            {
+                document.status = "superseded".to_string();
+                document.updated_at = now();
+            }
+        }
+
+        for node in &mut data.company_context {
+            if node.tenant_id == tenant_id
+                && node.owner_user_id.as_deref() == owner_user_id
+                && node.source_id.as_deref() == Some(source_id)
+                && node.status == "active"
+            {
+                node.status = "superseded".to_string();
+                node.retrieval_enabled = false;
+                node.updated_at = now();
+            }
+        }
+        for nodes in data.personal_context.values_mut() {
+            for node in nodes {
+                if node.tenant_id == tenant_id
+                    && node.owner_user_id.as_deref() == owner_user_id
+                    && node.source_id.as_deref() == Some(source_id)
+                    && node.status == "active"
+                {
+                    node.status = "superseded".to_string();
+                    node.retrieval_enabled = false;
+                    node.updated_at = now();
+                }
+            }
+        }
+
+        for link in data.links.values_mut() {
+            if link.tenant_id == tenant_id
+                && link.owner_user_id.as_deref() == owner_user_id
+                && link.relation == "part_of"
+                && link.status == "active"
+                && superseded_source_document_uris.contains(&link.target_uri)
+            {
+                link.status = "superseded".to_string();
+                link.updated_at = now();
+            }
+        }
+    }
+
     fn all_context_nodes_locked(&self, data: &StoreData) -> Vec<ContextNode> {
         let mut nodes = data.company_context.clone();
         for personal in data.personal_context.values() {
@@ -3397,6 +3837,81 @@ fn rank_nodes(
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
     scored
+}
+
+fn retrieval_candidate(node: &ContextNode) -> bool {
+    node.status == "active" && node.retrieval_enabled && node.retrieval_role == "fragment"
+}
+
+fn context_hit_from_node(node: &ContextNode, query: &str) -> ContextHit {
+    ContextHit {
+        uri: node.uri.clone(),
+        title: node.title.clone(),
+        layer: node.layer,
+        score: text_score(&format!("{} {}", node.title, node.body), query),
+        node_kind: Some(node.node_kind.clone()),
+        retrieval_role: Some(node.retrieval_role.clone()),
+        source_id: node.source_id.clone(),
+        revision_id: node.revision_id.clone(),
+        source_document_uri: node.source_document_uri.clone(),
+        fragment_index: node.fragment_index,
+        char_start: node.char_start,
+        char_end: node.char_end,
+        snippet: truncate_chars(&node.body, 240),
+    }
+}
+
+fn source_document_context_node(document: SourceDocument) -> ContextNode {
+    ContextNode {
+        uri: document.uri.clone(),
+        title: document.title.clone(),
+        layer: 2,
+        body: document.content.clone(),
+        tenant_id: document.tenant_id.clone(),
+        owner_user_id: document.owner_user_id.clone(),
+        index_uid: "rag_source_documents".to_string(),
+        index_kind: if document.owner_user_id.is_some() {
+            "personal".to_string()
+        } else {
+            "company".to_string()
+        },
+        ancestor_uris: ancestor_uris(&document.uri),
+        node_kind: "source_doc".to_string(),
+        retrieval_role: "none".to_string(),
+        retrieval_enabled: false,
+        parent_uri: None,
+        source_document_uri: Some(document.uri),
+        fragment_index: None,
+        char_start: None,
+        char_end: None,
+        token_estimate: Some(document.content.chars().count().div_ceil(4).max(1)),
+        checksum: Some(document.checksum),
+        source_id: Some(document.source_id),
+        revision_id: Some(document.revision_id),
+        status: document.status,
+        privacy: if document.owner_user_id.is_some() {
+            "private".to_string()
+        } else {
+            "company".to_string()
+        },
+        updated_at: document.updated_at,
+    }
+}
+
+fn node_kind_for_layer(layer: u8) -> &'static str {
+    match layer {
+        0 => "abstract",
+        1 => "overview",
+        _ => "fragment",
+    }
+}
+
+fn retrieval_role_for_layer(layer: u8) -> &'static str {
+    match layer {
+        2 => "fragment",
+        1 => "overview",
+        _ => "none",
+    }
 }
 
 fn stage_value(stage: &str, hits: &[(ContextNode, f32)], owner_user_id: Option<&str>) -> Value {
@@ -3494,6 +4009,46 @@ fn token_similarity(a: &str, b: &str) -> f32 {
 
 fn user_event_index_id(tenant_hash: &str, owner_user_id_hash: &str) -> String {
     format!("uei__t_{tenant_hash}__u_{owner_user_id_hash}")
+}
+
+fn source_document_id(
+    tenant_id: &str,
+    owner_user_id: Option<&str>,
+    source_id: &str,
+    revision_id: &str,
+) -> String {
+    format!(
+        "srcdoc_{}",
+        hmac_hex(
+            b"nowledge-source-document",
+            "source_document",
+            &format!(
+                "{}:{}:{}:{}",
+                tenant_id,
+                owner_user_id.unwrap_or(""),
+                source_id,
+                revision_id
+            ),
+            24,
+        )
+    )
+}
+
+fn part_of_link_id(
+    tenant_id: &str,
+    owner_user_id: Option<&str>,
+    source_uri: &str,
+    target_uri: &str,
+) -> String {
+    format!(
+        "link_{}",
+        hmac_hex(
+            b"nowledge-part-of-link",
+            "part_of",
+            &link_natural_key(tenant_id, owner_user_id, source_uri, target_uri, "part_of"),
+            24,
+        )
+    )
 }
 
 fn deterministic_stats(rows: &[Value], prior_rows_by_period: &[(String, Vec<Value>)]) -> Value {
