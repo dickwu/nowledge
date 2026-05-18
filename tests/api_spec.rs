@@ -1770,3 +1770,406 @@ async fn codex_auth_reader_accepts_cli_openai_api_key_shape() {
     let _ = std::fs::remove_file(&path);
     assert_eq!(read.as_deref(), Some(token));
 }
+
+#[tokio::test]
+async fn harness_registry_requires_manifest_for_revision_and_rolls_back() {
+    let app = app();
+    let (status, components) = call(
+        app.clone(),
+        Method::GET,
+        "/v1/admin/harness/components",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{components}");
+    assert!(components
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|component| { component["id"].as_str() == Some("retrieval.context_search") }));
+
+    let (status, rejected) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/harness/components/retrieval.context_search/revisions",
+        json!({ "content": { "candidate": "no manifest" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+
+    let (status, change1) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/harness/evolution/changes",
+        json!({
+            "iteration": 1,
+            "type": "improvement",
+            "component_id": "retrieval.context_search",
+            "files": ["src/store.rs"],
+            "failure_pattern": "retrieval_recall",
+            "root_cause": "ranking missed a fragment",
+            "targeted_fix": "tighten ranking",
+            "predicted_fixes": ["retrieval_recall"],
+            "risk_cases": ["source_doc_leak"],
+            "expected_metric_deltas": { "retrieval_recall_at_5": 0.1 },
+            "why_this_component": "context search owns fragment ranking",
+            "created_by": "test"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{change1}");
+    let change1_id = change1["id"].as_str().unwrap();
+
+    let (status, rev1) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/harness/components/retrieval.context_search/revisions",
+        json!({ "manifest_id": change1_id, "content": { "ranking": "candidate-a" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rev1}");
+    let rev1_id = rev1["id"].as_str().unwrap();
+
+    let (status, change2) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/harness/evolution/changes",
+        json!({
+            "iteration": 2,
+            "type": "improvement",
+            "component_id": "retrieval.context_search",
+            "files": ["src/store.rs"],
+            "failure_pattern": "citation_precision",
+            "root_cause": "candidate b changed scoring",
+            "targeted_fix": "second candidate",
+            "predicted_fixes": ["citation_precision"],
+            "risk_cases": ["retrieval_recall"],
+            "expected_metric_deltas": { "citation_precision": 0.1 },
+            "why_this_component": "context search owns scoring",
+            "created_by": "test"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{change2}");
+    let change2_id = change2["id"].as_str().unwrap();
+
+    let (status, rev2) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/harness/components/retrieval.context_search/revisions",
+        json!({ "manifest_id": change2_id, "content": { "ranking": "candidate-b" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rev2}");
+    assert_ne!(rev2["id"], rev1["id"]);
+
+    let (status, rollback) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/harness/components/retrieval.context_search/rollback",
+        json!({
+            "target_revision_id": rev1_id,
+            "manifest_id": change2_id,
+            "reason": "regression",
+            "created_by": "test"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rollback}");
+    assert_eq!(rollback["active_revision"]["id"], rev1_id);
+    assert!(rollback["history_event_id"].as_str().is_some());
+
+    let (status, detail) = call(
+        app.clone(),
+        Method::GET,
+        "/v1/admin/harness/components/retrieval.context_search",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["component"]["current_revision_id"], rev1_id);
+
+    let (status, change2_after) = call(
+        app,
+        Method::GET,
+        &format!("/v1/admin/harness/evolution/changes/{change2_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{change2_after}");
+    assert_eq!(change2_after["status"], "rollback");
+}
+
+#[tokio::test]
+async fn eval_run_stores_traces_reports_and_failure_clusters() {
+    let app = authed_app();
+    let keyword = format!("eval-grounding-{}", uuid::Uuid::now_v7());
+    let (status, state) = call_with_token(
+        app.clone(),
+        Method::PUT,
+        "/v1/state/profile/facts/eval-doc",
+        json!({
+            "state_type": "status",
+            "title": "Eval source",
+            "statement": "Eval source summary",
+            "document": {
+                "content": format!("# Eval\n\n{}", format!("{keyword} ").repeat(80)),
+                "content_type": "text/markdown",
+                "source_uri": "https://example.test/eval"
+            }
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{state}");
+    let source_document_uri = state["item"]["source_refs"][0]["meta"]["source_document_uri"]
+        .as_str()
+        .unwrap();
+
+    let (status, pass_case) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/eval/cases",
+        json!({
+            "owner_user_id": "u1",
+            "question": format!("{keyword} evidence"),
+            "expected_source_document_uris": [source_document_uri]
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pass_case}");
+    let pass_case_id = pass_case["id"].as_str().unwrap();
+
+    let (status, fail_case) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/eval/cases",
+        json!({
+            "owner_user_id": "u1",
+            "question": format!("{keyword} evidence"),
+            "expected_context_uris": ["ctx://missing/evidence"]
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{fail_case}");
+    let fail_case_id = fail_case["id"].as_str().unwrap();
+
+    let (status, run) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/eval/runs",
+        json!({ "case_ids": [pass_case_id, fail_case_id], "created_by": "test" }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{run}");
+    assert_eq!(run["status"], "failed");
+    assert_eq!(run["trace_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(run["result_ids"].as_array().unwrap().len(), 2);
+    let run_id = run["id"].as_str().unwrap();
+
+    let (status, report) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/eval/runs/{run_id}/report"),
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["case_results"].as_array().unwrap().len(), 2);
+    assert!(
+        report["overview"]["case_report_uris"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 2
+    );
+
+    let (status, overview) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/eval/runs/{run_id}/analysis/overview"),
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{overview}");
+    assert!(overview["failure_patterns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cluster| cluster["pattern"] == "retrieval_recall"));
+    assert_eq!(
+        overview["suggested_target_component"],
+        "retrieval.context_search"
+    );
+
+    let (status, case_detail) = call_with_token(
+        app,
+        Method::GET,
+        &format!("/v1/eval/runs/{run_id}/analysis/cases/{fail_case_id}"),
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{case_detail}");
+    assert!(case_detail["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|failure| failure == "retrieval_recall"));
+}
+
+#[tokio::test]
+async fn harness_verdict_keeps_passing_predicted_fix_and_detects_risk_regression() {
+    let app = authed_app();
+    let keyword = format!("verdict-grounding-{}", uuid::Uuid::now_v7());
+    let (status, state) = call_with_token(
+        app.clone(),
+        Method::PUT,
+        "/v1/state/profile/facts/verdict-doc",
+        json!({
+            "state_type": "status",
+            "title": "Verdict source",
+            "statement": "Verdict source summary",
+            "document": {
+                "content": format!("# Verdict\n\n{}", format!("{keyword} ").repeat(80)),
+                "content_type": "text/markdown",
+                "source_uri": "https://example.test/verdict"
+            }
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{state}");
+    let source_document_uri = state["item"]["source_refs"][0]["meta"]["source_document_uri"]
+        .as_str()
+        .unwrap();
+
+    let (status, keep_change) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/harness/evolution/changes",
+        json!({
+            "iteration": 1,
+            "type": "improvement",
+            "component_id": "retrieval.context_search",
+            "files": ["src/store.rs"],
+            "failure_pattern": "retrieval_recall",
+            "root_cause": "top five missed expected source",
+            "targeted_fix": "restore expected source recall",
+            "predicted_fixes": ["retrieval_recall"],
+            "risk_cases": ["source_doc_leak"],
+            "expected_metric_deltas": { "pass_rate": 1.0 },
+            "why_this_component": "retrieval owns recall",
+            "created_by": "test"
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{keep_change}");
+    let keep_change_id = keep_change["id"].as_str().unwrap();
+
+    let (status, pass_case) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/eval/cases",
+        json!({
+            "owner_user_id": "u1",
+            "question": format!("{keyword} evidence"),
+            "expected_source_document_uris": [source_document_uri]
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pass_case}");
+    let pass_case_id = pass_case["id"].as_str().unwrap();
+    let (status, pass_run) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/eval/runs",
+        json!({ "case_ids": [pass_case_id], "change_id": keep_change_id }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pass_run}");
+    assert_eq!(pass_run["status"], "passed", "{pass_run}");
+    let pass_run_id = pass_run["id"].as_str().unwrap();
+    let (status, keep_verdict) = call_with_token(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/admin/harness/evolution/changes/{keep_change_id}/verdict"),
+        json!({ "eval_run_id": pass_run_id }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{keep_verdict}");
+    assert_eq!(keep_verdict["verdict"], "keep");
+
+    let (status, risk_change) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/harness/evolution/changes",
+        json!({
+            "iteration": 2,
+            "type": "improvement",
+            "component_id": "retrieval.context_search",
+            "files": ["src/store.rs"],
+            "failure_pattern": "citation_precision",
+            "root_cause": "risky candidate",
+            "targeted_fix": "alter citation ordering",
+            "predicted_fixes": ["citation_precision"],
+            "risk_cases": ["retrieval_recall"],
+            "expected_metric_deltas": { "citation_precision": 0.1 },
+            "why_this_component": "retrieval owns ranking",
+            "created_by": "test"
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{risk_change}");
+    let risk_change_id = risk_change["id"].as_str().unwrap();
+    let (status, risk_case) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/eval/cases",
+        json!({
+            "owner_user_id": "u1",
+            "question": format!("{keyword} evidence"),
+            "expected_context_uris": ["ctx://missing/risk"]
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{risk_case}");
+    let risk_case_id = risk_case["id"].as_str().unwrap();
+    let (status, risk_run) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/eval/runs",
+        json!({ "case_ids": [risk_case_id], "change_id": risk_change_id }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{risk_run}");
+    assert_eq!(risk_run["status"], "failed");
+    let risk_run_id = risk_run["id"].as_str().unwrap();
+    let (status, risk_verdict) = call_with_token(
+        app,
+        Method::POST,
+        &format!("/v1/admin/harness/evolution/changes/{risk_change_id}/verdict"),
+        json!({ "eval_run_id": risk_run_id }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{risk_verdict}");
+    assert_eq!(risk_verdict["verdict"], "rollback_and_pivot");
+    assert!(risk_verdict["risk_cases_regressed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|risk| risk == "retrieval_recall"));
+}

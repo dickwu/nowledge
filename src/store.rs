@@ -2,6 +2,7 @@ use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
+    time::Instant,
 };
 
 use serde_json::{json, Value};
@@ -56,6 +57,64 @@ struct StoreData {
     traces: HashMap<String, TraceRecord>,
     links: HashMap<String, KnowledgeLink>,
     link_idempotency: HashMap<(String, String), String>,
+    harness_components: HashMap<String, HarnessComponent>,
+    harness_revisions: HashMap<String, Vec<HarnessComponentRevision>>,
+    harness_changes: HashMap<String, HarnessChangeManifest>,
+    harness_verdicts: HashMap<String, HarnessChangeVerdict>,
+    eval_cases: HashMap<String, RagEvalCase>,
+    eval_runs: HashMap<String, RagEvalRun>,
+    eval_case_results: HashMap<String, RagEvalCaseResult>,
+    eval_overviews: HashMap<String, RagEvalOverview>,
+}
+
+impl StoreData {
+    fn seed_harness_components(&mut self, tenant_id: &str) {
+        let created_at = now();
+        for (component_id, display_name, component_kind, description) in
+            default_harness_components()
+        {
+            if self.harness_components.contains_key(component_id) {
+                continue;
+            }
+            let revision_id = bootstrap_harness_revision_id(component_id);
+            self.harness_components.insert(
+                component_id.to_string(),
+                HarnessComponent {
+                    id: component_id.to_string(),
+                    tenant_id: tenant_id.to_string(),
+                    display_name: display_name.to_string(),
+                    component_kind: component_kind.to_string(),
+                    description: description.to_string(),
+                    status: "active".to_string(),
+                    current_revision_id: Some(revision_id.clone()),
+                    created_at,
+                    updated_at: created_at,
+                },
+            );
+            self.harness_revisions.insert(
+                component_id.to_string(),
+                vec![HarnessComponentRevision {
+                    id: revision_id,
+                    tenant_id: tenant_id.to_string(),
+                    component_id: component_id.to_string(),
+                    iteration: 0,
+                    manifest_id: "bootstrap".to_string(),
+                    files: Vec::new(),
+                    content: json!({
+                        "source": "built_in_registry",
+                        "invariants": [
+                            "preserve public API behavior",
+                            "preserve fragment-first retrieval",
+                            "preserve source-document traceback"
+                        ]
+                    }),
+                    status: "active".to_string(),
+                    created_by: "system_bootstrap".to_string(),
+                    created_at,
+                }],
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,8 +133,10 @@ struct DocumentIngestResult {
 
 impl Store {
     pub fn new(config: &Config) -> Self {
+        let mut data = StoreData::default();
+        data.seed_harness_components(&config.tenant_id);
         Self {
-            inner: Arc::new(RwLock::new(StoreData::default())),
+            inner: Arc::new(RwLock::new(data)),
             resolver: EventIndexResolver::new(config.index_hash_secret.clone()),
             repository: repository_from_config(config),
         }
@@ -87,6 +148,582 @@ impl Store {
 
     pub fn backend_name(&self) -> &'static str {
         self.repository.backend_name()
+    }
+
+    pub fn list_harness_components(&self) -> Result<Vec<HarnessComponent>, ApiError> {
+        let data = self.read()?;
+        let mut components = data
+            .harness_components
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        components.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(components)
+    }
+
+    pub fn harness_component_detail(
+        &self,
+        component_id: &str,
+    ) -> Result<HarnessComponentDetail, ApiError> {
+        let data = self.read()?;
+        let component = data
+            .harness_components
+            .get(component_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("harness component not found"))?;
+        let mut revisions = data
+            .harness_revisions
+            .get(component_id)
+            .cloned()
+            .unwrap_or_default();
+        revisions.sort_by_key(|revision| revision.iteration);
+        Ok(HarnessComponentDetail {
+            component,
+            revisions,
+        })
+    }
+
+    pub async fn create_harness_change_async(
+        &self,
+        tenant_id: &str,
+        req: CreateHarnessChangeManifestRequest,
+    ) -> Result<HarnessChangeManifest, ApiError> {
+        let component_id = require_string(req.component_id, "component_id")?;
+        let change_type = require_string(req.change_type, "type")?;
+        if !matches!(change_type.as_str(), "new" | "improvement" | "rollback") {
+            return Err(ApiError::bad_request(
+                "type must be one of new, improvement, rollback",
+            ));
+        }
+        let failure_pattern = require_string(req.failure_pattern, "failure_pattern")?;
+        let root_cause = require_string(req.root_cause, "root_cause")?;
+        let targeted_fix = require_string(req.targeted_fix, "targeted_fix")?;
+        let why_this_component = require_string(req.why_this_component, "why_this_component")?;
+        let created_by = req.created_by.unwrap_or_else(|| "admin".to_string());
+        let change = HarnessChangeManifest {
+            id: req.id.unwrap_or_else(|| new_id("hchange")),
+            tenant_id: tenant_id.to_string(),
+            iteration: req.iteration.unwrap_or(1),
+            change_type,
+            component_id,
+            files: req.files,
+            failure_pattern,
+            root_cause,
+            targeted_fix,
+            predicted_fixes: req.predicted_fixes,
+            risk_cases: req.risk_cases,
+            expected_metric_deltas: req.expected_metric_deltas,
+            why_this_component,
+            created_by,
+            created_at: now(),
+            status: "proposed".to_string(),
+        };
+        {
+            let mut data = self.write()?;
+            if !data.harness_components.contains_key(&change.component_id) {
+                return Err(ApiError::not_found("harness component not found"));
+            }
+            if data.harness_changes.contains_key(&change.id) {
+                return Err(ApiError::conflict("harness change already exists"));
+            }
+            data.harness_changes
+                .insert(change.id.clone(), change.clone());
+        }
+        let _ = self
+            .repository
+            .upsert_harness_changes(std::slice::from_ref(&change))
+            .await?;
+        Ok(change)
+    }
+
+    pub fn list_harness_changes(&self) -> Result<Vec<HarnessChangeManifest>, ApiError> {
+        let data = self.read()?;
+        let mut changes = data.harness_changes.values().cloned().collect::<Vec<_>>();
+        changes.sort_by_key(|change| Reverse(change.created_at));
+        Ok(changes)
+    }
+
+    pub fn harness_change(&self, change_id: &str) -> Result<HarnessChangeManifest, ApiError> {
+        let data = self.read()?;
+        data.harness_changes
+            .get(change_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("harness change not found"))
+    }
+
+    pub async fn create_harness_component_revision_async(
+        &self,
+        tenant_id: &str,
+        component_id: &str,
+        req: CreateHarnessComponentRevisionRequest,
+    ) -> Result<HarnessComponentRevision, ApiError> {
+        let manifest_id = require_string(req.manifest_id, "manifest_id")?;
+        let created_by = req.created_by.unwrap_or_else(|| "admin".to_string());
+        let (component, revisions, change, revision) = {
+            let mut data = self.write()?;
+            if !data.harness_components.contains_key(component_id) {
+                return Err(ApiError::not_found("harness component not found"));
+            }
+            let change = data
+                .harness_changes
+                .get(&manifest_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("harness change manifest not found"))?;
+            if change.component_id != component_id {
+                return Err(ApiError::bad_request(
+                    "manifest component_id does not match revision component_id",
+                ));
+            }
+            let revisions = data
+                .harness_revisions
+                .entry(component_id.to_string())
+                .or_default();
+            let iteration = revisions
+                .iter()
+                .map(|revision| revision.iteration)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            for existing in revisions.iter_mut() {
+                if existing.status == "active" {
+                    existing.status = "superseded".to_string();
+                }
+            }
+            let revision = HarnessComponentRevision {
+                id: new_id("hrev"),
+                tenant_id: tenant_id.to_string(),
+                component_id: component_id.to_string(),
+                iteration,
+                manifest_id: manifest_id.clone(),
+                files: if req.files.is_empty() {
+                    change.files.clone()
+                } else {
+                    req.files
+                },
+                content: req.content,
+                status: "active".to_string(),
+                created_by,
+                created_at: now(),
+            };
+            revisions.push(revision.clone());
+            let revisions = revisions.clone();
+            let component = data
+                .harness_components
+                .get_mut(component_id)
+                .ok_or_else(|| ApiError::not_found("harness component not found"))?;
+            component.current_revision_id = Some(revision.id.clone());
+            component.status = "active".to_string();
+            component.updated_at = now();
+            let component = component.clone();
+            let change = data
+                .harness_changes
+                .get_mut(&manifest_id)
+                .ok_or_else(|| ApiError::not_found("harness change manifest not found"))?;
+            change.status = "applied".to_string();
+            let change = change.clone();
+            (component, revisions, change, revision)
+        };
+        let _ = self
+            .repository
+            .upsert_harness_components(std::slice::from_ref(&component), &revisions)
+            .await?;
+        let _ = self
+            .repository
+            .upsert_harness_changes(std::slice::from_ref(&change))
+            .await?;
+        Ok(revision)
+    }
+
+    pub async fn rollback_harness_component_async(
+        &self,
+        tenant_id: &str,
+        component_id: &str,
+        req: RollbackHarnessComponentRequest,
+    ) -> Result<HarnessRollbackResponse, ApiError> {
+        let created_by = req.created_by.unwrap_or_else(|| "admin".to_string());
+        let (component, revisions, manifest, active_revision) = {
+            let mut data = self.write()?;
+            let component = data
+                .harness_components
+                .get(component_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("harness component not found"))?;
+            let current_revision_id = component.current_revision_id.clone();
+            let revisions = data
+                .harness_revisions
+                .get_mut(component_id)
+                .ok_or_else(|| ApiError::not_found("harness revisions not found"))?;
+            let target_revision_id = req
+                .target_revision_id
+                .clone()
+                .or_else(|| previous_revision_id(revisions, current_revision_id.as_deref()))
+                .ok_or_else(|| ApiError::bad_request("target_revision_id is required"))?;
+            if !revisions
+                .iter()
+                .any(|revision| revision.id == target_revision_id)
+            {
+                return Err(ApiError::not_found("target harness revision not found"));
+            }
+            for revision in revisions.iter_mut() {
+                if revision.id == target_revision_id {
+                    revision.status = "active".to_string();
+                } else if Some(revision.id.as_str()) == current_revision_id.as_deref() {
+                    revision.status = "rolled_back".to_string();
+                } else if revision.status == "active" {
+                    revision.status = "superseded".to_string();
+                }
+            }
+            let active_revision = revisions
+                .iter()
+                .find(|revision| revision.id == target_revision_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("target harness revision not found"))?;
+            let revisions = revisions.clone();
+            let component = data
+                .harness_components
+                .get_mut(component_id)
+                .ok_or_else(|| ApiError::not_found("harness component not found"))?;
+            component.current_revision_id = Some(target_revision_id);
+            component.status = "active".to_string();
+            component.updated_at = now();
+            let component = component.clone();
+            let manifest = if let Some(manifest_id) = req.manifest_id.as_deref() {
+                let manifest = data
+                    .harness_changes
+                    .get_mut(manifest_id)
+                    .ok_or_else(|| ApiError::not_found("harness change manifest not found"))?;
+                manifest.status = "rollback".to_string();
+                Some(manifest.clone())
+            } else {
+                None
+            };
+            (component, revisions, manifest, active_revision)
+        };
+
+        let history = self.append_internal_event(
+            tenant_id,
+            "company",
+            "harness.component.rollback",
+            "harness_component",
+            component_id,
+            req.reason.unwrap_or_else(|| {
+                format!("Harness component {component_id} rolled back by {created_by}")
+            }),
+            json!({
+                "component_id": component_id,
+                "active_revision_id": active_revision.id,
+                "created_by": created_by,
+                "scope": "harness_only"
+            }),
+        )?;
+        let _ = self.persist_history_event_by_id(&history.event.id).await?;
+        let _ = self
+            .repository
+            .upsert_harness_components(std::slice::from_ref(&component), &revisions)
+            .await?;
+        if let Some(manifest) = &manifest {
+            let _ = self
+                .repository
+                .upsert_harness_changes(std::slice::from_ref(manifest))
+                .await?;
+        }
+        Ok(HarnessRollbackResponse {
+            component,
+            active_revision,
+            history_event_id: history.event.id,
+        })
+    }
+
+    pub async fn create_harness_verdict_async(
+        &self,
+        tenant_id: &str,
+        change_id: &str,
+        req: CreateHarnessChangeVerdictRequest,
+    ) -> Result<HarnessChangeVerdict, ApiError> {
+        let created_by = req.created_by.unwrap_or_else(|| "admin".to_string());
+        let (change, run, overview) = {
+            let data = self.read()?;
+            let change = data
+                .harness_changes
+                .get(change_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found("harness change not found"))?;
+            let run = req
+                .eval_run_id
+                .as_deref()
+                .and_then(|run_id| data.eval_runs.get(run_id).cloned())
+                .or_else(|| latest_eval_run_for_change(&data, change_id));
+            let overview = run
+                .as_ref()
+                .and_then(|run| data.eval_overviews.get(&run.id).cloned());
+            (change, run, overview)
+        };
+        let observed_metric_deltas = if req.observed_metric_deltas.is_null() {
+            overview
+                .as_ref()
+                .map(|overview| metrics_to_value(&overview.metrics))
+                .unwrap_or_else(|| json!({}))
+        } else {
+            req.observed_metric_deltas
+        };
+        let evidence_text = verdict_evidence_text(run.as_ref(), overview.as_ref());
+        let risk_cases_regressed = change
+            .risk_cases
+            .iter()
+            .filter(|risk| contains_folded(&evidence_text, risk))
+            .cloned()
+            .collect::<Vec<_>>();
+        let predicted_fixes_confirmed = if run.as_ref().is_some_and(|run| run.status == "passed") {
+            change.predicted_fixes.clone()
+        } else {
+            Vec::new()
+        };
+        let verdict = if !risk_cases_regressed.is_empty() {
+            if predicted_fixes_confirmed.is_empty() {
+                "rollback_and_pivot"
+            } else {
+                "rollback"
+            }
+        } else if run
+            .as_ref()
+            .is_some_and(|run| run.status == "passed" && run.metrics.pass_rate >= 1.0)
+        {
+            "keep"
+        } else {
+            "improve"
+        }
+        .to_string();
+        let verdict_record = HarnessChangeVerdict {
+            id: new_id("hverdict"),
+            tenant_id: tenant_id.to_string(),
+            change_id: change_id.to_string(),
+            eval_run_id: run.as_ref().map(|run| run.id.clone()),
+            verdict,
+            predicted_fixes_confirmed,
+            risk_cases_regressed,
+            observed_metric_deltas,
+            evidence: json!({
+                "change_failure_pattern": change.failure_pattern,
+                "eval_run_status": run.as_ref().map(|run| run.status.clone()),
+                "overview": overview.as_ref().map(|overview| overview.overview_markdown.clone())
+            }),
+            created_by,
+            created_at: now(),
+        };
+        {
+            let mut data = self.write()?;
+            if let Some(change) = data.harness_changes.get_mut(change_id) {
+                change.status = verdict_record.verdict.clone();
+            }
+            data.harness_verdicts
+                .insert(verdict_record.id.clone(), verdict_record.clone());
+        }
+        let _ = self
+            .repository
+            .upsert_harness_verdicts(std::slice::from_ref(&verdict_record))
+            .await?;
+        Ok(verdict_record)
+    }
+
+    pub fn create_eval_case(
+        &self,
+        tenant_id: &str,
+        req: CreateRagEvalCaseRequest,
+    ) -> Result<RagEvalCase, ApiError> {
+        let question = require_string(req.question, "question")?;
+        let case = RagEvalCase {
+            id: req.id.unwrap_or_else(|| new_id("evalcase")),
+            tenant_id: tenant_id.to_string(),
+            owner_user_id: req.owner_user_id,
+            question,
+            expected_context_uris: req.expected_context_uris,
+            expected_source_document_uris: req.expected_source_document_uris,
+            expected_answer_contains: req.expected_answer_contains,
+            tags: req.tags,
+            metadata: req.metadata,
+            created_at: now(),
+        };
+        let mut data = self.write()?;
+        if data.eval_cases.contains_key(&case.id) {
+            return Err(ApiError::conflict("eval case already exists"));
+        }
+        data.eval_cases.insert(case.id.clone(), case.clone());
+        Ok(case)
+    }
+
+    pub fn list_eval_cases(&self) -> Result<Vec<RagEvalCase>, ApiError> {
+        let data = self.read()?;
+        let mut cases = data.eval_cases.values().cloned().collect::<Vec<_>>();
+        cases.sort_by_key(|case| case.created_at);
+        Ok(cases)
+    }
+
+    pub async fn create_eval_run_async(
+        &self,
+        tenant_id: &str,
+        req: CreateRagEvalRunRequest,
+        llm_health_false_ready: bool,
+    ) -> Result<RagEvalRun, ApiError> {
+        let cases = {
+            let data = self.read()?;
+            let mut cases = if req.case_ids.is_empty() {
+                data.eval_cases.values().cloned().collect::<Vec<_>>()
+            } else {
+                req.case_ids
+                    .iter()
+                    .map(|case_id| {
+                        data.eval_cases
+                            .get(case_id)
+                            .cloned()
+                            .ok_or_else(|| ApiError::not_found("eval case not found"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            cases.sort_by_key(|case| case.created_at);
+            cases
+        };
+        if cases.is_empty() {
+            return Err(ApiError::bad_request("at least one eval case is required"));
+        }
+
+        let run_id = new_id("evalrun");
+        let mut results = Vec::new();
+        let mut trace_ids = Vec::new();
+        for case in &cases {
+            let started = Instant::now();
+            let outcome = self
+                .search_context_async(
+                    tenant_id,
+                    ContextSearchRequest {
+                        query: Some(case.question.clone()),
+                        owner_user_id: case.owner_user_id.clone(),
+                        limit: 5,
+                        ..ContextSearchRequest::default()
+                    },
+                )
+                .await?;
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let answer = self.answer_from_context(outcome.clone());
+            trace_ids.push(answer.trace_id.clone());
+            results.push(
+                self.evaluate_case_result(tenant_id, &run_id, case, &outcome, answer, latency_ms)?,
+            );
+        }
+
+        let guard_results =
+            self.regression_guard_results(tenant_id, &results, llm_health_false_ready)?;
+        let mut metrics = aggregate_eval_metrics(&results);
+        metrics.llm_health_false_ready_rate = if llm_health_false_ready { 1.0 } else { 0.0 };
+        metrics.state_history_consistency_rate = if guard_results
+            .iter()
+            .filter(|guard| {
+                guard.name == "state_change_writes_history_event"
+                    || guard.name == "current_state_has_history_evidence"
+            })
+            .all(|guard| guard.passed)
+        {
+            1.0
+        } else {
+            0.0
+        };
+        let guard_failed = guard_results.iter().any(|guard| !guard.passed);
+        let status = if guard_failed || results.iter().any(|result| result.status == "failed") {
+            "failed"
+        } else {
+            "passed"
+        }
+        .to_string();
+        let mut run = RagEvalRun {
+            id: run_id.clone(),
+            tenant_id: tenant_id.to_string(),
+            change_id: req.change_id.clone(),
+            case_ids: cases.iter().map(|case| case.id.clone()).collect(),
+            result_ids: results.iter().map(|result| result.id.clone()).collect(),
+            trace_ids,
+            status: status.clone(),
+            metrics: metrics.clone(),
+            guard_results,
+            overview_source_document_uri: None,
+            report_source_document_uris: Vec::new(),
+            created_by: req.created_by.unwrap_or_else(|| "admin".to_string()),
+            created_at: now(),
+            completed_at: Some(now()),
+        };
+        let mut overview = build_eval_overview(&run, &results);
+        {
+            let mut data = self.write()?;
+            self.write_eval_reports_locked(&mut data, tenant_id, &mut run, &mut overview, &results);
+            for result in &results {
+                data.eval_case_results
+                    .insert(result.id.clone(), result.clone());
+            }
+            data.eval_overviews.insert(run.id.clone(), overview);
+            data.eval_runs.insert(run.id.clone(), run.clone());
+        }
+        let source_documents = self.source_documents_for_scope(tenant_id, None)?;
+        let _ = self
+            .repository
+            .upsert_source_documents(&source_documents)
+            .await?;
+        let company_nodes = self.context_nodes_for_index("rag_company_context")?;
+        let _ = self
+            .repository
+            .upsert_context_nodes("rag_company_context", &company_nodes)
+            .await?;
+        Ok(run)
+    }
+
+    pub fn get_eval_run(&self, run_id: &str) -> Result<RagEvalRun, ApiError> {
+        let data = self.read()?;
+        data.eval_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("eval run not found"))
+    }
+
+    pub fn eval_run_report(&self, run_id: &str) -> Result<Value, ApiError> {
+        let data = self.read()?;
+        let run = data
+            .eval_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("eval run not found"))?;
+        let overview = data
+            .eval_overviews
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("eval overview not found"))?;
+        let results = run
+            .result_ids
+            .iter()
+            .filter_map(|result_id| data.eval_case_results.get(result_id).cloned())
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "run": run,
+            "overview": overview,
+            "case_results": results
+        }))
+    }
+
+    pub fn eval_overview(&self, run_id: &str) -> Result<RagEvalOverview, ApiError> {
+        let data = self.read()?;
+        data.eval_overviews
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("eval overview not found"))
+    }
+
+    pub fn eval_case_result(
+        &self,
+        run_id: &str,
+        case_id: &str,
+    ) -> Result<RagEvalCaseResult, ApiError> {
+        let data = self.read()?;
+        data.eval_case_results
+            .values()
+            .find(|result| result.run_id == run_id && result.case_id == case_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("eval case result not found"))
     }
 
     pub fn usage_snapshot(
@@ -3288,6 +3925,318 @@ impl Store {
         }
     }
 
+    fn evaluate_case_result(
+        &self,
+        tenant_id: &str,
+        run_id: &str,
+        case: &RagEvalCase,
+        outcome: &ContextSearchOutcome,
+        answer: RagAnswerResponse,
+        latency_ms: u64,
+    ) -> Result<RagEvalCaseResult, ApiError> {
+        let retrieved_uris = outcome
+            .response
+            .hits
+            .iter()
+            .take(5)
+            .map(|hit| hit.uri.clone())
+            .collect::<Vec<_>>();
+        let source_doc_leaks = outcome
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.node_kind != "fragment"
+                    || node.retrieval_role != "fragment"
+                    || node.source_document_uri.as_deref() == Some(node.uri.as_str())
+            })
+            .count();
+        let acl_violations = outcome
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.owner_user_id
+                    .as_deref()
+                    .is_some_and(|owner| case.owner_user_id.as_deref() != Some(owner))
+            })
+            .count();
+        let stale_fragments = outcome
+            .nodes
+            .iter()
+            .filter(|node| !retrieval_candidate(node))
+            .count();
+
+        let mut citation_source_document_uris = Vec::new();
+        let mut traceback_failures = 0usize;
+        for hit in &outcome.response.hits {
+            match self.traceback(
+                tenant_id,
+                ContextTracebackRequest {
+                    uri: Some(hit.uri.clone()),
+                    owner_user_id: case.owner_user_id.clone(),
+                },
+                false,
+            ) {
+                Ok(traceback) => citation_source_document_uris.push(traceback.source_document_uri),
+                Err(_) => traceback_failures += 1,
+            }
+        }
+        let mut source_document_uris = citation_source_document_uris.clone();
+        source_document_uris.sort();
+        source_document_uris.dedup();
+
+        let expected_context_matches = case
+            .expected_context_uris
+            .iter()
+            .filter(|uri| retrieved_uris.contains(uri))
+            .count();
+        let expected_source_matches = case
+            .expected_source_document_uris
+            .iter()
+            .filter(|uri| source_document_uris.contains(uri))
+            .count();
+        let expected_total =
+            case.expected_context_uris.len() + case.expected_source_document_uris.len();
+        let retrieval_recall_at_5 = if expected_total == 0 {
+            1.0
+        } else {
+            (expected_context_matches + expected_source_matches) as f64 / expected_total as f64
+        };
+        let citation_precision = if answer.citations.is_empty() {
+            if case.expected_source_document_uris.is_empty() {
+                1.0
+            } else {
+                0.0
+            }
+        } else if case.expected_source_document_uris.is_empty() {
+            if source_doc_leaks == 0 && traceback_failures == 0 {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            let correct = citation_source_document_uris
+                .iter()
+                .filter(|uri| case.expected_source_document_uris.contains(uri))
+                .count();
+            correct as f64 / answer.citations.len().max(1) as f64
+        };
+        let traceback_success_rate = if outcome.response.hits.is_empty() {
+            1.0
+        } else {
+            (outcome
+                .response
+                .hits
+                .len()
+                .saturating_sub(traceback_failures)) as f64
+                / outcome.response.hits.len() as f64
+        };
+
+        let mut failures = Vec::new();
+        if retrieval_recall_at_5 < 1.0 {
+            failures.push("retrieval_recall".to_string());
+        }
+        if citation_precision < 1.0 {
+            failures.push("citation_precision".to_string());
+        }
+        if traceback_failures > 0 {
+            failures.push("traceback_missing".to_string());
+        }
+        if source_doc_leaks > 0 {
+            failures.push("source_doc_leak".to_string());
+        }
+        if acl_violations > 0 {
+            failures.push("acl_violation".to_string());
+        }
+        if stale_fragments > 0 {
+            failures.push("stale_fragment".to_string());
+        }
+        for expected in &case.expected_answer_contains {
+            if !answer.answer.contains(expected) {
+                failures.push("answer_expectation".to_string());
+                break;
+            }
+        }
+        failures.sort();
+        failures.dedup();
+
+        let guard_failures = failures
+            .iter()
+            .filter_map(|failure| guard_name_for_failure(failure).map(ToString::to_string))
+            .collect::<Vec<_>>();
+        let answer_text = answer.answer;
+        let citations = answer.citations;
+        let tokens_per_answer = answer_text.split_whitespace().count() as f64;
+        Ok(RagEvalCaseResult {
+            id: new_id("evalresult"),
+            run_id: run_id.to_string(),
+            case_id: case.id.clone(),
+            owner_user_id: case.owner_user_id.clone(),
+            status: if failures.is_empty() {
+                "passed".to_string()
+            } else {
+                "failed".to_string()
+            },
+            question: case.question.clone(),
+            trace_id: answer.trace_id.clone(),
+            answer: answer_text,
+            citations,
+            retrieved_uris,
+            source_document_uris,
+            failures: failures.clone(),
+            guard_failures,
+            metrics: json!({
+                "retrieval_recall_at_5": retrieval_recall_at_5,
+                "citation_precision": citation_precision,
+                "traceback_success_rate": traceback_success_rate,
+                "source_doc_leak_rate": if source_doc_leaks > 0 { 1.0 } else { 0.0 },
+                "acl_violation_rate": if acl_violations > 0 { 1.0 } else { 0.0 },
+                "stale_fragment_rate": if stale_fragments > 0 { 1.0 } else { 0.0 },
+                "tokens_per_answer": tokens_per_answer
+            }),
+            latency_ms,
+            created_at: now(),
+        })
+    }
+
+    fn regression_guard_results(
+        &self,
+        tenant_id: &str,
+        results: &[RagEvalCaseResult],
+        llm_health_false_ready: bool,
+    ) -> Result<Vec<RegressionGuardResult>, ApiError> {
+        let has_failure = |name: &str| {
+            results
+                .iter()
+                .any(|result| result.guard_failures.iter().any(|failure| failure == name))
+        };
+        let data = self.read()?;
+        let (part_of_ok, part_of_evidence) = part_of_links_guard_locked(&data, tenant_id);
+        let (superseded_ok, superseded_evidence) =
+            superseded_fragments_guard_locked(&data, tenant_id);
+        let (state_history_ok, state_history_evidence) =
+            state_history_guard_locked(&data, tenant_id);
+        Ok(vec![
+            RegressionGuardResult {
+                name: "source_doc_not_default_retrieved".to_string(),
+                passed: !has_failure("source_doc_not_default_retrieved"),
+                evidence: json!({ "failing_cases": guard_case_ids(results, "source_doc_not_default_retrieved") }),
+            },
+            RegressionGuardResult {
+                name: "fragment_traceback_required".to_string(),
+                passed: !has_failure("fragment_traceback_required"),
+                evidence: json!({ "failing_cases": guard_case_ids(results, "fragment_traceback_required") }),
+            },
+            RegressionGuardResult {
+                name: "owner_acl_never_leaks".to_string(),
+                passed: !has_failure("owner_acl_never_leaks"),
+                evidence: json!({ "failing_cases": guard_case_ids(results, "owner_acl_never_leaks") }),
+            },
+            RegressionGuardResult {
+                name: "superseded_fragments_not_active".to_string(),
+                passed: !has_failure("superseded_fragments_not_active") && superseded_ok,
+                evidence: superseded_evidence,
+            },
+            RegressionGuardResult {
+                name: "part_of_links_superseded_on_revision_update".to_string(),
+                passed: part_of_ok,
+                evidence: part_of_evidence,
+            },
+            RegressionGuardResult {
+                name: "llm_health_controls_ready".to_string(),
+                passed: !llm_health_false_ready,
+                evidence: json!({ "llm_health_false_ready": llm_health_false_ready }),
+            },
+            RegressionGuardResult {
+                name: "state_change_writes_history_event".to_string(),
+                passed: state_history_ok,
+                evidence: state_history_evidence.clone(),
+            },
+            RegressionGuardResult {
+                name: "current_state_has_history_evidence".to_string(),
+                passed: state_history_ok,
+                evidence: state_history_evidence,
+            },
+        ])
+    }
+
+    fn write_eval_reports_locked(
+        &self,
+        data: &mut StoreData,
+        tenant_id: &str,
+        run: &mut RagEvalRun,
+        overview: &mut RagEvalOverview,
+        results: &[RagEvalCaseResult],
+    ) {
+        for result in results {
+            let uri = format!(
+                "ctx://harness/eval/{}/cases/{}/report",
+                sanitize_slug(&run.id),
+                sanitize_slug(&result.case_id)
+            );
+            let content = case_result_markdown(result);
+            let checksum = hmac_hex(
+                tenant_id.as_bytes(),
+                "eval-case-report",
+                &format!("{}:{content}", result.id),
+                32,
+            );
+            let now = now();
+            data.source_documents.insert(
+                uri.clone(),
+                SourceDocument {
+                    id: source_document_id(
+                        tenant_id,
+                        result.owner_user_id.as_deref(),
+                        &format!("eval-case:{}", result.id),
+                        &run.id,
+                    ),
+                    tenant_id: tenant_id.to_string(),
+                    owner_user_id: result.owner_user_id.clone(),
+                    source_kind: "eval_case_report".to_string(),
+                    source_id: format!("eval-case:{}", result.id),
+                    revision_id: run.id.clone(),
+                    uri: uri.clone(),
+                    title: format!("Eval case {} report", result.case_id),
+                    content,
+                    checksum,
+                    status: "active".to_string(),
+                    retrieval_enabled: false,
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+            run.report_source_document_uris.push(uri.clone());
+            overview.case_report_uris.push(uri);
+        }
+
+        let overview_uri = format!("ctx://harness/eval/{}/overview", sanitize_slug(&run.id));
+        let checksum = hmac_hex(
+            tenant_id.as_bytes(),
+            "eval-overview-report",
+            &format!("{}:{}", run.id, overview.overview_markdown),
+            32,
+        );
+        let ingest = self.write_source_document_fragments_locked(
+            data,
+            tenant_id,
+            None,
+            "eval_overview_report",
+            &format!("eval-overview:{}", run.id),
+            &run.id,
+            &overview_uri,
+            &format!("Eval overview {}", run.id),
+            &overview.overview_markdown,
+            &checksum,
+            "company",
+            "rag_company_context",
+            None,
+            &[],
+            &[],
+        );
+        overview.overview_source_document_uri = Some(ingest.source_document_uri.clone());
+        run.overview_source_document_uri = Some(ingest.source_document_uri);
+    }
+
     fn context_nodes_for_index(&self, index_uid: &str) -> Result<Vec<ContextNode>, ApiError> {
         let data = self.read()?;
         if index_uid == "rag_company_context" {
@@ -4192,6 +5141,446 @@ impl Store {
     }
 }
 
+fn default_harness_components() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+    vec![
+        (
+            "retrieval.context_search",
+            "Context Search",
+            "retrieval",
+            "Ranks active fragments for default RAG context retrieval.",
+        ),
+        (
+            "retrieval.traceback",
+            "Traceback",
+            "retrieval",
+            "Maps fragments back to source documents and parse artifacts.",
+        ),
+        (
+            "ingestion.fragmenter",
+            "Fragmenter",
+            "ingestion",
+            "Turns parsed documents into retrievable fragment nodes.",
+        ),
+        (
+            "ingestion.parser_adapter",
+            "Parser Adapter",
+            "ingestion",
+            "Normalizes parser output into blocks and artifacts.",
+        ),
+        (
+            "llm.rag_answer_prompt",
+            "RAG Answer Prompt",
+            "llm",
+            "Builds grounded answer prompts over retrieved citations.",
+        ),
+        (
+            "llm.analysis_prompt",
+            "Analysis Prompt",
+            "llm",
+            "Builds grounded analysis prompts for insight generation.",
+        ),
+        (
+            "memory.insight_policy",
+            "Insight Policy",
+            "memory",
+            "Controls insight extraction and update decisions.",
+        ),
+        (
+            "memory.state_materialization_policy",
+            "State Materialization Policy",
+            "memory",
+            "Controls current-state writes and history evidence.",
+        ),
+        (
+            "safety.owner_acl",
+            "Owner ACL",
+            "safety",
+            "Prevents cross-owner private context leakage.",
+        ),
+        (
+            "safety.source_doc_retrieval_guard",
+            "Source Document Retrieval Guard",
+            "safety",
+            "Keeps source documents out of default context retrieval.",
+        ),
+        (
+            "health.llm_probe",
+            "LLM Probe",
+            "health",
+            "Controls LLM health and readiness evidence.",
+        ),
+    ]
+}
+
+fn bootstrap_harness_revision_id(component_id: &str) -> String {
+    format!("hrev_bootstrap_{}", sanitize_slug(component_id))
+}
+
+fn previous_revision_id(
+    revisions: &[HarnessComponentRevision],
+    current_revision_id: Option<&str>,
+) -> Option<String> {
+    revisions
+        .iter()
+        .filter(|revision| Some(revision.id.as_str()) != current_revision_id)
+        .filter(|revision| revision.status != "rolled_back")
+        .max_by_key(|revision| revision.iteration)
+        .map(|revision| revision.id.clone())
+}
+
+fn latest_eval_run_for_change(data: &StoreData, change_id: &str) -> Option<RagEvalRun> {
+    data.eval_runs
+        .values()
+        .filter(|run| run.change_id.as_deref() == Some(change_id))
+        .cloned()
+        .max_by_key(|run| run.created_at)
+}
+
+fn metrics_to_value(metrics: &RagEvalMetrics) -> Value {
+    json!({
+        "pass_rate": metrics.pass_rate,
+        "retrieval_recall_at_5": metrics.retrieval_recall_at_5,
+        "citation_precision": metrics.citation_precision,
+        "traceback_success_rate": metrics.traceback_success_rate,
+        "source_doc_leak_rate": metrics.source_doc_leak_rate,
+        "acl_violation_rate": metrics.acl_violation_rate,
+        "stale_fragment_rate": metrics.stale_fragment_rate,
+        "state_history_consistency_rate": metrics.state_history_consistency_rate,
+        "llm_health_false_ready_rate": metrics.llm_health_false_ready_rate,
+        "tokens_per_answer": metrics.tokens_per_answer,
+        "latency_p95": metrics.latency_p95
+    })
+}
+
+fn verdict_evidence_text(run: Option<&RagEvalRun>, overview: Option<&RagEvalOverview>) -> String {
+    let mut parts = Vec::new();
+    if let Some(run) = run {
+        parts.push(run.status.clone());
+        for guard in &run.guard_results {
+            if !guard.passed {
+                parts.push(guard.name.clone());
+            }
+        }
+    }
+    if let Some(overview) = overview {
+        for cluster in &overview.failure_patterns {
+            parts.push(cluster.pattern.clone());
+            parts.extend(cluster.root_cause_notes.clone());
+        }
+    }
+    parts.join("\n").to_lowercase()
+}
+
+fn contains_folded(haystack: &str, needle: &str) -> bool {
+    !needle.trim().is_empty() && haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+fn aggregate_eval_metrics(results: &[RagEvalCaseResult]) -> RagEvalMetrics {
+    if results.is_empty() {
+        return RagEvalMetrics::default();
+    }
+    let total = results.len() as f64;
+    RagEvalMetrics {
+        pass_rate: results
+            .iter()
+            .filter(|result| result.status == "passed")
+            .count() as f64
+            / total,
+        retrieval_recall_at_5: average_result_metric(results, "retrieval_recall_at_5"),
+        citation_precision: average_result_metric(results, "citation_precision"),
+        traceback_success_rate: average_result_metric(results, "traceback_success_rate"),
+        source_doc_leak_rate: average_result_metric(results, "source_doc_leak_rate"),
+        acl_violation_rate: average_result_metric(results, "acl_violation_rate"),
+        stale_fragment_rate: average_result_metric(results, "stale_fragment_rate"),
+        state_history_consistency_rate: 1.0,
+        llm_health_false_ready_rate: 0.0,
+        tokens_per_answer: average_result_metric(results, "tokens_per_answer"),
+        latency_p95: latency_p95(results) as f64,
+    }
+}
+
+fn average_result_metric(results: &[RagEvalCaseResult], key: &str) -> f64 {
+    results
+        .iter()
+        .map(|result| {
+            result
+                .metrics
+                .get(key)
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+        })
+        .sum::<f64>()
+        / results.len().max(1) as f64
+}
+
+fn latency_p95(results: &[RagEvalCaseResult]) -> u64 {
+    if results.is_empty() {
+        return 0;
+    }
+    let mut latencies = results
+        .iter()
+        .map(|result| result.latency_ms)
+        .collect::<Vec<_>>();
+    latencies.sort_unstable();
+    let index = ((latencies.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+    latencies[index.min(latencies.len() - 1)]
+}
+
+fn build_eval_overview(run: &RagEvalRun, results: &[RagEvalCaseResult]) -> RagEvalOverview {
+    let failure_patterns = failure_pattern_clusters(results);
+    let suggested_target_component = failure_patterns
+        .first()
+        .map(|cluster| cluster.suggested_target_component.clone())
+        .unwrap_or_else(|| "retrieval.context_search".to_string());
+    let root_cause_notes = failure_patterns
+        .iter()
+        .flat_map(|cluster| cluster.root_cause_notes.clone())
+        .collect::<Vec<_>>();
+    let mut markdown = String::new();
+    markdown.push_str(&format!("# RAG Eval Overview {}\n\n", run.id));
+    markdown.push_str(&format!("status: {}\n\n", run.status));
+    markdown.push_str("## Metrics\n");
+    for (name, value) in [
+        ("pass_rate", run.metrics.pass_rate),
+        ("retrieval_recall_at_5", run.metrics.retrieval_recall_at_5),
+        ("citation_precision", run.metrics.citation_precision),
+        ("traceback_success_rate", run.metrics.traceback_success_rate),
+        ("source_doc_leak_rate", run.metrics.source_doc_leak_rate),
+        ("acl_violation_rate", run.metrics.acl_violation_rate),
+        ("stale_fragment_rate", run.metrics.stale_fragment_rate),
+        (
+            "state_history_consistency_rate",
+            run.metrics.state_history_consistency_rate,
+        ),
+        (
+            "llm_health_false_ready_rate",
+            run.metrics.llm_health_false_ready_rate,
+        ),
+        ("tokens_per_answer", run.metrics.tokens_per_answer),
+        ("latency_p95", run.metrics.latency_p95),
+    ] {
+        markdown.push_str(&format!("- {name}: {value:.3}\n"));
+    }
+    markdown.push_str("\n## Failure Patterns\n");
+    if failure_patterns.is_empty() {
+        markdown.push_str("- none\n");
+    } else {
+        for cluster in &failure_patterns {
+            markdown.push_str(&format!(
+                "- {}: {} case(s), target {}\n",
+                cluster.pattern, cluster.count, cluster.suggested_target_component
+            ));
+        }
+    }
+    markdown.push_str(&format!(
+        "\n## Suggested Target Component\n{}\n",
+        suggested_target_component
+    ));
+    RagEvalOverview {
+        run_id: run.id.clone(),
+        status: run.status.clone(),
+        metrics: run.metrics.clone(),
+        failure_patterns,
+        suggested_target_component,
+        root_cause_notes,
+        overview_markdown: markdown,
+        case_report_uris: Vec::new(),
+        overview_source_document_uri: None,
+        generated_at: now(),
+    }
+}
+
+fn failure_pattern_clusters(results: &[RagEvalCaseResult]) -> Vec<FailurePatternCluster> {
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    for result in results {
+        for failure in &result.failures {
+            grouped
+                .entry(failure.clone())
+                .or_default()
+                .push(result.case_id.clone());
+        }
+    }
+    let mut clusters = grouped
+        .into_iter()
+        .map(|(pattern, case_ids)| FailurePatternCluster {
+            suggested_target_component: suggested_component_for_failure(&pattern).to_string(),
+            root_cause_notes: vec![root_cause_note_for_failure(&pattern).to_string()],
+            count: case_ids.len(),
+            case_ids,
+            pattern,
+        })
+        .collect::<Vec<_>>();
+    clusters.sort_by_key(|cluster| Reverse(cluster.count));
+    clusters
+}
+
+fn suggested_component_for_failure(failure: &str) -> &'static str {
+    match failure {
+        "traceback_missing" => "retrieval.traceback",
+        "source_doc_leak" => "safety.source_doc_retrieval_guard",
+        "acl_violation" => "safety.owner_acl",
+        "stale_fragment" => "ingestion.fragmenter",
+        "answer_expectation" => "llm.rag_answer_prompt",
+        "citation_precision" => "retrieval.traceback",
+        _ => "retrieval.context_search",
+    }
+}
+
+fn root_cause_note_for_failure(failure: &str) -> &'static str {
+    match failure {
+        "traceback_missing" => "A retrieved fragment did not resolve to source-document evidence.",
+        "source_doc_leak" => "Default retrieval included a non-fragment or source-document node.",
+        "acl_violation" => "A private node crossed the requested owner boundary.",
+        "stale_fragment" => {
+            "A retrieved fragment was inactive, superseded, or not retrieval-enabled."
+        }
+        "answer_expectation" => "The grounded answer did not contain expected answer evidence.",
+        "citation_precision" => "Retrieved citations did not align with expected source documents.",
+        _ => "Expected evidence was not present in the top retrieved fragments.",
+    }
+}
+
+fn guard_name_for_failure(failure: &str) -> Option<&'static str> {
+    match failure {
+        "source_doc_leak" => Some("source_doc_not_default_retrieved"),
+        "traceback_missing" => Some("fragment_traceback_required"),
+        "acl_violation" => Some("owner_acl_never_leaks"),
+        "stale_fragment" => Some("superseded_fragments_not_active"),
+        _ => None,
+    }
+}
+
+fn guard_case_ids(results: &[RagEvalCaseResult], guard_name: &str) -> Vec<String> {
+    results
+        .iter()
+        .filter(|result| {
+            result
+                .guard_failures
+                .iter()
+                .any(|failure| failure == guard_name)
+        })
+        .map(|result| result.case_id.clone())
+        .collect()
+}
+
+fn part_of_links_guard_locked(data: &StoreData, tenant_id: &str) -> (bool, Value) {
+    let nodes = all_context_nodes_for_guard(data);
+    let mut missing_links = Vec::new();
+    let mut stale_links = Vec::new();
+    for node in nodes
+        .iter()
+        .filter(|node| node.tenant_id == tenant_id && node.node_kind == "fragment")
+        .filter(|node| node.source_document_uri.is_some())
+        .filter(|node| node.status == "active")
+    {
+        let has_active_link = data.links.values().any(|link| {
+            link.tenant_id == tenant_id
+                && link.status == "active"
+                && link.relation == "part_of"
+                && link.source_uri == node.uri
+        });
+        if !has_active_link {
+            missing_links.push(node.uri.clone());
+        }
+    }
+    for link in data.links.values().filter(|link| {
+        link.tenant_id == tenant_id && link.status == "active" && link.relation == "part_of"
+    }) {
+        if data
+            .source_documents
+            .get(&link.target_uri)
+            .is_some_and(|document| document.status != "active")
+        {
+            stale_links.push(link.id.clone());
+        }
+    }
+    (
+        missing_links.is_empty() && stale_links.is_empty(),
+        json!({ "missing_links": missing_links, "stale_links": stale_links }),
+    )
+}
+
+fn superseded_fragments_guard_locked(data: &StoreData, tenant_id: &str) -> (bool, Value) {
+    let nodes = all_context_nodes_for_guard(data);
+    let mut unsafe_fragments = Vec::new();
+    for node in nodes
+        .iter()
+        .filter(|node| node.tenant_id == tenant_id && node.node_kind == "fragment")
+        .filter(|node| node.source_document_uri.is_some())
+    {
+        let source_superseded = node
+            .source_document_uri
+            .as_ref()
+            .and_then(|uri| data.source_documents.get(uri))
+            .is_some_and(|document| document.status != "active");
+        if (node.status == "superseded" && node.retrieval_enabled)
+            || (node.status == "active" && source_superseded)
+        {
+            unsafe_fragments.push(node.uri.clone());
+        }
+    }
+    (
+        unsafe_fragments.is_empty(),
+        json!({ "unsafe_fragments": unsafe_fragments }),
+    )
+}
+
+fn state_history_guard_locked(data: &StoreData, tenant_id: &str) -> (bool, Value) {
+    let mut missing_state_items = Vec::new();
+    for item in data
+        .state_items
+        .values()
+        .filter(|item| item.tenant_id == tenant_id && item.status == "active")
+    {
+        let has_history = data.event_by_id.values().any(|event| {
+            event.tenant_id == tenant_id
+                && event.owner_user_id == item.owner_user_id
+                && event.entity_type == "state_item"
+                && event.entity_id == item.id
+                && matches!(event.event_type.as_str(), "state.changed" | "state.patched")
+        });
+        if !has_history {
+            missing_state_items.push(item.id.clone());
+        }
+    }
+    (
+        missing_state_items.is_empty(),
+        json!({ "missing_state_items": missing_state_items }),
+    )
+}
+
+fn all_context_nodes_for_guard(data: &StoreData) -> Vec<&ContextNode> {
+    let mut nodes = data.company_context.iter().collect::<Vec<_>>();
+    for personal in data.personal_context.values() {
+        nodes.extend(personal.iter());
+    }
+    nodes
+}
+
+fn case_result_markdown(result: &RagEvalCaseResult) -> String {
+    format!(
+        "# Eval Case {}\n\nstatus: {}\n\ntrace_id: {}\n\n## Retrieved URIs\n{}\n\n## Source Documents\n{}\n\n## Failures\n{}\n",
+        result.case_id,
+        result.status,
+        result.trace_id,
+        markdown_list(&result.retrieved_uris),
+        markdown_list(&result.source_document_uris),
+        markdown_list(&result.failures),
+    )
+}
+
+fn markdown_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "- none".to_string()
+    } else {
+        values
+            .iter()
+            .map(|value| format!("- {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 fn upsert_context_nodes(target: &mut Vec<ContextNode>, nodes: Vec<ContextNode>) {
     for node in nodes {
         if let Some(existing) = target.iter_mut().find(|existing| existing.uri == node.uri) {
@@ -4767,4 +6156,142 @@ fn simple_slope(values: &[f64]) -> f64 {
         return 0.0;
     }
     (values[values.len() - 1] - values[0]) / (values.len() - 1) as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[tokio::test]
+    async fn source_doc_leak_guard_fails_when_source_doc_is_retrieved() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant_id = config.tenant_id.as_str();
+        let uri = "ctx://test/source/leaky";
+        let mut node = store.context_node(
+            uri,
+            "Leaky source doc",
+            2,
+            "source-doc-leak-keyword",
+            "company",
+            "rag_company_context",
+            tenant_id,
+            None,
+            Some("leaky-source".to_string()),
+            Some("v1".to_string()),
+        );
+        node.node_kind = "source_doc".to_string();
+        node.retrieval_role = "fragment".to_string();
+        node.retrieval_enabled = true;
+        node.source_document_uri = Some(uri.to_string());
+        {
+            let mut data = store.write().unwrap();
+            data.company_context.push(node);
+            data.source_documents.insert(
+                uri.to_string(),
+                SourceDocument {
+                    id: "source-doc-leak-fixture".to_string(),
+                    tenant_id: tenant_id.to_string(),
+                    owner_user_id: None,
+                    source_kind: "test".to_string(),
+                    source_id: "leaky-source".to_string(),
+                    revision_id: "v1".to_string(),
+                    uri: uri.to_string(),
+                    title: "Leaky source doc".to_string(),
+                    content: "source-doc-leak-keyword".to_string(),
+                    checksum: "checksum".to_string(),
+                    status: "active".to_string(),
+                    retrieval_enabled: false,
+                    created_at: now(),
+                    updated_at: now(),
+                },
+            );
+        }
+        let case = store
+            .create_eval_case(
+                tenant_id,
+                CreateRagEvalCaseRequest {
+                    question: Some("source-doc-leak-keyword".to_string()),
+                    ..CreateRagEvalCaseRequest::default()
+                },
+            )
+            .unwrap();
+        let run = store
+            .create_eval_run_async(
+                tenant_id,
+                CreateRagEvalRunRequest {
+                    case_ids: vec![case.id],
+                    ..CreateRagEvalRunRequest::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run
+            .guard_results
+            .iter()
+            .any(|guard| { guard.name == "source_doc_not_default_retrieved" && !guard.passed }));
+    }
+
+    #[tokio::test]
+    async fn owner_acl_guard_fails_on_cross_owner_retrieval_and_blocks_run() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant_id = config.tenant_id.as_str();
+        let routing = store
+            .ensure_user_index(tenant_id, "u1", EnsureUserEventIndexRequest::default())
+            .unwrap()
+            .routing;
+        let mut node = store.context_node(
+            "ctx://test/private/cross-owner/fragments/0001",
+            "Cross owner fragment",
+            2,
+            "cross-owner-leak-keyword",
+            "personal",
+            &routing.personal_context_index_uid,
+            tenant_id,
+            Some("u2".to_string()),
+            Some("cross-owner-source".to_string()),
+            Some("v1".to_string()),
+        );
+        node.node_kind = "fragment".to_string();
+        node.retrieval_role = "fragment".to_string();
+        node.retrieval_enabled = true;
+        node.source_document_uri = Some("ctx://test/private/cross-owner/source".to_string());
+        {
+            let mut data = store.write().unwrap();
+            data.personal_context
+                .entry(routing.personal_context_index_uid)
+                .or_default()
+                .push(node);
+        }
+        let case = store
+            .create_eval_case(
+                tenant_id,
+                CreateRagEvalCaseRequest {
+                    owner_user_id: Some("u1".to_string()),
+                    question: Some("cross-owner-leak-keyword".to_string()),
+                    ..CreateRagEvalCaseRequest::default()
+                },
+            )
+            .unwrap();
+        let run = store
+            .create_eval_run_async(
+                tenant_id,
+                CreateRagEvalRunRequest {
+                    case_ids: vec![case.id],
+                    ..CreateRagEvalRunRequest::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.status, "failed");
+        assert!(run
+            .guard_results
+            .iter()
+            .any(|guard| guard.name == "owner_acl_never_leaks" && !guard.passed));
+    }
 }

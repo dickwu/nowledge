@@ -71,6 +71,31 @@ pub fn build_router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/v1/usage", get(usage))
         .route("/v1/admin/bootstrap", post(bootstrap))
+        .route("/v1/admin/harness/components", get(list_harness_components))
+        .route(
+            "/v1/admin/harness/components/{component_id}",
+            get(get_harness_component),
+        )
+        .route(
+            "/v1/admin/harness/components/{component_id}/revisions",
+            post(create_harness_component_revision),
+        )
+        .route(
+            "/v1/admin/harness/components/{component_id}/rollback",
+            post(rollback_harness_component),
+        )
+        .route(
+            "/v1/admin/harness/evolution/changes",
+            post(create_harness_change).get(list_harness_changes),
+        )
+        .route(
+            "/v1/admin/harness/evolution/changes/{change_id}",
+            get(get_harness_change),
+        )
+        .route(
+            "/v1/admin/harness/evolution/changes/{change_id}/verdict",
+            post(create_harness_verdict),
+        )
         .route(
             "/v1/state/profile/facts/{fact_key}",
             put(upsert_state_fact)
@@ -178,6 +203,21 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/rag/answer", post(rag_answer))
         .route("/v1/rag/stream", post(rag_stream))
         .route("/v1/rag/debug", post(rag_debug))
+        .route(
+            "/v1/eval/cases",
+            post(create_eval_case).get(list_eval_cases),
+        )
+        .route("/v1/eval/runs", post(create_eval_run))
+        .route("/v1/eval/runs/{run_id}", get(get_eval_run))
+        .route("/v1/eval/runs/{run_id}/report", get(get_eval_run_report))
+        .route(
+            "/v1/eval/runs/{run_id}/analysis/overview",
+            get(get_eval_overview),
+        )
+        .route(
+            "/v1/eval/runs/{run_id}/analysis/cases/{case_id}",
+            get(get_eval_case_analysis),
+        )
         .route("/v1/sessions", post(create_session))
         .route(
             "/v1/sessions/{session_id}/messages",
@@ -256,6 +296,27 @@ async fn operational_health(state: AppState) -> impl IntoResponse {
         },
         Json(body),
     )
+}
+
+async fn llm_health_false_ready(state: &AppState) -> bool {
+    let config = state.effective_config();
+    let meili = state.meili.health_status().await;
+    let llm = state.llm_health.check(&config).await;
+    let parser = parser_health_status(&config).await;
+    let meili_healthy = meili
+        .get("healthy")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let llm_unhealthy = llm.status == "unhealthy"
+        || llm.quota_state == "exhausted"
+        || (!llm.auth_valid && config.health_require_llm);
+    let parser_unhealthy = config.parser_provider == "mineru"
+        && !parser
+            .get("healthy")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let ready = meili_healthy && !llm_unhealthy && !parser_unhealthy;
+    llm_unhealthy && ready
 }
 
 fn llm_health_json(llm: &LlmHealthProbeResult) -> Value {
@@ -380,6 +441,91 @@ async fn bootstrap(
         "tasks": result.tasks,
         "dry_run": result.dry_run
     })))
+}
+
+async fn list_harness_components(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<HarnessComponent>>, ApiError> {
+    Ok(Json(state.store.list_harness_components()?))
+}
+
+async fn get_harness_component(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Path(component_id): Path<String>,
+) -> Result<Json<HarnessComponentDetail>, ApiError> {
+    Ok(Json(state.store.harness_component_detail(&component_id)?))
+}
+
+async fn create_harness_component_revision(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Path(component_id): Path<String>,
+    Json(req): Json<CreateHarnessComponentRevisionRequest>,
+) -> Result<Json<HarnessComponentRevision>, ApiError> {
+    Ok(Json(
+        state
+            .store
+            .create_harness_component_revision_async(state.tenant_id(), &component_id, req)
+            .await?,
+    ))
+}
+
+async fn rollback_harness_component(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Path(component_id): Path<String>,
+    Json(req): Json<RollbackHarnessComponentRequest>,
+) -> Result<Json<HarnessRollbackResponse>, ApiError> {
+    Ok(Json(
+        state
+            .store
+            .rollback_harness_component_async(state.tenant_id(), &component_id, req)
+            .await?,
+    ))
+}
+
+async fn create_harness_change(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Json(req): Json<CreateHarnessChangeManifestRequest>,
+) -> Result<Json<HarnessChangeManifest>, ApiError> {
+    Ok(Json(
+        state
+            .store
+            .create_harness_change_async(state.tenant_id(), req)
+            .await?,
+    ))
+}
+
+async fn list_harness_changes(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<HarnessChangeManifest>>, ApiError> {
+    Ok(Json(state.store.list_harness_changes()?))
+}
+
+async fn get_harness_change(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Path(change_id): Path<String>,
+) -> Result<Json<HarnessChangeManifest>, ApiError> {
+    Ok(Json(state.store.harness_change(&change_id)?))
+}
+
+async fn create_harness_verdict(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Path(change_id): Path<String>,
+    Json(req): Json<CreateHarnessChangeVerdictRequest>,
+) -> Result<Json<HarnessChangeVerdict>, ApiError> {
+    Ok(Json(
+        state
+            .store
+            .create_harness_verdict_async(state.tenant_id(), &change_id, req)
+            .await?,
+    ))
 }
 
 async fn ensure_user_event_index(
@@ -1085,6 +1231,67 @@ async fn rag_debug(
         "trace": trace,
         "prompt": build_prompt(&req.question.unwrap_or_default(), &answer.citations)
     })))
+}
+
+async fn create_eval_case(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Json(req): Json<CreateRagEvalCaseRequest>,
+) -> Result<Json<RagEvalCase>, ApiError> {
+    Ok(Json(state.store.create_eval_case(state.tenant_id(), req)?))
+}
+
+async fn list_eval_cases(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<RagEvalCase>>, ApiError> {
+    Ok(Json(state.store.list_eval_cases()?))
+}
+
+async fn create_eval_run(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Json(req): Json<CreateRagEvalRunRequest>,
+) -> Result<Json<RagEvalRun>, ApiError> {
+    let llm_false_ready = llm_health_false_ready(&state).await;
+    Ok(Json(
+        state
+            .store
+            .create_eval_run_async(state.tenant_id(), req, llm_false_ready)
+            .await?,
+    ))
+}
+
+async fn get_eval_run(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<RagEvalRun>, ApiError> {
+    Ok(Json(state.store.get_eval_run(&run_id)?))
+}
+
+async fn get_eval_run_report(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.store.eval_run_report(&run_id)?))
+}
+
+async fn get_eval_overview(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<RagEvalOverview>, ApiError> {
+    Ok(Json(state.store.eval_overview(&run_id)?))
+}
+
+async fn get_eval_case_analysis(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Path((run_id, case_id)): Path<(String, String)>,
+) -> Result<Json<RagEvalCaseResult>, ApiError> {
+    Ok(Json(state.store.eval_case_result(&run_id, &case_id)?))
 }
 
 async fn create_session(

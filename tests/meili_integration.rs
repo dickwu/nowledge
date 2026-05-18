@@ -253,3 +253,67 @@ async fn meili_backend_context_search_retrieves_fragments_only() {
             && hit["uri"].as_str() != Some(source_document_uri)
     }));
 }
+
+#[tokio::test]
+async fn meili_bootstrap_creates_harness_indexes_and_indexes_changes() {
+    let Some(app) = meili_app() else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+
+    let (status, bootstrap) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/bootstrap",
+        json!({ "reset": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bootstrap}");
+    let indexes = bootstrap["indexes"].as_array().unwrap();
+    for uid in [
+        "rag_harness_components",
+        "rag_harness_changes",
+        "rag_harness_verdicts",
+    ] {
+        assert!(indexes.iter().any(|index| index.as_str() == Some(uid)));
+    }
+
+    let (status, change) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/harness/evolution/changes",
+        json!({
+            "iteration": 1,
+            "type": "improvement",
+            "component_id": "retrieval.context_search",
+            "files": ["src/store.rs"],
+            "failure_pattern": "meili_harness_change_pattern",
+            "root_cause": "test",
+            "targeted_fix": "test",
+            "predicted_fixes": ["meili_harness_change_pattern"],
+            "risk_cases": [],
+            "expected_metric_deltas": { "pass_rate": 1.0 },
+            "why_this_component": "test",
+            "created_by": "test"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{change}");
+
+    let (status, search) = call(
+        app,
+        Method::POST,
+        "/v1/debug/meili/search",
+        json!({
+            "index_uid": "rag_harness_changes",
+            "query": "meili_harness_change_pattern"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert!(search["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|hit| { hit["id"].as_str() == change["id"].as_str() }));
+}

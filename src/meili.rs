@@ -26,6 +26,9 @@ pub const FIXED_INDEXES: &[&str] = &[
     "rag_memory_diffs",
     "rag_feedback",
     "rag_traces",
+    "rag_harness_components",
+    "rag_harness_changes",
+    "rag_harness_verdicts",
 ];
 
 const MEILI_TASK_WAIT_ATTEMPTS: usize = 600;
@@ -464,6 +467,24 @@ pub fn settings_for(uid: &str) -> Value {
             "searchableAttributes": ["source_uri", "target_uri", "source_title", "target_title", "relation", "rationale", "evidence_text", "tags"],
             "filterableAttributes": ["id", "tenant_id", "owner_user_id", "source_uri", "target_uri", "relation", "status", "created_by"],
             "sortableAttributes": ["created_at", "updated_at"]
+        })
+    } else if uid == "rag_harness_components" {
+        json!({
+            "searchableAttributes": ["id", "display_name", "description", "component_id", "manifest_id", "files", "created_by"],
+            "filterableAttributes": ["id", "tenant_id", "doc_kind", "component_id", "status", "component_kind", "manifest_id", "created_by"],
+            "sortableAttributes": ["created_at", "updated_at", "iteration"]
+        })
+    } else if uid == "rag_harness_changes" {
+        json!({
+            "searchableAttributes": ["id", "component_id", "failure_pattern", "root_cause", "targeted_fix", "predicted_fixes", "risk_cases", "why_this_component", "created_by"],
+            "filterableAttributes": ["id", "tenant_id", "component_id", "type", "status", "created_by"],
+            "sortableAttributes": ["created_at", "iteration"]
+        })
+    } else if uid == "rag_harness_verdicts" {
+        json!({
+            "searchableAttributes": ["id", "change_id", "verdict", "predicted_fixes_confirmed", "risk_cases_regressed", "created_by"],
+            "filterableAttributes": ["id", "tenant_id", "change_id", "eval_run_id", "verdict", "created_by"],
+            "sortableAttributes": ["created_at"]
         })
     } else {
         json!({

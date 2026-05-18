@@ -71,6 +71,22 @@ pub trait KnowledgeRepository: Send + Sync {
 
     async fn upsert_links(&self, links: &[KnowledgeLink]) -> Result<Option<String>, ApiError>;
 
+    async fn upsert_harness_components(
+        &self,
+        components: &[HarnessComponent],
+        revisions: &[HarnessComponentRevision],
+    ) -> Result<Option<String>, ApiError>;
+
+    async fn upsert_harness_changes(
+        &self,
+        changes: &[HarnessChangeManifest],
+    ) -> Result<Option<String>, ApiError>;
+
+    async fn upsert_harness_verdicts(
+        &self,
+        verdicts: &[HarnessChangeVerdict],
+    ) -> Result<Option<String>, ApiError>;
+
     async fn search_user_events(
         &self,
         routing: &EventIndexRouting,
@@ -202,6 +218,28 @@ impl KnowledgeRepository for MemoryRepository {
     }
 
     async fn upsert_links(&self, _links: &[KnowledgeLink]) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_harness_components(
+        &self,
+        _components: &[HarnessComponent],
+        _revisions: &[HarnessComponentRevision],
+    ) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_harness_changes(
+        &self,
+        _changes: &[HarnessChangeManifest],
+    ) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_harness_verdicts(
+        &self,
+        _verdicts: &[HarnessChangeVerdict],
+    ) -> Result<Option<String>, ApiError> {
         Ok(None)
     }
 
@@ -456,6 +494,47 @@ impl KnowledgeRepository for MeiliRepository {
             .map(|link| to_document(link, &link.id))
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values("rag_links", &documents).await
+    }
+
+    async fn upsert_harness_components(
+        &self,
+        components: &[HarnessComponent],
+        revisions: &[HarnessComponentRevision],
+    ) -> Result<Option<String>, ApiError> {
+        let mut documents = components
+            .iter()
+            .map(|component| to_document_with_kind(component, &component.id, "component"))
+            .collect::<Result<Vec<_>, _>>()?;
+        documents.extend(
+            revisions
+                .iter()
+                .map(|revision| to_document_with_kind(revision, &revision.id, "revision"))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        self.upsert_values("rag_harness_components", &documents)
+            .await
+    }
+
+    async fn upsert_harness_changes(
+        &self,
+        changes: &[HarnessChangeManifest],
+    ) -> Result<Option<String>, ApiError> {
+        let documents = changes
+            .iter()
+            .map(|change| to_document(change, &change.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.upsert_values("rag_harness_changes", &documents).await
+    }
+
+    async fn upsert_harness_verdicts(
+        &self,
+        verdicts: &[HarnessChangeVerdict],
+    ) -> Result<Option<String>, ApiError> {
+        let documents = verdicts
+            .iter()
+            .map(|verdict| to_document(verdict, &verdict.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.upsert_values("rag_harness_verdicts", &documents).await
     }
 
     async fn search_user_events(
@@ -787,6 +866,18 @@ fn to_document<T: Serialize + ?Sized>(value: &T, id: &str) -> Result<Value, ApiE
         };
     document.insert("id".to_string(), Value::String(id.to_string()));
     Ok(Value::Object(document))
+}
+
+fn to_document_with_kind<T: Serialize + ?Sized>(
+    value: &T,
+    id: &str,
+    doc_kind: &str,
+) -> Result<Value, ApiError> {
+    let mut document = to_document(value, id)?;
+    if let Value::Object(map) = &mut document {
+        map.insert("doc_kind".to_string(), Value::String(doc_kind.to_string()));
+    }
+    Ok(document)
 }
 
 fn context_document_id(uri: &str) -> String {
