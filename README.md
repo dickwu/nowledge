@@ -50,6 +50,13 @@ RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true
 RAG_MEILI_URL=http://127.0.0.1:7700
 RAG_MEILI_API_KEY=optional-meili-key
 RAG_MEILI_WAIT_FOR_TASKS=false
+RAG_PARSER_PROVIDER=builtin
+RAG_MINERU_API_URL=http://127.0.0.1:8000
+RAG_MINERU_BACKEND=hybrid-auto-engine
+RAG_MINERU_RETURN_MD=true
+RAG_MINERU_RETURN_CONTENT_LIST=true
+RAG_MINERU_RETURN_MIDDLE_JSON=true
+RAG_MINERU_RETURN_IMAGES=true
 RAG_LLM_PROVIDER=none
 RAG_LLM_MODEL=none
 RAG_ANALYSIS_LLM_PROVIDER=none
@@ -81,6 +88,14 @@ Health endpoints split process liveness from operational readiness:
 - `GET /readyz` uses the same readiness decision as `/healthz`.
 - `GET /v1/usage` returns owner-scoped provider snapshots for ordinary users and
   global provider snapshots for admins.
+
+Document parser ingestion is an additive layer in front of the existing RAG
+backend. Use `RAG_PARSER_PROVIDER=builtin` for plain text fallback or
+`RAG_PARSER_PROVIDER=mineru` to call a remote `mineru-api` service. Ingestion
+APIs are `POST /v1/ingest/tasks`, `GET /v1/ingest/tasks/{task_id}`,
+`GET /v1/ingest/tasks/{task_id}/result`, and `POST /v1/ingest/files:sync`.
+Parsed blocks become retrieval fragments; source documents and parse artifacts
+are stored for traceback/read flows but are not searched by default.
 
 Link and analysis surfaces:
 

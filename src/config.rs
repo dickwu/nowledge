@@ -13,6 +13,13 @@ pub struct Config {
     pub meili_url: Option<String>,
     pub meili_api_key: Option<String>,
     pub meili_wait_for_tasks: bool,
+    pub parser_provider: String,
+    pub mineru_api_url: String,
+    pub mineru_backend: String,
+    pub mineru_return_md: bool,
+    pub mineru_return_content_list: bool,
+    pub mineru_return_middle_json: bool,
+    pub mineru_return_images: bool,
     pub llm_provider: String,
     pub llm_model: Option<String>,
     pub analysis_llm_provider: String,
@@ -69,6 +76,24 @@ impl Config {
             meili_wait_for_tasks: std::env::var("RAG_MEILI_WAIT_FOR_TASKS")
                 .map(|v| truthy(&v))
                 .unwrap_or(false),
+            parser_provider: std::env::var("RAG_PARSER_PROVIDER")
+                .unwrap_or_else(|_| "builtin".to_string()),
+            mineru_api_url: std::env::var("RAG_MINERU_API_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string()),
+            mineru_backend: std::env::var("RAG_MINERU_BACKEND")
+                .unwrap_or_else(|_| "hybrid-auto-engine".to_string()),
+            mineru_return_md: std::env::var("RAG_MINERU_RETURN_MD")
+                .map(|v| truthy(&v))
+                .unwrap_or(true),
+            mineru_return_content_list: std::env::var("RAG_MINERU_RETURN_CONTENT_LIST")
+                .map(|v| truthy(&v))
+                .unwrap_or(true),
+            mineru_return_middle_json: std::env::var("RAG_MINERU_RETURN_MIDDLE_JSON")
+                .map(|v| truthy(&v))
+                .unwrap_or(true),
+            mineru_return_images: std::env::var("RAG_MINERU_RETURN_IMAGES")
+                .map(|v| truthy(&v))
+                .unwrap_or(true),
             llm_provider: std::env::var("RAG_LLM_PROVIDER").unwrap_or_else(|_| "none".to_string()),
             llm_model: std::env::var("RAG_LLM_MODEL").ok(),
             analysis_llm_provider: std::env::var("RAG_ANALYSIS_LLM_PROVIDER").unwrap_or_else(
@@ -134,6 +159,9 @@ impl Config {
         if self.store_backend == "meili" && self.meili_url.is_none() {
             anyhow::bail!("RAG_STORE_BACKEND=meili requires RAG_MEILI_URL");
         }
+        if !matches!(self.parser_provider.as_str(), "builtin" | "mineru") {
+            anyhow::bail!("RAG_PARSER_PROVIDER must be builtin or mineru");
+        }
 
         if self.run_mode == "production"
             && !self.has_any_auth()
@@ -166,6 +194,13 @@ impl Config {
             meili_url: None,
             meili_api_key: None,
             meili_wait_for_tasks: true,
+            parser_provider: "builtin".to_string(),
+            mineru_api_url: "http://127.0.0.1:8000".to_string(),
+            mineru_backend: "hybrid-auto-engine".to_string(),
+            mineru_return_md: true,
+            mineru_return_content_list: true,
+            mineru_return_middle_json: true,
+            mineru_return_images: true,
             llm_provider: "none".to_string(),
             llm_model: Some("none".to_string()),
             analysis_llm_provider: "none".to_string(),

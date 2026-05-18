@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    net::{TcpStream, ToSocketAddrs},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     body::{to_bytes, Body},
@@ -11,6 +15,10 @@ use tower::ServiceExt;
 
 fn meili_app() -> Option<Router> {
     let url = std::env::var("RAG_TEST_MEILI_URL").ok()?;
+    if !meili_available(&url) {
+        eprintln!("skipping Meilisearch integration test; {url} is not reachable");
+        return None;
+    }
     let mut config = Config::test();
     config.tenant_id = format!("test-tenant-{}", uuid::Uuid::now_v7());
     config.store_backend = "meili".to_string();
@@ -18,6 +26,26 @@ fn meili_app() -> Option<Router> {
     config.meili_api_key = std::env::var("RAG_TEST_MEILI_API_KEY").ok();
     config.meili_wait_for_tasks = true;
     Some(build_router(AppState::new(Arc::new(config))))
+}
+
+fn meili_available(url: &str) -> bool {
+    let authority = url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let address = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:7700")
+    };
+    let Ok(addrs) = address.to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok())
 }
 
 async fn call(app: Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -197,6 +225,18 @@ async fn meili_backend_context_search_retrieves_fragments_only() {
     let source_document_uri = state["item"]["source_refs"][0]["meta"]["source_document_uri"]
         .as_str()
         .unwrap();
+
+    let (status, source_docs) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/debug/meili/search",
+        json!({ "index_uid": "rag_source_documents", "query": source_document_uri }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{source_docs}");
+    assert!(source_docs["hits"].as_array().unwrap().iter().any(|hit| {
+        hit["uri"].as_str() == Some(source_document_uri) && hit["retrieval_enabled"] == false
+    }));
 
     let (status, search) = call(
         app,

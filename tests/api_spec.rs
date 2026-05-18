@@ -599,6 +599,364 @@ async fn company_doc_fragments_traceback_and_update_supersedes_old_content() {
 }
 
 #[tokio::test]
+async fn mineru_content_list_ingest_creates_block_fragments_and_traceback_artifacts() {
+    let app = authed_app();
+    let content_list_v2 = json!([
+        {
+            "type": "title",
+            "text": "MinerU Fixture",
+            "text_level": 1,
+            "page_idx": 0,
+            "bbox": [0, 0, 500, 40],
+            "reading_order": 0
+        },
+        {
+            "type": "table",
+            "html": "<table><tr><td>table-block-keyword</td></tr></table>",
+            "table_caption": ["Revenue table caption"],
+            "page_idx": 1,
+            "bbox": [10, 20, 300, 160],
+            "reading_order": 1
+        },
+        {
+            "type": "equation",
+            "latex": "E = mc^2 + equation-block-keyword",
+            "page_idx": 2,
+            "bbox": [25, 50, 280, 90],
+            "reading_order": 2
+        },
+        {
+            "type": "image",
+            "img_path": "images/figure-1.png",
+            "caption": ["Architecture image-block-keyword"],
+            "page_idx": 3,
+            "bbox": [40, 80, 420, 260],
+            "reading_order": 3
+        }
+    ]);
+
+    let (status, result) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "owner_user_id": "u1",
+            "source_id": "mineru-fixture",
+            "revision_id": "v1",
+            "title": "MinerU Fixture",
+            "file_name": "fixture.pdf",
+            "content_type": "application/pdf",
+            "content": "raw-source-only-keyword is present only in the stored source document.",
+            "content_list_v2": content_list_v2
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["task"]["state"], "completed");
+    assert!(result["parse_artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|artifact| artifact["artifact_kind"] == "content_list_v2"));
+    let task_id = result["task"]["task_id"].as_str().unwrap();
+    let source_document_uri = result["source_document_uri"].as_str().unwrap();
+
+    let (status, task) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/ingest/tasks/{task_id}"),
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{task}");
+    assert_eq!(task["state"], "completed");
+
+    let (status, task_result) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/ingest/tasks/{task_id}/result"),
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{task_result}");
+    assert_eq!(task_result["parsed_blocks"].as_array().unwrap().len(), 4);
+
+    let (status, table_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "table-block-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{table_search}");
+    let table_hit = &table_search["hits"][0];
+    assert_eq!(table_hit["block_type"], "table");
+    assert_eq!(table_hit["page_idx"], 1);
+    assert_eq!(table_hit["bbox"], json!([10, 20, 300, 160]));
+    assert_eq!(table_hit["source_document_uri"], source_document_uri);
+
+    let (status, equation_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "equation-block-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{equation_search}");
+    assert_eq!(equation_search["hits"][0]["block_type"], "equation");
+    assert!(equation_search["hits"][0]["snippet"]
+        .as_str()
+        .unwrap()
+        .contains("E = mc^2"));
+
+    let (status, image_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "image-block-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{image_search}");
+    assert_eq!(image_search["hits"][0]["block_type"], "image");
+    assert_eq!(
+        image_search["hits"][0]["asset_refs"][0],
+        "images/figure-1.png"
+    );
+
+    let fragment_uri = table_hit["uri"].as_str().unwrap();
+    let (status, traceback) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/traceback",
+        json!({ "uri": fragment_uri }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{traceback}");
+    assert_eq!(traceback["source_document_uri"], source_document_uri);
+    assert_eq!(traceback["block_type"], "table");
+    assert_eq!(traceback["page_idx"], 1);
+    assert!(traceback["artifact_refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|artifact| artifact["artifact_kind"] == "content_list_v2"));
+
+    let (status, source_only_search) = call_with_token(
+        app,
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "raw-source-only-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{source_only_search}");
+    assert_eq!(source_only_search["hits"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn parsed_ingest_update_supersedes_old_fragments_and_part_of_links() {
+    let app = authed_app();
+    let source_id = "parsed-update-fixture";
+    let v1_blocks = json!([
+        {
+            "type": "paragraph",
+            "text": "old-ingest-keyword should be removed after the active revision changes.",
+            "page_idx": 0,
+            "bbox": [1, 2, 3, 4],
+            "reading_order": 0
+        }
+    ]);
+    let (status, first) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "source_id": source_id,
+            "revision_id": "v1",
+            "title": "Parsed Update Fixture",
+            "content": "source v1",
+            "content_list_v2": v1_blocks
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+
+    let (status, old_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "old-ingest-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{old_search}");
+    let old_fragment_uri = old_search["hits"][0]["uri"].as_str().unwrap();
+
+    let (status, old_link) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/links/search",
+        json!({ "uri": old_fragment_uri, "direction": "outbound", "relations": ["part_of"], "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{old_link}");
+    assert_eq!(old_link["outbound"].as_array().unwrap().len(), 1);
+
+    let v2_blocks = json!([
+        {
+            "type": "paragraph",
+            "text": "new-ingest-keyword replaces the old parsed block.",
+            "page_idx": 0,
+            "bbox": [5, 6, 7, 8],
+            "reading_order": 0
+        }
+    ]);
+    let (status, second) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "source_id": source_id,
+            "revision_id": "v2",
+            "title": "Parsed Update Fixture",
+            "content": "source v2",
+            "content_list_v2": v2_blocks
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+
+    let (status, old_after_update) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "old-ingest-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{old_after_update}");
+    assert_eq!(old_after_update["hits"].as_array().unwrap().len(), 0);
+
+    let (status, new_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "new-ingest-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{new_search}");
+    assert_eq!(new_search["hits"][0]["block_type"], "paragraph");
+
+    let (status, old_read) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/fs/read?uri={}", query_encode(old_fragment_uri)),
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{old_read}");
+
+    let (status, old_link_after_update) = call_with_token(
+        app,
+        Method::POST,
+        "/v1/links/search",
+        json!({ "uri": old_fragment_uri, "direction": "outbound", "relations": ["part_of"], "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{old_link_after_update}");
+    assert_eq!(
+        old_link_after_update["outbound"].as_array().unwrap().len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn parse_artifacts_and_fragments_are_owner_scoped() {
+    let app = authed_app();
+    let blocks = json!([
+        {
+            "type": "paragraph",
+            "text": "private-parse-artifact-keyword belongs to owner u1 only.",
+            "page_idx": 0,
+            "bbox": [0, 0, 100, 100],
+            "reading_order": 0
+        }
+    ]);
+    let (status, result) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "owner_user_id": "u1",
+            "source_id": "private-parse-fixture",
+            "revision_id": "v1",
+            "title": "Private Parse Fixture",
+            "content": "private source",
+            "content_list_v2": blocks
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let task_id = result["task"]["task_id"].as_str().unwrap();
+
+    let (status, u1_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "private-parse-artifact-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{u1_search}");
+    let fragment_uri = u1_search["hits"][0]["uri"].as_str().unwrap();
+
+    let (status, u2_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "private-parse-artifact-keyword", "limit": 5 }),
+        Some("u2-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{u2_search}");
+    assert_eq!(u2_search["hits"].as_array().unwrap().len(), 0);
+
+    let (status, u2_result) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/ingest/tasks/{task_id}/result"),
+        Value::Null,
+        Some("u2-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{u2_result}");
+
+    let (status, u2_traceback) = call_with_token(
+        app,
+        Method::POST,
+        "/v1/context/traceback",
+        json!({ "uri": fragment_uri }),
+        Some("u2-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{u2_traceback}");
+}
+
+#[tokio::test]
 async fn structured_rows_are_idempotent_by_row_id() {
     let app = app();
 

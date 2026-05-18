@@ -53,6 +53,11 @@ pub trait KnowledgeRepository: Send + Sync {
         documents: &[SourceDocument],
     ) -> Result<Option<String>, ApiError>;
 
+    async fn upsert_parse_artifacts(
+        &self,
+        artifacts: &[ParseArtifact],
+    ) -> Result<Option<String>, ApiError>;
+
     async fn upsert_structured_snapshot(
         &self,
         snapshot: &StructuredSnapshot,
@@ -163,6 +168,13 @@ impl KnowledgeRepository for MemoryRepository {
     async fn upsert_source_documents(
         &self,
         _documents: &[SourceDocument],
+    ) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_parse_artifacts(
+        &self,
+        _artifacts: &[ParseArtifact],
     ) -> Result<Option<String>, ApiError> {
         Ok(None)
     }
@@ -385,6 +397,17 @@ impl KnowledgeRepository for MeiliRepository {
             .map(|document| to_document(document, &document.id))
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values("rag_source_documents", &documents).await
+    }
+
+    async fn upsert_parse_artifacts(
+        &self,
+        artifacts: &[ParseArtifact],
+    ) -> Result<Option<String>, ApiError> {
+        let documents = artifacts
+            .iter()
+            .map(|artifact| to_document(artifact, &artifact.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.upsert_values("rag_parse_artifacts", &documents).await
     }
 
     async fn upsert_structured_snapshot(

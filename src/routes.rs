@@ -18,6 +18,7 @@ use crate::{
     llm::{llm_client_from_config, LlmHealthProbe, LlmHealthProbeResult, LlmRequest},
     meili::MeiliAdmin,
     models::*,
+    parser::parser_health_status,
     store::Store,
     util::{
         redact_secrets, redact_string, require_string, sanitize_slug, text_score, truncate_chars,
@@ -167,6 +168,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/context/search", post(context_search))
         .route("/v1/context/reveal", post(context_reveal))
         .route("/v1/context/traceback", post(context_traceback))
+        .route("/v1/ingest/tasks", post(create_ingest_task))
+        .route("/v1/ingest/tasks/{task_id}", get(get_ingest_task))
+        .route(
+            "/v1/ingest/tasks/{task_id}/result",
+            get(get_ingest_task_result),
+        )
+        .route("/v1/ingest/files:sync", post(ingest_file_sync))
         .route("/v1/rag/answer", post(rag_answer))
         .route("/v1/rag/stream", post(rag_stream))
         .route("/v1/rag/debug", post(rag_debug))
@@ -203,6 +211,7 @@ async fn operational_health(state: AppState) -> impl IntoResponse {
     let config = state.effective_config();
     let meili = state.meili.health_status().await;
     let llm = state.llm_health.check(&config).await;
+    let parser = parser_health_status(&config).await;
     let usage = compact_usage_summary(
         state
             .store
@@ -216,8 +225,13 @@ async fn operational_health(state: AppState) -> impl IntoResponse {
     let llm_unhealthy = llm.status == "unhealthy"
         || llm.quota_state == "exhausted"
         || (!llm.auth_valid && config.health_require_llm);
+    let parser_unhealthy = config.parser_provider == "mineru"
+        && !parser
+            .get("healthy")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let degraded = llm.status == "degraded" || llm.stale;
-    let ready = meili_healthy && !llm_unhealthy;
+    let ready = meili_healthy && !llm_unhealthy && !parser_unhealthy;
     let status = if !ready {
         "unhealthy"
     } else if degraded {
@@ -231,6 +245,7 @@ async fn operational_health(state: AppState) -> impl IntoResponse {
         "store_backend": state.store.backend_name(),
         "meilisearch": meili,
         "llm": llm_health_json(&llm),
+        "parser": parser,
         "usage": usage
     });
     (
@@ -271,6 +286,7 @@ fn compact_usage_summary(usage: Value) -> Value {
         "contextfs": providers.get("contextfs").cloned().unwrap_or(Value::Null),
         "rag": providers.get("rag").cloned().unwrap_or(Value::Null),
         "link_graph": providers.get("link_graph").cloned().unwrap_or(Value::Null),
+        "ingest": providers.get("ingest").cloned().unwrap_or(Value::Null),
         "structured_data": providers.get("structured_data").cloned().unwrap_or(Value::Null),
         "sessions": providers.get("sessions").cloned().unwrap_or(Value::Null)
     })
@@ -329,6 +345,22 @@ async fn usage(
             json!({
                 "configured": state.meili.configured(),
                 "store_backend": state.store.backend_name()
+            }),
+        );
+        providers.insert(
+            "parser".to_string(),
+            json!({
+                "provider": &config.parser_provider,
+                "mineru_api_url": if config.parser_provider == "mineru" {
+                    Some(config.mineru_api_url.clone())
+                } else {
+                    None
+                },
+                "backend": if config.parser_provider == "mineru" {
+                    config.mineru_backend.clone()
+                } else {
+                    "text".to_string()
+                }
             }),
         );
         providers.insert("llm".to_string(), llm_health_json(&llm));
@@ -963,6 +995,66 @@ async fn context_traceback(
     )?))
 }
 
+async fn create_ingest_task(
+    user: UserGuard,
+    State(state): State<AppState>,
+    Json(mut req): Json<IngestTaskRequest>,
+) -> Result<Json<IngestTask>, ApiError> {
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    require_owner_for_write(&user, req.owner_user_id.as_deref())?;
+    Ok(Json(
+        state
+            .store
+            .create_ingest_task_async(state.tenant_id(), req, &state.effective_config())
+            .await?,
+    ))
+}
+
+async fn get_ingest_task(
+    user: UserGuard,
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Query(mut query): Query<OwnerQuery>,
+) -> Result<Json<IngestTask>, ApiError> {
+    user.apply_owner_default(&mut query.owner_user_id)?;
+    let include_all_private = user.principal.is_admin() && query.owner_user_id.is_none();
+    Ok(Json(state.store.get_ingest_task(
+        &task_id,
+        query.owner_user_id.as_deref(),
+        include_all_private,
+    )?))
+}
+
+async fn get_ingest_task_result(
+    user: UserGuard,
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Query(mut query): Query<OwnerQuery>,
+) -> Result<Json<IngestTaskResult>, ApiError> {
+    user.apply_owner_default(&mut query.owner_user_id)?;
+    let include_all_private = user.principal.is_admin() && query.owner_user_id.is_none();
+    Ok(Json(state.store.get_ingest_task_result(
+        &task_id,
+        query.owner_user_id.as_deref(),
+        include_all_private,
+    )?))
+}
+
+async fn ingest_file_sync(
+    user: UserGuard,
+    State(state): State<AppState>,
+    Json(mut req): Json<IngestTaskRequest>,
+) -> Result<Json<IngestTaskResult>, ApiError> {
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    require_owner_for_write(&user, req.owner_user_id.as_deref())?;
+    Ok(Json(
+        state
+            .store
+            .ingest_file_sync_async(state.tenant_id(), req, &state.effective_config())
+            .await?,
+    ))
+}
+
 async fn rag_answer(
     user: UserGuard,
     State(state): State<AppState>,
@@ -1437,6 +1529,14 @@ fn history_event_context_hit(event: &HistoryEvent, query: &str) -> ContextHit {
         fragment_index: None,
         char_start: None,
         char_end: None,
+        block_type: None,
+        page_idx: None,
+        bbox: None,
+        section_path: Vec::new(),
+        heading_level: None,
+        asset_refs: Vec::new(),
+        artifact_refs: Vec::new(),
+        checksum: None,
         snippet: truncate_chars(&event.text, 240),
     }
 }

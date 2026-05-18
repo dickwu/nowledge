@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::models::FragmentPolicy;
+use crate::models::{FragmentPolicy, ParsedBlock};
 
 #[derive(Debug, Clone)]
 pub struct DocumentFragment {
@@ -12,6 +13,22 @@ pub struct DocumentFragment {
     pub char_end: usize,
     pub token_estimate: usize,
     pub checksum: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FragmentChunk {
+    pub fragment_index: u32,
+    pub content: String,
+    pub char_start: Option<usize>,
+    pub char_end: Option<usize>,
+    pub token_estimate: usize,
+    pub checksum: String,
+    pub block_type: Option<String>,
+    pub page_idx: Option<u32>,
+    pub bbox: Option<Value>,
+    pub section_path: Vec<String>,
+    pub heading_level: Option<u8>,
+    pub asset_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +113,120 @@ impl DocumentFragmenter {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BlockAwareFragmenter {
+    fallback: DocumentFragmenter,
+}
+
+impl BlockAwareFragmenter {
+    pub fn from_policy(policy: Option<&FragmentPolicy>) -> Self {
+        Self {
+            fallback: DocumentFragmenter::from_policy(policy),
+        }
+    }
+
+    pub fn fragment(&self, content: &str, blocks: &[ParsedBlock]) -> Vec<FragmentChunk> {
+        if blocks.is_empty() {
+            return self
+                .fallback
+                .fragment(content)
+                .into_iter()
+                .map(FragmentChunk::from)
+                .collect();
+        }
+
+        let mut ordered = blocks.to_vec();
+        ordered.sort_by_key(|block| {
+            (
+                block.reading_order,
+                block.page_idx.unwrap_or(u32::MAX),
+                block.block_id.clone(),
+            )
+        });
+
+        let mut chunks = Vec::new();
+        for block in ordered {
+            let Some(body) = block_body(&block) else {
+                continue;
+            };
+            if body.trim().is_empty() {
+                continue;
+            }
+
+            let block_type = block.block_type.clone();
+            let atomic = matches!(
+                block_type.as_str(),
+                "table" | "equation" | "image" | "chart" | "code"
+            );
+            if block_type == "paragraph" && body.chars().count() > self.fallback.chunk_size_chars {
+                for fragment in self.fallback.fragment(&body) {
+                    let mut chunk = FragmentChunk::from(fragment);
+                    chunk.fragment_index = chunks.len() as u32;
+                    chunk.block_type = Some(block_type.clone());
+                    chunk.page_idx = block.page_idx;
+                    chunk.bbox = block.bbox.clone();
+                    chunk.section_path = block.section_path.clone();
+                    chunk.heading_level = block.text_level;
+                    chunk.asset_refs = block.image_ref.clone().into_iter().collect();
+                    chunk.checksum = block_fragment_checksum(
+                        chunk.fragment_index,
+                        &block.block_id,
+                        chunk.char_start,
+                        chunk.char_end,
+                        &chunk.content,
+                    );
+                    chunks.push(chunk);
+                }
+                continue;
+            }
+
+            let fragment_index = chunks.len() as u32;
+            let text_level = block.text_level;
+            chunks.push(FragmentChunk {
+                fragment_index,
+                token_estimate: estimate_tokens(&body),
+                checksum: block_fragment_checksum(
+                    fragment_index,
+                    &block.block_id,
+                    None,
+                    None,
+                    &body,
+                ),
+                content: body,
+                char_start: None,
+                char_end: None,
+                block_type: Some(if atomic { block_type } else { block.block_type }),
+                page_idx: block.page_idx,
+                bbox: block.bbox,
+                section_path: block.section_path,
+                heading_level: text_level,
+                asset_refs: block.image_ref.into_iter().collect(),
+            });
+        }
+
+        chunks
+    }
+}
+
+impl From<DocumentFragment> for FragmentChunk {
+    fn from(fragment: DocumentFragment) -> Self {
+        Self {
+            fragment_index: fragment.fragment_index,
+            content: fragment.content,
+            char_start: Some(fragment.char_start),
+            char_end: Some(fragment.char_end),
+            token_estimate: fragment.token_estimate,
+            checksum: fragment.checksum,
+            block_type: Some("paragraph".to_string()),
+            page_idx: None,
+            bbox: None,
+            section_path: Vec::new(),
+            heading_level: None,
+            asset_refs: Vec::new(),
+        }
+    }
+}
+
 struct Breakpoints {
     headings: BTreeSet<usize>,
     paragraphs: BTreeSet<usize>,
@@ -176,4 +307,119 @@ fn fragment_checksum(index: u32, start: usize, end: usize, text: &str) -> String
     hasher.update(end.to_le_bytes());
     hasher.update(text.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn block_fragment_checksum(
+    index: u32,
+    block_id: &str,
+    start: Option<usize>,
+    end: Option<usize>,
+    text: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(index.to_le_bytes());
+    hasher.update(block_id.as_bytes());
+    hasher.update(start.unwrap_or_default().to_le_bytes());
+    hasher.update(end.unwrap_or_default().to_le_bytes());
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn block_body(block: &ParsedBlock) -> Option<String> {
+    let mut parts = Vec::new();
+    match block.block_type.as_str() {
+        "table" => {
+            if let Some(html) = block
+                .html
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(html.to_string());
+            } else if let Some(text) = block
+                .text
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(text.to_string());
+            }
+        }
+        "equation" => {
+            if let Some(latex) = block
+                .latex
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(latex.to_string());
+            } else if let Some(text) = block
+                .text
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(text.to_string());
+            }
+        }
+        "image" | "chart" => {
+            if let Some(caption) = block
+                .caption
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(caption.to_string());
+            }
+            if let Some(text) = block
+                .text
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(text.to_string());
+            }
+            if let Some(image_ref) = block
+                .image_ref
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(image_ref.to_string());
+            }
+        }
+        _ => {
+            if let Some(text) = block
+                .text
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(text.to_string());
+            } else if let Some(html) = block
+                .html
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(html.to_string());
+            } else if let Some(latex) = block
+                .latex
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(latex.to_string());
+            }
+        }
+    }
+
+    if let Some(caption) = block
+        .caption
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if !parts.iter().any(|part| part == caption) {
+            parts.push(caption.to_string());
+        }
+    }
+    if let Some(footnote) = block
+        .footnote
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        parts.push(footnote.to_string());
+    }
+
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }

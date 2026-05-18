@@ -5,6 +5,7 @@ pub mod fragmenter;
 pub mod llm;
 pub mod meili;
 pub mod models;
+pub mod parser;
 pub mod repository;
 pub mod resolver;
 pub mod routes;

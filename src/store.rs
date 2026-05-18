@@ -9,8 +9,9 @@ use serde_json::{json, Value};
 use crate::{
     config::Config,
     error::ApiError,
-    fragmenter::{DocumentFragment, DocumentFragmenter},
+    fragmenter::{BlockAwareFragmenter, FragmentChunk},
     models::*,
+    parser::{parser_from_config, ParserInput, ParserOutput},
     repository::{repository_from_config, KnowledgeRepository},
     resolver::{EventIndexResolver, EVENT_INDEX_SCHEMA_VERSION, EVENT_SETTINGS_HASH},
     util::{
@@ -40,6 +41,10 @@ struct StoreData {
     sources: HashMap<String, CompanySource>,
     source_revisions: HashMap<String, Vec<SourceRevision>>,
     source_documents: HashMap<String, SourceDocument>,
+    parse_artifacts: HashMap<String, ParseArtifact>,
+    parsed_blocks: HashMap<String, Vec<ParsedBlock>>,
+    ingest_tasks: HashMap<String, IngestTask>,
+    ingest_results: HashMap<String, IngestTaskResult>,
     preflight_decisions: HashMap<String, CompanyDocPreflightResponse>,
     datasets: HashMap<String, DatasetRecord>,
     snapshots: HashMap<String, StructuredSnapshot>,
@@ -200,6 +205,32 @@ impl Store {
                 }
             })
             .count();
+        let owner_option_matches = |owner: Option<&str>| {
+            include_global || owner_user_id.is_some_and(|target| owner == Some(target))
+        };
+        let ingest_tasks = data
+            .ingest_tasks
+            .values()
+            .filter(|task| task.tenant_id == tenant_id)
+            .filter(|task| owner_option_matches(task.owner_user_id.as_deref()))
+            .collect::<Vec<_>>();
+        let parse_artifact_count = data
+            .parse_artifacts
+            .values()
+            .filter(|artifact| artifact.tenant_id == tenant_id)
+            .filter(|artifact| owner_option_matches(artifact.owner_user_id.as_deref()))
+            .count();
+        let parsed_block_count = data
+            .parsed_blocks
+            .iter()
+            .filter(|(uri, _)| {
+                data.source_documents.get(*uri).is_some_and(|document| {
+                    document.tenant_id == tenant_id
+                        && owner_option_matches(document.owner_user_id.as_deref())
+                })
+            })
+            .map(|(_, blocks)| blocks.len())
+            .sum::<usize>();
         let sessions = data
             .sessions
             .values()
@@ -236,6 +267,18 @@ impl Store {
                 },
                 "link_graph": {
                     "link_count": link_count
+                },
+                "ingest": {
+                    "task_count": ingest_tasks.len(),
+                    "queued": ingest_tasks.iter().filter(|task| task.state == "queued").count(),
+                    "parsing": ingest_tasks.iter().filter(|task| task.state == "parsing").count(),
+                    "parsed": ingest_tasks.iter().filter(|task| task.state == "parsed").count(),
+                    "fragmenting": ingest_tasks.iter().filter(|task| task.state == "fragmenting").count(),
+                    "indexing": ingest_tasks.iter().filter(|task| task.state == "indexing").count(),
+                    "completed": ingest_tasks.iter().filter(|task| task.state == "completed").count(),
+                    "failed": ingest_tasks.iter().filter(|task| task.state == "failed").count(),
+                    "parse_artifact_count": parse_artifact_count,
+                    "parsed_block_count": parsed_block_count
                 },
                 "structured_data": {
                     "dataset_count": data.datasets.len(),
@@ -560,6 +603,232 @@ impl Store {
             let _ = self.persist_history_event_by_id(history_event_id).await?;
         }
         Ok(response)
+    }
+
+    pub async fn create_ingest_task_async(
+        &self,
+        tenant_id: &str,
+        req: IngestTaskRequest,
+        config: &Config,
+    ) -> Result<IngestTask, ApiError> {
+        self.ingest_file_sync_async(tenant_id, req, config)
+            .await
+            .map(|result| result.task)
+    }
+
+    pub async fn ingest_file_sync_async(
+        &self,
+        tenant_id: &str,
+        req: IngestTaskRequest,
+        config: &Config,
+    ) -> Result<IngestTaskResult, ApiError> {
+        let mut parser_config = config.clone();
+        if let Some(provider) = req.parser_provider.as_deref() {
+            parser_config.parser_provider = provider.to_string();
+        }
+        if let Some(backend) = req.parser_backend.as_deref() {
+            parser_config.mineru_backend = backend.to_string();
+        }
+        if !matches!(parser_config.parser_provider.as_str(), "builtin" | "mineru") {
+            return Err(ApiError::bad_request(
+                "parser_provider must be builtin or mineru",
+            ));
+        }
+
+        let content = req.content.clone().unwrap_or_default();
+        if content.trim().is_empty() && req.content_list.is_none() && req.content_list_v2.is_none()
+        {
+            return Err(ApiError::bad_request(
+                "content or MinerU content_list output is required",
+            ));
+        }
+
+        let title = req
+            .title
+            .clone()
+            .or_else(|| req.file_name.clone())
+            .or_else(|| req.source_uri.clone())
+            .unwrap_or_else(|| "Parsed document".to_string());
+        let source_id = req.source_id.clone().unwrap_or_else(|| {
+            format!(
+                "ingest:{}",
+                sanitize_slug(
+                    req.source_uri
+                        .as_deref()
+                        .or(req.file_name.as_deref())
+                        .unwrap_or(&title)
+                )
+            )
+        });
+        let revision_id = req.revision_id.clone().unwrap_or_else(|| new_id("rev"));
+        let source_document_uri = req.source_document_uri.clone().unwrap_or_else(|| {
+            let scope = if req.owner_user_id.is_some() {
+                "user"
+            } else {
+                "company"
+            };
+            format!(
+                "ctx://{scope}/ingest/{}/source/{}",
+                sanitize_slug(&source_id),
+                sanitize_slug(&revision_id)
+            )
+        });
+        let parser_provider = parser_config.parser_provider.clone();
+        let parser_backend = if parser_provider == "mineru" {
+            parser_config.mineru_backend.clone()
+        } else {
+            "text".to_string()
+        };
+        let now = now();
+        let task = IngestTask {
+            task_id: new_id("ingest"),
+            tenant_id: tenant_id.to_string(),
+            owner_user_id: req.owner_user_id.clone(),
+            source_id: source_id.clone(),
+            revision_id: revision_id.clone(),
+            source_document_uri: Some(source_document_uri.clone()),
+            parser_provider: parser_provider.clone(),
+            parser_backend: parser_backend.clone(),
+            state: "queued".to_string(),
+            error: None,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        {
+            let mut data = self.write()?;
+            data.ingest_tasks.insert(task.task_id.clone(), task.clone());
+        }
+
+        self.transition_ingest_task(&task.task_id, "parsing", None)?;
+        let parser = parser_from_config(&parser_config);
+        let parsed = match parser
+            .parse(ParserInput {
+                content: content.clone(),
+                content_type: req.content_type.clone(),
+                file_name: req.file_name.clone(),
+                content_list: req.content_list.clone(),
+                content_list_v2: req.content_list_v2.clone(),
+                middle_json: req.middle_json.clone(),
+                model_json: req.model_json.clone(),
+            })
+            .await
+        {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                let _ = self.transition_ingest_task(&task.task_id, "failed", Some(err.to_string()));
+                return Err(err);
+            }
+        };
+
+        self.transition_ingest_task(&task.task_id, "parsed", None)?;
+        let document_content = parsed_content(&content, &parsed);
+        let checksum = req
+            .checksum
+            .clone()
+            .unwrap_or_else(|| sha256_hex(document_content.as_bytes()));
+        let artifacts = build_parse_artifacts(
+            tenant_id,
+            req.owner_user_id.clone(),
+            &source_document_uri,
+            &source_id,
+            &revision_id,
+            &parsed,
+            &content,
+        )?;
+        let artifact_refs = artifacts
+            .iter()
+            .map(|artifact| ParseArtifactRef {
+                id: artifact.id.clone(),
+                artifact_kind: artifact.artifact_kind.clone(),
+                uri: artifact.uri.clone(),
+                checksum: Some(artifact.checksum.clone()),
+            })
+            .collect::<Vec<_>>();
+
+        self.transition_ingest_task(&task.task_id, "fragmenting", None)?;
+        let (index_kind, index_uid) = if let Some(owner) = req.owner_user_id.as_deref() {
+            let routing = self.resolver.resolve(tenant_id, owner, false, true)?;
+            ("personal".to_string(), routing.personal_context_index_uid)
+        } else {
+            ("company".to_string(), "rag_company_context".to_string())
+        };
+        let ingest = {
+            let mut data = self.write()?;
+            for artifact in artifacts.iter().cloned() {
+                data.parse_artifacts.insert(artifact.uri.clone(), artifact);
+            }
+            self.write_source_document_fragments_locked(
+                &mut data,
+                tenant_id,
+                req.owner_user_id.clone(),
+                "parsed_doc",
+                &source_id,
+                &revision_id,
+                &source_document_uri,
+                &title,
+                &document_content,
+                &checksum,
+                &index_kind,
+                &index_uid,
+                req.fragment_policy.as_ref(),
+                &parsed.blocks,
+                &artifact_refs,
+            )
+        };
+
+        self.transition_ingest_task(&task.task_id, "indexing", None)?;
+        if let Err(err) = self
+            .persist_ingest_outputs(tenant_id, req.owner_user_id.as_deref())
+            .await
+        {
+            let _ = self.transition_ingest_task(&task.task_id, "failed", Some(err.to_string()));
+            return Err(err);
+        }
+
+        let task = self.transition_ingest_task(&task.task_id, "completed", None)?;
+        let result = IngestTaskResult {
+            task: task.clone(),
+            source_document_uri: ingest.source_document_uri,
+            source_id: ingest.source_id,
+            revision_id,
+            parse_artifacts: artifacts,
+            parsed_blocks: parsed.blocks,
+            context_uris: ingest.fragment_uris.clone(),
+            fragment_uris: ingest.fragment_uris,
+        };
+        let mut data = self.write()?;
+        data.ingest_results
+            .insert(task.task_id.clone(), result.clone());
+        Ok(result)
+    }
+
+    pub fn get_ingest_task(
+        &self,
+        task_id: &str,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<IngestTask, ApiError> {
+        let data = self.read()?;
+        data.ingest_tasks
+            .get(task_id)
+            .filter(|task| ingest_task_visible(task, owner_user_id, include_all_private))
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("ingest task not found"))
+    }
+
+    pub fn get_ingest_task_result(
+        &self,
+        task_id: &str,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<IngestTaskResult, ApiError> {
+        let data = self.read()?;
+        data.ingest_results
+            .get(task_id)
+            .filter(|result| ingest_task_visible(&result.task, owner_user_id, include_all_private))
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("ingest result not found"))
     }
 
     pub async fn create_snapshot_async(
@@ -2410,6 +2679,13 @@ impl Store {
                     checksum: None,
                     source_id: None,
                     revision_id: None,
+                    block_type: None,
+                    page_idx: None,
+                    bbox: None,
+                    section_path: Vec::new(),
+                    heading_level: None,
+                    asset_refs: Vec::new(),
+                    artifact_refs: Vec::new(),
                     status: "active".to_string(),
                     privacy: "private".to_string(),
                     updated_at: now(),
@@ -2620,6 +2896,12 @@ impl Store {
             source_document_uri: source_document.uri,
             source_id: source_document.source_id,
             revision_id: source_document.revision_id,
+            page_idx: fragment.page_idx,
+            bbox: fragment.bbox,
+            block_type: fragment.block_type,
+            section_path: fragment.section_path,
+            asset_refs: fragment.asset_refs,
+            artifact_refs: fragment.artifact_refs,
             char_start: fragment.char_start,
             char_end: fragment.char_end,
             source_title: source_document.title,
@@ -2864,6 +3146,13 @@ impl Store {
                     checksum: None,
                     source_id: None,
                     revision_id: None,
+                    block_type: None,
+                    page_idx: None,
+                    bbox: None,
+                    section_path: Vec::new(),
+                    heading_level: None,
+                    asset_refs: Vec::new(),
+                    artifact_refs: Vec::new(),
                     status: "active".to_string(),
                     privacy: "private".to_string(),
                     updated_at: now(),
@@ -3011,6 +3300,55 @@ impl Store {
             .unwrap_or_default())
     }
 
+    async fn persist_ingest_outputs(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let (index_uid, source_owner) = if let Some(owner) = owner_user_id {
+            self.ensure_user_indexes_for_owner(tenant_id, owner).await?;
+            let routing = self.resolver.resolve(tenant_id, owner, false, true)?;
+            (routing.personal_context_index_uid, Some(owner))
+        } else {
+            ("rag_company_context".to_string(), None)
+        };
+        let nodes = self.context_nodes_for_index(&index_uid)?;
+        let _ = self
+            .repository
+            .upsert_context_nodes(&index_uid, &nodes)
+            .await?;
+        let source_documents = self.source_documents_for_scope(tenant_id, source_owner)?;
+        let _ = self
+            .repository
+            .upsert_source_documents(&source_documents)
+            .await?;
+        let artifacts = self.parse_artifacts_for_scope(tenant_id, source_owner)?;
+        let _ = self.repository.upsert_parse_artifacts(&artifacts).await?;
+        let links = self.links_for_tenant(tenant_id)?;
+        let _ = self.repository.upsert_links(&links).await?;
+        Ok(())
+    }
+
+    fn transition_ingest_task(
+        &self,
+        task_id: &str,
+        state: &str,
+        error: Option<String>,
+    ) -> Result<IngestTask, ApiError> {
+        let mut data = self.write()?;
+        let task = data
+            .ingest_tasks
+            .get_mut(task_id)
+            .ok_or_else(|| ApiError::not_found("ingest task not found"))?;
+        task.state = state.to_string();
+        task.error = error;
+        task.updated_at = now();
+        if matches!(state, "completed" | "failed") {
+            task.completed_at = Some(task.updated_at);
+        }
+        Ok(task.clone())
+    }
+
     fn company_source(&self, source_id: &str) -> Result<Option<CompanySource>, ApiError> {
         let data = self.read()?;
         Ok(data.sources.get(source_id).cloned())
@@ -3041,6 +3379,21 @@ impl Store {
             .values()
             .filter(|document| document.tenant_id == tenant_id)
             .filter(|document| document.owner_user_id.as_deref() == owner_user_id)
+            .cloned()
+            .collect())
+    }
+
+    fn parse_artifacts_for_scope(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+    ) -> Result<Vec<ParseArtifact>, ApiError> {
+        let data = self.read()?;
+        Ok(data
+            .parse_artifacts
+            .values()
+            .filter(|artifact| artifact.tenant_id == tenant_id)
+            .filter(|artifact| artifact.owner_user_id.as_deref() == owner_user_id)
             .cloned()
             .collect())
     }
@@ -3356,6 +3709,8 @@ impl Store {
             "company",
             "rag_company_context",
             None,
+            &[],
+            &[],
         )
     }
 
@@ -3407,6 +3762,8 @@ impl Store {
             "personal",
             &routing.personal_context_index_uid,
             policy,
+            &[],
+            &[],
         ))
     }
 
@@ -3426,6 +3783,8 @@ impl Store {
         index_kind: &str,
         index_uid: &str,
         policy: Option<&FragmentPolicy>,
+        blocks: &[ParsedBlock],
+        artifact_refs: &[ParseArtifactRef],
     ) -> DocumentIngestResult {
         self.supersede_source_artifacts_locked(
             data,
@@ -3461,8 +3820,13 @@ impl Store {
         data.source_documents
             .insert(source_document.uri.clone(), source_document);
 
-        let fragmenter = DocumentFragmenter::from_policy(policy);
-        let fragments = fragmenter.fragment(content);
+        if !blocks.is_empty() {
+            data.parsed_blocks
+                .insert(source_document_uri.to_string(), blocks.to_vec());
+        }
+
+        let fragmenter = BlockAwareFragmenter::from_policy(policy);
+        let fragments = fragmenter.fragment(content, blocks);
         let fragment_uris = fragments
             .iter()
             .map(|fragment| {
@@ -3487,6 +3851,7 @@ impl Store {
                     revision_id,
                     source_document_uri,
                     fragment,
+                    artifact_refs,
                 )
             })
             .collect::<Vec<_>>();
@@ -3579,6 +3944,13 @@ impl Store {
             checksum: None,
             source_id,
             revision_id,
+            block_type: None,
+            page_idx: None,
+            bbox: None,
+            section_path: Vec::new(),
+            heading_level: None,
+            asset_refs: Vec::new(),
+            artifact_refs: Vec::new(),
             status: "active".to_string(),
             privacy: if index_kind == "company" {
                 "company".to_string()
@@ -3601,7 +3973,8 @@ impl Store {
         source_id: &str,
         revision_id: &str,
         source_document_uri: &str,
-        fragment: &DocumentFragment,
+        fragment: &FragmentChunk,
+        artifact_refs: &[ParseArtifactRef],
     ) -> ContextNode {
         let mut node = self.context_node(
             uri,
@@ -3621,10 +3994,17 @@ impl Store {
         node.parent_uri = Some(source_document_uri.to_string());
         node.source_document_uri = Some(source_document_uri.to_string());
         node.fragment_index = Some(fragment.fragment_index);
-        node.char_start = Some(fragment.char_start);
-        node.char_end = Some(fragment.char_end);
+        node.char_start = fragment.char_start;
+        node.char_end = fragment.char_end;
         node.token_estimate = Some(fragment.token_estimate);
         node.checksum = Some(fragment.checksum.clone());
+        node.block_type = fragment.block_type.clone();
+        node.page_idx = fragment.page_idx;
+        node.bbox = fragment.bbox.clone();
+        node.section_path = fragment.section_path.clone();
+        node.heading_level = fragment.heading_level;
+        node.asset_refs = fragment.asset_refs.clone();
+        node.artifact_refs = artifact_refs.to_vec();
         node
     }
 
@@ -3857,6 +4237,14 @@ fn context_hit_from_node(node: &ContextNode, query: &str) -> ContextHit {
         fragment_index: node.fragment_index,
         char_start: node.char_start,
         char_end: node.char_end,
+        block_type: node.block_type.clone(),
+        page_idx: node.page_idx,
+        bbox: node.bbox.clone(),
+        section_path: node.section_path.clone(),
+        heading_level: node.heading_level,
+        asset_refs: node.asset_refs.clone(),
+        artifact_refs: node.artifact_refs.clone(),
+        checksum: node.checksum.clone(),
         snippet: truncate_chars(&node.body, 240),
     }
 }
@@ -3888,6 +4276,13 @@ fn source_document_context_node(document: SourceDocument) -> ContextNode {
         checksum: Some(document.checksum),
         source_id: Some(document.source_id),
         revision_id: Some(document.revision_id),
+        block_type: None,
+        page_idx: None,
+        bbox: None,
+        section_path: Vec::new(),
+        heading_level: None,
+        asset_refs: Vec::new(),
+        artifact_refs: Vec::new(),
         status: document.status,
         privacy: if document.owner_user_id.is_some() {
             "private".to_string()
@@ -3896,6 +4291,217 @@ fn source_document_context_node(document: SourceDocument) -> ContextNode {
         },
         updated_at: document.updated_at,
     }
+}
+
+fn parsed_content(original: &str, parsed: &ParserOutput) -> String {
+    parsed
+        .markdown
+        .clone()
+        .filter(|content| !content.trim().is_empty())
+        .unwrap_or_else(|| {
+            if original.trim().is_empty() {
+                parsed
+                    .blocks
+                    .iter()
+                    .filter_map(parsed_block_text)
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            } else {
+                original.to_string()
+            }
+        })
+}
+
+fn parsed_block_text(block: &ParsedBlock) -> Option<String> {
+    block
+        .text
+        .clone()
+        .or_else(|| block.html.clone())
+        .or_else(|| block.latex.clone())
+        .or_else(|| block.caption.clone())
+        .filter(|value| !value.trim().is_empty())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_parse_artifacts(
+    tenant_id: &str,
+    owner_user_id: Option<String>,
+    source_document_uri: &str,
+    source_id: &str,
+    revision_id: &str,
+    parsed: &ParserOutput,
+    original_content: &str,
+) -> Result<Vec<ParseArtifact>, ApiError> {
+    let mut artifacts = Vec::new();
+    if !original_content.is_empty() {
+        artifacts.push(parse_artifact_from_bytes(
+            tenant_id,
+            owner_user_id.clone(),
+            source_document_uri,
+            source_id,
+            revision_id,
+            parsed,
+            "original",
+            format!("{source_document_uri}/artifacts/original"),
+            original_content.as_bytes(),
+        ));
+    }
+    if let Some(markdown) = parsed
+        .markdown
+        .as_deref()
+        .filter(|markdown| !markdown.trim().is_empty())
+    {
+        artifacts.push(parse_artifact_from_bytes(
+            tenant_id,
+            owner_user_id.clone(),
+            source_document_uri,
+            source_id,
+            revision_id,
+            parsed,
+            "markdown",
+            format!("{source_document_uri}/artifacts/markdown"),
+            markdown.as_bytes(),
+        ));
+    }
+    for (kind, value) in [
+        ("content_list", parsed.content_list.as_ref()),
+        ("content_list_v2", parsed.content_list_v2.as_ref()),
+        ("middle_json", parsed.middle_json.as_ref()),
+        ("model_json", parsed.model_json.as_ref()),
+    ] {
+        if let Some(value) = value {
+            let bytes = serde_json::to_vec(value)
+                .map_err(|err| ApiError::Internal(format!("failed to encode {kind}: {err}")))?;
+            artifacts.push(parse_artifact_from_bytes(
+                tenant_id,
+                owner_user_id.clone(),
+                source_document_uri,
+                source_id,
+                revision_id,
+                parsed,
+                kind,
+                format!("{source_document_uri}/artifacts/{kind}"),
+                &bytes,
+            ));
+        }
+    }
+
+    for (index, image) in parsed.images.iter().enumerate() {
+        let uri = image_artifact_uri(source_document_uri, image, index as u32);
+        let bytes = serde_json::to_vec(image)
+            .map_err(|err| ApiError::Internal(format!("failed to encode image artifact: {err}")))?;
+        artifacts.push(parse_artifact_from_bytes(
+            tenant_id,
+            owner_user_id.clone(),
+            source_document_uri,
+            source_id,
+            revision_id,
+            parsed,
+            "image",
+            uri,
+            &bytes,
+        ));
+    }
+
+    for (index, image_ref) in parsed
+        .blocks
+        .iter()
+        .filter_map(|block| block.image_ref.as_deref())
+        .enumerate()
+    {
+        if artifacts.iter().any(|artifact| artifact.uri == image_ref) {
+            continue;
+        }
+        artifacts.push(parse_artifact_from_bytes(
+            tenant_id,
+            owner_user_id.clone(),
+            source_document_uri,
+            source_id,
+            revision_id,
+            parsed,
+            "image",
+            image_ref.to_string(),
+            image_ref.as_bytes(),
+        ));
+        if index > 10_000 {
+            break;
+        }
+    }
+
+    Ok(artifacts)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_artifact_from_bytes(
+    tenant_id: &str,
+    owner_user_id: Option<String>,
+    source_document_uri: &str,
+    source_id: &str,
+    revision_id: &str,
+    parsed: &ParserOutput,
+    kind: &str,
+    uri: String,
+    bytes: &[u8],
+) -> ParseArtifact {
+    ParseArtifact {
+        id: parse_artifact_id(&uri),
+        tenant_id: tenant_id.to_string(),
+        owner_user_id,
+        source_document_uri: source_document_uri.to_string(),
+        source_id: source_id.to_string(),
+        revision_id: revision_id.to_string(),
+        parser_provider: parsed.provider.clone(),
+        parser_backend: parsed.backend.clone(),
+        parser_version: parsed.parser_version.clone(),
+        artifact_kind: kind.to_string(),
+        uri,
+        checksum: sha256_hex(bytes),
+        byte_size: bytes.len(),
+        created_at: now(),
+    }
+}
+
+fn image_artifact_uri(source_document_uri: &str, image: &Value, index: u32) -> String {
+    image
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| {
+            image
+                .get("uri")
+                .or_else(|| image.get("path"))
+                .or_else(|| image.get("image_path"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| format!("{source_document_uri}/artifacts/images/{index:04}"))
+}
+
+fn parse_artifact_id(uri: &str) -> String {
+    format!(
+        "artifact_{}",
+        sha256_hex(uri.as_bytes())
+            .chars()
+            .take(24)
+            .collect::<String>()
+    )
+}
+
+fn ingest_task_visible(
+    task: &IngestTask,
+    owner_user_id: Option<&str>,
+    include_all_private: bool,
+) -> bool {
+    include_all_private
+        || task.owner_user_id.is_none()
+        || task.owner_user_id.as_deref() == owner_user_id
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 fn node_kind_for_layer(layer: u8) -> &'static str {
