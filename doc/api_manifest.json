@@ -28,6 +28,20 @@
     "file": "api/post_v1_admin_bootstrap.md"
   },
   {
+    "method": "POST",
+    "path": "/v1/admin/harness/evolution/changes/{change_id}/compare",
+    "handler": "compare_harness_change",
+    "group": "Harness",
+    "file": "api/post_v1_admin_harness_evolution_changes_change_id_compare.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/admin/harness/evolution/changes/{change_id}/delta",
+    "handler": "get_harness_change_delta",
+    "group": "Harness",
+    "file": "api/get_v1_admin_harness_evolution_changes_change_id_delta.md"
+  },
+  {
     "method": "GET",
     "path": "/v1/admin/history/user-event-indexes",
     "handler": "list_user_event_indexes",
@@ -278,6 +292,48 @@
     "handler": "llm_test",
     "group": "LLM",
     "file": "api/post_v1_llm_test.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/ingest/files:sync",
+    "handler": "ingest_file_sync",
+    "group": "Ingest",
+    "file": "api/post_v1_ingest_files_sync.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/ingest/tasks",
+    "handler": "create_ingest_task",
+    "group": "Ingest",
+    "file": "api/post_v1_ingest_tasks.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/ingest/tasks/{task_id}",
+    "handler": "get_ingest_task",
+    "group": "Ingest",
+    "file": "api/get_v1_ingest_tasks_task_id.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/ingest/tasks/{task_id}/result",
+    "handler": "get_ingest_task_result",
+    "group": "Ingest",
+    "file": "api/get_v1_ingest_tasks_task_id_result.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/ingest/uploads",
+    "handler": "create_ingest_upload",
+    "group": "Ingest",
+    "file": "api/post_v1_ingest_uploads.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/ingest/uploads:sync",
+    "handler": "ingest_upload_sync",
+    "group": "Ingest",
+    "file": "api/post_v1_ingest_uploads_sync.md"
   },
   {
     "method": "POST",

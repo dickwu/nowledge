@@ -1,7 +1,13 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, patch, post, put},
@@ -26,19 +32,96 @@ use crate::{
 };
 
 #[derive(Clone)]
+pub struct IngestTaskManager {
+    queue: Option<tokio::sync::mpsc::Sender<QueuedIngestJob>>,
+    queued_depth: Arc<AtomicUsize>,
+}
+
+struct QueuedIngestJob {
+    tenant_id: String,
+    task_id: String,
+    req: IngestTaskRequest,
+    config: Config,
+}
+
+impl IngestTaskManager {
+    fn new(store: Store, config: Arc<Config>) -> Self {
+        let queued_depth = Arc::new(AtomicUsize::new(0));
+        if !config.ingest_worker_enabled {
+            return Self {
+                queue: None,
+                queued_depth,
+            };
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<QueuedIngestJob>(
+            config.ingest_max_concurrent_tasks.max(1) * 8,
+        );
+        let depth = queued_depth.clone();
+        let max_concurrent = config.ingest_max_concurrent_tasks.max(1);
+        tokio::spawn(async move {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+            while let Some(job) = rx.recv().await {
+                depth.fetch_sub(1, Ordering::SeqCst);
+                let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                    break;
+                };
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(err) = store
+                        .run_ingest_task_async(&job.tenant_id, &job.task_id, job.req, &job.config)
+                        .await
+                    {
+                        tracing::warn!(task_id = %job.task_id, error = %err, "ingest task failed");
+                    }
+                });
+            }
+        });
+
+        Self {
+            queue: Some(tx),
+            queued_depth,
+        }
+    }
+
+    fn queued_ahead(&self) -> usize {
+        self.queued_depth.load(Ordering::SeqCst)
+    }
+
+    async fn enqueue(&self, job: QueuedIngestJob) -> Result<(), ApiError> {
+        let Some(queue) = &self.queue else {
+            return Ok(());
+        };
+        self.queued_depth.fetch_add(1, Ordering::SeqCst);
+        if queue.send(job).await.is_err() {
+            self.queued_depth.fetch_sub(1, Ordering::SeqCst);
+            return Err(ApiError::Internal(
+                "ingest worker queue is unavailable".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Store,
     pub meili: MeiliAdmin,
     pub llm_health: LlmHealthProbe,
+    pub ingest_manager: IngestTaskManager,
 }
 
 impl AppState {
     pub fn new(config: Arc<Config>) -> Self {
+        let store = Store::new(&config);
+        let ingest_manager = IngestTaskManager::new(store.clone(), config.clone());
         Self {
-            store: Store::new(&config),
+            store,
             meili: MeiliAdmin::from_config(&config),
             llm_health: LlmHealthProbe::new(),
+            ingest_manager,
             config,
         }
     }
@@ -95,6 +178,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/admin/harness/evolution/changes/{change_id}/verdict",
             post(create_harness_verdict),
+        )
+        .route(
+            "/v1/admin/harness/evolution/changes/{change_id}/compare",
+            post(compare_harness_change),
+        )
+        .route(
+            "/v1/admin/harness/evolution/changes/{change_id}/delta",
+            get(get_harness_change_delta),
         )
         .route(
             "/v1/state/profile/facts/{fact_key}",
@@ -199,6 +290,8 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/ingest/tasks/{task_id}/result",
             get(get_ingest_task_result),
         )
+        .route("/v1/ingest/uploads", post(create_ingest_upload))
+        .route("/v1/ingest/uploads:sync", post(ingest_upload_sync))
         .route("/v1/ingest/files:sync", post(ingest_file_sync))
         .route("/v1/rag/answer", post(rag_answer))
         .route("/v1/rag/stream", post(rag_stream))
@@ -436,10 +529,19 @@ async fn bootstrap(
 ) -> Result<Json<Value>, ApiError> {
     let reset = req.get("reset").and_then(Value::as_bool).unwrap_or(false);
     let result = state.meili.bootstrap(reset).await?;
+    let hydrated = if reset {
+        json!({})
+    } else {
+        state
+            .store
+            .hydrate_from_repository(state.tenant_id())
+            .await?
+    };
     Ok(Json(json!({
         "indexes": result.indexes,
         "tasks": result.tasks,
-        "dry_run": result.dry_run
+        "dry_run": result.dry_run,
+        "hydrated": hydrated
     })))
 }
 
@@ -525,6 +627,37 @@ async fn create_harness_verdict(
             .store
             .create_harness_verdict_async(state.tenant_id(), &change_id, req)
             .await?,
+    ))
+}
+
+async fn compare_harness_change(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Path(change_id): Path<String>,
+    Json(req): Json<Value>,
+) -> Result<Json<EvalDeltaReport>, ApiError> {
+    let baseline = req
+        .get("baseline_eval_run_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let candidate = req
+        .get("candidate_eval_run_id")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    Ok(Json(
+        state
+            .store
+            .compare_harness_change(&change_id, baseline, candidate)?,
+    ))
+}
+
+async fn get_harness_change_delta(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Path(change_id): Path<String>,
+) -> Result<Json<EvalDeltaReport>, ApiError> {
+    Ok(Json(
+        state.store.compare_harness_change(&change_id, None, None)?,
     ))
 }
 
@@ -1148,12 +1281,26 @@ async fn create_ingest_task(
 ) -> Result<Json<IngestTask>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
     require_owner_for_write(&user, req.owner_user_id.as_deref())?;
-    Ok(Json(
-        state
-            .store
-            .create_ingest_task_async(state.tenant_id(), req, &state.effective_config())
-            .await?,
-    ))
+    let config = state.effective_config();
+    let task = state
+        .store
+        .create_ingest_task_record_async(
+            state.tenant_id(),
+            &req,
+            &config,
+            state.ingest_manager.queued_ahead(),
+        )
+        .await?;
+    state
+        .ingest_manager
+        .enqueue(QueuedIngestJob {
+            tenant_id: state.tenant_id().to_string(),
+            task_id: task.task_id.clone(),
+            req,
+            config,
+        })
+        .await?;
+    Ok(Json(task))
 }
 
 async fn get_ingest_task(
@@ -1201,6 +1348,161 @@ async fn ingest_file_sync(
     ))
 }
 
+async fn create_ingest_upload(
+    user: UserGuard,
+    State(state): State<AppState>,
+    multipart: Multipart,
+) -> Result<Json<IngestTask>, ApiError> {
+    let mut req = ingest_request_from_multipart(multipart).await?;
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    require_owner_for_write(&user, req.owner_user_id.as_deref())?;
+    let config = state.effective_config();
+    let task = state
+        .store
+        .create_ingest_task_record_async(
+            state.tenant_id(),
+            &req,
+            &config,
+            state.ingest_manager.queued_ahead(),
+        )
+        .await?;
+    state
+        .ingest_manager
+        .enqueue(QueuedIngestJob {
+            tenant_id: state.tenant_id().to_string(),
+            task_id: task.task_id.clone(),
+            req,
+            config,
+        })
+        .await?;
+    Ok(Json(task))
+}
+
+async fn ingest_upload_sync(
+    user: UserGuard,
+    State(state): State<AppState>,
+    multipart: Multipart,
+) -> Result<Json<IngestTaskResult>, ApiError> {
+    let mut req = ingest_request_from_multipart(multipart).await?;
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    require_owner_for_write(&user, req.owner_user_id.as_deref())?;
+    Ok(Json(
+        state
+            .store
+            .ingest_file_sync_async(state.tenant_id(), req, &state.effective_config())
+            .await?,
+    ))
+}
+
+async fn ingest_request_from_multipart(
+    mut multipart: Multipart,
+) -> Result<IngestTaskRequest, ApiError> {
+    let mut req = IngestTaskRequest::default();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| ApiError::bad_request(format!("invalid multipart body: {err}")))?
+    {
+        let name = field.name().map(ToString::to_string).unwrap_or_default();
+        if matches!(name.as_str(), "file" | "document" | "upload") {
+            if req.file_name.is_none() {
+                req.file_name = field.file_name().map(ToString::to_string);
+            }
+            if req.content_type.is_none() {
+                req.content_type = field.content_type().map(ToString::to_string);
+            }
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|err| ApiError::bad_request(format!("invalid uploaded file: {err}")))?;
+            req.bytes = Some(bytes.to_vec());
+            continue;
+        }
+
+        let text = field.text().await.map_err(|err| {
+            ApiError::bad_request(format!("invalid multipart field {name}: {err}"))
+        })?;
+        apply_ingest_multipart_field(&mut req, &name, text)?;
+    }
+    Ok(req)
+}
+
+fn apply_ingest_multipart_field(
+    req: &mut IngestTaskRequest,
+    name: &str,
+    value: String,
+) -> Result<(), ApiError> {
+    match name {
+        "owner_user_id" => req.owner_user_id = non_empty(value),
+        "source_id" => req.source_id = non_empty(value),
+        "revision_id" => req.revision_id = non_empty(value),
+        "title" => req.title = non_empty(value),
+        "source_uri" => req.source_uri = non_empty(value),
+        "source_document_uri" => req.source_document_uri = non_empty(value),
+        "content" => req.content = Some(value),
+        "content_type" => req.content_type = non_empty(validate_multipart_content_type(&value)?),
+        "file_name" => req.file_name = non_empty(value),
+        "checksum" => req.checksum = non_empty(value),
+        "parser_provider" => req.parser_provider = non_empty(value),
+        "parser_backend" => req.parser_backend = non_empty(value),
+        "content_list" => req.content_list = Some(parse_json_field(name, &value)?),
+        "content_list_v2" => req.content_list_v2 = Some(parse_json_field(name, &value)?),
+        "middle_json" => req.middle_json = Some(parse_json_field(name, &value)?),
+        "model_json" => req.model_json = Some(parse_json_field(name, &value)?),
+        "fragment_policy" => {
+            req.fragment_policy = Some(parse_json_field::<FragmentPolicy>(name, &value)?)
+        }
+        "fragment_policy.chunk_size_chars" => {
+            req.fragment_policy
+                .get_or_insert_with(FragmentPolicy::default)
+                .chunk_size_chars = Some(parse_usize_field(name, &value)?);
+        }
+        "fragment_policy.overlap_chars" => {
+            req.fragment_policy
+                .get_or_insert_with(FragmentPolicy::default)
+                .overlap_chars = Some(parse_usize_field(name, &value)?);
+        }
+        "fragment_policy.min_chunk_chars" => {
+            req.fragment_policy
+                .get_or_insert_with(FragmentPolicy::default)
+                .min_chunk_chars = Some(parse_usize_field(name, &value)?);
+        }
+        "idempotency_key" => req.idempotency_key = non_empty(value),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn non_empty(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn validate_multipart_content_type(value: &str) -> Result<String, ApiError> {
+    reqwest::multipart::Part::bytes(Vec::new())
+        .mime_str(value)
+        .map_err(|err| ApiError::bad_request(format!("invalid content_type: {err}")))?;
+    Ok(value.to_string())
+}
+
+fn parse_json_field<T: serde::de::DeserializeOwned>(
+    name: &str,
+    value: &str,
+) -> Result<T, ApiError> {
+    serde_json::from_str(value)
+        .map_err(|err| ApiError::bad_request(format!("{name} must be valid JSON: {err}")))
+}
+
+fn parse_usize_field(name: &str, value: &str) -> Result<usize, ApiError> {
+    value
+        .parse::<usize>()
+        .map_err(|err| ApiError::bad_request(format!("{name} must be a positive integer: {err}")))
+}
+
 async fn rag_answer(
     user: UserGuard,
     State(state): State<AppState>,
@@ -1238,7 +1540,12 @@ async fn create_eval_case(
     State(state): State<AppState>,
     Json(req): Json<CreateRagEvalCaseRequest>,
 ) -> Result<Json<RagEvalCase>, ApiError> {
-    Ok(Json(state.store.create_eval_case(state.tenant_id(), req)?))
+    Ok(Json(
+        state
+            .store
+            .create_eval_case_async(state.tenant_id(), req)
+            .await?,
+    ))
 }
 
 async fn list_eval_cases(

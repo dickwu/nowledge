@@ -57,13 +57,16 @@ RAG_MINERU_RETURN_MD=true
 RAG_MINERU_RETURN_CONTENT_LIST=true
 RAG_MINERU_RETURN_MIDDLE_JSON=true
 RAG_MINERU_RETURN_IMAGES=true
+RAG_INGEST_MAX_CONCURRENT_TASKS=2
+RAG_INGEST_TASK_RETENTION_SECONDS=86400
+RAG_INGEST_CLEANUP_INTERVAL_SECONDS=300
+RAG_INGEST_WORKER_ENABLED=true
 RAG_LLM_PROVIDER=none
 RAG_LLM_MODEL=none
 RAG_ANALYSIS_LLM_PROVIDER=none
 RAG_ANALYSIS_LLM_MODEL=gpt-5.3-codex-spark
 RAG_OPENAI_API_KEY=optional-openai-key
 RAG_CODEX_AUTH_PATH=optional-explicit-codex-auth-json
-RAG_ALLOW_CODEX_AUTH_IMPORT=false
 RAG_HEALTH_LLM_ENABLED=true
 RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS=30
 RAG_HEALTH_LLM_PROBE_TTL_SECONDS=60
@@ -93,7 +96,12 @@ Document parser ingestion is an additive layer in front of the existing RAG
 backend. Use `RAG_PARSER_PROVIDER=builtin` for plain text fallback or
 `RAG_PARSER_PROVIDER=mineru` to call a remote `mineru-api` service. Ingestion
 APIs are `POST /v1/ingest/tasks`, `GET /v1/ingest/tasks/{task_id}`,
-`GET /v1/ingest/tasks/{task_id}/result`, and `POST /v1/ingest/files:sync`.
+`GET /v1/ingest/tasks/{task_id}/result`, `POST /v1/ingest/uploads`,
+`POST /v1/ingest/uploads:sync`, and `POST /v1/ingest/files:sync`.
+`POST /v1/ingest/tasks` and `/v1/ingest/uploads` return queued task metadata
+immediately; background workers perform parsing, fragmenting, and indexing.
+Multipart uploads send binary file bytes to MinerU when `parser_provider=mineru`;
+the builtin parser accepts UTF-8 text uploads.
 Parsed blocks become retrieval fragments; source documents and parse artifacts
 are stored for traceback/read flows but are not searched by default.
 
@@ -120,10 +128,19 @@ cargo check
 cargo test
 ```
 
-Optional Meilisearch integration tests run when `RAG_TEST_MEILI_URL` is set:
+Optional Meilisearch integration tests run when `RAG_TEST_MEILI_URL` is set.
+If the server requires a key, set `RAG_TEST_MEILI_API_KEY` too:
 
 ```sh
-RAG_TEST_MEILI_URL=http://127.0.0.1:7700 cargo test --test meili_integration
+RAG_TEST_MEILI_URL=http://127.0.0.1:7700 \
+RAG_TEST_MEILI_API_KEY=$MEILI_MASTER_KEY \
+cargo test --test meili_integration
+```
+
+Optional live MinerU integration tests run when `RAG_TEST_MINERU_API_URL` is set:
+
+```sh
+RAG_TEST_MINERU_API_URL=http://127.0.0.1:8000 cargo test --test mineru_integration
 ```
 
 The regression tests cover the v0.6 hard constraints around per-user event

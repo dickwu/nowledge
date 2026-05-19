@@ -2,7 +2,7 @@
 
 This directory contains one standalone English document for every HTTP API registered in `src/routes.rs::build_router`.
 
-Total documented APIs: 60.
+Total documented APIs: 68.
 
 Each endpoint file includes request parameters, response fields, access rules, and a Mermaid internal logic call graph.
 
@@ -22,6 +22,8 @@ Use `POST /v1/context/traceback` or explicit `GET /v1/fs/read` with normal ACL c
 | `GET` | `/livez` | `livez` | [api/get_livez.md](api/get_livez.md) |
 | `GET` | `/readyz` | `readyz` | [api/get_readyz.md](api/get_readyz.md) |
 | `POST` | `/v1/admin/bootstrap` | `bootstrap` | [api/post_v1_admin_bootstrap.md](api/post_v1_admin_bootstrap.md) |
+| `POST` | `/v1/admin/harness/evolution/changes/{change_id}/compare` | `compare_harness_change` | [api/post_v1_admin_harness_evolution_changes_change_id_compare.md](api/post_v1_admin_harness_evolution_changes_change_id_compare.md) |
+| `GET` | `/v1/admin/harness/evolution/changes/{change_id}/delta` | `get_harness_change_delta` | [api/get_v1_admin_harness_evolution_changes_change_id_delta.md](api/get_v1_admin_harness_evolution_changes_change_id_delta.md) |
 | `GET` | `/v1/admin/history/user-event-indexes` | `list_user_event_indexes` | [api/get_v1_admin_history_user_event_indexes.md](api/get_v1_admin_history_user_event_indexes.md) |
 | `POST` | `/v1/admin/history/user-event-indexes:reconcile` | `reconcile_user_event_indexes` | [api/post_v1_admin_history_user_event_indexes_reconcile.md](api/post_v1_admin_history_user_event_indexes_reconcile.md) |
 | `POST` | `/v1/analysis/insights` | `analyze_insights` | [api/post_v1_analysis_insights.md](api/post_v1_analysis_insights.md) |
@@ -58,6 +60,12 @@ Use `POST /v1/context/traceback` or explicit `GET /v1/fs/read` with normal ACL c
 | `POST` | `/v1/links/search` | `search_links` | [api/post_v1_links_search.md](api/post_v1_links_search.md) |
 | `GET` | `/v1/llm/status` | `llm_status` | [api/get_v1_llm_status.md](api/get_v1_llm_status.md) |
 | `POST` | `/v1/llm/test` | `llm_test` | [api/post_v1_llm_test.md](api/post_v1_llm_test.md) |
+| `POST` | `/v1/ingest/files:sync` | `ingest_file_sync` | [api/post_v1_ingest_files_sync.md](api/post_v1_ingest_files_sync.md) |
+| `POST` | `/v1/ingest/tasks` | `create_ingest_task` | [api/post_v1_ingest_tasks.md](api/post_v1_ingest_tasks.md) |
+| `GET` | `/v1/ingest/tasks/{task_id}` | `get_ingest_task` | [api/get_v1_ingest_tasks_task_id.md](api/get_v1_ingest_tasks_task_id.md) |
+| `GET` | `/v1/ingest/tasks/{task_id}/result` | `get_ingest_task_result` | [api/get_v1_ingest_tasks_task_id_result.md](api/get_v1_ingest_tasks_task_id_result.md) |
+| `POST` | `/v1/ingest/uploads` | `create_ingest_upload` | [api/post_v1_ingest_uploads.md](api/post_v1_ingest_uploads.md) |
+| `POST` | `/v1/ingest/uploads:sync` | `ingest_upload_sync` | [api/post_v1_ingest_uploads_sync.md](api/post_v1_ingest_uploads_sync.md) |
 | `POST` | `/v1/rag/answer` | `rag_answer` | [api/post_v1_rag_answer.md](api/post_v1_rag_answer.md) |
 | `POST` | `/v1/rag/debug` | `rag_debug` | [api/post_v1_rag_debug.md](api/post_v1_rag_debug.md) |
 | `POST` | `/v1/rag/stream` | `rag_stream` | [api/post_v1_rag_stream.md](api/post_v1_rag_stream.md) |

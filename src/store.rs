@@ -150,6 +150,127 @@ impl Store {
         self.repository.backend_name()
     }
 
+    pub async fn hydrate_from_repository(&self, tenant_id: &str) -> Result<Value, ApiError> {
+        let mut counts = serde_json::Map::new();
+
+        if let Some(components) = self.repository.list_harness_components(tenant_id).await? {
+            let mut data = self.write()?;
+            let count = components.len();
+            for component in components {
+                data.harness_components
+                    .insert(component.id.clone(), component);
+            }
+            counts.insert("harness_components".to_string(), json!(count));
+        }
+        if let Some(revisions) = self
+            .repository
+            .list_harness_component_revisions(tenant_id, None)
+            .await?
+        {
+            let mut data = self.write()?;
+            let count = revisions.len();
+            if !revisions.is_empty() {
+                data.harness_revisions.clear();
+                for revision in revisions {
+                    data.harness_revisions
+                        .entry(revision.component_id.clone())
+                        .or_default()
+                        .push(revision);
+                }
+                for revisions in data.harness_revisions.values_mut() {
+                    revisions.sort_by_key(|revision| revision.iteration);
+                }
+            }
+            counts.insert("harness_revisions".to_string(), json!(count));
+        }
+        if let Some(changes) = self.repository.list_harness_changes(tenant_id).await? {
+            let mut data = self.write()?;
+            let count = changes.len();
+            for change in changes {
+                data.harness_changes.insert(change.id.clone(), change);
+            }
+            counts.insert("harness_changes".to_string(), json!(count));
+        }
+        if let Some(verdicts) = self
+            .repository
+            .list_harness_verdicts(tenant_id, None)
+            .await?
+        {
+            let mut data = self.write()?;
+            let count = verdicts.len();
+            for verdict in verdicts {
+                data.harness_verdicts.insert(verdict.id.clone(), verdict);
+            }
+            counts.insert("harness_verdicts".to_string(), json!(count));
+        }
+        if let Some(cases) = self.repository.list_eval_cases(tenant_id).await? {
+            let mut data = self.write()?;
+            let count = cases.len();
+            for case in cases {
+                data.eval_cases.insert(case.id.clone(), case);
+            }
+            counts.insert("eval_cases".to_string(), json!(count));
+        }
+        if let Some(runs) = self.repository.list_eval_runs(tenant_id).await? {
+            let mut data = self.write()?;
+            let count = runs.len();
+            for run in runs {
+                data.eval_runs.insert(run.id.clone(), run);
+            }
+            counts.insert("eval_runs".to_string(), json!(count));
+        }
+        let run_ids = {
+            let data = self.read()?;
+            data.eval_runs.keys().cloned().collect::<Vec<_>>()
+        };
+        let mut eval_result_count = 0usize;
+        let mut eval_overview_count = 0usize;
+        for run_id in run_ids {
+            if let Some(results) = self
+                .repository
+                .list_eval_case_results(tenant_id, &run_id)
+                .await?
+            {
+                eval_result_count += results.len();
+                let mut data = self.write()?;
+                for result in results {
+                    data.eval_case_results.insert(result.id.clone(), result);
+                }
+            }
+            if let Some(overview) = self
+                .repository
+                .get_eval_overview(tenant_id, &run_id)
+                .await?
+            {
+                eval_overview_count += 1;
+                let mut data = self.write()?;
+                data.eval_overviews.insert(run_id.clone(), overview);
+            }
+        }
+        counts.insert("eval_case_results".to_string(), json!(eval_result_count));
+        counts.insert("eval_overviews".to_string(), json!(eval_overview_count));
+
+        if let Some(tasks) = self.repository.list_ingest_tasks(tenant_id).await? {
+            let mut data = self.write()?;
+            let count = tasks.len();
+            for task in tasks {
+                data.ingest_tasks.insert(task.task_id.clone(), task);
+            }
+            counts.insert("ingest_tasks".to_string(), json!(count));
+        }
+        if let Some(results) = self.repository.list_ingest_results(tenant_id).await? {
+            let mut data = self.write()?;
+            let count = results.len();
+            for result in results {
+                data.ingest_results
+                    .insert(result.task.task_id.clone(), result);
+            }
+            counts.insert("ingest_results".to_string(), json!(count));
+        }
+
+        Ok(Value::Object(counts))
+    }
+
     pub fn list_harness_components(&self) -> Result<Vec<HarnessComponent>, ApiError> {
         let data = self.read()?;
         let mut components = data
@@ -213,6 +334,8 @@ impl Store {
             predicted_fixes: req.predicted_fixes,
             risk_cases: req.risk_cases,
             expected_metric_deltas: req.expected_metric_deltas,
+            baseline_eval_run_id: req.baseline_eval_run_id,
+            candidate_eval_run_id: req.candidate_eval_run_id,
             why_this_component,
             created_by,
             created_at: now(),
@@ -441,6 +564,9 @@ impl Store {
         req: CreateHarnessChangeVerdictRequest,
     ) -> Result<HarnessChangeVerdict, ApiError> {
         let created_by = req.created_by.unwrap_or_else(|| "admin".to_string());
+        let delta = self
+            .compare_harness_change(change_id, None, req.eval_run_id.clone())
+            .ok();
         let (change, run, overview) = {
             let data = self.read()?;
             let change = data
@@ -466,33 +592,78 @@ impl Store {
         } else {
             req.observed_metric_deltas
         };
-        let evidence_text = verdict_evidence_text(run.as_ref(), overview.as_ref());
-        let risk_cases_regressed = change
-            .risk_cases
-            .iter()
-            .filter(|risk| contains_folded(&evidence_text, risk))
-            .cloned()
-            .collect::<Vec<_>>();
-        let predicted_fixes_confirmed = if run.as_ref().is_some_and(|run| run.status == "passed") {
-            change.predicted_fixes.clone()
-        } else {
-            Vec::new()
-        };
-        let verdict = if !risk_cases_regressed.is_empty() {
-            if predicted_fixes_confirmed.is_empty() {
-                "rollback_and_pivot"
-            } else {
-                "rollback"
-            }
-        } else if run
-            .as_ref()
-            .is_some_and(|run| run.status == "passed" && run.metrics.pass_rate >= 1.0)
+        let (predicted_fixes_confirmed, risk_cases_regressed, verdict, evidence) = if let Some(
+            delta,
+        ) = delta
         {
-            "keep"
+            let risk_cases_regressed = delta
+                .risk_matrix
+                .iter()
+                .filter(|risk| risk.regressed)
+                .map(|risk| risk.case_id.clone())
+                .collect::<Vec<_>>();
+            let predicted_fixes_confirmed =
+                predicted_fix_confirmations(&change.predicted_fixes, &delta);
+            let verdict = if !risk_cases_regressed.is_empty() {
+                if predicted_fixes_confirmed.is_empty() {
+                    "rollback_and_pivot"
+                } else {
+                    "rollback"
+                }
+            } else if !predicted_fixes_confirmed.is_empty()
+                && predicted_fixes_confirmed.len() >= change.predicted_fixes.len().max(1)
+            {
+                "keep"
+            } else {
+                "improve"
+            }
+            .to_string();
+            (
+                predicted_fixes_confirmed,
+                risk_cases_regressed,
+                verdict,
+                json!({ "delta": delta }),
+            )
         } else {
-            "improve"
-        }
-        .to_string();
+            let evidence_text = verdict_evidence_text(run.as_ref(), overview.as_ref());
+            let risk_cases_regressed = change
+                .risk_cases
+                .iter()
+                .filter(|risk| contains_folded(&evidence_text, risk))
+                .cloned()
+                .collect::<Vec<_>>();
+            let predicted_fixes_confirmed =
+                if run.as_ref().is_some_and(|run| run.status == "passed") {
+                    change.predicted_fixes.clone()
+                } else {
+                    Vec::new()
+                };
+            let verdict = if !risk_cases_regressed.is_empty() {
+                if predicted_fixes_confirmed.is_empty() {
+                    "rollback_and_pivot"
+                } else {
+                    "rollback"
+                }
+            } else if run
+                .as_ref()
+                .is_some_and(|run| run.status == "passed" && run.metrics.pass_rate >= 1.0)
+            {
+                "keep"
+            } else {
+                "improve"
+            }
+            .to_string();
+            (
+                predicted_fixes_confirmed,
+                risk_cases_regressed,
+                verdict,
+                json!({
+                    "change_failure_pattern": change.failure_pattern,
+                    "eval_run_status": run.as_ref().map(|run| run.status.clone()),
+                    "overview": overview.as_ref().map(|overview| overview.overview_markdown.clone())
+                }),
+            )
+        };
         let verdict_record = HarnessChangeVerdict {
             id: new_id("hverdict"),
             tenant_id: tenant_id.to_string(),
@@ -502,11 +673,7 @@ impl Store {
             predicted_fixes_confirmed,
             risk_cases_regressed,
             observed_metric_deltas,
-            evidence: json!({
-                "change_failure_pattern": change.failure_pattern,
-                "eval_run_status": run.as_ref().map(|run| run.status.clone()),
-                "overview": overview.as_ref().map(|overview| overview.overview_markdown.clone())
-            }),
+            evidence,
             created_by,
             created_at: now(),
         };
@@ -523,6 +690,89 @@ impl Store {
             .upsert_harness_verdicts(std::slice::from_ref(&verdict_record))
             .await?;
         Ok(verdict_record)
+    }
+
+    pub fn compare_harness_change(
+        &self,
+        change_id: &str,
+        baseline_eval_run_id: Option<String>,
+        candidate_eval_run_id: Option<String>,
+    ) -> Result<EvalDeltaReport, ApiError> {
+        let data = self.read()?;
+        let change = data
+            .harness_changes
+            .get(change_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("harness change not found"))?;
+        let baseline_run_id = baseline_eval_run_id
+            .or(change.baseline_eval_run_id.clone())
+            .ok_or_else(|| ApiError::bad_request("baseline_eval_run_id is required"))?;
+        let candidate_run_id = candidate_eval_run_id
+            .or(change.candidate_eval_run_id.clone())
+            .or_else(|| latest_eval_run_for_change(&data, change_id).map(|run| run.id))
+            .ok_or_else(|| ApiError::bad_request("candidate_eval_run_id is required"))?;
+        let baseline_run = data
+            .eval_runs
+            .get(&baseline_run_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("baseline eval run not found"))?;
+        let candidate_run = data
+            .eval_runs
+            .get(&candidate_run_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("candidate eval run not found"))?;
+        let baseline_results = eval_results_by_case(&data, &baseline_run);
+        let candidate_results = eval_results_by_case(&data, &candidate_run);
+        let mut case_ids = baseline_results
+            .keys()
+            .chain(candidate_results.keys())
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        case_ids.sort();
+
+        let mut fixed_cases = Vec::new();
+        let mut regressed_cases = Vec::new();
+        let mut unchanged_failed_cases = Vec::new();
+        let mut unchanged_passed_cases = Vec::new();
+        for case_id in &case_ids {
+            let baseline_status = baseline_results
+                .get(case_id)
+                .map(|result| result.status.as_str())
+                .unwrap_or("missing");
+            let candidate_status = candidate_results
+                .get(case_id)
+                .map(|result| result.status.as_str())
+                .unwrap_or("missing");
+            match (baseline_status, candidate_status) {
+                ("failed", "passed") => fixed_cases.push(case_id.clone()),
+                ("passed", "failed") => regressed_cases.push(case_id.clone()),
+                ("failed", "failed") => unchanged_failed_cases.push(case_id.clone()),
+                ("passed", "passed") => unchanged_passed_cases.push(case_id.clone()),
+                _ => {}
+            }
+        }
+
+        let risk_matrix = risk_matrix_for_change(
+            &change,
+            &baseline_results,
+            &candidate_results,
+            &regressed_cases,
+        );
+
+        Ok(EvalDeltaReport {
+            change_id: change_id.to_string(),
+            baseline_run_id,
+            candidate_run_id,
+            fixed_cases,
+            regressed_cases,
+            unchanged_failed_cases,
+            unchanged_passed_cases,
+            metric_deltas: metric_deltas(&baseline_run.metrics, &candidate_run.metrics),
+            risk_matrix,
+            generated_at: now(),
+        })
     }
 
     pub fn create_eval_case(
@@ -548,6 +798,16 @@ impl Store {
             return Err(ApiError::conflict("eval case already exists"));
         }
         data.eval_cases.insert(case.id.clone(), case.clone());
+        Ok(case)
+    }
+
+    pub async fn create_eval_case_async(
+        &self,
+        tenant_id: &str,
+        req: CreateRagEvalCaseRequest,
+    ) -> Result<RagEvalCase, ApiError> {
+        let case = self.create_eval_case(tenant_id, req)?;
+        let _ = self.repository.upsert_eval_case(&case).await?;
         Ok(case)
     }
 
@@ -670,6 +930,20 @@ impl Store {
             .repository
             .upsert_context_nodes("rag_company_context", &company_nodes)
             .await?;
+        let _ = self.repository.upsert_eval_run(&run).await?;
+        let report = self.eval_run_report(&run.id)?;
+        if let Some(results) = report.get("case_results").and_then(Value::as_array) {
+            let results = results
+                .iter()
+                .cloned()
+                .map(serde_json::from_value)
+                .collect::<Result<Vec<RagEvalCaseResult>, _>>()
+                .map_err(|err| ApiError::Internal(err.to_string()))?;
+            let _ = self.repository.upsert_eval_case_results(&results).await?;
+        }
+        if let Ok(overview) = self.eval_overview(&run.id) {
+            let _ = self.repository.upsert_eval_overview(&overview).await?;
+        }
         Ok(run)
     }
 
@@ -1248,7 +1522,10 @@ impl Store {
         req: IngestTaskRequest,
         config: &Config,
     ) -> Result<IngestTask, ApiError> {
-        self.ingest_file_sync_async(tenant_id, req, config)
+        let task = self
+            .create_ingest_task_record_async(tenant_id, &req, config, 0)
+            .await?;
+        self.run_ingest_task_async(tenant_id, &task.task_id, req, config)
             .await
             .map(|result| result.task)
     }
@@ -1259,6 +1536,20 @@ impl Store {
         req: IngestTaskRequest,
         config: &Config,
     ) -> Result<IngestTaskResult, ApiError> {
+        let task = self
+            .create_ingest_task_record_async(tenant_id, &req, config, 0)
+            .await?;
+        self.run_ingest_task_async(tenant_id, &task.task_id, req, config)
+            .await
+    }
+
+    pub async fn create_ingest_task_record_async(
+        &self,
+        tenant_id: &str,
+        req: &IngestTaskRequest,
+        config: &Config,
+        queued_ahead: usize,
+    ) -> Result<IngestTask, ApiError> {
         let mut parser_config = config.clone();
         if let Some(provider) = req.parser_provider.as_deref() {
             parser_config.parser_provider = provider.to_string();
@@ -1272,11 +1563,17 @@ impl Store {
             ));
         }
 
-        let content = req.content.clone().unwrap_or_default();
-        if content.trim().is_empty() && req.content_list.is_none() && req.content_list_v2.is_none()
+        let has_content = req
+            .content
+            .as_deref()
+            .is_some_and(|content| !content.trim().is_empty());
+        if !has_content
+            && req.bytes.as_ref().is_none_or(Vec::is_empty)
+            && req.content_list.is_none()
+            && req.content_list_v2.is_none()
         {
             return Err(ApiError::bad_request(
-                "content or MinerU content_list output is required",
+                "content, file bytes, or MinerU content_list output is required",
             ));
         }
 
@@ -1317,8 +1614,9 @@ impl Store {
             "text".to_string()
         };
         let now = now();
+        let task_id = new_id("ingest");
         let task = IngestTask {
-            task_id: new_id("ingest"),
+            task_id: task_id.clone(),
             tenant_id: tenant_id.to_string(),
             owner_user_id: req.owner_user_id.clone(),
             source_id: source_id.clone(),
@@ -1331,17 +1629,50 @@ impl Store {
             created_at: now,
             updated_at: now,
             completed_at: None,
+            status_url: Some(format!("/v1/ingest/tasks/{task_id}")),
+            result_url: Some(format!("/v1/ingest/tasks/{task_id}/result")),
+            queued_ahead: Some(queued_ahead),
         };
         {
             let mut data = self.write()?;
             data.ingest_tasks.insert(task.task_id.clone(), task.clone());
         }
+        let _ = self.repository.upsert_ingest_task(&task).await?;
+        Ok(task)
+    }
 
-        self.transition_ingest_task(&task.task_id, "parsing", None)?;
+    pub async fn run_ingest_task_async(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+        req: IngestTaskRequest,
+        config: &Config,
+    ) -> Result<IngestTaskResult, ApiError> {
+        let mut parser_config = config.clone();
+        if let Some(provider) = req.parser_provider.as_deref() {
+            parser_config.parser_provider = provider.to_string();
+        }
+        if let Some(backend) = req.parser_backend.as_deref() {
+            parser_config.mineru_backend = backend.to_string();
+        }
+        let task = self.ingest_task_for_run(task_id)?;
+        let original_content = req
+            .content
+            .clone()
+            .or_else(|| {
+                req.bytes
+                    .as_ref()
+                    .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
+            })
+            .unwrap_or_default();
+
+        self.transition_ingest_task_async(task_id, "parsing", None)
+            .await?;
         let parser = parser_from_config(&parser_config);
         let parsed = match parser
             .parse(ParserInput {
-                content: content.clone(),
+                content: req.content.clone(),
+                bytes: req.bytes.clone(),
                 content_type: req.content_type.clone(),
                 file_name: req.file_name.clone(),
                 content_list: req.content_list.clone(),
@@ -1353,13 +1684,16 @@ impl Store {
         {
             Ok(parsed) => parsed,
             Err(err) => {
-                let _ = self.transition_ingest_task(&task.task_id, "failed", Some(err.to_string()));
+                let _ = self
+                    .transition_ingest_task_async(task_id, "failed", Some(err.to_string()))
+                    .await;
                 return Err(err);
             }
         };
 
-        self.transition_ingest_task(&task.task_id, "parsed", None)?;
-        let document_content = parsed_content(&content, &parsed);
+        self.transition_ingest_task_async(task_id, "parsed", None)
+            .await?;
+        let document_content = parsed_content(&original_content, &parsed);
         let checksum = req
             .checksum
             .clone()
@@ -1367,11 +1701,11 @@ impl Store {
         let artifacts = build_parse_artifacts(
             tenant_id,
             req.owner_user_id.clone(),
-            &source_document_uri,
-            &source_id,
-            &revision_id,
+            task.source_document_uri.as_deref().unwrap_or_default(),
+            &task.source_id,
+            &task.revision_id,
             &parsed,
-            &content,
+            &original_content,
         )?;
         let artifact_refs = artifacts
             .iter()
@@ -1383,7 +1717,8 @@ impl Store {
             })
             .collect::<Vec<_>>();
 
-        self.transition_ingest_task(&task.task_id, "fragmenting", None)?;
+        self.transition_ingest_task_async(task_id, "fragmenting", None)
+            .await?;
         let (index_kind, index_uid) = if let Some(owner) = req.owner_user_id.as_deref() {
             let routing = self.resolver.resolve(tenant_id, owner, false, true)?;
             ("personal".to_string(), routing.personal_context_index_uid)
@@ -1400,10 +1735,14 @@ impl Store {
                 tenant_id,
                 req.owner_user_id.clone(),
                 "parsed_doc",
-                &source_id,
-                &revision_id,
-                &source_document_uri,
-                &title,
+                &task.source_id,
+                &task.revision_id,
+                task.source_document_uri.as_deref().unwrap_or_default(),
+                &req.title
+                    .clone()
+                    .or_else(|| req.file_name.clone())
+                    .or_else(|| req.source_uri.clone())
+                    .unwrap_or_else(|| "Parsed document".to_string()),
                 &document_content,
                 &checksum,
                 &index_kind,
@@ -1414,29 +1753,37 @@ impl Store {
             )
         };
 
-        self.transition_ingest_task(&task.task_id, "indexing", None)?;
+        self.transition_ingest_task_async(task_id, "indexing", None)
+            .await?;
         if let Err(err) = self
             .persist_ingest_outputs(tenant_id, req.owner_user_id.as_deref())
             .await
         {
-            let _ = self.transition_ingest_task(&task.task_id, "failed", Some(err.to_string()));
+            let _ = self
+                .transition_ingest_task_async(task_id, "failed", Some(err.to_string()))
+                .await;
             return Err(err);
         }
 
-        let task = self.transition_ingest_task(&task.task_id, "completed", None)?;
+        let task = self
+            .transition_ingest_task_async(task_id, "completed", None)
+            .await?;
         let result = IngestTaskResult {
             task: task.clone(),
             source_document_uri: ingest.source_document_uri,
             source_id: ingest.source_id,
-            revision_id,
+            revision_id: task.revision_id.clone(),
             parse_artifacts: artifacts,
             parsed_blocks: parsed.blocks,
             context_uris: ingest.fragment_uris.clone(),
             fragment_uris: ingest.fragment_uris,
         };
-        let mut data = self.write()?;
-        data.ingest_results
-            .insert(task.task_id.clone(), result.clone());
+        {
+            let mut data = self.write()?;
+            data.ingest_results
+                .insert(task.task_id.clone(), result.clone());
+        }
+        let _ = self.repository.upsert_ingest_result(&result).await?;
         Ok(result)
     }
 
@@ -1465,7 +1812,26 @@ impl Store {
             .get(task_id)
             .filter(|result| ingest_task_visible(&result.task, owner_user_id, include_all_private))
             .cloned()
-            .ok_or_else(|| ApiError::not_found("ingest result not found"))
+            .map(Ok)
+            .unwrap_or_else(|| {
+                let Some(task) = data
+                    .ingest_tasks
+                    .get(task_id)
+                    .filter(|task| ingest_task_visible(task, owner_user_id, include_all_private))
+                else {
+                    return Err(ApiError::not_found("ingest result not found"));
+                };
+                if task.state == "failed" {
+                    Err(ApiError::conflict(format!(
+                        "ingest task failed: {}",
+                        task.error
+                            .clone()
+                            .unwrap_or_else(|| "unknown error".to_string())
+                    )))
+                } else {
+                    Err(ApiError::conflict("ingest result is not ready"))
+                }
+            })
     }
 
     pub async fn create_snapshot_async(
@@ -4298,6 +4664,25 @@ impl Store {
         Ok(task.clone())
     }
 
+    async fn transition_ingest_task_async(
+        &self,
+        task_id: &str,
+        state: &str,
+        error: Option<String>,
+    ) -> Result<IngestTask, ApiError> {
+        let task = self.transition_ingest_task(task_id, state, error)?;
+        let _ = self.repository.upsert_ingest_task(&task).await?;
+        Ok(task)
+    }
+
+    fn ingest_task_for_run(&self, task_id: &str) -> Result<IngestTask, ApiError> {
+        let data = self.read()?;
+        data.ingest_tasks
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("ingest task not found"))
+    }
+
     fn company_source(&self, source_id: &str) -> Result<Option<CompanySource>, ApiError> {
         let data = self.read()?;
         Ok(data.sources.get(source_id).cloned())
@@ -5234,6 +5619,116 @@ fn latest_eval_run_for_change(data: &StoreData, change_id: &str) -> Option<RagEv
         .filter(|run| run.change_id.as_deref() == Some(change_id))
         .cloned()
         .max_by_key(|run| run.created_at)
+}
+
+fn eval_results_by_case(data: &StoreData, run: &RagEvalRun) -> HashMap<String, RagEvalCaseResult> {
+    run.result_ids
+        .iter()
+        .filter_map(|result_id| data.eval_case_results.get(result_id))
+        .map(|result| (result.case_id.clone(), result.clone()))
+        .collect()
+}
+
+fn predicted_fix_confirmations(predicted_fixes: &[String], delta: &EvalDeltaReport) -> Vec<String> {
+    if predicted_fixes.is_empty() {
+        return delta.fixed_cases.clone();
+    }
+    predicted_fixes
+        .iter()
+        .filter(|fix| {
+            delta.fixed_cases.iter().any(|case_id| case_id == *fix)
+                || delta.fixed_cases.iter().any(|case_id| {
+                    delta
+                        .risk_matrix
+                        .iter()
+                        .any(|risk| risk.case_id == *case_id && result_matches_label(risk, fix))
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+fn result_matches_label(result: &RiskCaseResult, label: &str) -> bool {
+    result.case_id == label
+        || result
+            .baseline_failures
+            .iter()
+            .chain(result.candidate_failures.iter())
+            .any(|failure| failure == label)
+}
+
+fn risk_matrix_for_change(
+    change: &HarnessChangeManifest,
+    baseline_results: &HashMap<String, RagEvalCaseResult>,
+    candidate_results: &HashMap<String, RagEvalCaseResult>,
+    regressed_cases: &[String],
+) -> Vec<RiskCaseResult> {
+    let mut risk_case_ids = change
+        .risk_cases
+        .iter()
+        .flat_map(|risk| {
+            let mut ids = Vec::new();
+            if baseline_results.contains_key(risk) || candidate_results.contains_key(risk) {
+                ids.push(risk.clone());
+            }
+            let matching_cases = candidate_results
+                .iter()
+                .filter(|(case_id, result)| {
+                    !ids.contains(case_id)
+                        && (result.failures.iter().any(|failure| failure == risk)
+                            || result.guard_failures.iter().any(|failure| failure == risk))
+                })
+                .map(|(case_id, _)| case_id.clone())
+                .collect::<Vec<_>>();
+            ids.extend(matching_cases);
+            ids
+        })
+        .collect::<Vec<_>>();
+    risk_case_ids.extend(regressed_cases.iter().cloned());
+    risk_case_ids.sort();
+    risk_case_ids.dedup();
+
+    risk_case_ids
+        .into_iter()
+        .map(|case_id| {
+            let baseline = baseline_results.get(&case_id);
+            let candidate = candidate_results.get(&case_id);
+            let baseline_status = baseline
+                .map(|result| result.status.clone())
+                .unwrap_or_else(|| "missing".to_string());
+            let candidate_status = candidate
+                .map(|result| result.status.clone())
+                .unwrap_or_else(|| "missing".to_string());
+            RiskCaseResult {
+                case_id,
+                regressed: baseline_status == "passed" && candidate_status == "failed",
+                baseline_status,
+                candidate_status,
+                baseline_failures: baseline
+                    .map(|result| result.failures.clone())
+                    .unwrap_or_default(),
+                candidate_failures: candidate
+                    .map(|result| result.failures.clone())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+fn metric_deltas(baseline: &RagEvalMetrics, candidate: &RagEvalMetrics) -> Value {
+    json!({
+        "pass_rate": candidate.pass_rate - baseline.pass_rate,
+        "retrieval_recall_at_5": candidate.retrieval_recall_at_5 - baseline.retrieval_recall_at_5,
+        "citation_precision": candidate.citation_precision - baseline.citation_precision,
+        "traceback_success_rate": candidate.traceback_success_rate - baseline.traceback_success_rate,
+        "source_doc_leak_rate": candidate.source_doc_leak_rate - baseline.source_doc_leak_rate,
+        "acl_violation_rate": candidate.acl_violation_rate - baseline.acl_violation_rate,
+        "stale_fragment_rate": candidate.stale_fragment_rate - baseline.stale_fragment_rate,
+        "state_history_consistency_rate": candidate.state_history_consistency_rate - baseline.state_history_consistency_rate,
+        "llm_health_false_ready_rate": candidate.llm_health_false_ready_rate - baseline.llm_health_false_ready_rate,
+        "tokens_per_answer": candidate.tokens_per_answer - baseline.tokens_per_answer,
+        "latency_p95": candidate.latency_p95 - baseline.latency_p95
+    })
 }
 
 fn metrics_to_value(metrics: &RagEvalMetrics) -> Value {
@@ -6293,5 +6788,214 @@ mod tests {
             .guard_results
             .iter()
             .any(|guard| guard.name == "owner_acl_never_leaks" && !guard.passed));
+    }
+
+    #[tokio::test]
+    async fn eval_delta_reports_fixed_and_regressed_risk_cases_for_verdict() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant_id = config.tenant_id.as_str();
+        let created_at = now();
+        {
+            let mut data = store.write().unwrap();
+            data.harness_changes.insert(
+                "delta-change".to_string(),
+                HarnessChangeManifest {
+                    id: "delta-change".to_string(),
+                    tenant_id: tenant_id.to_string(),
+                    iteration: 1,
+                    change_type: "improvement".to_string(),
+                    component_id: "retrieval.context_search".to_string(),
+                    files: vec!["src/store.rs".to_string()],
+                    failure_pattern: "retrieval_recall".to_string(),
+                    root_cause: "test".to_string(),
+                    targeted_fix: "test".to_string(),
+                    predicted_fixes: vec!["case-fixed".to_string()],
+                    risk_cases: vec!["case-risk".to_string()],
+                    expected_metric_deltas: json!({ "pass_rate": 0.5 }),
+                    baseline_eval_run_id: Some("baseline-run".to_string()),
+                    candidate_eval_run_id: Some("candidate-run".to_string()),
+                    why_this_component: "test".to_string(),
+                    created_by: "test".to_string(),
+                    created_at,
+                    status: "proposed".to_string(),
+                },
+            );
+            data.eval_runs.insert(
+                "baseline-run".to_string(),
+                RagEvalRun {
+                    id: "baseline-run".to_string(),
+                    tenant_id: tenant_id.to_string(),
+                    change_id: Some("delta-change".to_string()),
+                    case_ids: vec![
+                        "case-fixed".to_string(),
+                        "case-risk".to_string(),
+                        "case-still-failed".to_string(),
+                        "case-still-passed".to_string(),
+                    ],
+                    result_ids: vec![
+                        "baseline-fixed".to_string(),
+                        "baseline-risk".to_string(),
+                        "baseline-still-failed".to_string(),
+                        "baseline-still-passed".to_string(),
+                    ],
+                    trace_ids: Vec::new(),
+                    status: "failed".to_string(),
+                    metrics: RagEvalMetrics {
+                        pass_rate: 0.5,
+                        retrieval_recall_at_5: 0.5,
+                        ..RagEvalMetrics::default()
+                    },
+                    guard_results: Vec::new(),
+                    overview_source_document_uri: None,
+                    report_source_document_uris: Vec::new(),
+                    created_by: "test".to_string(),
+                    created_at,
+                    completed_at: Some(created_at),
+                },
+            );
+            data.eval_runs.insert(
+                "candidate-run".to_string(),
+                RagEvalRun {
+                    id: "candidate-run".to_string(),
+                    tenant_id: tenant_id.to_string(),
+                    change_id: Some("delta-change".to_string()),
+                    case_ids: vec![
+                        "case-fixed".to_string(),
+                        "case-risk".to_string(),
+                        "case-still-failed".to_string(),
+                        "case-still-passed".to_string(),
+                    ],
+                    result_ids: vec![
+                        "candidate-fixed".to_string(),
+                        "candidate-risk".to_string(),
+                        "candidate-still-failed".to_string(),
+                        "candidate-still-passed".to_string(),
+                    ],
+                    trace_ids: Vec::new(),
+                    status: "failed".to_string(),
+                    metrics: RagEvalMetrics {
+                        pass_rate: 0.5,
+                        retrieval_recall_at_5: 1.0,
+                        ..RagEvalMetrics::default()
+                    },
+                    guard_results: Vec::new(),
+                    overview_source_document_uri: None,
+                    report_source_document_uris: Vec::new(),
+                    created_by: "test".to_string(),
+                    created_at,
+                    completed_at: Some(created_at),
+                },
+            );
+            for (id, run_id, case_id, status, failures) in [
+                (
+                    "baseline-fixed",
+                    "baseline-run",
+                    "case-fixed",
+                    "failed",
+                    vec!["retrieval_recall"],
+                ),
+                (
+                    "candidate-fixed",
+                    "candidate-run",
+                    "case-fixed",
+                    "passed",
+                    vec![],
+                ),
+                (
+                    "baseline-risk",
+                    "baseline-run",
+                    "case-risk",
+                    "passed",
+                    vec![],
+                ),
+                (
+                    "candidate-risk",
+                    "candidate-run",
+                    "case-risk",
+                    "failed",
+                    vec!["citation_precision"],
+                ),
+                (
+                    "baseline-still-failed",
+                    "baseline-run",
+                    "case-still-failed",
+                    "failed",
+                    vec!["retrieval_recall"],
+                ),
+                (
+                    "candidate-still-failed",
+                    "candidate-run",
+                    "case-still-failed",
+                    "failed",
+                    vec!["retrieval_recall"],
+                ),
+                (
+                    "baseline-still-passed",
+                    "baseline-run",
+                    "case-still-passed",
+                    "passed",
+                    vec![],
+                ),
+                (
+                    "candidate-still-passed",
+                    "candidate-run",
+                    "case-still-passed",
+                    "passed",
+                    vec![],
+                ),
+            ] {
+                data.eval_case_results.insert(
+                    id.to_string(),
+                    RagEvalCaseResult {
+                        id: id.to_string(),
+                        run_id: run_id.to_string(),
+                        case_id: case_id.to_string(),
+                        owner_user_id: None,
+                        status: status.to_string(),
+                        question: case_id.to_string(),
+                        trace_id: "trace".to_string(),
+                        answer: String::new(),
+                        citations: Vec::new(),
+                        retrieved_uris: Vec::new(),
+                        source_document_uris: Vec::new(),
+                        failures: failures.into_iter().map(ToString::to_string).collect(),
+                        guard_failures: Vec::new(),
+                        metrics: json!({}),
+                        latency_ms: 0,
+                        created_at,
+                    },
+                );
+            }
+        }
+
+        let delta = store
+            .compare_harness_change("delta-change", None, None)
+            .unwrap();
+        assert_eq!(delta.fixed_cases, vec!["case-fixed"]);
+        assert_eq!(delta.regressed_cases, vec!["case-risk"]);
+        assert_eq!(delta.unchanged_failed_cases, vec!["case-still-failed"]);
+        assert_eq!(delta.unchanged_passed_cases, vec!["case-still-passed"]);
+        assert_eq!(delta.metric_deltas["retrieval_recall_at_5"], 0.5);
+        assert!(delta
+            .risk_matrix
+            .iter()
+            .any(|risk| risk.case_id == "case-risk" && risk.regressed));
+
+        let verdict = store
+            .create_harness_verdict_async(
+                tenant_id,
+                "delta-change",
+                CreateHarnessChangeVerdictRequest {
+                    eval_run_id: Some("candidate-run".to_string()),
+                    ..CreateHarnessChangeVerdictRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(verdict.verdict, "rollback");
+        assert_eq!(verdict.predicted_fixes_confirmed, vec!["case-fixed"]);
+        assert_eq!(verdict.risk_cases_regressed, vec!["case-risk"]);
+        assert!(verdict.evidence.get("delta").is_some());
     }
 }

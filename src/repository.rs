@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::{
@@ -86,6 +86,105 @@ pub trait KnowledgeRepository: Send + Sync {
         &self,
         verdicts: &[HarnessChangeVerdict],
     ) -> Result<Option<String>, ApiError>;
+
+    async fn upsert_ingest_task(&self, task: &IngestTask) -> Result<Option<String>, ApiError>;
+
+    async fn upsert_ingest_result(
+        &self,
+        result: &IngestTaskResult,
+    ) -> Result<Option<String>, ApiError>;
+
+    async fn upsert_eval_case(&self, case: &RagEvalCase) -> Result<Option<String>, ApiError>;
+
+    async fn upsert_eval_run(&self, run: &RagEvalRun) -> Result<Option<String>, ApiError>;
+
+    async fn upsert_eval_case_results(
+        &self,
+        results: &[RagEvalCaseResult],
+    ) -> Result<Option<String>, ApiError>;
+
+    async fn upsert_eval_overview(
+        &self,
+        overview: &RagEvalOverview,
+    ) -> Result<Option<String>, ApiError>;
+
+    async fn list_harness_components(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<HarnessComponent>>, ApiError>;
+
+    async fn list_harness_component_revisions(
+        &self,
+        tenant_id: &str,
+        component_id: Option<&str>,
+    ) -> Result<Option<Vec<HarnessComponentRevision>>, ApiError>;
+
+    async fn get_harness_change(
+        &self,
+        tenant_id: &str,
+        change_id: &str,
+    ) -> Result<Option<HarnessChangeManifest>, ApiError>;
+
+    async fn list_harness_changes(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<HarnessChangeManifest>>, ApiError>;
+
+    async fn list_harness_verdicts(
+        &self,
+        tenant_id: &str,
+        change_id: Option<&str>,
+    ) -> Result<Option<Vec<HarnessChangeVerdict>>, ApiError>;
+
+    async fn get_ingest_task(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+    ) -> Result<Option<IngestTask>, ApiError>;
+
+    async fn get_ingest_result(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+    ) -> Result<Option<IngestTaskResult>, ApiError>;
+
+    async fn list_ingest_tasks(&self, tenant_id: &str)
+        -> Result<Option<Vec<IngestTask>>, ApiError>;
+
+    async fn list_ingest_results(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<IngestTaskResult>>, ApiError>;
+
+    async fn list_eval_cases(&self, tenant_id: &str) -> Result<Option<Vec<RagEvalCase>>, ApiError>;
+
+    async fn get_eval_run(
+        &self,
+        tenant_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RagEvalRun>, ApiError>;
+
+    async fn list_eval_runs(&self, tenant_id: &str) -> Result<Option<Vec<RagEvalRun>>, ApiError>;
+
+    async fn get_eval_overview(
+        &self,
+        tenant_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RagEvalOverview>, ApiError>;
+
+    async fn list_eval_case_results(
+        &self,
+        tenant_id: &str,
+        run_id: &str,
+    ) -> Result<Option<Vec<RagEvalCaseResult>>, ApiError>;
+
+    async fn list_parse_artifacts(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        source_id: Option<&str>,
+        revision_id: Option<&str>,
+    ) -> Result<Option<Vec<ParseArtifact>>, ApiError>;
 
     async fn search_user_events(
         &self,
@@ -240,6 +339,152 @@ impl KnowledgeRepository for MemoryRepository {
         &self,
         _verdicts: &[HarnessChangeVerdict],
     ) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_ingest_task(&self, _task: &IngestTask) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_ingest_result(
+        &self,
+        _result: &IngestTaskResult,
+    ) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_eval_case(&self, _case: &RagEvalCase) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_eval_run(&self, _run: &RagEvalRun) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_eval_case_results(
+        &self,
+        _results: &[RagEvalCaseResult],
+    ) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_eval_overview(
+        &self,
+        _overview: &RagEvalOverview,
+    ) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_harness_components(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<HarnessComponent>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_harness_component_revisions(
+        &self,
+        _tenant_id: &str,
+        _component_id: Option<&str>,
+    ) -> Result<Option<Vec<HarnessComponentRevision>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn get_harness_change(
+        &self,
+        _tenant_id: &str,
+        _change_id: &str,
+    ) -> Result<Option<HarnessChangeManifest>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_harness_changes(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<HarnessChangeManifest>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_harness_verdicts(
+        &self,
+        _tenant_id: &str,
+        _change_id: Option<&str>,
+    ) -> Result<Option<Vec<HarnessChangeVerdict>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn get_ingest_task(
+        &self,
+        _tenant_id: &str,
+        _task_id: &str,
+    ) -> Result<Option<IngestTask>, ApiError> {
+        Ok(None)
+    }
+
+    async fn get_ingest_result(
+        &self,
+        _tenant_id: &str,
+        _task_id: &str,
+    ) -> Result<Option<IngestTaskResult>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_ingest_tasks(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<IngestTask>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_ingest_results(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<IngestTaskResult>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_eval_cases(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<RagEvalCase>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn get_eval_run(
+        &self,
+        _tenant_id: &str,
+        _run_id: &str,
+    ) -> Result<Option<RagEvalRun>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_eval_runs(&self, _tenant_id: &str) -> Result<Option<Vec<RagEvalRun>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn get_eval_overview(
+        &self,
+        _tenant_id: &str,
+        _run_id: &str,
+    ) -> Result<Option<RagEvalOverview>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_eval_case_results(
+        &self,
+        _tenant_id: &str,
+        _run_id: &str,
+    ) -> Result<Option<Vec<RagEvalCaseResult>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_parse_artifacts(
+        &self,
+        _tenant_id: &str,
+        _owner_user_id: Option<&str>,
+        _source_id: Option<&str>,
+        _revision_id: Option<&str>,
+    ) -> Result<Option<Vec<ParseArtifact>>, ApiError> {
         Ok(None)
     }
 
@@ -537,6 +782,299 @@ impl KnowledgeRepository for MeiliRepository {
         self.upsert_values("rag_harness_verdicts", &documents).await
     }
 
+    async fn upsert_ingest_task(&self, task: &IngestTask) -> Result<Option<String>, ApiError> {
+        self.upsert_values("rag_ingest_tasks", &[to_document(task, &task.task_id)?])
+            .await
+    }
+
+    async fn upsert_ingest_result(
+        &self,
+        result: &IngestTaskResult,
+    ) -> Result<Option<String>, ApiError> {
+        let mut document = to_document(result, &result.task.task_id)?;
+        if let Value::Object(map) = &mut document {
+            map.insert(
+                "tenant_id".to_string(),
+                Value::String(result.task.tenant_id.clone()),
+            );
+            map.insert(
+                "task_id".to_string(),
+                Value::String(result.task.task_id.clone()),
+            );
+            if let Some(owner) = &result.task.owner_user_id {
+                map.insert("owner_user_id".to_string(), Value::String(owner.clone()));
+            }
+        }
+        self.upsert_values("rag_ingest_results", &[document]).await
+    }
+
+    async fn upsert_eval_case(&self, case: &RagEvalCase) -> Result<Option<String>, ApiError> {
+        self.upsert_values("rag_eval_cases", &[to_document(case, &case.id)?])
+            .await
+    }
+
+    async fn upsert_eval_run(&self, run: &RagEvalRun) -> Result<Option<String>, ApiError> {
+        self.upsert_values("rag_eval_runs", &[to_document(run, &run.id)?])
+            .await
+    }
+
+    async fn upsert_eval_case_results(
+        &self,
+        results: &[RagEvalCaseResult],
+    ) -> Result<Option<String>, ApiError> {
+        let documents = results
+            .iter()
+            .map(|result| to_document(result, &result.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.upsert_values("rag_eval_case_results", &documents)
+            .await
+    }
+
+    async fn upsert_eval_overview(
+        &self,
+        overview: &RagEvalOverview,
+    ) -> Result<Option<String>, ApiError> {
+        self.upsert_values(
+            "rag_eval_overviews",
+            &[to_document(overview, &overview.run_id)?],
+        )
+        .await
+    }
+
+    async fn list_harness_components(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<HarnessComponent>>, ApiError> {
+        self.search_many(
+            "rag_harness_components",
+            &format!(
+                "tenant_id = {} AND doc_kind = \"component\"",
+                meili_string(tenant_id)?
+            ),
+            1000,
+            Some(&["id:asc"]),
+        )
+        .await
+    }
+
+    async fn list_harness_component_revisions(
+        &self,
+        tenant_id: &str,
+        component_id: Option<&str>,
+    ) -> Result<Option<Vec<HarnessComponentRevision>>, ApiError> {
+        let mut filters = vec![
+            format!("tenant_id = {}", meili_string(tenant_id)?),
+            "doc_kind = \"revision\"".to_string(),
+        ];
+        if let Some(component_id) = component_id {
+            filters.push(format!("component_id = {}", meili_string(component_id)?));
+        }
+        self.search_many(
+            "rag_harness_components",
+            &filters.join(" AND "),
+            1000,
+            Some(&["iteration:asc"]),
+        )
+        .await
+    }
+
+    async fn get_harness_change(
+        &self,
+        tenant_id: &str,
+        change_id: &str,
+    ) -> Result<Option<HarnessChangeManifest>, ApiError> {
+        self.search_one(
+            "rag_harness_changes",
+            &format!(
+                "tenant_id = {} AND id = {}",
+                meili_string(tenant_id)?,
+                meili_string(change_id)?
+            ),
+        )
+        .await
+    }
+
+    async fn list_harness_changes(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<HarnessChangeManifest>>, ApiError> {
+        self.search_many(
+            "rag_harness_changes",
+            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            1000,
+            Some(&["created_at:desc"]),
+        )
+        .await
+    }
+
+    async fn list_harness_verdicts(
+        &self,
+        tenant_id: &str,
+        change_id: Option<&str>,
+    ) -> Result<Option<Vec<HarnessChangeVerdict>>, ApiError> {
+        let mut filters = vec![format!("tenant_id = {}", meili_string(tenant_id)?)];
+        if let Some(change_id) = change_id {
+            filters.push(format!("change_id = {}", meili_string(change_id)?));
+        }
+        self.search_many(
+            "rag_harness_verdicts",
+            &filters.join(" AND "),
+            1000,
+            Some(&["created_at:desc"]),
+        )
+        .await
+    }
+
+    async fn get_ingest_task(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+    ) -> Result<Option<IngestTask>, ApiError> {
+        self.search_one(
+            "rag_ingest_tasks",
+            &format!(
+                "tenant_id = {} AND task_id = {}",
+                meili_string(tenant_id)?,
+                meili_string(task_id)?
+            ),
+        )
+        .await
+    }
+
+    async fn get_ingest_result(
+        &self,
+        tenant_id: &str,
+        task_id: &str,
+    ) -> Result<Option<IngestTaskResult>, ApiError> {
+        self.search_one(
+            "rag_ingest_results",
+            &format!(
+                "tenant_id = {} AND task_id = {}",
+                meili_string(tenant_id)?,
+                meili_string(task_id)?
+            ),
+        )
+        .await
+    }
+
+    async fn list_ingest_tasks(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<IngestTask>>, ApiError> {
+        self.search_many(
+            "rag_ingest_tasks",
+            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            1000,
+            Some(&["created_at:desc"]),
+        )
+        .await
+    }
+
+    async fn list_ingest_results(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<IngestTaskResult>>, ApiError> {
+        self.search_many(
+            "rag_ingest_results",
+            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            1000,
+            None,
+        )
+        .await
+    }
+
+    async fn list_eval_cases(&self, tenant_id: &str) -> Result<Option<Vec<RagEvalCase>>, ApiError> {
+        self.search_many(
+            "rag_eval_cases",
+            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            1000,
+            Some(&["created_at:asc"]),
+        )
+        .await
+    }
+
+    async fn get_eval_run(
+        &self,
+        tenant_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RagEvalRun>, ApiError> {
+        self.search_one(
+            "rag_eval_runs",
+            &format!(
+                "tenant_id = {} AND id = {}",
+                meili_string(tenant_id)?,
+                meili_string(run_id)?
+            ),
+        )
+        .await
+    }
+
+    async fn list_eval_runs(&self, tenant_id: &str) -> Result<Option<Vec<RagEvalRun>>, ApiError> {
+        self.search_many(
+            "rag_eval_runs",
+            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            1000,
+            Some(&["created_at:desc"]),
+        )
+        .await
+    }
+
+    async fn get_eval_overview(
+        &self,
+        tenant_id: &str,
+        run_id: &str,
+    ) -> Result<Option<RagEvalOverview>, ApiError> {
+        let _ = tenant_id;
+        self.search_one(
+            "rag_eval_overviews",
+            &format!("run_id = {}", meili_string(run_id)?),
+        )
+        .await
+    }
+
+    async fn list_eval_case_results(
+        &self,
+        tenant_id: &str,
+        run_id: &str,
+    ) -> Result<Option<Vec<RagEvalCaseResult>>, ApiError> {
+        let _ = tenant_id;
+        self.search_many(
+            "rag_eval_case_results",
+            &format!("run_id = {}", meili_string(run_id)?),
+            1000,
+            None,
+        )
+        .await
+    }
+
+    async fn list_parse_artifacts(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        source_id: Option<&str>,
+        revision_id: Option<&str>,
+    ) -> Result<Option<Vec<ParseArtifact>>, ApiError> {
+        let mut filters = vec![format!("tenant_id = {}", meili_string(tenant_id)?)];
+        if let Some(owner) = owner_user_id {
+            filters.push(format!("owner_user_id = {}", meili_string(owner)?));
+        } else {
+            filters.push("owner_user_id IS NULL".to_string());
+        }
+        if let Some(source_id) = source_id {
+            filters.push(format!("source_id = {}", meili_string(source_id)?));
+        }
+        if let Some(revision_id) = revision_id {
+            filters.push(format!("revision_id = {}", meili_string(revision_id)?));
+        }
+        self.search_many(
+            "rag_parse_artifacts",
+            &filters.join(" AND "),
+            1000,
+            Some(&["created_at:asc"]),
+        )
+        .await
+    }
+
     async fn search_user_events(
         &self,
         routing: &EventIndexRouting,
@@ -823,6 +1361,44 @@ impl KnowledgeRepository for MeiliRepository {
 }
 
 impl MeiliRepository {
+    async fn search_one<T: DeserializeOwned>(
+        &self,
+        index_uid: &str,
+        filter: &str,
+    ) -> Result<Option<T>, ApiError> {
+        let response: SearchResponse<T> = self
+            .admin
+            .search(
+                index_uid,
+                json!({
+                    "q": "",
+                    "limit": 1,
+                    "filter": filter
+                }),
+            )
+            .await?;
+        Ok(response.hits.into_iter().next())
+    }
+
+    async fn search_many<T: DeserializeOwned>(
+        &self,
+        index_uid: &str,
+        filter: &str,
+        limit: usize,
+        sort: Option<&[&str]>,
+    ) -> Result<Option<Vec<T>>, ApiError> {
+        let mut body = json!({
+            "q": "",
+            "limit": limit.max(1),
+            "filter": filter
+        });
+        if let Some(sort) = sort {
+            body["sort"] = json!(sort);
+        }
+        let response: SearchResponse<T> = self.admin.search(index_uid, body).await?;
+        Ok(Some(response.hits))
+    }
+
     async fn search_context_index(
         &self,
         index_uid: &str,

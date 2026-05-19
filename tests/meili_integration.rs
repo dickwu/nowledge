@@ -13,17 +13,33 @@ use nowledge::{build_router, AppState, Config};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-fn meili_app() -> Option<Router> {
+async fn meili_app() -> Option<Router> {
     let url = std::env::var("RAG_TEST_MEILI_URL").ok()?;
     if !meili_available(&url) {
         eprintln!("skipping Meilisearch integration test; {url} is not reachable");
         return None;
     }
+    let api_key = std::env::var("RAG_TEST_MEILI_API_KEY").ok();
+    if api_key.is_none() {
+        let response = reqwest::Client::new()
+            .get(format!("{}/indexes", url.trim_end_matches('/')))
+            .send()
+            .await;
+        if response
+            .as_ref()
+            .is_ok_and(|response| response.status().as_u16() == 401)
+        {
+            eprintln!(
+                "skipping Meilisearch integration test; server requires a key, set RAG_TEST_MEILI_API_KEY"
+            );
+            return None;
+        }
+    }
     let mut config = Config::test();
     config.tenant_id = format!("test-tenant-{}", uuid::Uuid::now_v7());
     config.store_backend = "meili".to_string();
     config.meili_url = Some(url);
-    config.meili_api_key = std::env::var("RAG_TEST_MEILI_API_KEY").ok();
+    config.meili_api_key = api_key;
     config.meili_wait_for_tasks = true;
     Some(build_router(AppState::new(Arc::new(config))))
 }
@@ -48,6 +64,37 @@ fn meili_available(url: &str) -> bool {
         .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok())
 }
 
+async fn meili_config_with_tenant(tenant_id: String) -> Option<Config> {
+    let url = std::env::var("RAG_TEST_MEILI_URL").ok()?;
+    if !meili_available(&url) {
+        eprintln!("skipping Meilisearch integration test; {url} is not reachable");
+        return None;
+    }
+    let api_key = std::env::var("RAG_TEST_MEILI_API_KEY").ok();
+    if api_key.is_none() {
+        let response = reqwest::Client::new()
+            .get(format!("{}/indexes", url.trim_end_matches('/')))
+            .send()
+            .await;
+        if response
+            .as_ref()
+            .is_ok_and(|response| response.status().as_u16() == 401)
+        {
+            eprintln!(
+                "skipping Meilisearch integration test; server requires a key, set RAG_TEST_MEILI_API_KEY"
+            );
+            return None;
+        }
+    }
+    let mut config = Config::test();
+    config.tenant_id = tenant_id;
+    config.store_backend = "meili".to_string();
+    config.meili_url = Some(url);
+    config.meili_api_key = api_key;
+    config.meili_wait_for_tasks = true;
+    Some(config)
+}
+
 async fn call(app: Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
     let request = Request::builder()
         .method(method)
@@ -68,7 +115,7 @@ async fn call(app: Router, method: Method, uri: &str, body: Value) -> (StatusCod
 
 #[tokio::test]
 async fn meili_backend_creates_dynamic_user_indexes_and_searches_events() {
-    let Some(app) = meili_app() else {
+    let Some(app) = meili_app().await else {
         eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
         return;
     };
@@ -142,7 +189,7 @@ async fn meili_backend_creates_dynamic_user_indexes_and_searches_events() {
 
 #[tokio::test]
 async fn meili_backend_indexes_internal_state_events() {
-    let Some(app) = meili_app() else {
+    let Some(app) = meili_app().await else {
         eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
         return;
     };
@@ -186,7 +233,7 @@ async fn meili_backend_indexes_internal_state_events() {
 
 #[tokio::test]
 async fn meili_backend_context_search_retrieves_fragments_only() {
-    let Some(app) = meili_app() else {
+    let Some(app) = meili_app().await else {
         eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
         return;
     };
@@ -256,7 +303,7 @@ async fn meili_backend_context_search_retrieves_fragments_only() {
 
 #[tokio::test]
 async fn meili_bootstrap_creates_harness_indexes_and_indexes_changes() {
-    let Some(app) = meili_app() else {
+    let Some(app) = meili_app().await else {
         eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
         return;
     };
@@ -316,4 +363,133 @@ async fn meili_bootstrap_creates_harness_indexes_and_indexes_changes() {
         .unwrap()
         .iter()
         .any(|hit| { hit["id"].as_str() == change["id"].as_str() }));
+}
+
+#[tokio::test]
+async fn meili_hydrates_harness_eval_and_ingest_metadata_into_fresh_app() {
+    let tenant_id = format!("test-tenant-{}", uuid::Uuid::now_v7());
+    let Some(config) = meili_config_with_tenant(tenant_id.clone()).await else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    let app = build_router(AppState::new(Arc::new(config.clone())));
+    let (status, bootstrap) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/bootstrap",
+        json!({ "reset": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bootstrap}");
+
+    let (status, change) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/harness/evolution/changes",
+        json!({
+            "iteration": 1,
+            "type": "improvement",
+            "component_id": "retrieval.context_search",
+            "files": ["src/store.rs"],
+            "failure_pattern": "hydration_failure_pattern",
+            "root_cause": "test",
+            "targeted_fix": "test",
+            "predicted_fixes": ["hydration-eval-case"],
+            "risk_cases": [],
+            "expected_metric_deltas": { "pass_rate": 1.0 },
+            "why_this_component": "test",
+            "created_by": "test"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{change}");
+    let change_id = change["id"].as_str().unwrap();
+
+    let (status, eval_case) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/eval/cases",
+        json!({
+            "id": "hydration-eval-case",
+            "question": "hydration eval should persist",
+            "expected_answer_contains": ["unlikely-token"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{eval_case}");
+
+    let (status, eval_run) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/eval/runs",
+        json!({ "case_ids": ["hydration-eval-case"], "change_id": change_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{eval_run}");
+    let run_id = eval_run["id"].as_str().unwrap();
+
+    let (status, ingest) = call(
+        app,
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "source_id": "hydration-ingest-fixture",
+            "revision_id": "v1",
+            "title": "Hydration Ingest Fixture",
+            "content": "hydration ingest metadata should persist"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ingest}");
+    let task_id = ingest["task"]["task_id"].as_str().unwrap();
+
+    let fresh = build_router(AppState::new(Arc::new(config)));
+    let (status, hydrated) = call(
+        fresh.clone(),
+        Method::POST,
+        "/v1/admin/bootstrap",
+        json!({ "reset": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{hydrated}");
+    assert!(
+        hydrated["hydrated"]["harness_changes"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 1
+    );
+
+    let (status, hydrated_change) = call(
+        fresh.clone(),
+        Method::GET,
+        &format!("/v1/admin/harness/evolution/changes/{change_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{hydrated_change}");
+    assert_eq!(hydrated_change["id"], change["id"]);
+
+    let (status, hydrated_report) = call(
+        fresh.clone(),
+        Method::GET,
+        &format!("/v1/eval/runs/{run_id}/report"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{hydrated_report}");
+    assert_eq!(hydrated_report["run"]["id"], eval_run["id"]);
+    assert_eq!(
+        hydrated_report["case_results"][0]["case_id"],
+        "hydration-eval-case"
+    );
+
+    let (status, hydrated_result) = call(
+        fresh,
+        Method::GET,
+        &format!("/v1/ingest/tasks/{task_id}/result"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{hydrated_result}");
+    assert_eq!(hydrated_result["task"]["task_id"], task_id);
 }

@@ -29,6 +29,12 @@ pub const FIXED_INDEXES: &[&str] = &[
     "rag_harness_components",
     "rag_harness_changes",
     "rag_harness_verdicts",
+    "rag_ingest_tasks",
+    "rag_ingest_results",
+    "rag_eval_cases",
+    "rag_eval_runs",
+    "rag_eval_case_results",
+    "rag_eval_overviews",
 ];
 
 const MEILI_TASK_WAIT_ATTEMPTS: usize = 600;
@@ -485,6 +491,42 @@ pub fn settings_for(uid: &str) -> Value {
             "searchableAttributes": ["id", "change_id", "verdict", "predicted_fixes_confirmed", "risk_cases_regressed", "created_by"],
             "filterableAttributes": ["id", "tenant_id", "change_id", "eval_run_id", "verdict", "created_by"],
             "sortableAttributes": ["created_at"]
+        })
+    } else if uid == "rag_ingest_tasks" {
+        json!({
+            "searchableAttributes": ["task_id", "source_id", "revision_id", "parser_provider", "parser_backend", "error"],
+            "filterableAttributes": ["id", "task_id", "tenant_id", "owner_user_id", "source_id", "revision_id", "state", "parser_provider", "parser_backend"],
+            "sortableAttributes": ["created_at", "updated_at", "completed_at"]
+        })
+    } else if uid == "rag_ingest_results" {
+        json!({
+            "searchableAttributes": ["task_id", "source_id", "revision_id", "source_document_uri", "fragment_uris", "context_uris"],
+            "filterableAttributes": ["id", "task_id", "tenant_id", "owner_user_id", "source_id", "revision_id"],
+            "sortableAttributes": ["created_at", "updated_at"]
+        })
+    } else if uid == "rag_eval_cases" {
+        json!({
+            "searchableAttributes": ["id", "question", "expected_context_uris", "expected_source_document_uris", "expected_answer_contains", "tags"],
+            "filterableAttributes": ["id", "tenant_id", "owner_user_id", "tags"],
+            "sortableAttributes": ["created_at"]
+        })
+    } else if uid == "rag_eval_runs" {
+        json!({
+            "searchableAttributes": ["id", "change_id", "case_ids", "status", "created_by"],
+            "filterableAttributes": ["id", "tenant_id", "change_id", "status", "created_by"],
+            "sortableAttributes": ["created_at", "completed_at"]
+        })
+    } else if uid == "rag_eval_case_results" {
+        json!({
+            "searchableAttributes": ["id", "run_id", "case_id", "status", "question", "answer", "failures", "guard_failures"],
+            "filterableAttributes": ["id", "run_id", "case_id", "owner_user_id", "status", "failures", "guard_failures"],
+            "sortableAttributes": ["created_at", "latency_ms"]
+        })
+    } else if uid == "rag_eval_overviews" {
+        json!({
+            "searchableAttributes": ["run_id", "status", "overview_markdown", "suggested_target_component"],
+            "filterableAttributes": ["id", "run_id", "status", "suggested_target_component"],
+            "sortableAttributes": ["generated_at"]
         })
     } else {
         json!({

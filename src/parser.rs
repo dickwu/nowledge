@@ -10,7 +10,8 @@ use crate::{config::Config, error::ApiError, models::*};
 
 #[derive(Debug, Clone)]
 pub struct ParserInput {
-    pub content: String,
+    pub content: Option<String>,
+    pub bytes: Option<Vec<u8>>,
     pub content_type: Option<String>,
     pub file_name: Option<String>,
     pub content_list: Option<Value>,
@@ -46,11 +47,18 @@ impl DocumentParser for BuiltinTextParser {
     async fn parse(&self, input: ParserInput) -> Result<ParserOutput, ApiError> {
         let blocks =
             parse_supplied_blocks(input.content_list.as_ref(), input.content_list_v2.as_ref());
+        let markdown = match (input.content, input.bytes) {
+            (Some(content), _) => Some(content),
+            (None, Some(bytes)) => Some(String::from_utf8(bytes).map_err(|_| {
+                ApiError::bad_request("builtin parser only supports UTF-8 text uploads")
+            })?),
+            (None, None) => None,
+        };
         Ok(ParserOutput {
             provider: "builtin".to_string(),
             backend: "text".to_string(),
             parser_version: Some("builtin-text".to_string()),
-            markdown: Some(input.content),
+            markdown,
             content_list: input.content_list,
             content_list_v2: input.content_list_v2,
             middle_json: input.middle_json,
@@ -96,7 +104,7 @@ impl DocumentParser for MineruParserClient {
                 provider: "mineru".to_string(),
                 backend: self.backend.clone(),
                 parser_version: Some("mineru-supplied".to_string()),
-                markdown: Some(input.content),
+                markdown: input.content,
                 content_list: input.content_list,
                 content_list_v2: input.content_list_v2,
                 middle_json: input.middle_json,
@@ -109,7 +117,12 @@ impl DocumentParser for MineruParserClient {
         let file_name = input
             .file_name
             .unwrap_or_else(|| "document.txt".to_string());
-        let mut part = Part::bytes(input.content.into_bytes()).file_name(file_name);
+        let bytes = input
+            .bytes
+            .or_else(|| input.content.map(String::into_bytes));
+        let bytes = bytes
+            .ok_or_else(|| ApiError::bad_request("content or uploaded file bytes are required"))?;
+        let mut part = Part::bytes(bytes).file_name(file_name);
         if let Some(content_type) = input.content_type.as_deref() {
             part = part
                 .mime_str(content_type)

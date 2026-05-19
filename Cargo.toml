@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["json", "macros"] }
+axum = { version = "0.8", features = ["json", "macros", "multipart"] }
 chrono = { version = "0.4", features = ["clock", "serde"] }
 hex = "0.4"
 hmac = "0.12"

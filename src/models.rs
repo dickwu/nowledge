@@ -881,22 +881,6 @@ pub struct LlmStatusResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ImportCodexAuthRequest {
-    pub codex_auth_path: Option<String>,
-    #[serde(default)]
-    pub store_imported_token: bool,
-    #[serde(default)]
-    pub test_after_import: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImportCodexAuthResponse {
-    pub status: String,
-    pub auth_source: String,
-    pub test_ok: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LlmTestRequest {
     pub prompt: Option<String>,
 }
@@ -1090,6 +1074,8 @@ pub struct IngestTaskRequest {
     pub source_document_uri: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub bytes: Option<Vec<u8>>,
     #[serde(default)]
     pub content_type: Option<String>,
     #[serde(default)]
@@ -1133,6 +1119,12 @@ pub struct IngestTask {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_ahead: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1209,6 +1201,10 @@ pub struct HarnessChangeManifest {
     pub risk_cases: Vec<String>,
     #[serde(default)]
     pub expected_metric_deltas: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_eval_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_eval_run_id: Option<String>,
     pub why_this_component: String,
     pub created_by: String,
     pub created_at: DateTime<Utc>,
@@ -1295,6 +1291,10 @@ pub struct CreateHarnessChangeManifestRequest {
     pub risk_cases: Vec<String>,
     #[serde(default)]
     pub expected_metric_deltas: Value,
+    #[serde(default)]
+    pub baseline_eval_run_id: Option<String>,
+    #[serde(default)]
+    pub candidate_eval_run_id: Option<String>,
     #[serde(default)]
     pub why_this_component: Option<String>,
     #[serde(default)]
@@ -1409,6 +1409,38 @@ pub struct RagEvalCaseResult {
     pub metrics: Value,
     pub latency_ms: u64,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskCaseResult {
+    pub case_id: String,
+    pub baseline_status: String,
+    pub candidate_status: String,
+    pub regressed: bool,
+    #[serde(default)]
+    pub baseline_failures: Vec<String>,
+    #[serde(default)]
+    pub candidate_failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalDeltaReport {
+    pub change_id: String,
+    pub baseline_run_id: String,
+    pub candidate_run_id: String,
+    #[serde(default)]
+    pub fixed_cases: Vec<String>,
+    #[serde(default)]
+    pub regressed_cases: Vec<String>,
+    #[serde(default)]
+    pub unchanged_failed_cases: Vec<String>,
+    #[serde(default)]
+    pub unchanged_passed_cases: Vec<String>,
+    #[serde(default)]
+    pub metric_deltas: Value,
+    #[serde(default)]
+    pub risk_matrix: Vec<RiskCaseResult>,
+    pub generated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -20,6 +20,10 @@ pub struct Config {
     pub mineru_return_content_list: bool,
     pub mineru_return_middle_json: bool,
     pub mineru_return_images: bool,
+    pub ingest_max_concurrent_tasks: usize,
+    pub ingest_task_retention_seconds: u64,
+    pub ingest_cleanup_interval_seconds: u64,
+    pub ingest_worker_enabled: bool,
     pub llm_provider: String,
     pub llm_model: Option<String>,
     pub analysis_llm_provider: String,
@@ -27,7 +31,6 @@ pub struct Config {
     pub openai_api_key: Option<String>,
     pub codex_auth_path: Option<String>,
     pub codex_base_url: String,
-    pub allow_codex_auth_import: bool,
     pub health_llm_enabled: bool,
     pub health_llm_probe_interval_seconds: u64,
     pub health_llm_probe_ttl_seconds: u64,
@@ -94,6 +97,21 @@ impl Config {
             mineru_return_images: std::env::var("RAG_MINERU_RETURN_IMAGES")
                 .map(|v| truthy(&v))
                 .unwrap_or(true),
+            ingest_max_concurrent_tasks: std::env::var("RAG_INGEST_MAX_CONCURRENT_TASKS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+            ingest_task_retention_seconds: std::env::var("RAG_INGEST_TASK_RETENTION_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(86_400),
+            ingest_cleanup_interval_seconds: std::env::var("RAG_INGEST_CLEANUP_INTERVAL_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+            ingest_worker_enabled: std::env::var("RAG_INGEST_WORKER_ENABLED")
+                .map(|v| truthy(&v))
+                .unwrap_or(true),
             llm_provider: std::env::var("RAG_LLM_PROVIDER").unwrap_or_else(|_| "none".to_string()),
             llm_model: std::env::var("RAG_LLM_MODEL").ok(),
             analysis_llm_provider: std::env::var("RAG_ANALYSIS_LLM_PROVIDER").unwrap_or_else(
@@ -111,9 +129,6 @@ impl Config {
             codex_base_url: std::env::var("RAG_CODEX_BASE_URL")
                 .or_else(|_| std::env::var("OPENVIKING_CODEX_BASE_URL"))
                 .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".to_string()),
-            allow_codex_auth_import: std::env::var("RAG_ALLOW_CODEX_AUTH_IMPORT")
-                .map(|v| truthy(&v))
-                .unwrap_or(false),
             health_llm_enabled: std::env::var("RAG_HEALTH_LLM_ENABLED")
                 .map(|v| truthy(&v))
                 .unwrap_or(true),
@@ -201,6 +216,10 @@ impl Config {
             mineru_return_content_list: true,
             mineru_return_middle_json: true,
             mineru_return_images: true,
+            ingest_max_concurrent_tasks: 2,
+            ingest_task_retention_seconds: 86_400,
+            ingest_cleanup_interval_seconds: 300,
+            ingest_worker_enabled: true,
             llm_provider: "none".to_string(),
             llm_model: Some("none".to_string()),
             analysis_llm_provider: "none".to_string(),
@@ -208,7 +227,6 @@ impl Config {
             openai_api_key: None,
             codex_auth_path: None,
             codex_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-            allow_codex_auth_import: false,
             health_llm_enabled: true,
             health_llm_probe_interval_seconds: 30,
             health_llm_probe_ttl_seconds: 60,

@@ -20,7 +20,15 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("invalid bind address")?;
 
-    let app = build_router(AppState::new(config.clone()));
+    let state = AppState::new(config.clone());
+    if config.store_backend == "meili" && config.meili_url.is_some() {
+        let hydrated = state
+            .store
+            .hydrate_from_repository(&config.tenant_id)
+            .await?;
+        tracing::info!(%hydrated, "hydrated repository-backed metadata");
+    }
+    let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind {addr}"))?;

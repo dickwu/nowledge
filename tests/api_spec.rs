@@ -2,11 +2,16 @@ use std::sync::Arc;
 
 use axum::{
     body::{to_bytes, Body},
+    extract::Multipart,
     http::{header::CONTENT_TYPE, Method, Request, StatusCode},
-    Router,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
 };
 use nowledge::{build_router, AppState, Config};
 use serde_json::{json, Value};
+use std::time::Duration;
+use tokio::time::sleep;
 use tower::ServiceExt;
 
 fn app() -> Router {
@@ -35,9 +40,29 @@ fn authed_app() -> Router {
     build_router(AppState::new(Arc::new(config)))
 }
 
+fn authed_app_with_config(mut config: Config) -> Router {
+    config.auth_users = vec![
+        nowledge::config::AuthUserConfig {
+            token: "u1-token".to_string(),
+            owner_user_id: Some("u1".to_string()),
+            roles: vec!["user".to_string()],
+        },
+        nowledge::config::AuthUserConfig {
+            token: "u2-token".to_string(),
+            owner_user_id: Some("u2".to_string()),
+            roles: vec!["user".to_string()],
+        },
+        nowledge::config::AuthUserConfig {
+            token: "admin-token".to_string(),
+            owner_user_id: None,
+            roles: vec!["admin".to_string()],
+        },
+    ];
+    build_router(AppState::new(Arc::new(config)))
+}
+
 fn codex_import_app() -> Router {
     let mut config = Config::test();
-    config.allow_codex_auth_import = true;
     config.auth_users = vec![nowledge::config::AuthUserConfig {
         token: "admin-token".to_string(),
         owner_user_id: None,
@@ -115,6 +140,118 @@ async fn call_with_token(
             .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }))
     };
     (status, value)
+}
+
+async fn call_multipart_with_token(
+    app: Router,
+    uri: &str,
+    fields: &[(&str, &str)],
+    file_name: &str,
+    file_content_type: &str,
+    file_bytes: &[u8],
+    token: Option<&str>,
+) -> (StatusCode, Value) {
+    let boundary = format!("nowledge-boundary-{}", uuid::Uuid::now_v7());
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: {file_content_type}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(file_bytes);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+    let mut builder = Request::builder().method(Method::POST).uri(uri).header(
+        CONTENT_TYPE,
+        format!("multipart/form-data; boundary={boundary}"),
+    );
+    if let Some(token) = token {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }))
+    };
+    (status, value)
+}
+
+async fn wait_for_task_state(app: Router, task_id: &str, token: &str, target: &str) -> Value {
+    for _ in 0..40 {
+        let (status, task) = call_with_token(
+            app.clone(),
+            Method::GET,
+            &format!("/v1/ingest/tasks/{task_id}"),
+            Value::Null,
+            Some(token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{task}");
+        if task["state"] == target {
+            return task;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!("task {task_id} did not reach {target}");
+}
+
+async fn spawn_mineru_mock() -> String {
+    async fn health() -> Json<Value> {
+        Json(json!({ "status": "ok" }))
+    }
+
+    async fn file_parse(mut multipart: Multipart) -> impl IntoResponse {
+        let mut saw_file = false;
+        while let Some(field) = multipart.next_field().await.unwrap() {
+            if field.name() == Some("files") {
+                saw_file = true;
+                let bytes = field.bytes().await.unwrap();
+                assert!(!bytes.is_empty());
+            }
+        }
+        assert!(saw_file);
+        Json(json!({
+            "markdown": "# MinerU Mock\n\nmineru-multipart-keyword",
+            "content_list_v2": [
+                {
+                    "type": "paragraph",
+                    "text": "mineru-multipart-keyword from mock PDF bytes",
+                    "page_idx": 0,
+                    "bbox": [0, 0, 10, 10],
+                    "reading_order": 0
+                }
+            ],
+            "parser_version": "mock-mineru"
+        }))
+    }
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/file_parse", post(file_parse));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
 }
 
 fn event_body(owner: &str, entity: &str, text: &str) -> Value {
@@ -596,6 +733,225 @@ async fn company_doc_fragments_traceback_and_update_supersedes_old_content() {
         old_link_after_update["outbound"].as_array().unwrap().len(),
         0
     );
+}
+
+#[tokio::test]
+async fn async_ingest_task_returns_queued_and_worker_completes() {
+    let app = authed_app();
+    let keyword = format!("async-ingest-keyword-{}", uuid::Uuid::now_v7());
+    let (status, task) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/tasks",
+        json!({
+            "owner_user_id": "u1",
+            "source_id": "async-ingest-fixture",
+            "revision_id": "v1",
+            "title": "Async Ingest Fixture",
+            "content": format!("This queued task eventually indexes {keyword}.")
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{task}");
+    assert_eq!(task["state"], "queued");
+    assert!(task["status_url"]
+        .as_str()
+        .unwrap()
+        .contains("/v1/ingest/tasks/"));
+    assert!(task["result_url"].as_str().unwrap().contains("/result"));
+    let task_id = task["task_id"].as_str().unwrap();
+
+    let task = wait_for_task_state(app.clone(), task_id, "u1-token", "completed").await;
+    assert_eq!(task["state"], "completed");
+
+    let (status, result) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/ingest/tasks/{task_id}/result"),
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["task"]["state"], "completed");
+
+    let (status, search) = call_with_token(
+        app,
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": keyword, "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert!(!search["hits"].as_array().unwrap().is_empty(), "{search}");
+}
+
+#[tokio::test]
+async fn async_ingest_not_ready_failure_acl_and_usage_are_reported() {
+    let mut config = Config::test();
+    config.ingest_worker_enabled = false;
+    let app = authed_app_with_config(config);
+    let (status, task) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/tasks",
+        json!({
+            "owner_user_id": "u1",
+            "source_id": "queued-only-fixture",
+            "content": "queued-only-keyword"
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{task}");
+    assert_eq!(task["state"], "queued");
+    let task_id = task["task_id"].as_str().unwrap();
+
+    let (status, result) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/ingest/tasks/{task_id}/result"),
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{result}");
+    assert!(result["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not ready"));
+
+    let (status, u2_task) = call_with_token(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/ingest/tasks/{task_id}"),
+        Value::Null,
+        Some("u2-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{u2_task}");
+
+    let (status, usage) = call_with_token(
+        app,
+        Method::GET,
+        "/v1/usage",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{usage}");
+    assert_eq!(usage["providers"]["ingest"]["queued"], 1);
+}
+
+#[tokio::test]
+async fn multipart_upload_supports_builtin_text_and_mineru_bytes() {
+    let app = authed_app();
+    let (status, result) = call_multipart_with_token(
+        app.clone(),
+        "/v1/ingest/uploads:sync",
+        &[
+            ("owner_user_id", "u1"),
+            ("source_id", "multipart-text-fixture"),
+            ("revision_id", "v1"),
+            ("title", "Multipart Text Fixture"),
+        ],
+        "fixture.md",
+        "text/markdown",
+        b"# Multipart\n\nmultipart-text-keyword",
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["task"]["state"], "completed");
+
+    let (status, search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "multipart-text-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert!(!search["hits"].as_array().unwrap().is_empty(), "{search}");
+
+    let mineru_url = spawn_mineru_mock().await;
+    let mut config = Config::test();
+    config.mineru_api_url = mineru_url;
+    let mineru_app = authed_app_with_config(config);
+    let (status, mineru_result) = call_multipart_with_token(
+        mineru_app.clone(),
+        "/v1/ingest/uploads:sync",
+        &[
+            ("owner_user_id", "u1"),
+            ("source_id", "multipart-mineru-fixture"),
+            ("revision_id", "v1"),
+            ("title", "Multipart MinerU Fixture"),
+            ("parser_provider", "mineru"),
+        ],
+        "fixture.pdf",
+        "application/pdf",
+        b"%PDF-1.4 fake bytes",
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{mineru_result}");
+    assert_eq!(mineru_result["task"]["parser_provider"], "mineru");
+    assert_eq!(mineru_result["parsed_blocks"].as_array().unwrap().len(), 1);
+
+    let (status, mineru_search) = call_with_token(
+        mineru_app,
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "mineru-multipart-keyword", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{mineru_search}");
+    assert!(
+        !mineru_search["hits"].as_array().unwrap().is_empty(),
+        "{mineru_search}"
+    );
+}
+
+#[tokio::test]
+async fn multipart_builtin_binary_failure_sets_task_failed() {
+    let app = authed_app();
+    let (status, task) = call_multipart_with_token(
+        app.clone(),
+        "/v1/ingest/uploads",
+        &[
+            ("owner_user_id", "u1"),
+            ("source_id", "multipart-binary-failure"),
+            ("revision_id", "v1"),
+            ("title", "Binary Failure Fixture"),
+        ],
+        "fixture.bin",
+        "application/octet-stream",
+        &[0xff, 0xfe, 0xfd],
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{task}");
+    assert_eq!(task["state"], "queued");
+    let task_id = task["task_id"].as_str().unwrap();
+    let task = wait_for_task_state(app.clone(), task_id, "u1-token", "failed").await;
+    assert!(task["error"]
+        .as_str()
+        .unwrap()
+        .contains("UTF-8 text uploads"));
+
+    let (status, result) = call_with_token(
+        app,
+        Method::GET,
+        &format!("/v1/ingest/tasks/{task_id}/result"),
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{result}");
 }
 
 #[tokio::test]
