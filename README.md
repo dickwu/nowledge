@@ -104,6 +104,14 @@ Multipart uploads send binary file bytes to MinerU when `parser_provider=mineru`
 the builtin parser accepts UTF-8 text uploads.
 Parsed blocks become retrieval fragments; source documents and parse artifacts
 are stored for traceback/read flows but are not searched by default.
+`POST /v1/context/search` supports `compact`, `standard`, and `full` return
+profiles plus optional include payloads for traceback, links, neighboring
+fragments, source summaries, artifact refs, score breakdowns, and raw stage
+debug. Default retrieval still returns only active fragments; standard/full
+responses add source groups and location/block provenance for highlighting.
+`POST /v1/rag/answer` citations preserve the same provenance, including source
+document URI, page index, bounding box, block type, section path, artifact refs,
+fragment offsets, and checksums when available.
 
 Link and analysis surfaces:
 

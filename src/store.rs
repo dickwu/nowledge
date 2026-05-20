@@ -13,7 +13,7 @@ use crate::{
     fragmenter::{BlockAwareFragmenter, FragmentChunk},
     models::*,
     parser::{parser_from_config, ParserInput, ParserOutput},
-    repository::{repository_from_config, KnowledgeRepository},
+    repository::{repository_from_config, KnowledgeRepository, RepositoryContextSearchQuery},
     resolver::{EventIndexResolver, EVENT_INDEX_SCHEMA_VERSION, EVENT_SETTINGS_HASH},
     util::{
         ancestor_uris, hmac_hex, new_id, now, require_string, sanitize_slug, text_score,
@@ -860,6 +860,7 @@ impl Store {
                         limit: 5,
                         ..ContextSearchRequest::default()
                     },
+                    false,
                 )
                 .await?;
             let latency_ms = started.elapsed().as_millis() as u64;
@@ -1909,44 +1910,58 @@ impl Store {
         &self,
         tenant_id: &str,
         req: ContextSearchRequest,
+        is_admin: bool,
     ) -> Result<ContextSearchOutcome, ApiError> {
         let query = require_string(req.query.clone(), "query")?;
-        let owner_user_id = req
-            .owner_user_id
-            .clone()
-            .or_else(|| owner_from_filters(&req.filters).map(ToString::to_string));
+        let owner_user_id = resolve_context_owner(req.owner_user_id.clone(), &req.filters)?;
         let limit = req.limit.max(1);
+        let structured_filters = parse_context_filters(&req.filters)?;
+        let include = ContextIncludeSet::from_request(&req.include)?;
+        let profile = ContextReturnProfile::from_request(&req.return_profile)?;
         if let Some(result) = self
             .repository
-            .search_context(
+            .search_context(RepositoryContextSearchQuery {
                 tenant_id,
-                owner_user_id.as_deref(),
-                &query,
-                &req.mode,
+                owner_user_id: owner_user_id.as_deref(),
+                query: &query,
+                mode: &req.mode,
                 limit,
-                &self.resolver,
-            )
+                filters: &structured_filters,
+                resolver: &self.resolver,
+            })
             .await?
         {
-            let hits = result
+            let mut hits = result
                 .nodes
                 .iter()
                 .map(|node| context_hit_from_node(node, &query))
                 .collect::<Vec<_>>();
+            self.enrich_context_hits(
+                tenant_id,
+                owner_user_id.as_deref(),
+                &result.nodes,
+                &mut hits,
+                &include,
+                profile,
+            )?;
+            let groups = context_source_groups(profile, &hits);
+            let hits = shape_context_hits(hits, profile, &include);
+            let stages = sanitize_context_stages(result.stages, req.debug, is_admin);
             let trace = TraceRecord {
                 id: new_id("trace"),
                 tenant_id: tenant_id.to_string(),
                 owner_user_id,
                 query,
                 mode: req.mode,
-                stages: result.stages.clone(),
+                stages: stages.clone(),
                 context_uris: hits.iter().map(|hit| hit.uri.clone()).collect(),
                 created_at: now(),
             };
             let response = ContextSearchResponse {
                 trace_id: trace.id.clone(),
                 hits,
-                stages: result.stages,
+                groups,
+                stages,
             };
             self.insert_trace(trace.clone())?;
             let _ = self.repository.upsert_trace(&trace).await?;
@@ -1956,13 +1971,14 @@ impl Store {
                 nodes: result.nodes,
             });
         }
-        self.search_context(tenant_id, req)
+        self.search_context(tenant_id, req, is_admin)
     }
 
     pub async fn answer_rag_async(
         &self,
         tenant_id: &str,
         req: RagAnswerRequest,
+        is_admin: bool,
     ) -> Result<RagAnswerResponse, ApiError> {
         let question = require_string(req.question.clone(), "question")?;
         let owner_user_id = req.owner_user_id.clone().or_else(|| {
@@ -1980,9 +1996,32 @@ impl Store {
                     debug: req.debug,
                     ..ContextSearchRequest::default()
                 },
+                is_admin,
             )
             .await?;
         Ok(self.answer_from_context(outcome))
+    }
+
+    fn enrich_context_hits(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        nodes: &[ContextNode],
+        hits: &mut [ContextHit],
+        include: &ContextIncludeSet,
+        profile: ContextReturnProfile,
+    ) -> Result<(), ApiError> {
+        let data = self.read()?;
+        enrich_context_hits_locked(
+            &data,
+            tenant_id,
+            owner_user_id,
+            nodes,
+            hits,
+            include,
+            profile,
+        );
+        Ok(())
     }
 
     pub async fn commit_session_async(
@@ -3915,12 +3954,14 @@ impl Store {
         &self,
         tenant_id: &str,
         req: ContextSearchRequest,
+        is_admin: bool,
     ) -> Result<ContextSearchOutcome, ApiError> {
         let query = require_string(req.query, "query")?;
-        let owner_user_id = req
-            .owner_user_id
-            .or_else(|| owner_from_filters(&req.filters).map(ToString::to_string));
+        let owner_user_id = resolve_context_owner(req.owner_user_id, &req.filters)?;
         let limit = req.limit.max(1);
+        let structured_filters = parse_context_filters(&req.filters)?;
+        let include = ContextIncludeSet::from_request(&req.include)?;
+        let profile = ContextReturnProfile::from_request(&req.return_profile)?;
         let data = self.read()?;
         let nodes = self.context_scope_locked(&data, tenant_id, owner_user_id.as_deref())?;
 
@@ -3928,26 +3969,43 @@ impl Store {
             nodes
                 .iter()
                 .filter(|node| retrieval_candidate(node))
+                .filter(|node| structured_filters.matches_node(node))
                 .cloned(),
             &query,
             limit,
         );
-        drop(data);
 
         let selected_nodes: Vec<_> = fragments
             .iter()
             .map(|(node, _)| node.clone())
             .take(limit)
             .collect();
-        let hits: Vec<_> = selected_nodes
+        let mut hits: Vec<_> = selected_nodes
             .iter()
             .map(|node| context_hit_from_node(node, &query))
             .collect();
-        let stages = vec![stage_value(
-            "fragments",
-            &fragments,
+        enrich_context_hits_locked(
+            &data,
+            tenant_id,
             owner_user_id.as_deref(),
-        )];
+            &selected_nodes,
+            &mut hits,
+            &include,
+            profile,
+        );
+        drop(data);
+
+        let stages = sanitize_context_stages(
+            vec![stage_value(
+                "fragments",
+                &fragments,
+                owner_user_id.as_deref(),
+            )],
+            req.debug,
+            is_admin,
+        );
+        let groups = context_source_groups(profile, &hits);
+        let hits = shape_context_hits(hits, profile, &include);
         let trace = TraceRecord {
             id: new_id("trace"),
             tenant_id: tenant_id.to_string(),
@@ -3962,6 +4020,7 @@ impl Store {
         let response = ContextSearchResponse {
             trace_id: trace.id.clone(),
             hits,
+            groups,
             stages,
         };
         let mut data = self.write()?;
@@ -4031,6 +4090,7 @@ impl Store {
                 debug: req.debug,
                 ..ContextSearchRequest::default()
             },
+            false,
         )?;
         Ok(self.answer_from_context(outcome))
     }
@@ -4256,14 +4316,7 @@ impl Store {
             .hits
             .iter()
             .take(5)
-            .map(|hit| Citation {
-                uri: hit.uri.clone(),
-                source_id: hit.source_id.clone(),
-                revision_id: hit.revision_id.clone(),
-                title: hit.title.clone(),
-                quote: hit.snippet.clone(),
-                score: hit.score,
-            })
+            .map(citation_from_hit)
             .collect();
         let answer = if citations.is_empty() {
             "I do not have enough indexed context to answer that yet.".to_string()
@@ -6118,6 +6171,8 @@ fn context_hit_from_node(node: &ContextNode, query: &str) -> ContextHit {
         source_id: node.source_id.clone(),
         revision_id: node.revision_id.clone(),
         source_document_uri: node.source_document_uri.clone(),
+        source_title: None,
+        source_relation: None,
         fragment_index: node.fragment_index,
         char_start: node.char_start,
         char_end: node.char_end,
@@ -6129,7 +6184,37 @@ fn context_hit_from_node(node: &ContextNode, query: &str) -> ContextHit {
         asset_refs: node.asset_refs.clone(),
         artifact_refs: node.artifact_refs.clone(),
         checksum: node.checksum.clone(),
+        source_summary: None,
+        neighbor_fragments: Vec::new(),
+        related_links: Vec::new(),
+        score_breakdown: None,
         snippet: truncate_chars(&node.body, 240),
+    }
+}
+
+fn citation_from_hit(hit: &ContextHit) -> Citation {
+    Citation {
+        uri: hit.uri.clone(),
+        node_kind: hit.node_kind.clone(),
+        retrieval_role: hit.retrieval_role.clone(),
+        source_id: hit.source_id.clone(),
+        revision_id: hit.revision_id.clone(),
+        source_document_uri: hit.source_document_uri.clone(),
+        source_title: hit.source_title.clone(),
+        block_type: hit.block_type.clone(),
+        page_idx: hit.page_idx,
+        bbox: hit.bbox.clone(),
+        section_path: hit.section_path.clone(),
+        heading_level: hit.heading_level,
+        asset_refs: hit.asset_refs.clone(),
+        artifact_refs: hit.artifact_refs.clone(),
+        fragment_index: hit.fragment_index,
+        char_start: hit.char_start,
+        char_end: hit.char_end,
+        checksum: hit.checksum.clone(),
+        title: hit.title.clone(),
+        quote: hit.snippet.clone(),
+        score: hit.score,
     }
 }
 
@@ -6467,6 +6552,496 @@ fn link_search_text(link: &KnowledgeLink) -> String {
         link.rationale.as_deref().unwrap_or_default(),
         link.tags.join(" ")
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextReturnProfile {
+    Compact,
+    Standard,
+    Full,
+}
+
+impl ContextReturnProfile {
+    fn from_request(value: &str) -> Result<Self, ApiError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "standard" => Ok(Self::Standard),
+            "compact" => Ok(Self::Compact),
+            "full" => Ok(Self::Full),
+            other => Err(ApiError::bad_request(format!(
+                "unsupported return_profile: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ContextIncludeSet {
+    traceback: bool,
+    links: bool,
+    neighbor_fragments: bool,
+    source_summary: bool,
+    artifact_refs: bool,
+    score_breakdown: bool,
+}
+
+impl ContextIncludeSet {
+    fn from_request(values: &[String]) -> Result<Self, ApiError> {
+        let mut include = Self::default();
+        for value in values {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "" => {}
+                "traceback" => include.traceback = true,
+                "links" => include.links = true,
+                "neighbor_fragments" => include.neighbor_fragments = true,
+                "source_summary" => include.source_summary = true,
+                "artifact_refs" => include.artifact_refs = true,
+                "score_breakdown" => include.score_breakdown = true,
+                "raw_stage_debug" => {}
+                other => {
+                    return Err(ApiError::bad_request(format!(
+                        "unsupported include value: {other}"
+                    )));
+                }
+            }
+        }
+        Ok(include)
+    }
+}
+
+fn resolve_context_owner(
+    owner_user_id: Option<String>,
+    filters: &Value,
+) -> Result<Option<String>, ApiError> {
+    let filter_owner = owner_from_filters(filters).map(ToString::to_string);
+    match (owner_user_id, filter_owner) {
+        (Some(owner), Some(filter_owner)) if owner != filter_owner => Err(ApiError::bad_request(
+            "owner_user_id and filters.owner_user_id must match",
+        )),
+        (Some(owner), _) => Ok(Some(owner)),
+        (None, owner) => Ok(owner),
+    }
+}
+
+fn parse_context_filters(filters: &Value) -> Result<ContextStructuredFilters, ApiError> {
+    if filters.is_null() {
+        return Ok(ContextStructuredFilters::default());
+    }
+    let object = filters
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("filters must be an object"))?;
+    Ok(ContextStructuredFilters {
+        source_id: optional_filter_string(object, "source_id")?,
+        revision_id: optional_filter_string(object, "revision_id")?,
+        source_document_uri: optional_filter_string(object, "source_document_uri")?,
+        block_type: optional_filter_string(object, "block_type")?,
+        page_idx: optional_filter_u32(object, "page_idx")?,
+        page_idx_gte: optional_filter_u32(object, "page_idx_gte")?,
+        page_idx_lte: optional_filter_u32(object, "page_idx_lte")?,
+        section_path_contains: optional_filter_string(object, "section_path_contains")?,
+        artifact_kind: optional_filter_string(object, "artifact_kind")?,
+    })
+}
+
+fn optional_filter_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, ApiError> {
+    match object.get(key) {
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(Value::String(_)) | None | Some(Value::Null) => Ok(None),
+        Some(_) => Err(ApiError::bad_request(format!("{key} must be a string"))),
+    }
+}
+
+fn optional_filter_u32(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<u32>, ApiError> {
+    match object.get(key) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| ApiError::bad_request(format!("{key} must be a non-negative integer"))),
+        Some(Value::String(value)) if !value.trim().is_empty() => value
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| ApiError::bad_request(format!("{key} must be a non-negative integer"))),
+        Some(Value::String(_)) | None | Some(Value::Null) => Ok(None),
+        Some(_) => Err(ApiError::bad_request(format!(
+            "{key} must be a non-negative integer"
+        ))),
+    }
+}
+
+fn enrich_context_hits_locked(
+    data: &StoreData,
+    tenant_id: &str,
+    owner_user_id: Option<&str>,
+    nodes: &[ContextNode],
+    hits: &mut [ContextHit],
+    include: &ContextIncludeSet,
+    profile: ContextReturnProfile,
+) {
+    let wants_source_metadata = profile != ContextReturnProfile::Compact || include.traceback;
+    let wants_source_summary =
+        include.source_summary || matches!(profile, ContextReturnProfile::Full);
+    let wants_links = include.links || matches!(profile, ContextReturnProfile::Full);
+    let wants_neighbors = include.neighbor_fragments;
+
+    for hit in hits {
+        if wants_source_metadata {
+            if let Some(document) =
+                source_document_for_hit_locked(data, tenant_id, owner_user_id, hit)
+            {
+                hit.source_document_uri = Some(document.uri.clone());
+                hit.source_id = Some(document.source_id.clone());
+                hit.revision_id = Some(document.revision_id.clone());
+                hit.source_title = Some(document.title.clone());
+                if include.traceback || matches!(profile, ContextReturnProfile::Full) {
+                    hit.source_relation = Some("part_of".to_string());
+                }
+                if wants_source_summary {
+                    hit.source_summary = Some(ContextSourceSummary {
+                        source_document_uri: document.uri.clone(),
+                        source_id: document.source_id.clone(),
+                        revision_id: document.revision_id.clone(),
+                        source_title: document.title.clone(),
+                    });
+                }
+            }
+        }
+
+        if wants_links {
+            hit.related_links = related_links_for_hit_locked(
+                data,
+                tenant_id,
+                owner_user_id,
+                &hit.uri,
+                include.links,
+            );
+        }
+        if wants_neighbors {
+            hit.neighbor_fragments =
+                neighbor_fragments_for_hit_locked(data, tenant_id, owner_user_id, nodes, hit);
+        }
+        if include.score_breakdown {
+            hit.score_breakdown = Some(json!({ "lexical": hit.score }));
+        }
+    }
+}
+
+fn source_document_for_hit_locked(
+    data: &StoreData,
+    tenant_id: &str,
+    owner_user_id: Option<&str>,
+    hit: &ContextHit,
+) -> Option<SourceDocument> {
+    let source_document_uri = hit
+        .source_document_uri
+        .as_deref()
+        .map(ToString::to_string)
+        .or_else(|| {
+            data.links
+                .values()
+                .find(|link| {
+                    link.tenant_id == tenant_id
+                        && link.status == "active"
+                        && link.relation == "part_of"
+                        && link.source_uri == hit.uri
+                        && link_visible_to_owner(link, owner_user_id)
+                })
+                .map(|link| link.target_uri.clone())
+        })?;
+    data.source_documents
+        .get(&source_document_uri)
+        .filter(|document| document.status == "active")
+        .filter(|document| document.tenant_id == tenant_id || document.tenant_id == "default")
+        .filter(|document| owner_can_see_optional(document.owner_user_id.as_deref(), owner_user_id))
+        .cloned()
+}
+
+fn related_links_for_hit_locked(
+    data: &StoreData,
+    tenant_id: &str,
+    owner_user_id: Option<&str>,
+    uri: &str,
+    include_non_part_of: bool,
+) -> Vec<ContextRelatedLink> {
+    let mut part_of = data
+        .links
+        .values()
+        .filter(|link| {
+            link.tenant_id == tenant_id
+                && link.status == "active"
+                && link.relation == "part_of"
+                && link.source_uri == uri
+                && link_visible_to_owner(link, owner_user_id)
+        })
+        .map(context_related_link)
+        .collect::<Vec<_>>();
+    part_of.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+
+    if include_non_part_of {
+        let mut other_links = data
+            .links
+            .values()
+            .filter(|link| {
+                link.tenant_id == tenant_id
+                    && link.status == "active"
+                    && link.relation != "part_of"
+                    && (link.source_uri == uri || link.target_uri == uri)
+                    && link_visible_to_owner(link, owner_user_id)
+            })
+            .map(context_related_link)
+            .collect::<Vec<_>>();
+        other_links.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+        part_of.extend(other_links.into_iter().take(5));
+    }
+
+    part_of
+}
+
+fn context_related_link(link: &KnowledgeLink) -> ContextRelatedLink {
+    ContextRelatedLink {
+        id: link.id.clone(),
+        source_uri: link.source_uri.clone(),
+        target_uri: link.target_uri.clone(),
+        relation: link.relation.clone(),
+        source_title: link.source_title.clone(),
+        target_title: link.target_title.clone(),
+        confidence: link.confidence,
+        updated_at: link.updated_at,
+    }
+}
+
+fn neighbor_fragments_for_hit_locked(
+    data: &StoreData,
+    tenant_id: &str,
+    owner_user_id: Option<&str>,
+    scoped_nodes: &[ContextNode],
+    hit: &ContextHit,
+) -> Vec<ContextNeighborFragment> {
+    let Some(source_document_uri) = hit.source_document_uri.as_deref() else {
+        return Vec::new();
+    };
+    let Some(fragment_index) = hit.fragment_index else {
+        return Vec::new();
+    };
+    let mut candidates = scoped_nodes
+        .iter()
+        .cloned()
+        .chain(data.company_context.iter().cloned())
+        .chain(data.personal_context.values().flatten().cloned())
+        .filter(|node| node.uri != hit.uri)
+        .filter(|node| node.tenant_id == tenant_id || node.tenant_id == "default")
+        .filter(retrieval_candidate)
+        .filter(|node| node.source_document_uri.as_deref() == Some(source_document_uri))
+        .filter(|node| {
+            owner_can_see_optional(node.owner_user_id.as_deref(), owner_user_id)
+                && node
+                    .fragment_index
+                    .is_some_and(|idx| idx.abs_diff(fragment_index) <= 1)
+        })
+        .map(|node| ContextNeighborFragment {
+            uri: node.uri,
+            title: node.title,
+            fragment_index: node.fragment_index,
+            page_idx: node.page_idx,
+            block_type: node.block_type,
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|fragment| fragment.fragment_index.unwrap_or(u32::MAX));
+    candidates.dedup_by(|a, b| a.uri == b.uri);
+    candidates
+}
+
+fn link_visible_to_owner(link: &KnowledgeLink, owner_user_id: Option<&str>) -> bool {
+    owner_can_see_optional(link.owner_user_id.as_deref(), owner_user_id)
+}
+
+fn owner_can_see_optional(resource_owner: Option<&str>, owner_user_id: Option<&str>) -> bool {
+    if let Some(owner) = owner_user_id {
+        resource_owner.is_none() || resource_owner == Some(owner)
+    } else {
+        resource_owner.is_none()
+    }
+}
+
+fn shape_context_hits(
+    hits: Vec<ContextHit>,
+    profile: ContextReturnProfile,
+    include: &ContextIncludeSet,
+) -> Vec<ContextHit> {
+    if profile != ContextReturnProfile::Compact {
+        return hits;
+    }
+    hits.into_iter()
+        .map(|mut hit| {
+            hit.node_kind = None;
+            hit.retrieval_role = None;
+            if !(include.traceback || include.source_summary) {
+                hit.source_id = None;
+                hit.revision_id = None;
+                hit.source_document_uri = None;
+                hit.source_title = None;
+                hit.source_relation = None;
+            }
+            hit.fragment_index = None;
+            hit.char_start = None;
+            hit.char_end = None;
+            hit.block_type = None;
+            hit.page_idx = None;
+            hit.bbox = None;
+            hit.section_path.clear();
+            hit.heading_level = None;
+            hit.asset_refs.clear();
+            if !include.artifact_refs {
+                hit.artifact_refs.clear();
+            }
+            hit.checksum = None;
+            if !include.source_summary {
+                hit.source_summary = None;
+            }
+            if !include.neighbor_fragments {
+                hit.neighbor_fragments.clear();
+            }
+            if !include.links {
+                hit.related_links.clear();
+            }
+            if !include.score_breakdown {
+                hit.score_breakdown = None;
+            }
+            hit
+        })
+        .collect()
+}
+
+fn context_source_groups(
+    profile: ContextReturnProfile,
+    hits: &[ContextHit],
+) -> Vec<ContextSourceGroup> {
+    if matches!(profile, ContextReturnProfile::Compact) {
+        return Vec::new();
+    }
+
+    #[derive(Default)]
+    struct Accumulator {
+        group: Option<ContextSourceGroup>,
+        page_min: Option<u32>,
+        page_max: Option<u32>,
+    }
+
+    let mut order = Vec::new();
+    let mut groups: HashMap<String, Accumulator> = HashMap::new();
+    for hit in hits {
+        let key = hit
+            .source_document_uri
+            .clone()
+            .unwrap_or_else(|| hit.uri.clone());
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+        }
+        let accumulator = groups.entry(key.clone()).or_default();
+        if accumulator.group.is_none() {
+            accumulator.group = Some(ContextSourceGroup {
+                source_document_uri: key,
+                source_id: hit.source_id.clone().unwrap_or_default(),
+                revision_id: hit.revision_id.clone().unwrap_or_default(),
+                source_title: hit
+                    .source_title
+                    .clone()
+                    .unwrap_or_else(|| hit.title.clone()),
+                top_score: hit.score,
+                hit_count: 0,
+                page_range: None,
+                block_types: Vec::new(),
+                top_hit_uri: hit.uri.clone(),
+            });
+        }
+        let group = accumulator.group.as_mut().expect("group initialized");
+        group.top_score = group.top_score.max(hit.score);
+        group.hit_count += 1;
+        if let Some(page_idx) = hit.page_idx {
+            accumulator.page_min = Some(
+                accumulator
+                    .page_min
+                    .map_or(page_idx, |min| min.min(page_idx)),
+            );
+            accumulator.page_max = Some(
+                accumulator
+                    .page_max
+                    .map_or(page_idx, |max| max.max(page_idx)),
+            );
+        }
+        if let Some(block_type) = hit.block_type.as_deref() {
+            if !group.block_types.iter().any(|value| value == block_type) {
+                group.block_types.push(block_type.to_string());
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|key| {
+            let mut accumulator = groups.remove(&key)?;
+            let mut group = accumulator.group.take()?;
+            group.page_range = accumulator
+                .page_min
+                .zip(accumulator.page_max)
+                .map(|(start, end)| ContextPageRange { start, end });
+            Some(group)
+        })
+        .collect()
+}
+
+fn sanitize_context_stages(stages: Vec<Value>, debug: bool, is_admin: bool) -> Vec<Value> {
+    stages
+        .into_iter()
+        .map(|stage| sanitize_context_stage(stage, debug, is_admin))
+        .collect()
+}
+
+fn sanitize_context_stage(stage: Value, debug: bool, is_admin: bool) -> Value {
+    let Value::Object(mut object) = stage else {
+        return stage;
+    };
+    let raw_stage = Value::Object(object.clone());
+    if !debug {
+        object.remove("index_uid");
+        object.remove("filter");
+        object.remove("raw_stage_debug");
+        return Value::Object(object);
+    }
+
+    if is_admin {
+        object.insert("raw_stage_debug".to_string(), raw_stage);
+        return Value::Object(object);
+    }
+
+    if let Some(index_uid) = object.get_mut("index_uid") {
+        if index_uid
+            .as_str()
+            .is_some_and(|value| value != "rag_company_context")
+        {
+            *index_uid = json!("personal_context_redacted");
+        }
+    }
+    if object.get("filter").is_some() {
+        object.insert("filter".to_string(), json!("redacted"));
+    }
+    object.remove("raw_stage_debug");
+    Value::Object(object)
 }
 
 fn owner_from_filters(filters: &Value) -> Option<&str> {

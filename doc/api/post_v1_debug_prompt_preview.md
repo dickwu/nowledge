@@ -1,7 +1,7 @@
 # POST /v1/debug/prompt/preview
 
 ## Summary
-Build a fragment-grounded RAG answer and return the redacted prompt preview, trace id, and citations.
+Build a fragment-grounded RAG answer and return the redacted prompt preview, trace id, and provenance-rich citations.
 
 ## Handler
 - Rust handler: `prompt_preview`
@@ -38,6 +38,7 @@ Schema: `JsonValue`
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Prompt preview uses the same default fragment-only RAG retrieval as /v1/rag/answer.
+- The preview prompt includes source title, `page_idx`, `block_type`, `section_path`, URI, and quote for each citation, then applies the normal secret redaction path before returning.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph

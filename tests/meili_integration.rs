@@ -302,6 +302,141 @@ async fn meili_backend_context_search_retrieves_fragments_only() {
 }
 
 #[tokio::test]
+async fn meili_backend_context_search_applies_structured_filters() {
+    let Some(app) = meili_app().await else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+
+    let (status, bootstrap) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/bootstrap",
+        json!({ "reset": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bootstrap}");
+
+    let owner = format!("u-{}", uuid::Uuid::now_v7());
+    let source_a = format!("meili-filter-a-{}", uuid::Uuid::now_v7());
+    let source_b = format!("meili-filter-b-{}", uuid::Uuid::now_v7());
+    let keyword = format!("meili-filter-keyword-{}", uuid::Uuid::now_v7());
+
+    let (status, ingest_a) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "owner_user_id": owner,
+            "source_id": source_a,
+            "revision_id": "v1",
+            "title": "Meili Filter A",
+            "content": "source a",
+            "content_list_v2": [
+                {
+                    "type": "table",
+                    "html": format!("<table><tr><td>{keyword} table row</td></tr></table>"),
+                    "page_idx": 1,
+                    "bbox": [0, 0, 10, 10],
+                    "reading_order": 0
+                },
+                {
+                    "type": "paragraph",
+                    "text": format!("{keyword} paragraph page three"),
+                    "page_idx": 3,
+                    "bbox": [1, 1, 11, 11],
+                    "reading_order": 1
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ingest_a}");
+
+    let (status, ingest_b) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "owner_user_id": owner,
+            "source_id": source_b,
+            "revision_id": "v1",
+            "title": "Meili Filter B",
+            "content": "source b",
+            "content_list_v2": [
+                {
+                    "type": "table",
+                    "html": format!("<table><tr><td>{keyword} other table</td></tr></table>"),
+                    "page_idx": 1,
+                    "bbox": [2, 2, 12, 12],
+                    "reading_order": 0
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ingest_b}");
+
+    let (status, table_search) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({
+            "owner_user_id": owner,
+            "query": keyword,
+            "filters": { "block_type": "table", "source_id": source_a },
+            "limit": 10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{table_search}");
+    assert_eq!(table_search["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(table_search["hits"][0]["block_type"], "table");
+    assert_eq!(table_search["hits"][0]["source_id"], source_a);
+    assert!(!table_search.to_string().contains("index_uid"));
+    assert!(!table_search.to_string().contains("\"filter\""));
+
+    let (status, page_search) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({
+            "owner_user_id": owner,
+            "query": keyword,
+            "filters": { "page_idx_gte": 3, "page_idx_lte": 3 },
+            "limit": 10
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page_search}");
+    assert!(!page_search["hits"].as_array().unwrap().is_empty());
+    assert!(page_search["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|hit| hit["page_idx"] == 3));
+
+    let (status, debug_search) = call(
+        app,
+        Method::POST,
+        "/v1/context/search",
+        json!({
+            "owner_user_id": owner,
+            "query": keyword,
+            "debug": true,
+            "limit": 5
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{debug_search}");
+    assert!(debug_search["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|stage| stage.get("raw_stage_debug").is_some()));
+}
+
+#[tokio::test]
 async fn meili_bootstrap_creates_harness_indexes_and_indexes_changes() {
     let Some(app) = meili_app().await else {
         eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");

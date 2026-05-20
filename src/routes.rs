@@ -993,7 +993,9 @@ async fn analyze_insights(
             "owner_user_id is required for history_event_id analysis",
         ));
     }
-    Ok(Json(run_analysis_insights(&state, req).await?))
+    Ok(Json(
+        run_analysis_insights(&state, req, user.principal.is_admin()).await?,
+    ))
 }
 
 async fn preflight_doc(
@@ -1234,7 +1236,7 @@ async fn context_search(
     Ok(Json(
         state
             .store
-            .search_context_async(state.tenant_id(), req)
+            .search_context_async(state.tenant_id(), req, user.principal.is_admin())
             .await?
             .response,
     ))
@@ -1509,7 +1511,9 @@ async fn rag_answer(
     Json(mut req): Json<RagAnswerRequest>,
 ) -> Result<Json<RagAnswerResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
-    Ok(Json(answer_rag_with_llm(&state, req).await?))
+    Ok(Json(
+        answer_rag_with_llm(&state, req, user.principal.is_admin()).await?,
+    ))
 }
 
 async fn rag_stream(
@@ -1526,7 +1530,7 @@ async fn rag_debug(
     Json(mut req): Json<RagAnswerRequest>,
 ) -> Result<Json<Value>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
-    let answer = answer_rag_with_llm(&state, req.clone()).await?;
+    let answer = answer_rag_with_llm(&state, req.clone(), user.principal.is_admin()).await?;
     let trace = state.store.get_trace_async(&answer.trace_id).await?;
     Ok(Json(json!({
         "answer": answer,
@@ -1706,7 +1710,7 @@ async fn prompt_preview(
     State(state): State<AppState>,
     Json(req): Json<RagAnswerRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let answer = answer_rag_with_llm(&state, req.clone()).await?;
+    let answer = answer_rag_with_llm(&state, req.clone(), true).await?;
     let prompt = build_prompt(&req.question.unwrap_or_default(), &answer.citations);
     Ok(Json(redact_for_state(
         &state,
@@ -1721,10 +1725,11 @@ async fn prompt_preview(
 async fn answer_rag_with_llm(
     state: &AppState,
     req: RagAnswerRequest,
+    is_admin: bool,
 ) -> Result<RagAnswerResponse, ApiError> {
     let mut answer = state
         .store
-        .answer_rag_async(state.tenant_id(), req.clone())
+        .answer_rag_async(state.tenant_id(), req.clone(), is_admin)
         .await?;
     let config = state.effective_config();
     if config.llm_provider != "none" {
@@ -1758,6 +1763,7 @@ async fn answer_rag_with_llm(
 async fn run_analysis_insights(
     state: &AppState,
     req: AnalysisInsightRequest,
+    is_admin: bool,
 ) -> Result<AnalysisInsightResponse, ApiError> {
     let query = require_string(req.query.clone(), "query")?;
     let owner_user_id = req.owner_user_id.clone();
@@ -1793,6 +1799,7 @@ async fn run_analysis_insights(
                         debug: req.debug,
                         ..ContextSearchRequest::default()
                     },
+                    is_admin,
                 )
                 .await?;
             let existing_links = state
@@ -2040,6 +2047,8 @@ fn history_event_context_hit(event: &HistoryEvent, query: &str) -> ContextHit {
         source_id: Some(event.id.clone()),
         revision_id: None,
         source_document_uri: None,
+        source_title: None,
+        source_relation: None,
         fragment_index: None,
         char_start: None,
         char_end: None,
@@ -2051,6 +2060,10 @@ fn history_event_context_hit(event: &HistoryEvent, query: &str) -> ContextHit {
         asset_refs: Vec::new(),
         artifact_refs: Vec::new(),
         checksum: None,
+        source_summary: None,
+        neighbor_fragments: Vec::new(),
+        related_links: Vec::new(),
+        score_breakdown: None,
         snippet: truncate_chars(&event.text, 240),
     }
 }
@@ -2058,9 +2071,41 @@ fn history_event_context_hit(event: &HistoryEvent, query: &str) -> ContextHit {
 fn build_prompt(question: &str, citations: &[Citation]) -> String {
     let context = citations
         .iter()
-        .map(|citation| format!("[{}] {}", citation.uri, citation.quote))
+        .enumerate()
+        .map(|(idx, citation)| {
+            let source_title = citation
+                .source_title
+                .as_deref()
+                .unwrap_or(citation.title.as_str());
+            let mut location = Vec::new();
+            if let Some(page_idx) = citation.page_idx {
+                location.push(format!("page_idx={page_idx}"));
+            }
+            if let Some(block_type) = citation.block_type.as_deref() {
+                location.push(format!("block_type={block_type}"));
+            }
+            if !citation.section_path.is_empty() {
+                location.push(format!(
+                    "section_path={}",
+                    citation.section_path.join(" > ")
+                ));
+            }
+            let location = if location.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", location.join(", "))
+            };
+            format!(
+                "[{}] {}{} uri={}\nquote: {}",
+                idx + 1,
+                source_title,
+                location,
+                citation.uri,
+                citation.quote
+            )
+        })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n\n");
     format!("Question:\n{question}\n\nContextFS staged context:\n{context}")
 }
 

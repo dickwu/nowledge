@@ -1,7 +1,7 @@
 # POST /v1/rag/answer
 
 ## Summary
-Answer a question using active fragment retrieval results and the configured LLM provider when enabled.
+Answer a question using active fragment retrieval results and the configured LLM provider when enabled. Citations preserve source, page, block, geometry, artifact, and fragment-offset provenance for UI highlighting.
 
 ## Handler
 - Rust handler: `rag_answer`
@@ -40,8 +40,23 @@ Schema: `RagAnswerResponse`
 | Field | Type | Description |
 | --- | --- | --- |
 | uri | string | Fragment context URI used as evidence. |
+| node_kind | string? | Usually `fragment` for default RAG retrieval. |
+| retrieval_role | string? | Usually `fragment` for default RAG retrieval. |
 | source_id | string? | Source identifier when the fragment came from a source document. |
 | revision_id | string? | Source revision identifier when present. |
+| source_document_uri | string? | Full source document URI for explicit read/traceback operations. |
+| source_title | string? | Parent source document title when known. |
+| block_type | string? | Parser block type, such as `text`, `table`, `image`, or `equation`. |
+| page_idx | integer? | Zero-based page index from parser metadata when available. |
+| bbox | JSON? | Parser-provided bounding box for source highlighting when available. |
+| section_path | string[] | Section hierarchy for the fragment. |
+| heading_level | integer? | Heading level for heading-derived fragments. |
+| asset_refs | string[] | Parser asset references, such as extracted image paths. |
+| artifact_refs | ParseArtifactRef[] | Parse artifact references attached to the fragment. |
+| fragment_index | integer? | Zero-based fragment index within the source document. |
+| char_start | integer? | Fragment start character offset in the source document. |
+| char_end | integer? | Fragment end character offset in the source document. |
+| checksum | string? | Fragment checksum. |
 | title | string | Fragment title. |
 | quote | string | Quoted fragment text used for grounding. |
 | score | number | Retrieval score. |
@@ -50,6 +65,8 @@ Schema: `RagAnswerResponse`
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Default RAG retrieval searches only active fragments; source documents are not directly searched.
+- The generated prompt includes each citation's source title, `page_idx`, `block_type`, `section_path`, URI, and quote; secret redaction still applies to debug/preview surfaces.
+- Citation `source_document_uri` is metadata only. Full source document bodies are readable only through explicit `GET /v1/fs/read` with ACL checks.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph

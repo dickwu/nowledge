@@ -1,7 +1,7 @@
 # POST /v1/rag/debug
 
 ## Summary
-Return a fragment-grounded RAG answer plus its trace and prompt preview for debugging.
+Return a fragment-grounded RAG answer plus its trace and prompt preview for debugging. The nested answer uses the same provenance-rich citation shape as `/v1/rag/answer`.
 
 ## Handler
 - Rust handler: `rag_debug`
@@ -38,6 +38,8 @@ Schema: `JsonValue`
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Debug output is based on the same default fragment-only RAG retrieval as /v1/rag/answer.
+- The prompt preview includes citation source title, `page_idx`, `block_type`, `section_path`, URI, and quote.
+- Trace stages follow the same redaction behavior as `/v1/context/search`: non-admin debug redacts personal index/filter details, while admin debug can expose raw stage details.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph

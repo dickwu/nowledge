@@ -10,7 +10,17 @@ Each endpoint file includes request parameters, response fields, access rules, a
 
 Long documents are stored as non-retrieval `SourceDocument` records and fragmented into active `ContextNode` fragments. Default context search and RAG retrieval only search active fragments with `retrieval_enabled=true`, `retrieval_role=fragment`, and `status=active`; raw source documents are kept out of default retrieval.
 
-Use `POST /v1/context/traceback` or explicit `GET /v1/fs/read` with normal ACL checks to trace a fragment back to its full source document.
+`POST /v1/context/search` has three response profiles:
+
+- `compact` returns minimal hit fields for lightweight callers.
+- `standard` is the default and returns source/location/block provenance plus source groups.
+- `full` adds source summaries and active `part_of` links; `include: ["links"]` also adds up to 5 non-`part_of` related links per hit.
+
+Supported context-search include values are `traceback`, `links`, `neighbor_fragments`, `source_summary`, `artifact_refs`, `score_breakdown`, and `raw_stage_debug`. Supported structured filters include `source_id`, `revision_id`, `source_document_uri`, `block_type`, `page_idx`, `page_idx_gte`, `page_idx_lte`, `section_path_contains`, and `artifact_kind`.
+
+Use `include: ["traceback"]`, `POST /v1/context/traceback`, or explicit `GET /v1/fs/read` with normal ACL checks to trace a fragment back to its full source document. Search traceback returns source metadata only; it never includes the full source document body.
+
+`/v1/rag/answer` citations preserve the same source/location provenance as context hits, including `source_document_uri`, `page_idx`, `bbox`, `block_type`, `section_path`, parser artifact references, fragment offsets, and checksums when available.
 
 `ContextNode.node_kind` is one of `source_doc`, `fragment`, `abstract`, or `overview`. `ContextNode.retrieval_role` is one of `none`, `fragment`, or `overview`. Source documents are stored in `rag_source_documents` with `retrieval_enabled=false` by default.
 

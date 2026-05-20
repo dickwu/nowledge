@@ -1054,6 +1054,118 @@ async fn mineru_content_list_ingest_creates_block_fragments_and_traceback_artifa
     assert_eq!(table_hit["page_idx"], 1);
     assert_eq!(table_hit["bbox"], json!([10, 20, 300, 160]));
     assert_eq!(table_hit["source_document_uri"], source_document_uri);
+    assert_eq!(table_hit["source_title"], "MinerU Fixture");
+    assert_eq!(
+        table_search["groups"][0]["source_document_uri"],
+        source_document_uri
+    );
+    assert_eq!(table_search["groups"][0]["source_id"], "mineru-fixture");
+    assert_eq!(table_search["groups"][0]["source_title"], "MinerU Fixture");
+    assert_eq!(table_search["groups"][0]["page_range"]["start"], 1);
+    assert!(!table_search.to_string().contains("index_uid"));
+    assert!(!table_search.to_string().contains("\"filter\""));
+
+    let (status, compact_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({
+            "query": "table-block-keyword",
+            "return_profile": "compact",
+            "limit": 5
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{compact_search}");
+    let compact_hit = &compact_search["hits"][0];
+    assert!(compact_hit.get("source_document_uri").is_none());
+    assert!(compact_hit.get("block_type").is_none());
+    assert!(compact_search
+        .get("groups")
+        .is_none_or(|groups| groups.as_array().unwrap().is_empty()));
+
+    let (status, full_traceback_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({
+            "query": "table-block-keyword",
+            "return_profile": "full",
+            "include": ["traceback", "links"],
+            "limit": 5
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{full_traceback_search}");
+    let full_hit = &full_traceback_search["hits"][0];
+    assert_eq!(full_hit["source_document_uri"], source_document_uri);
+    assert_eq!(full_hit["source_title"], "MinerU Fixture");
+    assert_eq!(full_hit["source_relation"], "part_of");
+    assert!(full_hit["related_links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|link| link["relation"] == "part_of"
+            && link["target_uri"].as_str() == Some(source_document_uri)));
+
+    let (status, admin_debug_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({
+            "query": "table-block-keyword",
+            "debug": true,
+            "limit": 5
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{admin_debug_search}");
+    assert!(admin_debug_search["stages"][0]
+        .get("raw_stage_debug")
+        .is_some());
+
+    let (status, table_filter_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({
+            "query": "block-keyword",
+            "filters": { "block_type": "table" },
+            "limit": 10
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{table_filter_search}");
+    assert!(!table_filter_search["hits"].as_array().unwrap().is_empty());
+    assert!(table_filter_search["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|hit| hit["block_type"] == "table"));
+
+    let (status, page_filter_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({
+            "query": "block-keyword",
+            "filters": { "page_idx_gte": 2, "page_idx_lte": 2 },
+            "limit": 10
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page_filter_search}");
+    assert!(!page_filter_search["hits"].as_array().unwrap().is_empty());
+    assert!(page_filter_search["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|hit| hit["page_idx"] == 2));
 
     let (status, equation_search) = call_with_token(
         app.clone(),
@@ -1103,6 +1215,71 @@ async fn mineru_content_list_ingest_creates_block_fragments_and_traceback_artifa
         .unwrap()
         .iter()
         .any(|artifact| artifact["artifact_kind"] == "content_list_v2"));
+
+    let (status, answer) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/rag/answer",
+        json!({ "question": "What does table-block-keyword say?" }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let citation = &answer["citations"][0];
+    assert_eq!(citation["block_type"], "table");
+    assert_eq!(citation["page_idx"], 1);
+    assert_eq!(citation["bbox"], json!([10, 20, 300, 160]));
+    assert_eq!(citation["source_document_uri"], source_document_uri);
+    assert!(citation["artifact_refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|artifact| artifact["artifact_kind"] == "content_list_v2"));
+
+    let (status, other_result) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "owner_user_id": "u1",
+            "source_id": "other-mineru-fixture",
+            "revision_id": "v1",
+            "title": "Other MinerU Fixture",
+            "content": "other source",
+            "content_list_v2": [
+                {
+                    "type": "table",
+                    "html": "<table><tr><td>table-block-keyword from another source</td></tr></table>",
+                    "page_idx": 4,
+                    "bbox": [1, 1, 2, 2],
+                    "reading_order": 0
+                }
+            ]
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{other_result}");
+
+    let (status, source_filter_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({
+            "query": "table-block-keyword",
+            "filters": { "source_id": "mineru-fixture" },
+            "limit": 10
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{source_filter_search}");
+    assert!(!source_filter_search["hits"].as_array().unwrap().is_empty());
+    assert!(source_filter_search["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|hit| hit["source_id"] == "mineru-fixture"));
 
     let (status, source_only_search) = call_with_token(
         app,
@@ -1268,6 +1445,7 @@ async fn parse_artifacts_and_fragments_are_owner_scoped() {
     .await;
     assert_eq!(status, StatusCode::OK, "{result}");
     let task_id = result["task"]["task_id"].as_str().unwrap();
+    let source_document_uri = result["source_document_uri"].as_str().unwrap();
 
     let (status, u1_search) = call_with_token(
         app.clone(),
@@ -1280,16 +1458,52 @@ async fn parse_artifacts_and_fragments_are_owner_scoped() {
     assert_eq!(status, StatusCode::OK, "{u1_search}");
     let fragment_uri = u1_search["hits"][0]["uri"].as_str().unwrap();
 
+    let (status, u1_full_search) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({
+            "query": "private-parse-artifact-keyword",
+            "return_profile": "full",
+            "include": ["traceback", "links"],
+            "limit": 5
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{u1_full_search}");
+    assert_eq!(
+        u1_full_search["hits"][0]["source_document_uri"],
+        source_document_uri
+    );
+    assert!(u1_full_search["hits"][0]["artifact_refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|artifact| artifact["artifact_kind"] == "content_list_v2"));
+    assert!(u1_full_search["hits"][0]["related_links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|link| link["relation"] == "part_of"
+            && link["target_uri"].as_str() == Some(source_document_uri)));
+
     let (status, u2_search) = call_with_token(
         app.clone(),
         Method::POST,
         "/v1/context/search",
-        json!({ "query": "private-parse-artifact-keyword", "limit": 5 }),
+        json!({
+            "query": "private-parse-artifact-keyword",
+            "return_profile": "full",
+            "include": ["traceback", "links"],
+            "limit": 5
+        }),
         Some("u2-token"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{u2_search}");
     assert_eq!(u2_search["hits"].as_array().unwrap().len(), 0);
+    assert!(!u2_search.to_string().contains(source_document_uri));
 
     let (status, u2_result) = call_with_token(
         app.clone(),

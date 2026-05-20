@@ -19,6 +19,16 @@ pub struct RepositoryContextSearch {
     pub stages: Vec<Value>,
 }
 
+pub struct RepositoryContextSearchQuery<'a> {
+    pub tenant_id: &'a str,
+    pub owner_user_id: Option<&'a str>,
+    pub query: &'a str,
+    pub mode: &'a str,
+    pub limit: usize,
+    pub filters: &'a ContextStructuredFilters,
+    pub resolver: &'a EventIndexResolver,
+}
+
 #[async_trait]
 pub trait KnowledgeRepository: Send + Sync {
     fn backend_name(&self) -> &'static str;
@@ -194,12 +204,7 @@ pub trait KnowledgeRepository: Send + Sync {
 
     async fn search_context(
         &self,
-        tenant_id: &str,
-        owner_user_id: Option<&str>,
-        query: &str,
-        mode: &str,
-        limit: usize,
-        resolver: &EventIndexResolver,
+        request: RepositoryContextSearchQuery<'_>,
     ) -> Result<Option<RepositoryContextSearch>, ApiError>;
 
     async fn get_event(
@@ -498,12 +503,7 @@ impl KnowledgeRepository for MemoryRepository {
 
     async fn search_context(
         &self,
-        _tenant_id: &str,
-        _owner_user_id: Option<&str>,
-        _query: &str,
-        _mode: &str,
-        _limit: usize,
-        _resolver: &EventIndexResolver,
+        _request: RepositoryContextSearchQuery<'_>,
     ) -> Result<Option<RepositoryContextSearch>, ApiError> {
         Ok(None)
     }
@@ -1126,61 +1126,85 @@ impl KnowledgeRepository for MeiliRepository {
 
     async fn search_context(
         &self,
-        tenant_id: &str,
-        owner_user_id: Option<&str>,
-        query: &str,
-        mode: &str,
-        limit: usize,
-        resolver: &EventIndexResolver,
+        request: RepositoryContextSearchQuery<'_>,
     ) -> Result<Option<RepositoryContextSearch>, ApiError> {
         let mut stages = Vec::new();
         let mut all_nodes = Vec::new();
+        let search_limit = if request.filters.requires_post_filter() {
+            request
+                .limit
+                .saturating_mul(20)
+                .max(request.limit)
+                .min(1000)
+        } else {
+            request.limit
+        };
 
-        let company_filter = context_filter(tenant_id, None)?;
+        let company_filter = context_filter(request.tenant_id, None, request.filters)?;
         let company = self
-            .search_context_index("rag_company_context", query, &company_filter, limit)
+            .search_context_index(
+                "rag_company_context",
+                request.query,
+                &company_filter,
+                search_limit,
+            )
             .await?;
+        let company_hits = company
+            .hits
+            .into_iter()
+            .filter(|node| request.filters.matches_node(node))
+            .collect::<Vec<_>>();
         stages.push(context_stage(
             "fragments_company",
             "rag_company_context",
-            query,
+            request.query,
             &company_filter,
             company.processing_time_ms,
-            &company.hits,
+            &company_hits,
         ));
-        all_nodes.extend(company.hits);
+        all_nodes.extend(company_hits);
 
-        if let Some(owner) = owner_user_id {
-            let routing = resolver.resolve(tenant_id, owner, false, true)?;
-            let personal_filter = context_filter(tenant_id, Some(owner))?;
+        if let Some(owner) = request.owner_user_id {
+            let routing = request
+                .resolver
+                .resolve(request.tenant_id, owner, false, true)?;
+            let personal_filter = context_filter(request.tenant_id, Some(owner), request.filters)?;
             let personal = self
                 .search_context_index(
                     &routing.personal_context_index_uid,
-                    query,
+                    request.query,
                     &personal_filter,
-                    limit,
+                    search_limit,
                 )
                 .await?;
+            let personal_hits = personal
+                .hits
+                .into_iter()
+                .filter(|node| request.filters.matches_node(node))
+                .collect::<Vec<_>>();
             stages.push(context_stage(
                 "fragments_personal",
                 &routing.personal_context_index_uid,
-                query,
+                request.query,
                 &personal_filter,
                 personal.processing_time_ms,
-                &personal.hits,
+                &personal_hits,
             ));
-            all_nodes.extend(personal.hits);
+            all_nodes.extend(personal_hits);
         }
 
         all_nodes.sort_by(|a, b| {
-            text_score(&format!("{} {}", b.title, b.body), query)
-                .partial_cmp(&text_score(&format!("{} {}", a.title, a.body), query))
+            text_score(&format!("{} {}", b.title, b.body), request.query)
+                .partial_cmp(&text_score(
+                    &format!("{} {}", a.title, a.body),
+                    request.query,
+                ))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        all_nodes.truncate(limit);
+        all_nodes.truncate(request.limit);
         stages.push(json!({
             "stage": "selection",
-            "mode": mode,
+            "mode": request.mode,
             "selected_uris": all_nodes.iter().map(|node| &node.uri).collect::<Vec<_>>()
         }));
 
@@ -1468,7 +1492,11 @@ fn meili_string_array(values: &[String]) -> Result<String, ApiError> {
     serde_json::to_string(values).map_err(|e| ApiError::Internal(e.to_string()))
 }
 
-fn context_filter(tenant_id: &str, owner_user_id: Option<&str>) -> Result<String, ApiError> {
+fn context_filter(
+    tenant_id: &str,
+    owner_user_id: Option<&str>,
+    structured: &ContextStructuredFilters,
+) -> Result<String, ApiError> {
     let mut filters = vec![
         format!("tenant_id = {}", meili_string(tenant_id)?),
         "status = \"active\"".to_string(),
@@ -1481,7 +1509,34 @@ fn context_filter(tenant_id: &str, owner_user_id: Option<&str>) -> Result<String
     } else {
         filters.push("privacy = \"company\"".to_string());
     }
+    filters.extend(context_filter_clauses(structured)?);
     Ok(filters.join(" AND "))
+}
+
+fn context_filter_clauses(filters: &ContextStructuredFilters) -> Result<Vec<String>, ApiError> {
+    let mut clauses = Vec::new();
+    if let Some(source_id) = filters.source_id.as_deref() {
+        clauses.push(format!("source_id = {}", meili_string(source_id)?));
+    }
+    if let Some(revision_id) = filters.revision_id.as_deref() {
+        clauses.push(format!("revision_id = {}", meili_string(revision_id)?));
+    }
+    if let Some(uri) = filters.source_document_uri.as_deref() {
+        clauses.push(format!("source_document_uri = {}", meili_string(uri)?));
+    }
+    if let Some(block_type) = filters.block_type.as_deref() {
+        clauses.push(format!("block_type = {}", meili_string(block_type)?));
+    }
+    if let Some(page_idx) = filters.page_idx {
+        clauses.push(format!("page_idx = {page_idx}"));
+    }
+    if let Some(page_idx_gte) = filters.page_idx_gte {
+        clauses.push(format!("page_idx >= {page_idx_gte}"));
+    }
+    if let Some(page_idx_lte) = filters.page_idx_lte {
+        clauses.push(format!("page_idx <= {page_idx_lte}"));
+    }
+    Ok(clauses)
 }
 
 fn context_stage(
