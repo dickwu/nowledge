@@ -46,6 +46,16 @@ pub trait KnowledgeRepository: Send + Sync {
         nodes: &[ContextNode],
     ) -> Result<Option<String>, ApiError>;
 
+    /// Load every company-scoped context node persisted for `tenant_id`.
+    /// Returns `Ok(None)` for backends that do not keep their own copy
+    /// (e.g. the in-memory backend); callers should then fall back to the
+    /// in-process state. The Meili backend rehydrates from
+    /// `rag_company_context`.
+    async fn list_company_context_nodes(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<ContextNode>>, ApiError>;
+
     async fn upsert_state_item(&self, item: &StateItem) -> Result<Option<String>, ApiError>;
 
     async fn upsert_company_source(
@@ -264,6 +274,13 @@ impl KnowledgeRepository for MemoryRepository {
         _index_uid: &str,
         _nodes: &[ContextNode],
     ) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_company_context_nodes(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<ContextNode>>, ApiError> {
         Ok(None)
     }
 
@@ -645,6 +662,19 @@ impl KnowledgeRepository for MeiliRepository {
             .map(|node| to_document(node, &context_document_id(&node.uri)))
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values(index_uid, &documents).await
+    }
+
+    async fn list_company_context_nodes(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<ContextNode>>, ApiError> {
+        self.search_many(
+            "rag_company_context",
+            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            1000,
+            Some(&["updated_at:desc"]),
+        )
+        .await
     }
 
     async fn upsert_state_item(&self, item: &StateItem) -> Result<Option<String>, ApiError> {

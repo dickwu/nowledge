@@ -268,6 +268,20 @@ impl Store {
             counts.insert("ingest_results".to_string(), json!(count));
         }
 
+        // Rehydrate company-scoped context nodes from the persistent store.
+        // Without this, every restart left fs_ls / context_search staring at
+        // an empty in-memory cache even though Meili kept the documents.
+        if let Some(nodes) = self
+            .repository
+            .list_company_context_nodes(tenant_id)
+            .await?
+        {
+            let count = nodes.len();
+            let mut data = self.write()?;
+            data.company_context = nodes;
+            counts.insert("company_context_nodes".to_string(), json!(count));
+        }
+
         Ok(Value::Object(counts))
     }
 

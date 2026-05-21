@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"rtk ls /Users/lifefarmer/opensource/nowledge/doc/ && echo \\\"---\\\" && rtk ls /Users/lifefarmer/opensource/nowledge/doc/api/ | head -10 && echo \\\"---\\\" && rtk find /Users/lifefarmer/opensour...",
+  "error": "Exit code 1\napi/\nREADME.md  11.8K\napi_manifest.json  12.4K\n---\nget_healthz.md  1.4K\nget_livez.md  904B\nget_readyz.md  1.4K\nget_v1_admin_harness_evolution_changes_change_id_delta.md  475B\nget_v1_admin_history_user_event_indexes.md  1.0K\nget_v1_debug_traces_trace_id.md  1.1K\nget_v1_fs_abstract.md  1.8K\nget_v1_fs_ls.md  1.6K\nget_v1_fs_overview.md  1.8K\nget_v1_fs_read.md  3.0K\n---\nrtk: rtk find does not support compound predicates or actions (e.g. -not, -exec). Use `find` directly.",
+  "timestamp": "2026-05-21T04:37:52.472Z",
+  "retry_count": 2
+}
