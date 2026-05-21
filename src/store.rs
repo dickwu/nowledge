@@ -282,6 +282,41 @@ impl Store {
             counts.insert("company_context_nodes".to_string(), json!(count));
         }
 
+        // Rehydrate the source registry. Without these two, fs_read of
+        // ctx://company/docs/{source_id} 404s after a restart, the
+        // /v1/history/.../revisions endpoint returns []`, and create_revision
+        // would silently spawn a fresh source row (clobbering the old
+        // active_revision_id pointer) because `sources.entry().or_insert_with`
+        // never sees the existing entry.
+        if let Some(sources) = self.repository.list_company_sources(tenant_id).await? {
+            let count = sources.len();
+            let mut data = self.write()?;
+            data.sources = sources
+                .into_iter()
+                .map(|s| (s.id.clone(), s))
+                .collect();
+            counts.insert("company_sources".to_string(), json!(count));
+        }
+        if let Some(revisions) = self.repository.list_source_revisions(tenant_id).await? {
+            let count = revisions.len();
+            let mut by_source: HashMap<String, Vec<SourceRevision>> = HashMap::new();
+            for revision in revisions {
+                by_source
+                    .entry(revision.source_id.clone())
+                    .or_default()
+                    .push(revision);
+            }
+            // Keep revisions in chronological order so callers iterating
+            // `source_revisions[source_id]` see the latest at the back, the
+            // same shape create_revision produces at runtime.
+            for revs in by_source.values_mut() {
+                revs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            }
+            let mut data = self.write()?;
+            data.source_revisions = by_source;
+            counts.insert("source_revisions".to_string(), json!(count));
+        }
+
         Ok(Value::Object(counts))
     }
 

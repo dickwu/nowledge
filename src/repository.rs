@@ -56,6 +56,23 @@ pub trait KnowledgeRepository: Send + Sync {
         tenant_id: &str,
     ) -> Result<Option<Vec<ContextNode>>, ApiError>;
 
+    /// Rehydrate every persisted CompanySource so the in-memory `sources`
+    /// table survives a restart. CompanySource has no tenant column today
+    /// (rag_sources is shared across tenants); tenant_id is accepted for
+    /// symmetry but the Meili backend returns every row.
+    async fn list_company_sources(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<CompanySource>>, ApiError>;
+
+    /// Rehydrate every persisted SourceRevision so revision history and the
+    /// edit / reindex flows keep working after a restart. Returned rows are
+    /// regrouped into `source_revisions` by source_id in the store.
+    async fn list_source_revisions(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<SourceRevision>>, ApiError>;
+
     async fn upsert_state_item(&self, item: &StateItem) -> Result<Option<String>, ApiError>;
 
     async fn upsert_company_source(
@@ -281,6 +298,20 @@ impl KnowledgeRepository for MemoryRepository {
         &self,
         _tenant_id: &str,
     ) -> Result<Option<Vec<ContextNode>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_company_sources(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<CompanySource>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_source_revisions(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<SourceRevision>>, ApiError> {
         Ok(None)
     }
 
@@ -675,6 +706,43 @@ impl KnowledgeRepository for MeiliRepository {
             Some(&["updated_at:desc"]),
         )
         .await
+    }
+
+    async fn list_company_sources(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<CompanySource>>, ApiError> {
+        // rag_sources isn't tenant-keyed (CompanySource has no tenant_id),
+        // so pull every row. Use admin.search directly so we can omit the
+        // filter field instead of sending an empty string.
+        let response: SearchResponse<CompanySource> = self
+            .admin
+            .search(
+                "rag_sources",
+                json!({
+                    "q": "",
+                    "limit": 1000
+                }),
+            )
+            .await?;
+        Ok(Some(response.hits))
+    }
+
+    async fn list_source_revisions(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<SourceRevision>>, ApiError> {
+        let response: SearchResponse<SourceRevision> = self
+            .admin
+            .search(
+                "rag_source_revisions",
+                json!({
+                    "q": "",
+                    "limit": 2000
+                }),
+            )
+            .await?;
+        Ok(Some(response.hits))
     }
 
     async fn upsert_state_item(&self, item: &StateItem) -> Result<Option<String>, ApiError> {
