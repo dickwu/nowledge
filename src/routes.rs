@@ -319,6 +319,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/sessions/{session_id}/commit", post(commit_session))
         .route("/v1/llm/status", get(llm_status))
         .route("/v1/llm/test", post(llm_test))
+        .route("/v1/llm/title", post(llm_title))
         .route("/v1/debug/traces/{trace_id}", get(get_trace))
         .route("/v1/debug/meili/search", post(debug_meili_search))
         .route("/v1/debug/prompt/preview", post(prompt_preview))
@@ -1675,6 +1676,79 @@ async fn llm_test(
         model: status.model,
         latency_ms: response.latency_ms,
         sample: response.text,
+    }))
+}
+
+/// Summarize `content` into a short title via the configured LLM. Available
+/// to any authenticated user (UserGuard); the LLM call is governed by the
+/// service-level config the same way RAG answers are.
+async fn llm_title(
+    _user: UserGuard,
+    State(state): State<AppState>,
+    Json(req): Json<LlmTitleRequest>,
+) -> Result<Json<LlmTitleResponse>, ApiError> {
+    let content = req.content.trim();
+    if content.is_empty() {
+        return Err(ApiError::bad_request("content is required"));
+    }
+    let max_chars = req.max_chars.unwrap_or(80).clamp(20, 200);
+    let language_hint = req
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!(" in {s}"))
+        .unwrap_or_else(|| " in the same language as the content".to_string());
+    let hint_line = req
+        .hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("\nThe user proposed this draft to refine: \"{s}\""))
+        .unwrap_or_default();
+
+    // Keep prompt size bounded — only the first ~2000 chars are needed to
+    // pick a good title, and longer prompts inflate latency / cost.
+    let truncated: String = content.chars().take(2000).collect();
+
+    let prompt = format!(
+        "You are a precise editor. Produce a single concise title{language_hint} \
+that captures the main topic of the document below. Constraints: max {max_chars} \
+characters; no surrounding quotes; no trailing period; no leading numbering or \
+emoji; do NOT wrap in markdown. Return ONLY the title text on one line.{hint_line}\n\n\
+Document:\n{truncated}"
+    );
+
+    let config = state.effective_config();
+    let client = llm_client_from_config(&config);
+    let status = client.status().await;
+    let response = client.complete_text(LlmRequest { prompt }).await?;
+
+    // Clean up common LLM artifacts: surrounding quotes, leading "Title:",
+    // trailing punctuation, newlines, and enforce the soft length cap.
+    let mut title = response.text.trim().to_string();
+    title = title.trim_start_matches('#').trim().to_string();
+    for prefix in ["Title:", "title:", "TITLE:", "Title -", "title -"] {
+        if let Some(rest) = title.strip_prefix(prefix) {
+            title = rest.trim().to_string();
+        }
+    }
+    title = title.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_string();
+    if let Some(first_line) = title.lines().next() {
+        title = first_line.to_string();
+    }
+    title = title.trim().trim_end_matches('.').trim().to_string();
+    if title.chars().count() > max_chars {
+        title = title.chars().take(max_chars).collect();
+    }
+    if title.is_empty() {
+        title = "Untitled".to_string();
+    }
+
+    Ok(Json(LlmTitleResponse {
+        title,
+        model: status.model,
+        latency_ms: response.latency_ms,
     }))
 }
 

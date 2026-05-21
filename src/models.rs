@@ -1051,6 +1051,29 @@ pub struct LlmTestResponse {
     pub sample: String,
 }
 
+/// Ask the LLM to summarize document content into a short title.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmTitleRequest {
+    pub content: String,
+    /// Soft cap on the returned title; clamped to [20, 200], default 80.
+    #[serde(default)]
+    pub max_chars: Option<usize>,
+    /// Optional language hint (e.g. "English", "Simplified Chinese"). When
+    /// None the model is asked to match the input language.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Optional user-supplied draft / keywords the model should incorporate.
+    #[serde(default)]
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmTitleResponse {
+    pub title: String,
+    pub model: String,
+    pub latency_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionCreateRequest {
     pub owner_user_id: Option<String>,
