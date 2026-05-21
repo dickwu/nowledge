@@ -209,6 +209,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/links", post(upsert_link))
         .route("/v1/links/search", post(search_links))
         .route("/v1/analysis/insights", post(analyze_insights))
+        .route("/v1/state/company-docs", get(list_company_docs))
+        .route("/v1/state/company-docs/{source_id}", get(get_company_doc))
         .route("/v1/state/company-docs/preflight", post(preflight_doc))
         .route(
             "/v1/state/company-docs/{source_id}/revisions",
@@ -1033,6 +1035,21 @@ async fn activate_revision(
             .activate_revision_async(state.tenant_id(), &source_id, &revision_id, req)
             .await?,
     ))
+}
+
+async fn list_company_docs(
+    _user: UserGuard,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.store.list_company_docs()?))
+}
+
+async fn get_company_doc(
+    _user: UserGuard,
+    State(state): State<AppState>,
+    Path(source_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.store.get_company_doc(&source_id)?))
 }
 
 async fn list_revisions(

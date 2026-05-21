@@ -3468,6 +3468,70 @@ impl Store {
         }))
     }
 
+    pub fn list_company_docs(&self) -> Result<Value, ApiError> {
+        let data = self.read()?;
+        let mut sources: Vec<Value> = data
+            .sources
+            .values()
+            .map(|s| {
+                let revisions = data.source_revisions.get(&s.id);
+                let revision_count = revisions.map(|v| v.len()).unwrap_or(0);
+                let active_rev = s.active_revision_id.as_deref().and_then(|active_id| {
+                    revisions.and_then(|revs| revs.iter().find(|r| r.id == active_id))
+                });
+                json!({
+                    "source_id": s.id,
+                    "title": s.title,
+                    "source_uri": s.source_uri,
+                    "active_revision_id": active_rev.map(|r| &r.id),
+                    "active_revision_created_at": active_rev.map(|r| r.created_at),
+                    "active_revision_status": active_rev.map(|r| &r.status),
+                    "revision_count": revision_count
+                })
+            })
+            .collect();
+        // Sort by active_revision_created_at descending; sources without an active revision sort last.
+        sources.sort_by(|a, b| {
+            let ta = a["active_revision_created_at"].as_str().unwrap_or("");
+            let tb = b["active_revision_created_at"].as_str().unwrap_or("");
+            tb.cmp(ta)
+        });
+        Ok(json!({ "sources": sources }))
+    }
+
+    pub fn get_company_doc(&self, source_id: &str) -> Result<Value, ApiError> {
+        let data = self.read()?;
+        let source = data
+            .sources
+            .get(source_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("source not found"))?;
+        let revisions = data
+            .source_revisions
+            .get(source_id)
+            .cloned()
+            .unwrap_or_default();
+        if revisions.is_empty() {
+            return Err(ApiError::not_found("no revisions for source"));
+        }
+        // Prefer active revision; fall back to the last (most recent) revision.
+        let rev = revisions
+            .iter()
+            .find(|r| r.status == "active")
+            .or_else(|| revisions.last())
+            .unwrap(); // safe: revisions non-empty
+        Ok(json!({
+            "source_id": source.id,
+            "title": rev.title,
+            "content": rev.content,
+            "revision_id": rev.id,
+            "status": rev.status,
+            "created_at": rev.created_at,
+            "source_uri": rev.source_uri,
+            "active_revision_id": source.active_revision_id
+        }))
+    }
+
     pub fn upsert_dataset(
         &self,
         dataset_key: &str,
