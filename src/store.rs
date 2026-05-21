@@ -3514,10 +3514,16 @@ impl Store {
         if revisions.is_empty() {
             return Err(ApiError::not_found("no revisions for source"));
         }
-        // Prefer active revision; fall back to the last (most recent) revision.
-        let rev = revisions
-            .iter()
-            .find(|r| r.status == "active")
+        // The canonical "active" pointer lives on CompanySource — individual
+        // SourceRevision rows can carry a stale status="active" from prior
+        // activations (the activation flow updates the source pointer but
+        // doesn't demote prior revisions' status). Follow the source pointer
+        // first, fall back to the most recent revision if the source doesn't
+        // name an active one yet.
+        let rev = source
+            .active_revision_id
+            .as_deref()
+            .and_then(|active_id| revisions.iter().find(|r| r.id == active_id))
             .or_else(|| revisions.last())
             .unwrap(); // safe: revisions non-empty
         Ok(json!({
