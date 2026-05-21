@@ -3538,6 +3538,45 @@ impl Store {
         }))
     }
 
+    pub async fn delete_company_doc(
+        &self,
+        tenant_id: &str,
+        source_id: &str,
+    ) -> Result<Value, ApiError> {
+        // Existence check first so we can return a clean 404 without
+        // touching Meili.
+        {
+            let data = self.read()?;
+            if !data.sources.contains_key(source_id) {
+                return Err(ApiError::not_found("source not found"));
+            }
+        }
+
+        // Persistence cascade (Meili) BEFORE in-memory mutation so a Meili
+        // rejection leaves the in-memory state intact and recoverable.
+        let report = self
+            .repository
+            .delete_company_source(tenant_id, source_id)
+            .await?;
+
+        // In-memory cleanup.
+        let mut data = self.write()?;
+        data.sources.remove(source_id);
+        data.source_revisions.remove(source_id);
+        // Drop any company-context fragments that point at this source.
+        data.company_context
+            .retain(|n| n.source_id.as_deref() != Some(source_id));
+
+        Ok(json!({
+            "source_id": source_id,
+            "deleted": true,
+            "fragments_task": report.fragments_task,
+            "revisions_task": report.revisions_task,
+            "source_task": report.source_task,
+            "auxiliary_tasks": report.auxiliary_tasks,
+        }))
+    }
+
     pub fn upsert_dataset(
         &self,
         dataset_key: &str,

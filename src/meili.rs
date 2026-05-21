@@ -267,6 +267,81 @@ impl MeiliAdmin {
         }
     }
 
+    pub async fn delete_documents_by_filter(
+        &self,
+        index_uid: &str,
+        filter: &str,
+    ) -> Result<Option<String>, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(None);
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{}/indexes/{}/documents/delete",
+                url.trim_end_matches('/'),
+                index_uid
+            ))
+            .headers(self.headers()?)
+            .json(&json!({ "filter": filter }))
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+
+        if response.status().is_success() {
+            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+            Ok(task_uid(&body))
+        } else {
+            Err(ApiError::Upstream(format!(
+                "failed to delete Meilisearch documents from {index_uid}: {}",
+                response.status()
+            )))
+        }
+    }
+
+    pub async fn delete_documents_by_ids(
+        &self,
+        index_uid: &str,
+        ids: &[String],
+    ) -> Result<Option<String>, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(None);
+        };
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let response = self
+            .client
+            .post(format!(
+                "{}/indexes/{}/documents/delete-batch",
+                url.trim_end_matches('/'),
+                index_uid
+            ))
+            .headers(self.headers()?)
+            .json(ids)
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+
+        if response.status().is_success() {
+            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+            Ok(task_uid(&body))
+        } else {
+            Err(ApiError::Upstream(format!(
+                "failed to delete Meilisearch documents from {index_uid}: {}",
+                response.status()
+            )))
+        }
+    }
+
     pub async fn search<T: DeserializeOwned>(
         &self,
         index_uid: &str,

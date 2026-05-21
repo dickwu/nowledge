@@ -210,7 +210,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/links/search", post(search_links))
         .route("/v1/analysis/insights", post(analyze_insights))
         .route("/v1/state/company-docs", get(list_company_docs))
-        .route("/v1/state/company-docs/{source_id}", get(get_company_doc))
+        .route(
+            "/v1/state/company-docs/{source_id}",
+            get(get_company_doc).delete(delete_company_doc),
+        )
         .route("/v1/state/company-docs/preflight", post(preflight_doc))
         .route(
             "/v1/state/company-docs/{source_id}/revisions",
@@ -1050,6 +1053,19 @@ async fn get_company_doc(
     Path(source_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(state.store.get_company_doc(&source_id)?))
+}
+
+async fn delete_company_doc(
+    _user: UserGuard,
+    State(state): State<AppState>,
+    Path(source_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        state
+            .store
+            .delete_company_doc(state.tenant_id(), &source_id)
+            .await?,
+    ))
 }
 
 async fn list_revisions(

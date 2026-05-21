@@ -1689,6 +1689,18 @@ pub struct CompanySource {
     pub active_revision_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeleteSourceReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragments_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revisions_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auxiliary_tasks: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceRevision {
     pub id: String,

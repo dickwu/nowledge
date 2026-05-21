@@ -85,6 +85,15 @@ pub trait KnowledgeRepository: Send + Sync {
         revision: &SourceRevision,
     ) -> Result<Option<String>, ApiError>;
 
+    /// Remove a company source and every Meili row that references it
+    /// (fragments, revisions, source pointer, plus operational auxiliary
+    /// tracking rows). In-memory backends return an empty report.
+    async fn delete_company_source(
+        &self,
+        tenant_id: &str,
+        source_id: &str,
+    ) -> Result<DeleteSourceReport, ApiError>;
+
     async fn upsert_source_documents(
         &self,
         documents: &[SourceDocument],
@@ -331,6 +340,14 @@ impl KnowledgeRepository for MemoryRepository {
         _revision: &SourceRevision,
     ) -> Result<Option<String>, ApiError> {
         Ok(None)
+    }
+
+    async fn delete_company_source(
+        &self,
+        _tenant_id: &str,
+        _source_id: &str,
+    ) -> Result<DeleteSourceReport, ApiError> {
+        Ok(DeleteSourceReport::default())
     }
 
     async fn upsert_source_documents(
@@ -767,6 +784,70 @@ impl KnowledgeRepository for MeiliRepository {
             &[to_document(revision, &revision.id)?],
         )
         .await
+    }
+
+    async fn delete_company_source(
+        &self,
+        _tenant_id: &str,
+        source_id: &str,
+    ) -> Result<DeleteSourceReport, ApiError> {
+        let filter = format!("source_id = {}", meili_string(source_id)?);
+        let mut report = DeleteSourceReport::default();
+
+        // 1. Fragments — stop search hits immediately.
+        report.fragments_task = self
+            .admin
+            .delete_documents_by_filter("rag_company_context", &filter)
+            .await?;
+        self.maybe_wait(&report.fragments_task).await?;
+
+        // 2. Revision content blobs.
+        report.revisions_task = self
+            .admin
+            .delete_documents_by_filter("rag_source_revisions", &filter)
+            .await?;
+        self.maybe_wait(&report.revisions_task).await?;
+
+        // 3. Source pointer (doc id == source_id).
+        report.source_task = self
+            .admin
+            .delete_documents_by_ids("rag_sources", &[source_id.to_string()])
+            .await?;
+        self.maybe_wait(&report.source_task).await?;
+
+        // 4. Auxiliary indices — best-effort. Orphan rows here are
+        //    harmless once the canonical source is gone, but cleaning
+        //    them keeps Meili lean. Errors are logged, not fatal.
+        for aux_uid in [
+            "rag_source_documents",
+            "rag_parse_artifacts",
+            "rag_ingest_tasks",
+            "rag_ingest_results",
+        ] {
+            match self
+                .admin
+                .delete_documents_by_filter(aux_uid, &filter)
+                .await
+            {
+                Ok(Some(task)) => {
+                    let wait_task = Some(task.clone());
+                    let _ = self.maybe_wait(&wait_task).await;
+                    report.auxiliary_tasks.push(task);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "nowledge::delete_company_source",
+                        index = aux_uid,
+                        source_id = source_id,
+                        error = %e,
+                        "auxiliary cleanup failed; continuing"
+                    );
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     async fn upsert_source_documents(
