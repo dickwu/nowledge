@@ -478,7 +478,7 @@ pub fn settings_for(uid: &str) -> Value {
         json!({
             "searchableAttributes": ["id", "display_name", "description", "component_id", "manifest_id", "files", "created_by"],
             "filterableAttributes": ["id", "tenant_id", "doc_kind", "component_id", "status", "component_kind", "manifest_id", "created_by"],
-            "sortableAttributes": ["created_at", "updated_at", "iteration"]
+            "sortableAttributes": ["id", "created_at", "updated_at", "iteration"]
         })
     } else if uid == "rag_harness_changes" {
         json!({
