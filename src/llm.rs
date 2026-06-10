@@ -65,6 +65,8 @@ pub struct RateLimitSnapshot {
 pub struct LlmHealthProbeResult {
     pub provider: String,
     pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub status: String,
     pub can_call: bool,
     pub auth_valid: bool,
@@ -160,6 +162,7 @@ impl LlmClient for MockLlmClient {
 pub struct OpenAiResponsesClient {
     provider: String,
     model: String,
+    reasoning_effort: Option<String>,
     auth_source: String,
     api_key: Option<String>,
     client: reqwest::Client,
@@ -168,6 +171,7 @@ pub struct OpenAiResponsesClient {
 #[derive(Clone)]
 pub struct CodexResponsesClient {
     model: String,
+    reasoning_effort: Option<String>,
     auth_source: String,
     credentials: Option<CodexAuthCredentials>,
     base_url: String,
@@ -191,8 +195,14 @@ impl LlmClient for OpenAiResponsesClient {
             .as_deref()
             .ok_or_else(|| ApiError::Unauthorized("LLM API key is not configured".to_string()))?;
         let started = Instant::now();
-        let body =
-            complete_openai_responses(&self.client, &self.model, api_key, &request.prompt).await?;
+        let body = complete_openai_responses(
+            &self.client,
+            &self.model,
+            self.reasoning_effort.as_deref(),
+            api_key,
+            &request.prompt,
+        )
+        .await?;
         Ok(LlmTextResponse {
             text: extract_response_text(&body)
                 .unwrap_or_else(|| "LLM response did not contain output text".to_string()),
@@ -222,6 +232,7 @@ impl LlmClient for CodexResponsesClient {
             let body = complete_openai_responses(
                 &self.client,
                 &self.model,
+                self.reasoning_effort.as_deref(),
                 &credentials.token,
                 &request.prompt,
             )
@@ -240,7 +251,11 @@ impl LlmClient for CodexResponsesClient {
             .post(endpoint)
             .bearer_auth(&credentials.token)
             .header(ACCEPT, "text/event-stream")
-            .json(&codex_responses_payload(&self.model, &request.prompt));
+            .json(&codex_responses_payload(
+                &self.model,
+                &request.prompt,
+                self.reasoning_effort.as_deref(),
+            ));
         if let Some(account_id) = credentials.account_id.as_deref() {
             builder = builder.header("ChatGPT-Account-Id", account_id);
         }
@@ -272,17 +287,21 @@ impl LlmClient for CodexResponsesClient {
 async fn complete_openai_responses(
     client: &reqwest::Client,
     model: &str,
+    reasoning_effort: Option<&str>,
     api_key: &str,
     prompt: &str,
 ) -> Result<Value, ApiError> {
+    let mut payload = json!({
+        "model": model,
+        "input": prompt,
+        "store": false
+    });
+    set_reasoning_effort(&mut payload, reasoning_effort);
+
     let response = client
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(api_key)
-        .json(&json!({
-            "model": model,
-            "input": prompt,
-            "store": false
-        }))
+        .json(&payload)
         .send()
         .await
         .map_err(|e| ApiError::Upstream(e.to_string()))?;
@@ -302,8 +321,8 @@ async fn complete_openai_responses(
         .map_err(|e| ApiError::Upstream(e.to_string()))
 }
 
-fn codex_responses_payload(model: &str, prompt: &str) -> Value {
-    json!({
+fn codex_responses_payload(model: &str, prompt: &str, reasoning_effort: Option<&str>) -> Value {
+    let mut payload = json!({
         "model": model,
         "instructions": "Answer the user request directly. When context is supplied, stay grounded in that context.",
         "input": [{
@@ -315,7 +334,19 @@ fn codex_responses_payload(model: &str, prompt: &str) -> Value {
         }],
         "store": false,
         "stream": true
-    })
+    });
+    set_reasoning_effort(&mut payload, reasoning_effort);
+    payload
+}
+
+fn set_reasoning_effort(payload: &mut Value, reasoning_effort: Option<&str>) {
+    let Some(reasoning_effort) = reasoning_effort
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    payload["reasoning"] = json!({ "effort": reasoning_effort });
 }
 
 fn codex_responses_endpoint(base_url: &str) -> String {
@@ -332,12 +363,14 @@ pub fn llm_client_from_config(config: &Config) -> Box<dyn LlmClient> {
         "openai_api_key" => Box::new(OpenAiResponsesClient {
             provider: "openai_api_key".to_string(),
             model,
+            reasoning_effort: config.llm_reasoning_effort.clone(),
             auth_source: "RAG_OPENAI_API_KEY".to_string(),
             api_key: config.openai_api_key.clone(),
             client: reqwest::Client::new(),
         }),
         "codex_auth" => Box::new(CodexResponsesClient {
             model,
+            reasoning_effort: config.llm_reasoning_effort.clone(),
             auth_source: config
                 .codex_auth_path
                 .clone()
@@ -365,7 +398,7 @@ impl LlmHealthProbe {
 
     pub async fn check(&self, config: &Config) -> LlmHealthProbeResult {
         if !config.health_llm_enabled {
-            return disabled_probe(config);
+            return with_reasoning_effort(disabled_probe(config), config);
         }
 
         if let Ok(cache) = self.cache.read() {
@@ -384,7 +417,7 @@ impl LlmHealthProbe {
             .ok()
             .and_then(|cache| cache.as_ref().map(|cached| cached.consecutive_failures))
             .unwrap_or(0);
-        let mut result = probe_now(config).await;
+        let mut result = with_reasoning_effort(probe_now(config).await, config);
         let consecutive_failures = if is_threshold_failure(&result) {
             previous_failures.saturating_add(1)
         } else {
@@ -419,6 +452,7 @@ impl LlmHealthProbe {
 
     fn cached_with_age(&self, cached: &CachedLlmProbe, config: &Config) -> LlmHealthProbeResult {
         let mut result = cached.result.clone();
+        result.reasoning_effort = config.llm_reasoning_effort.clone();
         let age = cached.checked_instant.elapsed();
         result.age_seconds = age.as_secs();
         result.stale = age > Duration::from_secs(config.health_llm_probe_ttl_seconds);
@@ -431,6 +465,14 @@ impl LlmHealthProbe {
         }
         result
     }
+}
+
+fn with_reasoning_effort(
+    mut result: LlmHealthProbeResult,
+    config: &Config,
+) -> LlmHealthProbeResult {
+    result.reasoning_effort = config.llm_reasoning_effort.clone();
+    result
 }
 
 async fn probe_now(config: &Config) -> LlmHealthProbeResult {
@@ -517,15 +559,17 @@ async fn probe_openai_responses(
 ) -> LlmHealthProbeResult {
     let started = Instant::now();
     let client = reqwest::Client::new();
+    let mut payload = json!({
+        "model": model,
+        "input": "health check",
+        "store": false,
+        "max_output_tokens": 8
+    });
+    set_reasoning_effort(&mut payload, config.llm_reasoning_effort.as_deref());
     let request = client
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(api_key)
-        .json(&json!({
-            "model": model,
-            "input": "health check",
-            "store": false,
-            "max_output_tokens": 8
-        }));
+        .json(&payload);
     let sent = timeout(
         Duration::from_millis(config.health_llm_timeout_ms),
         request.send(),
@@ -576,7 +620,11 @@ async fn probe_codex_responses(
         .post(codex_responses_endpoint(&config.codex_base_url))
         .bearer_auth(&credentials.token)
         .header(ACCEPT, "text/event-stream")
-        .json(&codex_responses_payload(&model, "Reply with exactly: ok"));
+        .json(&codex_responses_payload(
+            &model,
+            "Reply with exactly: ok",
+            config.llm_reasoning_effort.as_deref(),
+        ));
     if let Some(account_id) = credentials.account_id.as_deref() {
         request = request.header("ChatGPT-Account-Id", account_id);
     }
@@ -893,6 +941,7 @@ fn probe_result(input: ProbeResultInput<'_>) -> LlmHealthProbeResult {
     LlmHealthProbeResult {
         provider: input.provider,
         model: input.model,
+        reasoning_effort: None,
         status: input.status.to_string(),
         can_call: input.can_call,
         auth_valid: input.auth_valid,
@@ -1129,5 +1178,25 @@ mod tests {
         assert_eq!(credentials.token, "header.payload.signature");
         assert_eq!(credentials.account_id.as_deref(), Some("acct-test"));
         assert_eq!(credentials.token_kind, CodexAuthTokenKind::CodexOauth);
+    }
+
+    #[test]
+    fn codex_payload_includes_reasoning_effort() {
+        let payload = codex_responses_payload("gpt-5.5", "hello", Some("xhigh"));
+
+        assert_eq!(
+            payload
+                .get("reasoning")
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(Value::as_str),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn codex_payload_omits_empty_reasoning_effort() {
+        let payload = codex_responses_payload("gpt-5.5", "hello", Some(" "));
+
+        assert!(payload.get("reasoning").is_none());
     }
 }

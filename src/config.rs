@@ -26,8 +26,10 @@ pub struct Config {
     pub ingest_worker_enabled: bool,
     pub llm_provider: String,
     pub llm_model: Option<String>,
+    pub llm_reasoning_effort: Option<String>,
     pub analysis_llm_provider: String,
     pub analysis_llm_model: Option<String>,
+    pub analysis_llm_reasoning_effort: Option<String>,
     pub openai_api_key: Option<String>,
     pub codex_auth_path: Option<String>,
     pub codex_base_url: String,
@@ -114,12 +116,16 @@ impl Config {
                 .unwrap_or(true),
             llm_provider: std::env::var("RAG_LLM_PROVIDER").unwrap_or_else(|_| "none".to_string()),
             llm_model: std::env::var("RAG_LLM_MODEL").ok(),
+            llm_reasoning_effort: std::env::var("RAG_LLM_REASONING_EFFORT").ok(),
             analysis_llm_provider: std::env::var("RAG_ANALYSIS_LLM_PROVIDER").unwrap_or_else(
                 |_| std::env::var("RAG_LLM_PROVIDER").unwrap_or_else(|_| "none".to_string()),
             ),
             analysis_llm_model: std::env::var("RAG_ANALYSIS_LLM_MODEL")
                 .ok()
                 .or_else(|| std::env::var("RAG_LLM_MODEL").ok()),
+            analysis_llm_reasoning_effort: std::env::var("RAG_ANALYSIS_LLM_REASONING_EFFORT")
+                .ok()
+                .or_else(|| std::env::var("RAG_LLM_REASONING_EFFORT").ok()),
             openai_api_key: std::env::var("RAG_OPENAI_API_KEY")
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .ok(),
@@ -167,6 +173,7 @@ impl Config {
         let mut config = self.clone();
         config.llm_provider = self.analysis_llm_provider.clone();
         config.llm_model = self.analysis_llm_model.clone();
+        config.llm_reasoning_effort = self.analysis_llm_reasoning_effort.clone();
         config
     }
 
@@ -222,8 +229,10 @@ impl Config {
             ingest_worker_enabled: true,
             llm_provider: "none".to_string(),
             llm_model: Some("none".to_string()),
+            llm_reasoning_effort: None,
             analysis_llm_provider: "none".to_string(),
             analysis_llm_model: Some("none".to_string()),
+            analysis_llm_reasoning_effort: None,
             openai_api_key: None,
             codex_auth_path: None,
             codex_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
@@ -272,4 +281,23 @@ fn parse_auth_users(value: &str) -> Vec<AuthUserConfig> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analysis_llm_config_uses_analysis_reasoning_effort() {
+        let mut config = Config::test();
+        config.llm_reasoning_effort = Some("high".to_string());
+        config.analysis_llm_reasoning_effort = Some("xhigh".to_string());
+
+        let analysis_config = config.analysis_llm_config();
+
+        assert_eq!(
+            analysis_config.llm_reasoning_effort.as_deref(),
+            Some("xhigh")
+        );
+    }
 }

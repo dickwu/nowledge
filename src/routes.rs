@@ -422,6 +422,7 @@ fn llm_health_json(llm: &LlmHealthProbeResult) -> Value {
     json!({
         "provider": &llm.provider,
         "model": &llm.model,
+        "reasoning_effort": &llm.reasoning_effort,
         "status": &llm.status,
         "can_call": llm.can_call,
         "auth_valid": llm.auth_valid,
@@ -480,6 +481,7 @@ async fn usage(
                     .llm_model
                     .clone()
                     .unwrap_or_else(|| "none".to_string()),
+                reasoning_effort: config.llm_reasoning_effort.clone(),
                 status: "unknown".to_string(),
                 can_call: false,
                 auth_valid: false,
@@ -1766,7 +1768,9 @@ Document:\n{truncated}"
             title = rest.trim().to_string();
         }
     }
-    title = title.trim_matches(|c: char| c == '"' || c == '\'' || c == '`').to_string();
+    title = title
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+        .to_string();
     if let Some(first_line) = title.lines().next() {
         title = first_line.to_string();
     }

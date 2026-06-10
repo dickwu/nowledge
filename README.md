@@ -63,8 +63,10 @@ RAG_INGEST_CLEANUP_INTERVAL_SECONDS=300
 RAG_INGEST_WORKER_ENABLED=true
 RAG_LLM_PROVIDER=none
 RAG_LLM_MODEL=none
+RAG_LLM_REASONING_EFFORT=optional-low-medium-high-xhigh
 RAG_ANALYSIS_LLM_PROVIDER=none
 RAG_ANALYSIS_LLM_MODEL=gpt-5.3-codex-spark
+RAG_ANALYSIS_LLM_REASONING_EFFORT=optional-low-medium-high-xhigh
 RAG_OPENAI_API_KEY=optional-openai-key
 RAG_CODEX_AUTH_PATH=optional-explicit-codex-auth-json
 RAG_HEALTH_LLM_ENABLED=true
@@ -123,9 +125,12 @@ Link and analysis surfaces:
 - `POST /v1/analysis/insights` searches ingested context, includes existing
   links as evidence, and can materialize new links plus insight records. It uses
   `RAG_ANALYSIS_LLM_PROVIDER` / `RAG_ANALYSIS_LLM_MODEL`, so analysis can run on
-  a different model from `/v1/rag/answer`. When `history_event_id` is supplied,
-  the caller must also provide or be bound to `owner_user_id`; analysis evidence
-  is then constrained to that owner's same history event index.
+  a different model from `/v1/rag/answer`. `RAG_LLM_REASONING_EFFORT` is passed
+  to configured Responses API calls, and
+  `RAG_ANALYSIS_LLM_REASONING_EFFORT` can override it for analysis jobs. When
+  `history_event_id` is supplied, the caller must also provide or be bound to
+  `owner_user_id`; analysis evidence is then constrained to that owner's same
+  history event index.
 
 ## Verify
 
