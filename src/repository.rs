@@ -792,13 +792,15 @@ impl KnowledgeRepository for MeiliRepository {
         source_id: &str,
     ) -> Result<DeleteSourceReport, ApiError> {
         let filter = format!("source_id = {}", meili_string(source_id)?);
-        let mut report = DeleteSourceReport::default();
 
         // 1. Fragments — stop search hits immediately.
-        report.fragments_task = self
-            .admin
-            .delete_documents_by_filter("rag_company_context", &filter)
-            .await?;
+        let mut report = DeleteSourceReport {
+            fragments_task: self
+                .admin
+                .delete_documents_by_filter("rag_company_context", &filter)
+                .await?,
+            ..Default::default()
+        };
         self.maybe_wait(&report.fragments_task).await?;
 
         // 2. Revision content blobs.

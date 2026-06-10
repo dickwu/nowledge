@@ -291,10 +291,7 @@ impl Store {
         if let Some(sources) = self.repository.list_company_sources(tenant_id).await? {
             let count = sources.len();
             let mut data = self.write()?;
-            data.sources = sources
-                .into_iter()
-                .map(|s| (s.id.clone(), s))
-                .collect();
+            data.sources = sources.into_iter().map(|s| (s.id.clone(), s)).collect();
             counts.insert("company_sources".to_string(), json!(count));
         }
         if let Some(revisions) = self.repository.list_source_revisions(tenant_id).await? {
@@ -310,7 +307,7 @@ impl Store {
             // `source_revisions[source_id]` see the latest at the back, the
             // same shape create_revision produces at runtime.
             for revs in by_source.values_mut() {
-                revs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+                revs.sort_by_key(|rev| rev.created_at);
             }
             let mut data = self.write()?;
             data.source_revisions = by_source;
