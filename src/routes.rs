@@ -334,8 +334,17 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Crate version and git revision baked in at compile time so every health
+/// surface can answer "which build is actually running?" on a deploy host.
+const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SERVICE_GIT_REV: &str = env!("NOWLEDGE_GIT_REV");
+
 async fn livez() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+    Json(json!({
+        "status": "ok",
+        "version": SERVICE_VERSION,
+        "git_rev": SERVICE_GIT_REV
+    }))
 }
 
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
@@ -381,6 +390,8 @@ async fn operational_health(state: AppState) -> impl IntoResponse {
     let body = json!({
         "status": status,
         "ready": ready,
+        "version": SERVICE_VERSION,
+        "git_rev": SERVICE_GIT_REV,
         "store_backend": state.store.backend_name(),
         "meilisearch": meili,
         "llm": llm_health_json(&llm),

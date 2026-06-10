@@ -24,6 +24,8 @@ Schema: `HealthResponse`
 | --- | --- | --- |
 | status | string | ok, degraded, or unhealthy. |
 | ready | boolean | True when Meilisearch and required LLM checks allow traffic. |
+| version | string | Crate version baked in at compile time. |
+| git_rev | string | Short git revision of the build, `-dirty` suffix when built from a modified tree, `unknown` outside a git checkout. |
 | store_backend | string | Active store backend name. |
 | meilisearch | object | Meilisearch health payload. |
 | llm | object | LLM health payload with provider, model, auth, quota, and stale status. |

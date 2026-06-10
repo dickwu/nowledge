@@ -378,7 +378,9 @@ async fn livez_is_minimal_process_liveness() {
     let app = llm_health_app("mock");
     let (status, body) = call(app, Method::GET, "/livez", Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, json!({ "status": "ok" }));
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert!(body["git_rev"].is_string(), "{body}");
     assert!(body.get("llm").is_none());
     assert!(body.get("usage").is_none());
 }
@@ -390,6 +392,8 @@ async fn healthz_includes_llm_health_and_usage() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "ok");
     assert_eq!(body["ready"], true);
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert!(body["git_rev"].is_string(), "{body}");
     assert_eq!(body["llm"]["provider"], "mock");
     assert_eq!(body["llm"]["auth_valid"], true);
     assert_eq!(body["llm"]["quota_state"], "available");

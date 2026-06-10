@@ -23,6 +23,8 @@ Schema: `LivezResponse`
 | Field | Type | Description |
 | --- | --- | --- |
 | status | string | Always ok when the process can serve the request. |
+| version | string | Crate version baked in at compile time. |
+| git_rev | string | Short git revision of the build, `-dirty` suffix when built from a modified tree, `unknown` outside a git checkout. |
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
