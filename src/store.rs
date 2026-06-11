@@ -1,7 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
 
@@ -19,6 +19,7 @@ use crate::{
         ancestor_uris, hmac_hex, new_id, now, require_string, sanitize_slug, text_score,
         truncate_chars,
     },
+    vector_match::{VectorMatcher, VectorScoreMap},
 };
 
 #[derive(Clone)]
@@ -26,6 +27,7 @@ pub struct Store {
     inner: Arc<RwLock<StoreData>>,
     resolver: EventIndexResolver,
     repository: Arc<dyn KnowledgeRepository>,
+    vector: Arc<Mutex<VectorMatcher>>,
 }
 
 #[derive(Default)]
@@ -139,7 +141,49 @@ impl Store {
             inner: Arc::new(RwLock::new(data)),
             resolver: EventIndexResolver::new(config.index_hash_secret.clone()),
             repository: repository_from_config(config),
+            vector: Arc::new(Mutex::new(VectorMatcher::from_config(config))),
         }
+    }
+
+    /// Acquire the vector matcher.
+    ///
+    /// The matcher mutex is leaf-level: no data lock is ever acquired while
+    /// it is held (the matcher never touches `inner`), and every caller
+    /// acquires data locks first when it needs both, so the order
+    /// `data -> vector` is consistent and cannot deadlock. A poisoned lock
+    /// recovers the matcher and keeps serving — vector scoring degrades,
+    /// never the search itself.
+    fn vector_matcher(&self) -> std::sync::MutexGuard<'_, VectorMatcher> {
+        self.vector.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("vector matcher lock poisoned; recovering matcher state");
+            poisoned.into_inner()
+        })
+    }
+
+    /// Per-query turbovec scores for candidate fragments.
+    fn vector_score_map(&self, query: &str, nodes: &[ContextNode]) -> VectorScoreMap {
+        self.vector_matcher().score_map(
+            query,
+            nodes
+                .iter()
+                .map(|node| (vector_match_key(node), node_match_text(node))),
+        )
+    }
+
+    /// Document-level vector scores for the source documents referenced by
+    /// a candidate set; candidates come from [`doc_candidates_locked`].
+    fn vector_doc_score_map(
+        &self,
+        query: &str,
+        candidates: Vec<(String, String)>,
+    ) -> VectorScoreMap {
+        self.vector_matcher().doc_score_map(query, candidates)
+    }
+
+    /// Pre-embed saved documents and fragments. Best-effort warm-up: the
+    /// scoring paths lazily embed anything this missed or that predates it.
+    fn vector_warm(&self, entries: Vec<(String, String)>) {
+        self.vector_matcher().warm(entries);
     }
 
     pub fn resolver(&self) -> &EventIndexResolver {
@@ -1977,15 +2021,47 @@ impl Store {
             })
             .await?
         {
-            let mut hits = result
+            // Hybrid re-rank of the repository's candidates: Meilisearch
+            // decided membership, the blended text+vector score decides the
+            // final order. Repository matches are never dropped here — a
+            // node below the vector threshold keeps its text score.
+            let doc_candidates = {
+                let data = self.read()?;
+                doc_candidates_locked(&data, &result.nodes)
+            };
+            let vector_scores = self.vector_score_map(&query, &result.nodes);
+            let doc_scores = self.vector_doc_score_map(&query, doc_candidates);
+            let mut scored_nodes: Vec<(ContextNode, f32)> = result
                 .nodes
+                .into_iter()
+                .map(|node| {
+                    let text = text_score(&node_match_text(&node), &query);
+                    let score = hybrid_node_score(&node, &query, &vector_scores, &doc_scores)
+                        .unwrap_or(text);
+                    (node, score)
+                })
+                .collect();
+            scored_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let nodes: Vec<ContextNode> =
+                scored_nodes.iter().map(|(node, _)| node.clone()).collect();
+            let mut hits = scored_nodes
                 .iter()
-                .map(|node| context_hit_from_node(node, &query))
+                .map(|(node, score)| {
+                    let mut hit = context_hit_from_node(node, *score);
+                    hit.score_breakdown = Some(score_breakdown_value(
+                        node,
+                        &query,
+                        &vector_scores,
+                        &doc_scores,
+                        *score,
+                    ));
+                    hit
+                })
                 .collect::<Vec<_>>();
             self.enrich_context_hits(
                 tenant_id,
                 owner_user_id.as_deref(),
-                &result.nodes,
+                &nodes,
                 &mut hits,
                 &include,
                 profile,
@@ -2014,7 +2090,7 @@ impl Store {
             return Ok(ContextSearchOutcome {
                 response,
                 trace,
-                nodes: result.nodes,
+                nodes,
             });
         }
         self.search_context(tenant_id, req, is_admin)
@@ -4120,14 +4196,21 @@ impl Store {
         let data = self.read()?;
         let nodes = self.context_scope_locked(&data, tenant_id, owner_user_id.as_deref())?;
 
+        let candidates: Vec<ContextNode> = nodes
+            .iter()
+            .filter(|node| retrieval_candidate(node))
+            .filter(|node| structured_filters.matches_node(node))
+            .cloned()
+            .collect();
+        let vector_scores = self.vector_score_map(&query, &candidates);
+        let doc_scores =
+            self.vector_doc_score_map(&query, doc_candidates_locked(&data, &candidates));
         let fragments = rank_nodes(
-            nodes
-                .iter()
-                .filter(|node| retrieval_candidate(node))
-                .filter(|node| structured_filters.matches_node(node))
-                .cloned(),
+            candidates.into_iter(),
             &query,
             limit,
+            &vector_scores,
+            &doc_scores,
         );
 
         let selected_nodes: Vec<_> = fragments
@@ -4135,9 +4218,20 @@ impl Store {
             .map(|(node, _)| node.clone())
             .take(limit)
             .collect();
-        let mut hits: Vec<_> = selected_nodes
+        let mut hits: Vec<_> = fragments
             .iter()
-            .map(|node| context_hit_from_node(node, &query))
+            .take(limit)
+            .map(|(node, score)| {
+                let mut hit = context_hit_from_node(node, *score);
+                hit.score_breakdown = Some(score_breakdown_value(
+                    node,
+                    &query,
+                    &vector_scores,
+                    &doc_scores,
+                    *score,
+                ));
+                hit
+            })
             .collect();
         enrich_context_hits_locked(
             &data,
@@ -4429,7 +4523,9 @@ impl Store {
                 .cloned()
                 .unwrap_or_default()
         };
-        let hits = rank_nodes(nodes.into_iter(), query, 20)
+        let vector_scores = self.vector_score_map(query, &nodes);
+        let doc_scores = self.vector_doc_score_map(query, doc_candidates_locked(&data, &nodes));
+        let hits = rank_nodes(nodes.into_iter(), query, 20, &vector_scores, &doc_scores)
             .into_iter()
             .map(|(node, score)| {
                 json!({
@@ -5398,6 +5494,21 @@ impl Store {
             })
             .collect::<Vec<_>>();
 
+        // Pre-embed the saved document and its fragments so the first
+        // search after a save does not pay the embedding cost. Collected
+        // before the nodes move into the context store; applied after the
+        // write completes (lock order stays data -> vector).
+        let mut warm_entries = Vec::with_capacity(nodes.len() + 1);
+        warm_entries.push((
+            vector_doc_key(index_uid, source_document_uri),
+            format!("{title} {content}"),
+        ));
+        warm_entries.extend(
+            nodes
+                .iter()
+                .map(|node| (vector_match_key(node), node_match_text(node))),
+        );
+
         if index_kind == "company" {
             upsert_context_nodes(&mut data.company_context, nodes);
         } else {
@@ -5442,6 +5553,8 @@ impl Store {
                 },
             );
         }
+
+        self.vector_warm(warm_entries);
 
         DocumentIngestResult {
             source_id: source_id.to_string(),
@@ -6294,17 +6407,113 @@ fn upsert_context_nodes(target: &mut Vec<ContextNode>, nodes: Vec<ContextNode>) 
     }
 }
 
+/// Scoped key for vector-match entries. `index_uid` is the resolver-derived
+/// per-user (or company) index UID, so keys cannot collide across owners —
+/// the same isolation primitive the rest of the store relies on.
+fn vector_match_key(node: &ContextNode) -> String {
+    format!("{}|{}", node.index_uid, node.uri)
+}
+
+fn node_match_text(node: &ContextNode) -> String {
+    format!("{} {}", node.title, node.body)
+}
+
+/// Scoped key for a document-level vector entry, derived from the same
+/// index UID as the fragments that reference the document.
+fn vector_doc_key(index_uid: &str, source_document_uri: &str) -> String {
+    format!("doc|{index_uid}|{source_document_uri}")
+}
+
+/// Collect distinct `(scoped key, title + content)` candidates for the
+/// source documents referenced by `nodes`. Scope safety: `nodes` are
+/// already isolation-filtered and every fragment references its own
+/// document, so the candidate set cannot leave the caller's visibility.
+fn doc_candidates_locked(data: &StoreData, nodes: &[ContextNode]) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for node in nodes {
+        let Some(uri) = node.source_document_uri.as_deref() else {
+            continue;
+        };
+        let key = vector_doc_key(&node.index_uid, uri);
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let Some(document) = data.source_documents.get(uri) else {
+            continue;
+        };
+        if document.status != "active" {
+            continue;
+        }
+        candidates.push((key, format!("{} {}", document.title, document.content)));
+    }
+    candidates
+}
+
+/// Blended relevance for a node: lexical substring score plus
+/// fragment-level vector score, boosted by document-level vector evidence
+/// from the node's source document.
+///
+/// Document evidence only ever boosts a fragment that already matched on
+/// its own (lexically or by fragment vector) — it never admits one. Source
+/// document bodies are excluded from default retrieval by contract, so a
+/// query matching only the raw document text must not surface its
+/// fragments; the regression suite pins this.
+fn hybrid_node_score(
+    node: &ContextNode,
+    query: &str,
+    vector_scores: &VectorScoreMap,
+    doc_scores: &VectorScoreMap,
+) -> Option<f32> {
+    let text = text_score(&node_match_text(node), query);
+    let fragment = vector_scores.combined_score(&vector_match_key(node), text)?;
+    let document = node
+        .source_document_uri
+        .as_deref()
+        .and_then(|uri| doc_scores.evidence(&vector_doc_key(&node.index_uid, uri)))
+        .unwrap_or(0.0);
+    Some(fragment + document)
+}
+
+fn score_breakdown_value(
+    node: &ContextNode,
+    query: &str,
+    vector_scores: &VectorScoreMap,
+    doc_scores: &VectorScoreMap,
+    combined: f32,
+) -> Value {
+    let mut breakdown = serde_json::Map::new();
+    breakdown.insert(
+        "lexical".to_string(),
+        json!(text_score(&node_match_text(node), query)),
+    );
+    if let Some(vector) = vector_scores.vector_score(&vector_match_key(node)) {
+        breakdown.insert("vector".to_string(), json!(vector));
+    }
+    if let Some(document) = node
+        .source_document_uri
+        .as_deref()
+        .and_then(|uri| doc_scores.vector_score(&vector_doc_key(&node.index_uid, uri)))
+    {
+        breakdown.insert("document_vector".to_string(), json!(document));
+    }
+    breakdown.insert("combined".to_string(), json!(combined));
+    Value::Object(breakdown)
+}
+
 fn rank_nodes(
     nodes: impl Iterator<Item = ContextNode>,
     query: &str,
     limit: usize,
+    vector_scores: &VectorScoreMap,
+    doc_scores: &VectorScoreMap,
 ) -> Vec<(ContextNode, f32)> {
     let mut scored: Vec<_> = nodes
-        .map(|node| {
-            let score = text_score(&format!("{} {}", node.title, node.body), query);
-            (node, score)
+        .filter_map(|node| {
+            hybrid_node_score(&node, query, vector_scores, doc_scores)
+                .filter(|score| *score > 0.0)
+                .map(|score| (node, score))
         })
-        .filter(|(_, score)| *score > 0.0)
         .collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
@@ -6315,12 +6524,12 @@ fn retrieval_candidate(node: &ContextNode) -> bool {
     node.status == "active" && node.retrieval_enabled && node.retrieval_role == "fragment"
 }
 
-fn context_hit_from_node(node: &ContextNode, query: &str) -> ContextHit {
+fn context_hit_from_node(node: &ContextNode, score: f32) -> ContextHit {
     ContextHit {
         uri: node.uri.clone(),
         title: node.title.clone(),
         layer: node.layer,
-        score: text_score(&format!("{} {}", node.title, node.body), query),
+        score,
         node_kind: Some(node.node_kind.clone()),
         retrieval_role: Some(node.retrieval_role.clone()),
         source_id: node.source_id.clone(),
@@ -6880,7 +7089,7 @@ fn enrich_context_hits_locked(
             hit.neighbor_fragments =
                 neighbor_fragments_for_hit_locked(data, tenant_id, owner_user_id, nodes, hit);
         }
-        if include.score_breakdown {
+        if include.score_breakdown && hit.score_breakdown.is_none() {
             hit.score_breakdown = Some(json!({ "lexical": hit.score }));
         }
     }

@@ -41,6 +41,10 @@ pub struct Config {
     pub health_require_llm: bool,
     pub health_llm_failure_threshold: u32,
     pub health_llm_rate_limit_unhealthy: bool,
+    pub vector_match_enabled: bool,
+    pub vector_match_weight: f32,
+    pub vector_match_doc_weight: f32,
+    pub vector_match_min_score: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +170,21 @@ impl Config {
             health_llm_rate_limit_unhealthy: std::env::var("RAG_HEALTH_LLM_RATE_LIMIT_UNHEALTHY")
                 .map(|v| truthy(&v))
                 .unwrap_or(false),
+            vector_match_enabled: std::env::var("RAG_VECTOR_MATCH_ENABLED")
+                .map(|v| truthy(&v))
+                .unwrap_or(true),
+            vector_match_weight: std::env::var("RAG_VECTOR_MATCH_WEIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4.0),
+            vector_match_doc_weight: std::env::var("RAG_VECTOR_MATCH_DOC_WEIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2.0),
+            vector_match_min_score: std::env::var("RAG_VECTOR_MATCH_MIN_SCORE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.25),
         }
     }
 
@@ -244,6 +263,10 @@ impl Config {
             health_require_llm: true,
             health_llm_failure_threshold: 3,
             health_llm_rate_limit_unhealthy: false,
+            vector_match_enabled: true,
+            vector_match_weight: 4.0,
+            vector_match_doc_weight: 2.0,
+            vector_match_min_score: 0.25,
         }
     }
 }

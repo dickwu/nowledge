@@ -19,6 +19,10 @@ specs.
 - Company document preflight, revisions, and activation.
 - Structured dataset snapshots, idempotent row ingestion, and deterministic
   numeric summary calculation.
+- Hybrid document matching backed by [turbovec](https://github.com/RyanCodrai/turbovec)
+  (Google's TurboQuant quantized vector index): saved documents and fragments
+  are embedded into a local vector index, and retrieval blends lexical scores
+  with fragment-level and document-level vector similarity.
 - Obsidian-style bidirectional knowledge links with backlink/outbound search.
 - Independent analysis API that can use a separate LLM provider/model to create
   links and insight records from ingested context.
@@ -57,6 +61,10 @@ RAG_MINERU_RETURN_MD=true
 RAG_MINERU_RETURN_CONTENT_LIST=true
 RAG_MINERU_RETURN_MIDDLE_JSON=true
 RAG_MINERU_RETURN_IMAGES=true
+RAG_VECTOR_MATCH_ENABLED=true
+RAG_VECTOR_MATCH_WEIGHT=4.0
+RAG_VECTOR_MATCH_DOC_WEIGHT=2.0
+RAG_VECTOR_MATCH_MIN_SCORE=0.25
 RAG_INGEST_MAX_CONCURRENT_TASKS=2
 RAG_INGEST_TASK_RETENTION_SECONDS=86400
 RAG_INGEST_CLEANUP_INTERVAL_SECONDS=300
@@ -114,6 +122,24 @@ responses add source groups and location/block provenance for highlighting.
 `POST /v1/rag/answer` citations preserve the same provenance, including source
 document URI, page index, bounding box, block type, section path, artifact refs,
 fragment offsets, and checksums when available.
+
+Document matching is hybrid: full documents and their fragments are embedded
+into a [turbovec](https://github.com/RyanCodrai/turbovec) quantized vector
+index when they are saved, and context search blends the lexical substring
+score with fragment-level vector similarity plus document-level vector
+evidence from the fragment's source document. Inflected or reordered queries
+("deployment pipelines" vs "deploy pipeline") match without an exact
+substring, and document-level evidence boosts fragments that already match
+on their own. Raw source document bodies stay out of default retrieval:
+document evidence never admits a fragment by itself. Vector search is always restricted to the caller's
+isolation-filtered candidates, embeddings are deterministic hashed lexical
+features (no external embedding service), and `include: ["score_breakdown"]`
+exposes the `lexical` / `vector` / `document_vector` / `combined` components
+per hit. Disable with `RAG_VECTOR_MATCH_ENABLED=false`; tune the blend with
+`RAG_VECTOR_MATCH_WEIGHT`, `RAG_VECTOR_MATCH_DOC_WEIGHT`, and
+`RAG_VECTOR_MATCH_MIN_SCORE`. Building on Linux requires OpenBLAS
+(`libopenblas-dev` on Debian/Ubuntu); macOS uses the built-in Accelerate
+framework.
 
 Link and analysis surfaces:
 

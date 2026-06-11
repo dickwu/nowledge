@@ -96,6 +96,9 @@ Skipped from AGENTS.md generation: `target/` (build output), `.git/`, and the
   hand-written endpoint docs under `doc/` are the source of truth for humans).
 - `uuid` 1 (v7) — id minting.
 - `chrono` — timestamps.
+- `turbovec` 0.9 — TurboQuant quantized vector index behind
+  `src/vector_match.rs` hybrid document matching. Links OpenBLAS on Linux
+  (CI and Linux hosts need `libopenblas-dev`) and Accelerate on macOS.
 - `validator` 0.20, `thiserror` 2, `anyhow` 1, `secrecy` 0.10 — supporting.
 
 ### Runtime Services

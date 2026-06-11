@@ -11,6 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # turbovec links OpenBLAS on Linux (Accelerate on macOS).
+      - run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test

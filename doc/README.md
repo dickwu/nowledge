@@ -10,6 +10,8 @@ Each endpoint file includes request parameters, response fields, access rules, a
 
 Long documents are stored as non-retrieval `SourceDocument` records and fragmented into active `ContextNode` fragments. Default context search and RAG retrieval only search active fragments with `retrieval_enabled=true`, `retrieval_role=fragment`, and `status=active`; raw source documents are kept out of default retrieval.
 
+Document matching is hybrid. Every fragment and every saved source document is embedded into a [turbovec](https://github.com/RyanCodrai/turbovec) quantized vector index at save time (`src/vector_match.rs`); searches blend the legacy lexical substring score with fragment-level vector similarity and document-level vector evidence from the fragment's full source document. Inflected or reordered queries that contain no exact substring can therefore still match, and document-level evidence boosts fragments that already match on their own — it never admits a fragment by itself, so raw source document bodies stay out of default retrieval. Vector scoring is allowlist-restricted to the caller's isolation-filtered candidate set, so per-user scope is enforced before any vector search runs. Tune with `RAG_VECTOR_MATCH_ENABLED`, `RAG_VECTOR_MATCH_WEIGHT`, `RAG_VECTOR_MATCH_DOC_WEIGHT`, and `RAG_VECTOR_MATCH_MIN_SCORE`.
+
 `POST /v1/context/search` has three response profiles:
 
 - `compact` returns minimal hit fields for lightweight callers.

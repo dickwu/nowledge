@@ -67,7 +67,7 @@ Schema: `ContextSearchResponse`
 | neighbor_fragments | Adds adjacent fragments from the same active source document when available. |
 | source_summary | Adds `source_summary` with source document URI, source id, revision id, and source title. |
 | artifact_refs | Preserves `artifact_refs` in compact profile; standard/full include them when present. |
-| score_breakdown | Adds a lightweight score breakdown object. |
+| score_breakdown | Adds a score breakdown object with `lexical` (substring score), `vector` (fragment-level turbovec similarity, when scored), `document_vector` (source-document-level turbovec similarity, when scored), and `combined` (the final blended score). |
 | raw_stage_debug | Accepted as an include value; raw stage visibility is still controlled by `debug` and admin status. |
 
 ### ContextHit Fields
@@ -76,7 +76,7 @@ Schema: `ContextSearchResponse`
 | uri | string | Fragment context URI. |
 | title | string | Fragment title. |
 | layer | integer | Context layer. |
-| score | number | Retrieval score. |
+| score | number | Hybrid retrieval score: lexical substring score blended with fragment-level and document-level turbovec vector similarity. |
 | node_kind | string? | Usually `fragment` for default retrieval. |
 | retrieval_role | string? | Usually `fragment` for default retrieval. |
 | source_id | string? | Source identifier when the fragment came from a source document. |
@@ -98,7 +98,7 @@ Schema: `ContextSearchResponse`
 | source_summary | ContextSourceSummary? | Lightweight parent source metadata when requested or using `full`. |
 | neighbor_fragments | ContextNeighborFragment[] | Adjacent source fragments when requested. |
 | related_links | ContextRelatedLink[] | Lightweight related links when requested or using `full`. |
-| score_breakdown | object? | Score details when requested. |
+| score_breakdown | object? | Score details when requested: `lexical`, `vector`, `document_vector` (each when scored), and `combined`. |
 | snippet | string | Search snippet from the matching fragment. |
 
 ### ContextSourceGroup Fields

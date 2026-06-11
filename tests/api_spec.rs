@@ -701,7 +701,20 @@ async fn company_doc_fragments_traceback_and_update_supersedes_old_content() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{old_search}");
-    assert_eq!(old_search["hits"].as_array().unwrap().len(), 0);
+    // Hybrid vector matching may legitimately relate this query to the
+    // active v2 text ("replaces the legacy wording"), but superseded v1
+    // content must stay unreachable: every hit must come from the active
+    // revision and must not carry the retired keyword.
+    for hit in old_search["hits"].as_array().unwrap() {
+        assert_eq!(hit["revision_id"], revision_id, "{old_search}");
+        assert!(
+            !hit["snippet"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("legacy-retention-keyword"),
+            "{old_search}"
+        );
+    }
 
     let (status, new_search) = call_with_token(
         app.clone(),
@@ -1382,7 +1395,17 @@ async fn parsed_ingest_update_supersedes_old_fragments_and_part_of_links() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{old_after_update}");
-    assert_eq!(old_after_update["hits"].as_array().unwrap().len(), 0);
+    // Hybrid vector matching may legitimately relate this query to the
+    // active v2 block ("new-ingest-keyword replaces the old parsed
+    // block"), but the superseded v1 fragment must stay unreachable.
+    for hit in old_after_update["hits"].as_array().unwrap() {
+        assert_ne!(
+            hit["uri"].as_str().unwrap(),
+            old_fragment_uri,
+            "{old_after_update}"
+        );
+        assert_eq!(hit["revision_id"], "v2", "{old_after_update}");
+    }
 
     let (status, new_search) = call_with_token(
         app.clone(),
@@ -2746,4 +2769,174 @@ async fn harness_verdict_keeps_passing_predicted_fix_and_detects_risk_regression
         .unwrap()
         .iter()
         .any(|risk| risk == "retrieval_recall"));
+}
+
+#[tokio::test]
+async fn context_search_matches_inflected_query_via_vector_match() {
+    let app = app();
+    let (status, result) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "owner_user_id": "u1",
+            "source_id": "vector-fixture",
+            "revision_id": "v1",
+            "title": "Deploy Pipeline Runbook",
+            "file_name": "runbook.txt",
+            "content_type": "text/plain",
+            "content": "Deploy pipeline runbook for the staging cluster."
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+
+    // "deployment pipelines" is not a substring of the fragment and neither
+    // query token appears verbatim ("deploy"/"pipeline" are shorter forms),
+    // so util::text_score scores 0 — a hit can only come from turbovec
+    // vector matching.
+    let (status, search) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "deployment pipelines", "owner_user_id": "u1", "limit": 5 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    let hits = search["hits"].as_array().unwrap();
+    assert!(
+        hits.iter().any(|hit| {
+            hit["title"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("Deploy Pipeline Runbook")
+        }),
+        "vector match should surface inflected forms: {search}"
+    );
+    assert!(hits[0]["score"].as_f64().unwrap() > 0.0);
+
+    // An unrelated query must not ride in on vector noise.
+    let (status, unrelated) = call(
+        app,
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "quarterly macro nutrition totals", "owner_user_id": "u1", "limit": 5 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unrelated}");
+    assert!(
+        unrelated["hits"].as_array().unwrap().is_empty(),
+        "unrelated query must stay empty: {unrelated}"
+    );
+}
+
+#[tokio::test]
+async fn vector_match_preserves_owner_isolation() {
+    let app = authed_app();
+    let (status, result) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "owner_user_id": "u1",
+            "source_id": "vector-isolation-fixture",
+            "revision_id": "v1",
+            "title": "Deploy Pipeline Runbook",
+            "file_name": "runbook.txt",
+            "content_type": "text/plain",
+            "content": "Deploy pipeline runbook for the staging cluster."
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+
+    // u1 finds their own document through the vector path.
+    let (status, own) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "deployment pipelines", "limit": 5 }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{own}");
+    assert!(!own["hits"].as_array().unwrap().is_empty(), "{own}");
+
+    // u2 runs the same query: u1's personal document is embedded in the
+    // shared vector index but must never enter u2's candidate allowlist.
+    let (status, cross) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "deployment pipelines", "limit": 5 }),
+        Some("u2-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cross}");
+    assert!(
+        cross["hits"].as_array().unwrap().is_empty(),
+        "owner isolation must hold on the vector path: {cross}"
+    );
+
+    // Explicitly requesting u1's scope with u2's token stays a 403.
+    let (status, forbidden) = call_with_token(
+        app,
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": "deployment pipelines", "owner_user_id": "u1", "limit": 5 }),
+        Some("u2-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{forbidden}");
+}
+
+#[tokio::test]
+async fn document_level_vector_evidence_supports_fragments() {
+    let app = app();
+    // Each fragment carries only part of the topic; the full document
+    // carries all of it. Document-level vector evidence should support
+    // the fragments even though no query token appears verbatim anywhere.
+    let (status, result) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "owner_user_id": "u1",
+            "source_id": "doc-evidence-fixture",
+            "revision_id": "v1",
+            "title": "Deploy Pipeline Handbook",
+            "file_name": "handbook.txt",
+            "content_type": "text/plain",
+            "content": "Deploy the pipeline to staging. Pipeline deploys run nightly."
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+
+    let (status, search) = call(
+        app,
+        Method::POST,
+        "/v1/context/search",
+        json!({
+            "query": "deployment pipelines",
+            "owner_user_id": "u1",
+            "limit": 5,
+            "include": ["score_breakdown"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    let hits = search["hits"].as_array().unwrap();
+    assert!(
+        !hits.is_empty(),
+        "vector evidence should admit the fragments: {search}"
+    );
+    let breakdown = &hits[0]["score_breakdown"];
+    assert_eq!(breakdown["lexical"].as_f64().unwrap(), 0.0, "{search}");
+    assert!(
+        breakdown["document_vector"].as_f64().unwrap() > 0.0,
+        "document-level score missing: {search}"
+    );
+    assert!(breakdown["combined"].as_f64().unwrap() > 0.0, "{search}");
 }

@@ -13,7 +13,7 @@ directories) — every file under `src/` is a top-level module declared in
 | File | Description |
 |------|-------------|
 | `main.rs` | Binary entrypoint. Initializes JSON tracing, parses `Config::from_env()`, runs `validate_startup`, hydrates the repository-backed store when `store_backend=meili`, and serves the router over a `tokio::net::TcpListener`. |
-| `lib.rs` | Module re-exports. Public surface: `Config`, `build_router`, `AppState`, plus the `auth`, `config`, `error`, `fragmenter`, `llm`, `meili`, `models`, `parser`, `repository`, `resolver`, `routes`, `store`, `util` modules. |
+| `lib.rs` | Module re-exports. Public surface: `Config`, `build_router`, `AppState`, plus the `auth`, `config`, `error`, `fragmenter`, `llm`, `meili`, `models`, `parser`, `repository`, `resolver`, `routes`, `store`, `util`, `vector_match` modules. |
 | `config.rs` | `Config` and `AuthUserConfig` structs. Parses all `RAG_*` env vars in `from_env()`, with `validate_startup()` enforcing the Meili-URL invariant and production-auth invariant. Provides `Config::test()` for fixtures and `analysis_llm_config()` to swap to the analysis provider. |
 | `error.rs` | `ApiError` enum (`BadRequest`, `Unauthorized`, `Forbidden`, `NotFound`, `Conflict`, `Upstream`, `Internal`) with `IntoResponse` mapping to status codes and a single `{ "error": { code, message, details } }` JSON envelope. |
 | `auth.rs` | `Principal`, `UserGuard`, `AdminGuard` axum extractors. Resolves the bearer token against `RAG_AUTH_USERS`, then `RAG_ADMIN_TOKEN`, then `RAG_BEARER_TOKEN`. Enforces `require_owner_access` and applies the owner default when missing. |
@@ -27,6 +27,7 @@ directories) — every file under `src/` is a top-level module declared in
 | `llm.rs` (~34 KB) | `LlmClient` trait, plus `OpenAi*`, `Codex*`, `Mock`, and `None` implementations. `LlmHealthProbe` caches probe results with a TTL/stale window and surfaces `auth_valid`, `quota_state`, `rate_limit_state`, and `RateLimitSnapshot` to `/healthz` and `/v1/llm/status`. Codex auth resolution reads `RAG_CODEX_AUTH_PATH` / `CODEX_AUTH_PATH`. |
 | `parser.rs` (~16 KB) | `DocumentParser` trait, `BuiltinTextParser` (UTF-8 text only), `MineruParserClient` (multipart POST to `RAG_MINERU_API_URL` with `RAG_MINERU_BACKEND`). `parser_from_config` picks the impl. `parser_health_status` exposes parser readiness to `/healthz`. |
 | `fragmenter.rs` (~13 KB) | `DocumentFragmenter` (legacy plain-text chunker with `chunk_size_chars=1200`, `overlap_chars=150`, `min_chunk_chars=200` defaults) and `BlockAwareFragmenter` (block-anchored chunking that preserves `page_idx`, `bbox`, `section_path`, `asset_refs` for traceback/highlight). Drives the active retrieval fragments. |
+| `vector_match.rs` | Hybrid document matching on top of the `turbovec` quantized vector index. Deterministic signed feature-hash embeddings (word unigrams/bigrams, 5-char prefixes, char trigrams, log-TF, L2-normalized, dim 512), `VectorMatcher` with lazy/warm entry maintenance keyed by scoped `{index_uid}\|{uri}` strings, allowlist-restricted scoring, and `VectorScoreMap` blend policy (`RAG_VECTOR_MATCH_*` knobs). Includes a calibration regression test tied to the shipped `min_score` default. |
 
 ## Subdirectories
 None. All Rust code lives at this level.

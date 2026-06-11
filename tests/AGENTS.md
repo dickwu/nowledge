@@ -9,7 +9,10 @@ Integration tests that exercise the full axum router built by
 fixture (or a Meili/MinerU-backed variant) and drive HTTP requests through
 `tower::ServiceExt::oneshot`. The suite enforces the v0.6 hard constraints
 around per-user event isolation, owner-mismatch rejection, state upsert shape,
-company-doc preflight, structured-row idempotency, and token redaction.
+company-doc preflight, structured-row idempotency, and token redaction. It
+also covers turbovec hybrid document matching: inflected-query matches with
+zero lexical score, vector-path owner isolation, and document-level vector
+evidence exposed through `score_breakdown`.
 
 ## Key Files
 | File | Description |

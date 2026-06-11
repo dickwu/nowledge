@@ -11,6 +11,7 @@ pub mod resolver;
 pub mod routes;
 pub mod store;
 pub mod util;
+pub mod vector_match;
 
 pub use config::Config;
 pub use routes::{build_router, AppState};
