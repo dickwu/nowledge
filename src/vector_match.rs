@@ -36,6 +36,9 @@ const PREFIX_CHARS: usize = 5;
 /// Guardrails for the operator-tunable blend knobs.
 const MIN_SCORE_FLOOR: f32 = 0.001;
 const MIN_SCORE_CEILING: f32 = 1.0;
+/// Fallback when the configured min score is non-finite (NaN/inf parse as
+/// valid f32 but defeat `clamp`); mirrors the config default.
+const MIN_SCORE_DEFAULT: f32 = 0.25;
 /// Hashing is O(text length); cap the embedded prefix so one pathological
 /// full-document save cannot stall scoring. The head of a document carries
 /// its title/abstract/topic signal, which is what document-level matching
@@ -152,11 +155,18 @@ impl VectorMatcher {
     pub fn new(enabled: bool, weight: f32, doc_weight: f32, min_score: f32) -> Self {
         let index = IdMapIndex::new(VECTOR_DIM, VECTOR_BIT_WIDTH)
             .expect("VECTOR_DIM and VECTOR_BIT_WIDTH are valid turbovec parameters");
+        // NaN survives `clamp` and would make every threshold comparison
+        // false, silently disabling vector-only matches.
+        let min_score = if min_score.is_finite() {
+            min_score.clamp(MIN_SCORE_FLOOR, MIN_SCORE_CEILING)
+        } else {
+            MIN_SCORE_DEFAULT
+        };
         Self {
             enabled,
             weight: weight.max(0.0),
             doc_weight: doc_weight.max(0.0),
-            min_score: min_score.clamp(MIN_SCORE_FLOOR, MIN_SCORE_CEILING),
+            min_score,
             index,
             entries: HashMap::new(),
             next_id: 1,
@@ -529,6 +539,18 @@ mod tests {
         );
         let evidence = map.evidence("doc|idx|ctx://doc").expect("evidence");
         assert!((evidence - 2.0 * vector).abs() < 1e-5);
+    }
+
+    #[test]
+    fn non_finite_min_score_falls_back_to_default() {
+        let mut matcher = VectorMatcher::new(true, 4.0, 2.0, f32::NAN);
+        let map = matcher.score_map(
+            "deployment pipelines",
+            candidates(&[("idx|ctx://doc", "deploy pipeline runbook for staging")]),
+        );
+        // A NaN threshold would reject every vector-only match; the
+        // fallback default must keep strong fuzzy matches admissible.
+        assert!(map.combined_score("idx|ctx://doc", 0.0).is_some());
     }
 
     #[test]
