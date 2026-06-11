@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1779338116160,
+  "lastScanned": 1781118701150,
   "projectRoot": "/Users/lifefarmer/opensource/nowledge",
   "techStack": {
     "languages": [
@@ -24,8 +24,8 @@
     "runtime": null
   },
   "build": {
-    "buildCommand": "cargo build",
-    "testCommand": "cargo test",
+    "buildCommand": "/usr/bin/ssh -o ConnectTimeout=8 -o BatchMode=yes gfit 'ps aux | grep -E \"cargo build|rustc --crate\" | grep -v grep | wc -l; sudo git -C /server/nowledge log -1 --format=\"%h %s\"' 2>&1",
+    "testCommand": "rtk cargo fmt --check && rtk cargo clippy --all-targets -- -D warnings && rtk cargo check && rtk cargo test 2>&1 | tail -15",
     "lintCommand": "cargo clippy",
     "devCommand": "cargo run",
     "scripts": {}
@@ -44,16 +44,20 @@
       "src",
       "tests"
     ],
-    "gitBranches": null
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
   },
   "customNotes": [],
   "directoryMap": {
     "doc": {
       "path": "doc",
       "purpose": null,
-      "fileCount": 2,
-      "lastAccessed": 1779338116154,
+      "fileCount": 3,
+      "lastAccessed": 1781118701145,
       "keyFiles": [
+        "AGENTS.md",
         "README.md",
         "api_manifest.json"
       ]
@@ -61,34 +65,34 @@
     "scripts": {
       "path": "scripts",
       "purpose": "Build/utility scripts",
-      "fileCount": 6,
-      "lastAccessed": 1779338116155,
+      "fileCount": 7,
+      "lastAccessed": 1781118701145,
       "keyFiles": [
+        "AGENTS.md",
         "deploy_gfit.sh",
         "gfit_meili_env.sh",
         "gfit_meili_test.sh",
-        "gfit_meili_tunnel.sh",
-        "install_gfit_root_server.sh"
+        "gfit_meili_tunnel.sh"
       ]
     },
     "src": {
       "path": "src",
       "purpose": "Source code",
-      "fileCount": 15,
-      "lastAccessed": 1779338116155,
+      "fileCount": 16,
+      "lastAccessed": 1781118701146,
       "keyFiles": [
+        "AGENTS.md",
         "auth.rs",
         "config.rs",
         "error.rs",
-        "fragmenter.rs",
-        "lib.rs"
+        "fragmenter.rs"
       ]
     },
     "target": {
       "path": "target",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1779338116155,
+      "lastAccessed": 1781118701146,
       "keyFiles": [
         "CACHEDIR.TAG"
       ]
@@ -96,9 +100,10 @@
     "tests": {
       "path": "tests",
       "purpose": "Test files",
-      "fileCount": 3,
-      "lastAccessed": 1779338116155,
+      "fileCount": 4,
+      "lastAccessed": 1781118701146,
       "keyFiles": [
+        "AGENTS.md",
         "api_spec.rs",
         "meili_integration.rs",
         "mineru_integration.rs"
@@ -107,26 +112,74 @@
     "doc/api": {
       "path": "doc/api",
       "purpose": "API routes",
-      "fileCount": 68,
-      "lastAccessed": 1779338116156,
+      "fileCount": 69,
+      "lastAccessed": 1781118701147,
       "keyFiles": [
+        "AGENTS.md",
         "get_healthz.md",
-        "get_livez.md",
-        "get_readyz.md"
+        "get_livez.md"
       ]
     }
   },
   "hotPaths": [
     {
       "path": "src/store.rs",
-      "accessCount": 2,
-      "lastAccessed": 1779338238283,
+      "accessCount": 4,
+      "lastAccessed": 1781119094607,
+      "type": "file"
+    },
+    {
+      "path": "src/routes.rs",
+      "accessCount": 4,
+      "lastAccessed": 1781119342181,
+      "type": "file"
+    },
+    {
+      "path": "tests/api_spec.rs",
+      "accessCount": 4,
+      "lastAccessed": 1781119348983,
+      "type": "file"
+    },
+    {
+      "path": "src/repository.rs",
+      "accessCount": 3,
+      "lastAccessed": 1781119093561,
       "type": "file"
     },
     {
       "path": "Cargo.toml",
-      "accessCount": 1,
-      "lastAccessed": 1779338164149,
+      "accessCount": 3,
+      "lastAccessed": 1781119366237,
+      "type": "file"
+    },
+    {
+      "path": "doc/api/get_healthz.md",
+      "accessCount": 3,
+      "lastAccessed": 1781119371445,
+      "type": "file"
+    },
+    {
+      "path": "scripts/update_gfit_root_server.sh",
+      "accessCount": 3,
+      "lastAccessed": 1781119703981,
+      "type": "file"
+    },
+    {
+      "path": "scripts/install_gfit_root_server.sh",
+      "accessCount": 2,
+      "lastAccessed": 1781119059143,
+      "type": "file"
+    },
+    {
+      "path": "doc/api/get_livez.md",
+      "accessCount": 2,
+      "lastAccessed": 1781119369061,
+      "type": "file"
+    },
+    {
+      "path": "doc/api/get_readyz.md",
+      "accessCount": 2,
+      "lastAccessed": 1781119373998,
       "type": "file"
     },
     {
@@ -184,18 +237,6 @@
       "type": "file"
     },
     {
-      "path": "src/routes.rs",
-      "accessCount": 1,
-      "lastAccessed": 1779338214044,
-      "type": "file"
-    },
-    {
-      "path": "src/repository.rs",
-      "accessCount": 1,
-      "lastAccessed": 1779338215506,
-      "type": "file"
-    },
-    {
       "path": "src/meili.rs",
       "accessCount": 1,
       "lastAccessed": 1779338216025,
@@ -220,12 +261,6 @@
       "type": "file"
     },
     {
-      "path": "tests/api_spec.rs",
-      "accessCount": 1,
-      "lastAccessed": 1779338219068,
-      "type": "file"
-    },
-    {
       "path": "tests/meili_integration.rs",
       "accessCount": 1,
       "lastAccessed": 1779338220091,
@@ -241,12 +276,6 @@
       "path": "scripts/deploy_gfit.sh",
       "accessCount": 1,
       "lastAccessed": 1779338221650,
-      "type": "file"
-    },
-    {
-      "path": "scripts/install_gfit_root_server.sh",
-      "accessCount": 1,
-      "lastAccessed": 1779338222589,
       "type": "file"
     },
     {
@@ -271,12 +300,6 @@
       "path": "scripts/gfit_meili_tunnel.sh",
       "accessCount": 1,
       "lastAccessed": 1779338224813,
-      "type": "file"
-    },
-    {
-      "path": "doc/api/get_healthz.md",
-      "accessCount": 1,
-      "lastAccessed": 1779338236766,
       "type": "file"
     },
     {
