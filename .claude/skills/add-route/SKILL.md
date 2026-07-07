@@ -13,7 +13,7 @@ Before writing anything:
 1. HTTP method (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`).
 2. Path (e.g. `/v1/state/profile/facts/{fact_key}`).
 3. Rust handler name (snake_case, matches `src/routes.rs::build_router` registration).
-4. Group label for the manifest (`Health` | `Admin` | `Harness` | `Context` | `Debug` | `Filesystem` | `History` | `Links` | `LLM` | `Ingest` | `Rag` | `Sessions` | `State` | `Usage` — pick from existing entries in `doc/api_manifest.json`).
+4. Group label for the manifest — pick from the existing `group` values in `doc/api_manifest.json` (e.g. `Health`, `Harness`, `Eval`, `Company Docs`); introduce a new group only for a genuinely new API surface.
 5. Authentication mode: `None` | `UserGuard` | `UserGuard; owner default may apply` | `AdminGuard`.
 6. Request and response schema names from `src/models.rs` (or new types you'll add there).
 
@@ -75,4 +75,4 @@ ls doc/api/ | wc -l
 jq 'length' doc/api_manifest.json
 ```
 
-The doc count and manifest count should match the number of registered routes (currently 68 — update this number in `doc/README.md`'s "Total documented APIs" line if it changes).
+The doc count and manifest count must match the number of registered routes. When the count changes, update the "Total documented APIs" line in `doc/README.md` to match.

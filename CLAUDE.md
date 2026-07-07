@@ -11,27 +11,12 @@ Per-directory context lives in `AGENTS.md` files, organized hierarchically from 
 
 ## Verify gauntlet
 
-The project's pre-merge verification is exactly this sequence — match it, in order, when reporting work done:
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo check
-cargo test
-```
-
-Clippy with `-D warnings` is non-negotiable; CI fails on any warning. `--all-targets` covers tests and examples.
-
-Optional integration tests are gated by environment variables and are skipped (with `eprintln!`) when unset:
-- `cargo test --test meili_integration` requires `RAG_TEST_MEILI_URL` (and `RAG_TEST_MEILI_API_KEY` when the server is keyed).
-- `cargo test --test mineru_integration` requires `RAG_TEST_MINERU_API_URL`.
+Pre-merge verification is the four-step gauntlet in `AGENTS.md` (fmt → clippy → check → test) — run it in that order and report results in that order. Clippy `-D warnings` is non-negotiable. CI is not identical: it has no `cargo check` step but adds `libopenblas-dev` install and `cargo package --allow-dirty --no-verify`.
 
 ## Hard invariants
 
-These break callers if violated — the regression suite covers each:
+Isolation and token-redaction invariants are covered in `AGENTS.md`. Additionally — the regression suite covers each:
 
-- **Per-user isolation**: every per-user index UID must come from `resolver::EventIndexResolver` (`rag_events__t_{tenant_hash}__u_{user_hash}` and `rag_context__t_{tenant_hash}__u_{user_hash}`). Owner mismatch returns 403, never a silent fallback.
-- **Token redaction**: anything that may land in a trace/log/debug payload must pass through `util::redact_secrets` / `util::redact_string` before serialization.
 - **Idempotency keys** are HMAC-hashed via `EventIndexResolver::idempotency_hash` before use as map keys.
 - **Per-unit vs absolute numeric contracts** must be agreed at boundaries — don't silently mix the two in structured-dataset writes (lesson from GFI-205 in cross-system contracts).
 
@@ -44,13 +29,7 @@ These break callers if violated — the regression suite covers each:
   3. A matching `doc/api/{method_lowercase}_{path_with_underscores}.md` file using the template in `doc/api/AGENTS.md`.
   The `/add-route` skill walks this checklist.
 - **`scripts/` is gitignored** (operator-private gfit deploy + Meili tunnel helpers). Don't add scripts there expecting them to ship; do not auto-commit changes inside `scripts/`.
-- **Commit style is conventional commits** (`feat:`, `fix:`, `chore:`, `refactor:`, `docs:`, etc.). The most recent example is `feat: add POST /v1/llm/title for LLM-based document summarization`.
-
-## Service runtime
-
-Default bind is `127.0.0.1:14242`. Storage defaults to in-memory (`RAG_STORE_BACKEND=memory`); set `RAG_STORE_BACKEND=meili` + `RAG_MEILI_URL` to mirror writes to Meilisearch. Production mode (`RAG_RUN_MODE=production`) requires `RAG_BEARER_TOKEN`, `RAG_ADMIN_TOKEN`, or `RAG_AUTH_USERS` — or an explicit `RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true`. The full env-var list is in `README.md`.
-
-LLM provider routing splits the main RAG provider (`RAG_LLM_PROVIDER` / `RAG_LLM_MODEL`, consumed by `/v1/rag/*`) from the analysis provider (`RAG_ANALYSIS_LLM_PROVIDER` / `RAG_ANALYSIS_LLM_MODEL`, consumed by `/v1/analysis/insights`). Both default to `none`.
+- **Commit style is conventional commits** (`feat:`, `fix:`, `chore:`, `refactor:`, `docs:`, etc.).
 
 ## Working notes
 
@@ -58,3 +37,5 @@ LLM provider routing splits the main RAG provider (`RAG_LLM_PROVIDER` / `RAG_LLM
 - `MeiliAdmin` should only be called directly from admin bootstrap and the `/v1/debug/meili/search` shim. Everything else flows through `Store` → `KnowledgeRepository`.
 - All ids use `util::new_id("prefix")` (uuid v7 simple form) — don't hand-mint identifiers.
 - ContextFS ancestor walking goes through `util::ancestor_uris`; don't split on `/` directly because the `ctx://` prefix must be preserved.
+- `build.rs` injects `NOWLEDGE_GIT_REV`, consumed at compile time via `env!` in the `routes.rs` health surfaces — the crate does not compile without the build script; don't remove or bypass it.
+- The reported git rev gets a `-dirty` suffix whenever tracked files are modified; `.omc/` session state is git-tracked, so `/healthz` showing `<sha>-dirty` during agent sessions is expected, not a deploy anomaly.

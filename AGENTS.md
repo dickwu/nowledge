@@ -13,7 +13,7 @@ RAG answer surfaces. Built as a single Rust + axum binary that runs on
 ## Key Files
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | Crate manifest. Name `nowledge`, version `0.10.0`, edition 2021. Pins axum 0.8, meilisearch-sdk 0.33, reqwest 0.12, utoipa 5, uuid v7. |
+| `Cargo.toml` | Crate manifest. Name `nowledge`, edition 2021. Pins axum 0.8, meilisearch-sdk 0.33, reqwest 0.12, utoipa 5, uuid v7. |
 | `Cargo.lock` | Locked dependency graph for reproducible builds. |
 | `README.md` | Public-facing run/verify guide. Lists environment variables, the verify command set (`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo check && cargo test`), and optional Meili/MinerU integration test gates. |
 | `.gitignore` | Standard Rust ignores. |

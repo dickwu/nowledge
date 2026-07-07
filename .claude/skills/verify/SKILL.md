@@ -5,7 +5,7 @@ description: Run the project's standard pre-merge verification gauntlet for the 
 
 # verify
 
-Run the exact verification sequence used by CI. CI (`.github/workflows/ci.yml`) runs the same steps in the same order, so a green local run mirrors a green pipeline.
+Run the project's standard pre-merge gauntlet. CI (`.github/workflows/ci.yml`) is close but not identical: it installs `libopenblas-dev`, then runs fmt → clippy → test → `cargo package --allow-dirty --no-verify`, with no `cargo check` step.
 
 ## Mandatory sequence
 
@@ -21,7 +21,7 @@ cargo test
 Notes:
 - `--all-targets` is required for clippy so test and example code are linted.
 - `-D warnings` is non-negotiable — any warning is a hard fail.
-- `cargo check` after clippy looks redundant but matches CI; keep it.
+- `cargo check` is not a CI step; it stays in the gauntlet as a fast type-level sanity pass.
 - `cargo test` runs the default integration suite (`tests/api_spec.rs`). The optional `meili_integration` and `mineru_integration` tests are skipped silently unless `RAG_TEST_MEILI_URL` / `RAG_TEST_MINERU_API_URL` are set.
 
 ## Optional integration runs
