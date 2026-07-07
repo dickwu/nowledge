@@ -2,7 +2,7 @@
 
 This directory contains one standalone English document for every HTTP API registered in `src/routes.rs::build_router`.
 
-Total documented APIs: 68.
+Total documented APIs: 87.
 
 Each endpoint file includes request parameters, response fields, access rules, and a Mermaid internal logic call graph.
 
@@ -34,8 +34,16 @@ Use `include: ["traceback"]`, `POST /v1/context/traceback`, or explicit `GET /v1
 | `GET` | `/livez` | `livez` | [api/get_livez.md](api/get_livez.md) |
 | `GET` | `/readyz` | `readyz` | [api/get_readyz.md](api/get_readyz.md) |
 | `POST` | `/v1/admin/bootstrap` | `bootstrap` | [api/post_v1_admin_bootstrap.md](api/post_v1_admin_bootstrap.md) |
+| `GET` | `/v1/admin/harness/components` | `list_harness_components` | [api/get_v1_admin_harness_components.md](api/get_v1_admin_harness_components.md) |
+| `GET` | `/v1/admin/harness/components/{component_id}` | `get_harness_component` | [api/get_v1_admin_harness_components_component_id.md](api/get_v1_admin_harness_components_component_id.md) |
+| `POST` | `/v1/admin/harness/components/{component_id}/revisions` | `create_harness_component_revision` | [api/post_v1_admin_harness_components_component_id_revisions.md](api/post_v1_admin_harness_components_component_id_revisions.md) |
+| `POST` | `/v1/admin/harness/components/{component_id}/rollback` | `rollback_harness_component` | [api/post_v1_admin_harness_components_component_id_rollback.md](api/post_v1_admin_harness_components_component_id_rollback.md) |
+| `GET` | `/v1/admin/harness/evolution/changes` | `list_harness_changes` | [api/get_v1_admin_harness_evolution_changes.md](api/get_v1_admin_harness_evolution_changes.md) |
+| `POST` | `/v1/admin/harness/evolution/changes` | `create_harness_change` | [api/post_v1_admin_harness_evolution_changes.md](api/post_v1_admin_harness_evolution_changes.md) |
+| `GET` | `/v1/admin/harness/evolution/changes/{change_id}` | `get_harness_change` | [api/get_v1_admin_harness_evolution_changes_change_id.md](api/get_v1_admin_harness_evolution_changes_change_id.md) |
 | `POST` | `/v1/admin/harness/evolution/changes/{change_id}/compare` | `compare_harness_change` | [api/post_v1_admin_harness_evolution_changes_change_id_compare.md](api/post_v1_admin_harness_evolution_changes_change_id_compare.md) |
 | `GET` | `/v1/admin/harness/evolution/changes/{change_id}/delta` | `get_harness_change_delta` | [api/get_v1_admin_harness_evolution_changes_change_id_delta.md](api/get_v1_admin_harness_evolution_changes_change_id_delta.md) |
+| `POST` | `/v1/admin/harness/evolution/changes/{change_id}/verdict` | `create_harness_verdict` | [api/post_v1_admin_harness_evolution_changes_change_id_verdict.md](api/post_v1_admin_harness_evolution_changes_change_id_verdict.md) |
 | `GET` | `/v1/admin/history/user-event-indexes` | `list_user_event_indexes` | [api/get_v1_admin_history_user_event_indexes.md](api/get_v1_admin_history_user_event_indexes.md) |
 | `POST` | `/v1/admin/history/user-event-indexes:reconcile` | `reconcile_user_event_indexes` | [api/post_v1_admin_history_user_event_indexes_reconcile.md](api/post_v1_admin_history_user_event_indexes_reconcile.md) |
 | `POST` | `/v1/analysis/insights` | `analyze_insights` | [api/post_v1_analysis_insights.md](api/post_v1_analysis_insights.md) |
@@ -45,6 +53,13 @@ Use `include: ["traceback"]`, `POST /v1/context/traceback`, or explicit `GET /v1
 | `POST` | `/v1/debug/meili/search` | `debug_meili_search` | [api/post_v1_debug_meili_search.md](api/post_v1_debug_meili_search.md) |
 | `POST` | `/v1/debug/prompt/preview` | `prompt_preview` | [api/post_v1_debug_prompt_preview.md](api/post_v1_debug_prompt_preview.md) |
 | `GET` | `/v1/debug/traces/{trace_id}` | `get_trace` | [api/get_v1_debug_traces_trace_id.md](api/get_v1_debug_traces_trace_id.md) |
+| `GET` | `/v1/eval/cases` | `list_eval_cases` | [api/get_v1_eval_cases.md](api/get_v1_eval_cases.md) |
+| `POST` | `/v1/eval/cases` | `create_eval_case` | [api/post_v1_eval_cases.md](api/post_v1_eval_cases.md) |
+| `POST` | `/v1/eval/runs` | `create_eval_run` | [api/post_v1_eval_runs.md](api/post_v1_eval_runs.md) |
+| `GET` | `/v1/eval/runs/{run_id}` | `get_eval_run` | [api/get_v1_eval_runs_run_id.md](api/get_v1_eval_runs_run_id.md) |
+| `GET` | `/v1/eval/runs/{run_id}/analysis/cases/{case_id}` | `get_eval_case_analysis` | [api/get_v1_eval_runs_run_id_analysis_cases_case_id.md](api/get_v1_eval_runs_run_id_analysis_cases_case_id.md) |
+| `GET` | `/v1/eval/runs/{run_id}/analysis/overview` | `get_eval_overview` | [api/get_v1_eval_runs_run_id_analysis_overview.md](api/get_v1_eval_runs_run_id_analysis_overview.md) |
+| `GET` | `/v1/eval/runs/{run_id}/report` | `get_eval_run_report` | [api/get_v1_eval_runs_run_id_report.md](api/get_v1_eval_runs_run_id_report.md) |
 | `GET` | `/v1/fs/abstract` | `fs_abstract` | [api/get_v1_fs_abstract.md](api/get_v1_fs_abstract.md) |
 | `GET` | `/v1/fs/ls` | `fs_ls` | [api/get_v1_fs_ls.md](api/get_v1_fs_ls.md) |
 | `GET` | `/v1/fs/overview` | `fs_overview` | [api/get_v1_fs_overview.md](api/get_v1_fs_overview.md) |
@@ -72,6 +87,7 @@ Use `include: ["traceback"]`, `POST /v1/context/traceback`, or explicit `GET /v1
 | `POST` | `/v1/links/search` | `search_links` | [api/post_v1_links_search.md](api/post_v1_links_search.md) |
 | `GET` | `/v1/llm/status` | `llm_status` | [api/get_v1_llm_status.md](api/get_v1_llm_status.md) |
 | `POST` | `/v1/llm/test` | `llm_test` | [api/post_v1_llm_test.md](api/post_v1_llm_test.md) |
+| `POST` | `/v1/llm/title` | `llm_title` | [api/post_v1_llm_title.md](api/post_v1_llm_title.md) |
 | `POST` | `/v1/ingest/files:sync` | `ingest_file_sync` | [api/post_v1_ingest_files_sync.md](api/post_v1_ingest_files_sync.md) |
 | `POST` | `/v1/ingest/tasks` | `create_ingest_task` | [api/post_v1_ingest_tasks.md](api/post_v1_ingest_tasks.md) |
 | `GET` | `/v1/ingest/tasks/{task_id}` | `get_ingest_task` | [api/get_v1_ingest_tasks_task_id.md](api/get_v1_ingest_tasks_task_id.md) |
@@ -84,7 +100,10 @@ Use `include: ["traceback"]`, `POST /v1/context/traceback`, or explicit `GET /v1
 | `POST` | `/v1/sessions` | `create_session` | [api/post_v1_sessions.md](api/post_v1_sessions.md) |
 | `POST` | `/v1/sessions/{session_id}/commit` | `commit_session` | [api/post_v1_sessions_session_id_commit.md](api/post_v1_sessions_session_id_commit.md) |
 | `POST` | `/v1/sessions/{session_id}/messages` | `add_session_message` | [api/post_v1_sessions_session_id_messages.md](api/post_v1_sessions_session_id_messages.md) |
+| `GET` | `/v1/state/company-docs` | `list_company_docs` | [api/get_v1_state_company_docs.md](api/get_v1_state_company_docs.md) |
 | `POST` | `/v1/state/company-docs/preflight` | `preflight_doc` | [api/post_v1_state_company_docs_preflight.md](api/post_v1_state_company_docs_preflight.md) |
+| `DELETE` | `/v1/state/company-docs/{source_id}` | `delete_company_doc` | [api/delete_v1_state_company_docs_source_id.md](api/delete_v1_state_company_docs_source_id.md) |
+| `GET` | `/v1/state/company-docs/{source_id}` | `get_company_doc` | [api/get_v1_state_company_docs_source_id.md](api/get_v1_state_company_docs_source_id.md) |
 | `POST` | `/v1/state/company-docs/{source_id}/revisions` | `create_revision` | [api/post_v1_state_company_docs_source_id_revisions.md](api/post_v1_state_company_docs_source_id_revisions.md) |
 | `POST` | `/v1/state/company-docs/{source_id}/revisions/{revision_id}/activate` | `activate_revision` | [api/post_v1_state_company_docs_source_id_revisions_revision_id_activate.md](api/post_v1_state_company_docs_source_id_revisions_revision_id_activate.md) |
 | `POST` | `/v1/state/insights` | `upsert_insight` | [api/post_v1_state_insights.md](api/post_v1_state_insights.md) |

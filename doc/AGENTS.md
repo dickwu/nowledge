@@ -7,14 +7,14 @@
 Human-readable API reference for `nowledge`. The directory contains one
 hand-maintained markdown file per HTTP endpoint registered in
 `src/routes.rs::build_router`, plus a top-level index and a machine-readable
-manifest. Endpoint coverage is exhaustive — the manifest tracks 68 documented
+manifest. Endpoint coverage is exhaustive — the manifest tracks 87 documented
 APIs and must stay in sync with the router.
 
 ## Key Files
 | File | Description |
 |------|-------------|
 | `README.md` | Endpoint index. Lists every documented route as a `\| Method \| Path \| Handler \| Document \|` row, plus narrative context for retrieval semantics (return profiles, include values, structured filters, traceback rules, citation provenance, and the `ContextNode.node_kind` / `retrieval_role` enumerations). |
-| `api_manifest.json` | Machine-readable list of `{ method, path, handler, group, file }` entries. Groups in use: `Health`, `Admin`, `Harness`, `Context`, `Debug`, `Filesystem`, `History`, `Links`, `LLM`, `Ingest`, `Rag`, `Sessions`, `State`, `Usage`. Useful for tooling that validates handler/path coverage. |
+| `api_manifest.json` | Machine-readable list of `{ method, path, handler, group, file }` entries. Groups in use: `Health`, `Admin`, `Harness`, `Analysis`, `Context`, `Debug`, `Eval`, `Context FS`, `Company Docs`, `History Alias`, `Insights`, `Structured History`, `History User Indexes`, `History Events`, `Links`, `LLM`, `Ingest`, `RAG`, `Sessions`, `State`, `Structured State`, `Usage`. Useful for tooling that validates handler/path coverage. |
 
 ## Subdirectories
 | Directory | Purpose |

@@ -7,7 +7,7 @@
 One markdown document per HTTP endpoint exposed by `src/routes.rs::build_router`.
 Each document captures the request shape, response shape, access rules, error
 behavior, and a Mermaid flowchart of the internal call graph so callers can
-review behavior without reading Rust source. The directory currently holds 68
+review behavior without reading Rust source. The directory currently holds 87
 endpoint files plus no index of its own (the index lives in `../README.md`).
 
 ## Key Files

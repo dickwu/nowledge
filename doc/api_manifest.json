@@ -28,6 +28,55 @@
     "file": "api/post_v1_admin_bootstrap.md"
   },
   {
+    "method": "GET",
+    "path": "/v1/admin/harness/components",
+    "handler": "list_harness_components",
+    "group": "Harness",
+    "file": "api/get_v1_admin_harness_components.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/admin/harness/components/{component_id}",
+    "handler": "get_harness_component",
+    "group": "Harness",
+    "file": "api/get_v1_admin_harness_components_component_id.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/admin/harness/components/{component_id}/revisions",
+    "handler": "create_harness_component_revision",
+    "group": "Harness",
+    "file": "api/post_v1_admin_harness_components_component_id_revisions.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/admin/harness/components/{component_id}/rollback",
+    "handler": "rollback_harness_component",
+    "group": "Harness",
+    "file": "api/post_v1_admin_harness_components_component_id_rollback.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/admin/harness/evolution/changes",
+    "handler": "list_harness_changes",
+    "group": "Harness",
+    "file": "api/get_v1_admin_harness_evolution_changes.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/admin/harness/evolution/changes",
+    "handler": "create_harness_change",
+    "group": "Harness",
+    "file": "api/post_v1_admin_harness_evolution_changes.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/admin/harness/evolution/changes/{change_id}",
+    "handler": "get_harness_change",
+    "group": "Harness",
+    "file": "api/get_v1_admin_harness_evolution_changes_change_id.md"
+  },
+  {
     "method": "POST",
     "path": "/v1/admin/harness/evolution/changes/{change_id}/compare",
     "handler": "compare_harness_change",
@@ -40,6 +89,13 @@
     "handler": "get_harness_change_delta",
     "group": "Harness",
     "file": "api/get_v1_admin_harness_evolution_changes_change_id_delta.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/admin/harness/evolution/changes/{change_id}/verdict",
+    "handler": "create_harness_verdict",
+    "group": "Harness",
+    "file": "api/post_v1_admin_harness_evolution_changes_change_id_verdict.md"
   },
   {
     "method": "GET",
@@ -103,6 +159,55 @@
     "handler": "get_trace",
     "group": "Debug",
     "file": "api/get_v1_debug_traces_trace_id.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/eval/cases",
+    "handler": "list_eval_cases",
+    "group": "Eval",
+    "file": "api/get_v1_eval_cases.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/eval/cases",
+    "handler": "create_eval_case",
+    "group": "Eval",
+    "file": "api/post_v1_eval_cases.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/eval/runs",
+    "handler": "create_eval_run",
+    "group": "Eval",
+    "file": "api/post_v1_eval_runs.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/eval/runs/{run_id}",
+    "handler": "get_eval_run",
+    "group": "Eval",
+    "file": "api/get_v1_eval_runs_run_id.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/eval/runs/{run_id}/analysis/cases/{case_id}",
+    "handler": "get_eval_case_analysis",
+    "group": "Eval",
+    "file": "api/get_v1_eval_runs_run_id_analysis_cases_case_id.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/eval/runs/{run_id}/analysis/overview",
+    "handler": "get_eval_overview",
+    "group": "Eval",
+    "file": "api/get_v1_eval_runs_run_id_analysis_overview.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/eval/runs/{run_id}/report",
+    "handler": "get_eval_run_report",
+    "group": "Eval",
+    "file": "api/get_v1_eval_runs_run_id_report.md"
   },
   {
     "method": "GET",
@@ -295,6 +400,13 @@
   },
   {
     "method": "POST",
+    "path": "/v1/llm/title",
+    "handler": "llm_title",
+    "group": "LLM",
+    "file": "api/post_v1_llm_title.md"
+  },
+  {
+    "method": "POST",
     "path": "/v1/ingest/files:sync",
     "handler": "ingest_file_sync",
     "group": "Ingest",
@@ -378,11 +490,32 @@
     "file": "api/post_v1_sessions_session_id_messages.md"
   },
   {
+    "method": "GET",
+    "path": "/v1/state/company-docs",
+    "handler": "list_company_docs",
+    "group": "Company Docs",
+    "file": "api/get_v1_state_company_docs.md"
+  },
+  {
     "method": "POST",
     "path": "/v1/state/company-docs/preflight",
     "handler": "preflight_doc",
     "group": "Company Docs",
     "file": "api/post_v1_state_company_docs_preflight.md"
+  },
+  {
+    "method": "DELETE",
+    "path": "/v1/state/company-docs/{source_id}",
+    "handler": "delete_company_doc",
+    "group": "Company Docs",
+    "file": "api/delete_v1_state_company_docs_source_id.md"
+  },
+  {
+    "method": "GET",
+    "path": "/v1/state/company-docs/{source_id}",
+    "handler": "get_company_doc",
+    "group": "Company Docs",
+    "file": "api/get_v1_state_company_docs_source_id.md"
   },
   {
     "method": "POST",
