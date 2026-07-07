@@ -2054,6 +2054,8 @@ async fn llm_mock_provider_test_is_token_safe() {
     assert_eq!(body["ok"], true);
     assert_eq!(body["model"], "mock-model");
     assert!(body["sample"].as_str().unwrap().contains("mock summary"));
+    assert!(body["usage"]["input_tokens"].as_u64().unwrap() >= 1);
+    assert!(body["usage"]["output_tokens"].as_u64().unwrap() >= 1);
 }
 
 #[tokio::test]
@@ -2081,6 +2083,17 @@ async fn rag_answer_uses_mock_llm_provider() {
     assert_eq!(status, StatusCode::OK, "{answer}");
     assert!(answer["answer"].as_str().unwrap().contains("mock summary"));
     assert_ne!(answer["usage"]["provider"], "none");
+
+    // Real token counts from the provider must flow into the usage block so
+    // downstream consumers (e.g. the GFIT check-in summary) stop estimating.
+    let input_tokens = answer["usage"]["input_tokens"].as_u64().unwrap();
+    let output_tokens = answer["usage"]["output_tokens"].as_u64().unwrap();
+    assert!(input_tokens >= 1);
+    assert!(output_tokens >= 1);
+    assert_eq!(
+        answer["usage"]["total_tokens"].as_u64(),
+        Some(input_tokens + output_tokens)
+    );
 }
 
 #[tokio::test]

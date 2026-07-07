@@ -29,6 +29,7 @@ Schema: `LlmTestResponse`
 | ok | boolean | True when the test call completed. |
 | model | string | Model used. |
 | latency_ms | integer | Provider latency. |
+| usage | object? | Real provider token counts (`input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`) when reported. |
 | sample | string | Generated text sample. |
 
 ## Errors and Access Rules

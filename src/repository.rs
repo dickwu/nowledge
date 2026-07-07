@@ -140,6 +140,11 @@ pub trait KnowledgeRepository: Send + Sync {
         result: &IngestTaskResult,
     ) -> Result<Option<String>, ApiError>;
 
+    /// Remove expired ingest tasks (and their stored results) from the
+    /// backing store, keyed by task id. The memory backend is a no-op — the
+    /// in-memory maps are canonical there and the Store prunes them itself.
+    async fn delete_ingest_tasks(&self, task_ids: &[String]) -> Result<(), ApiError>;
+
     async fn upsert_eval_case(&self, case: &RagEvalCase) -> Result<Option<String>, ApiError>;
 
     async fn upsert_eval_run(&self, run: &RagEvalRun) -> Result<Option<String>, ApiError>;
@@ -421,6 +426,10 @@ impl KnowledgeRepository for MemoryRepository {
         _result: &IngestTaskResult,
     ) -> Result<Option<String>, ApiError> {
         Ok(None)
+    }
+
+    async fn delete_ingest_tasks(&self, _task_ids: &[String]) -> Result<(), ApiError> {
+        Ok(())
     }
 
     async fn upsert_eval_case(&self, _case: &RagEvalCase) -> Result<Option<String>, ApiError> {
@@ -987,6 +996,35 @@ impl KnowledgeRepository for MeiliRepository {
             }
         }
         self.upsert_values("rag_ingest_results", &[document]).await
+    }
+
+    async fn delete_ingest_tasks(&self, task_ids: &[String]) -> Result<(), ApiError> {
+        if task_ids.is_empty() {
+            return Ok(());
+        }
+        // Best-effort on both indexes: a failed delete only delays cleanup
+        // until the next sweep, so log and continue rather than abort.
+        for index_uid in ["rag_ingest_tasks", "rag_ingest_results"] {
+            match self
+                .admin
+                .delete_documents_by_ids(index_uid, task_ids)
+                .await
+            {
+                Ok(task) => {
+                    let _ = self.maybe_wait(&task).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "nowledge::ingest_cleanup",
+                        index = index_uid,
+                        count = task_ids.len(),
+                        error = %e,
+                        "failed to delete expired ingest documents"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn upsert_eval_case(&self, case: &RagEvalCase) -> Result<Option<String>, ApiError> {

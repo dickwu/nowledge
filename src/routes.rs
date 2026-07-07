@@ -117,6 +117,7 @@ impl AppState {
     pub fn new(config: Arc<Config>) -> Self {
         let store = Store::new(&config);
         let ingest_manager = IngestTaskManager::new(store.clone(), config.clone());
+        spawn_ingest_task_cleanup(store.clone(), &config);
         Self {
             store,
             meili: MeiliAdmin::from_config(&config),
@@ -133,6 +134,36 @@ impl AppState {
     fn effective_config(&self) -> Config {
         (*self.config).clone()
     }
+}
+
+/// Periodically prune terminal ingest tasks past their retention window:
+/// `RAG_INGEST_TASK_RETENTION_SECONDS` (0 disables pruning entirely), swept
+/// every `RAG_INGEST_CLEANUP_INTERVAL_SECONDS`.
+fn spawn_ingest_task_cleanup(store: Store, config: &Arc<Config>) {
+    let retention_seconds = config.ingest_task_retention_seconds;
+    if retention_seconds == 0 {
+        return;
+    }
+    let interval_seconds = config.ingest_cleanup_interval_seconds.max(1);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // interval() completes its first tick immediately; skip it so a
+        // fresh process doesn't sweep while it is still reloading state.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match store.cleanup_ingest_tasks_async(retention_seconds).await {
+                Ok(pruned) if !pruned.is_empty() => {
+                    tracing::info!(count = pruned.len(), "pruned expired ingest tasks");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, "ingest task cleanup pass failed");
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,7 +470,9 @@ fn llm_health_json(llm: &LlmHealthProbeResult) -> Value {
         "auth_valid": llm.auth_valid,
         "quota_state": &llm.quota_state,
         "rate_limit_state": &llm.rate_limit_state,
-        "rate_limits": &llm.rate_limits,
+        // Freshest live snapshot for this provider (real calls update it
+        // between probe intervals), falling back to the probe's own capture.
+        "rate_limits": crate::llm::effective_rate_limits(llm),
         "checked_at": llm.checked_at,
         "latency_ms": llm.latency_ms,
         "stale": llm.stale,
@@ -448,6 +481,18 @@ fn llm_health_json(llm: &LlmHealthProbeResult) -> Value {
         "error_kind": &llm.error_kind,
         "message": &llm.message
     })
+}
+
+/// Flatten provider-reported token counts into an API `usage` JSON block.
+fn merge_token_usage(usage: &mut Value, tokens: &crate::llm::LlmTokenUsage) {
+    let Ok(token_value) = serde_json::to_value(tokens) else {
+        return;
+    };
+    if let (Some(target), Some(source)) = (usage.as_object_mut(), token_value.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 fn compact_usage_summary(usage: Value) -> Value {
@@ -1721,6 +1766,7 @@ async fn llm_test(
         ok: true,
         model: status.model,
         latency_ms: response.latency_ms,
+        usage: response.usage,
         sample: response.text,
     }))
 }
@@ -1797,6 +1843,7 @@ Document:\n{truncated}"
         title,
         model: status.model,
         latency_ms: response.latency_ms,
+        usage: response.usage,
     }))
 }
 
@@ -1871,13 +1918,17 @@ async fn answer_rag_with_llm(
         );
         let llm = client.complete_text(LlmRequest { prompt }).await?;
         answer.answer = llm.text;
-        answer.usage = json!({
+        let mut usage = json!({
             "provider": status.provider,
             "model": status.model,
             "latency_ms": llm.latency_ms,
             "backend": state.store.backend_name(),
             "grounded": true
         });
+        if let Some(tokens) = llm.usage.as_ref() {
+            merge_token_usage(&mut usage, tokens);
+        }
+        answer.usage = usage;
     }
     Ok(answer)
 }
@@ -1981,6 +2032,9 @@ async fn run_analysis_insights(
         }
         usage["latency_ms"] = json!(llm.latency_ms);
         usage["raw_response_preview"] = json!(truncate_for_json(&llm.text, 500));
+        if let Some(tokens) = llm.usage.as_ref() {
+            merge_token_usage(&mut usage, tokens);
+        }
     }
 
     let title_by_uri = context_hits

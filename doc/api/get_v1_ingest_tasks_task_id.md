@@ -16,6 +16,9 @@ Return current task metadata for an ingest task visible to the caller.
 
 - Private owner tasks are hidden from other owners.
 - `failed` tasks retain the error string for polling/debugging.
+- Terminal (`completed`/`failed`) tasks expire after
+  `RAG_INGEST_TASK_RETENTION_SECONDS` (default 86400, 0 = never) and then
+  return 404; poll or fetch results within the retention window.
 
 ```mermaid
 flowchart TD

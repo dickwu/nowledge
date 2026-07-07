@@ -36,6 +36,24 @@ Schema: `RagAnswerResponse`
 | citations | Citation[] | Grounding citations from retrieval fragments. |
 | usage | object | LLM/backend usage metadata. |
 
+### Usage Fields
+| Field | Type | Description |
+| --- | --- | --- |
+| provider | string | LLM provider that generated the answer. |
+| model | string | Model name. |
+| latency_ms | integer | Generation latency. |
+| backend | string | Store backend that served retrieval. |
+| grounded | boolean | True when the answer was grounded in retrieved citations. |
+| input_tokens | integer? | Real prompt token count reported by the provider. |
+| cached_input_tokens | integer? | Cached prompt tokens (subset of `input_tokens`). |
+| output_tokens | integer? | Real completion token count reported by the provider. |
+| reasoning_output_tokens | integer? | Reasoning tokens (subset of `output_tokens`). |
+| total_tokens | integer? | Provider-reported total, or `input + output` when absent. |
+
+Token fields are present whenever the upstream provider reports them
+(OpenAI Responses body `usage`, Codex SSE `response.completed` event);
+consumers should fall back to estimation only when they are absent.
+
 ### Citation Fields
 | Field | Type | Description |
 | --- | --- | --- |

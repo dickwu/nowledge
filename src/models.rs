@@ -1048,6 +1048,8 @@ pub struct LlmTestResponse {
     pub ok: bool,
     pub model: String,
     pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::llm::LlmTokenUsage>,
     pub sample: String,
 }
 
@@ -1072,6 +1074,8 @@ pub struct LlmTitleResponse {
     pub title: String,
     pub model: String,
     pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::llm::LlmTokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

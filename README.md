@@ -98,6 +98,18 @@ Health endpoints split process liveness from operational readiness:
   including auth validity, quota/rate-limit state, stale probe state, and a
   compact usage summary. If `RAG_HEALTH_REQUIRE_LLM=true`, an unconfigured or
   exhausted LLM makes the service unhealthy.
+- The `llm.rate_limits` block carries the freshest live provider budget
+  snapshot. For `codex_auth` it is parsed from the ChatGPT Codex `x-codex-*`
+  response headers on every health probe and real completion: `primary` (5h)
+  and `secondary` (weekly) windows with `used_percent` / `remaining_percent` /
+  reset times, `plan_type`, credits, and model-scoped `additional_limits`.
+  `llm.rate_limit_state` becomes `near_limit` at ≥90% window usage and
+  `limited` at 100%, so dashboards can warn before hard 429s.
+- LLM-backed responses (`/v1/rag/answer`, `/v1/analysis/insights`,
+  `/v1/llm/title`, `/v1/llm/test`) include real provider token counts in
+  their `usage` blocks (`input_tokens`, `cached_input_tokens`,
+  `output_tokens`, `reasoning_output_tokens`, `total_tokens`) whenever the
+  upstream reports them, so consumers no longer need char-based estimates.
 - `GET /readyz` uses the same readiness decision as `/healthz`.
 - `GET /v1/usage` returns owner-scoped provider snapshots for ordinary users and
   global provider snapshots for admins.
@@ -110,6 +122,12 @@ APIs are `POST /v1/ingest/tasks`, `GET /v1/ingest/tasks/{task_id}`,
 `POST /v1/ingest/uploads:sync`, and `POST /v1/ingest/files:sync`.
 `POST /v1/ingest/tasks` and `/v1/ingest/uploads` return queued task metadata
 immediately; background workers perform parsing, fragmenting, and indexing.
+Finished (`completed`/`failed`) task records and their stored results are
+pruned after `RAG_INGEST_TASK_RETENTION_SECONDS` (default 86400; set 0 to
+keep them forever), swept every `RAG_INGEST_CLEANUP_INTERVAL_SECONDS` —
+covering both the in-memory maps and the mirrored Meilisearch documents.
+Ingested fragments and source documents are unaffected; only the task
+bookkeeping expires.
 Multipart uploads send binary file bytes to MinerU when `parser_provider=mineru`;
 the builtin parser accepts UTF-8 text uploads.
 Parsed blocks become retrieval fragments; source documents and parse artifacts

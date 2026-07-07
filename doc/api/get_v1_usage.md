@@ -27,6 +27,13 @@ Schema: `UsageResponse`
 | generated_at | datetime | Snapshot generation time. |
 | providers | object | Per-provider usage data plus meilisearch and llm health. |
 
+`providers.llm` mirrors the `/healthz` `llm` block, including the
+`rate_limits` snapshot (Codex `primary`/`secondary` windows with
+`used_percent` / `remaining_percent` / reset times, plan type, credits, and
+model-scoped `additional_limits`) — see `get_healthz.md` for the field
+reference. This is the surface downstream dashboards poll to display
+provider running status and remaining usage.
+
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.

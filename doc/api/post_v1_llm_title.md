@@ -32,6 +32,7 @@ Schema: `LlmTitleResponse`
 | title | string | Cleaned single-line title: quote/markdown/"Title:" artifacts stripped, trailing period removed, capped at `max_chars`, `Untitled` fallback when the model returns nothing usable. |
 | model | string | Model reported by the provider status probe. |
 | latency_ms | integer | Provider completion latency in milliseconds. |
+| usage | object? | Real provider token counts (`input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`) when reported. |
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.

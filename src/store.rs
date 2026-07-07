@@ -1621,6 +1621,41 @@ impl Store {
             .map(|result| result.task)
     }
 
+    /// Prune terminal ingest tasks (`completed` / `failed`) whose lifecycle
+    /// ended more than `retention_seconds` ago, together with their stored
+    /// results — both in the in-memory maps and the backing repository, so
+    /// pruned tasks do not resurrect from Meilisearch on restart.
+    /// Non-terminal tasks are never pruned regardless of age. Returns the
+    /// pruned task ids.
+    pub async fn cleanup_ingest_tasks_async(
+        &self,
+        retention_seconds: u64,
+    ) -> Result<Vec<String>, ApiError> {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::seconds(retention_seconds.min(i64::MAX as u64) as i64);
+        let expired: Vec<String> = {
+            let data = self.read()?;
+            data.ingest_tasks
+                .values()
+                .filter(|task| matches!(task.state.as_str(), "completed" | "failed"))
+                .filter(|task| task.completed_at.unwrap_or(task.updated_at) < cutoff)
+                .map(|task| task.task_id.clone())
+                .collect()
+        };
+        if expired.is_empty() {
+            return Ok(expired);
+        }
+        {
+            let mut data = self.write()?;
+            for task_id in &expired {
+                data.ingest_tasks.remove(task_id);
+                data.ingest_results.remove(task_id);
+            }
+        }
+        self.repository.delete_ingest_tasks(&expired).await?;
+        Ok(expired)
+    }
+
     pub async fn ingest_file_sync_async(
         &self,
         tenant_id: &str,
@@ -7596,6 +7631,86 @@ fn simple_slope(values: &[f64]) -> f64 {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    fn ingest_task_fixture(
+        task_id: &str,
+        tenant_id: &str,
+        state: &str,
+        age_seconds: i64,
+    ) -> IngestTask {
+        let stamp = chrono::Utc::now() - chrono::Duration::seconds(age_seconds);
+        IngestTask {
+            task_id: task_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            owner_user_id: None,
+            source_id: format!("src-{task_id}"),
+            revision_id: format!("rev-{task_id}"),
+            source_document_uri: None,
+            parser_provider: "builtin".to_string(),
+            parser_backend: "text".to_string(),
+            state: state.to_string(),
+            error: None,
+            created_at: stamp,
+            updated_at: stamp,
+            completed_at: matches!(state, "completed" | "failed").then_some(stamp),
+            status_url: None,
+            result_url: None,
+            queued_ahead: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_cleanup_prunes_only_expired_terminal_tasks() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant_id = config.tenant_id.as_str();
+
+        let expired_completed = ingest_task_fixture("task-old-done", tenant_id, "completed", 7_200);
+        let expired_failed = ingest_task_fixture("task-old-failed", tenant_id, "failed", 7_200);
+        let expired_but_running =
+            ingest_task_fixture("task-old-running", tenant_id, "parsing", 7_200);
+        let fresh_completed = ingest_task_fixture("task-new-done", tenant_id, "completed", 10);
+
+        {
+            let mut data = store.write().unwrap();
+            for task in [
+                &expired_completed,
+                &expired_failed,
+                &expired_but_running,
+                &fresh_completed,
+            ] {
+                data.ingest_tasks
+                    .insert(task.task_id.clone(), (*task).clone());
+            }
+            data.ingest_results.insert(
+                expired_completed.task_id.clone(),
+                IngestTaskResult {
+                    task: expired_completed.clone(),
+                    source_document_uri: "ctx://test/source-doc/task-old-done".to_string(),
+                    source_id: expired_completed.source_id.clone(),
+                    revision_id: expired_completed.revision_id.clone(),
+                    parse_artifacts: Vec::new(),
+                    parsed_blocks: Vec::new(),
+                    fragment_uris: Vec::new(),
+                    context_uris: Vec::new(),
+                },
+            );
+        }
+
+        let mut pruned = store.cleanup_ingest_tasks_async(3_600).await.unwrap();
+        pruned.sort();
+        assert_eq!(
+            pruned,
+            vec!["task-old-done".to_string(), "task-old-failed".to_string()]
+        );
+
+        let data = store.read().unwrap();
+        assert!(!data.ingest_tasks.contains_key("task-old-done"));
+        assert!(!data.ingest_tasks.contains_key("task-old-failed"));
+        assert!(!data.ingest_results.contains_key("task-old-done"));
+        assert!(data.ingest_tasks.contains_key("task-old-running"));
+        assert!(data.ingest_tasks.contains_key("task-new-done"));
+    }
 
     #[tokio::test]
     async fn source_doc_leak_guard_fails_when_source_doc_is_retrieved() {

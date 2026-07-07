@@ -1,6 +1,7 @@
 use std::{
+    collections::HashMap,
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
     time::{Duration, Instant},
 };
 
@@ -25,6 +26,25 @@ pub struct LlmRequest {
 pub struct LlmTextResponse {
     pub text: String,
     pub latency_ms: u64,
+    /// Real token counts reported by the upstream provider, when available.
+    pub usage: Option<LlmTokenUsage>,
+}
+
+/// Token counts as reported by the provider (OpenAI/Codex Responses API).
+/// Serialized flat into API `usage` blocks; absent fields are omitted so
+/// downstream consumers can distinguish "reported" from "unknown".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct LlmTokenUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +79,79 @@ pub struct RateLimitSnapshot {
     pub reset_requests: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_tokens: Option<String>,
+    /// When this snapshot was observed on a live upstream response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<DateTime<Utc>>,
+    /// ChatGPT/Codex subscription plan (`x-codex-plan-type`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    /// Which limit bucket is currently governing (`x-codex-active-limit`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_limit: Option<String>,
+    /// Codex short-window budget (5h rolling window).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary: Option<RateLimitWindow>,
+    /// Codex long-window budget (weekly rolling window).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<RateLimitWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits: Option<CodexCredits>,
+    /// Model-scoped limit buckets (`x-codex-{bucket}-primary-...` families).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_limits: Vec<NamedRateLimit>,
+}
+
+impl RateLimitSnapshot {
+    pub fn has_data(&self) -> bool {
+        self.remaining_requests.is_some()
+            || self.remaining_tokens.is_some()
+            || self.reset_requests.is_some()
+            || self.reset_tokens.is_some()
+            || self.plan_type.is_some()
+            || self.active_limit.is_some()
+            || self.primary.is_some()
+            || self.secondary.is_some()
+            || self.credits.is_some()
+            || !self.additional_limits.is_empty()
+    }
+}
+
+/// One rolling rate-limit window as reported by the Codex backend.
+/// `remaining_percent` is derived (`100 - used_percent`, clamped) so status
+/// consumers can render "left available usage" without recomputing.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RateLimitWindow {
+    pub used_percent: f64,
+    pub remaining_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_in_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CodexCredits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_credits: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlimited: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<String>,
+}
+
+/// A named model-scoped limit bucket, e.g. the `bengalfox` family carrying
+/// `x-codex-bengalfox-limit-name: GPT-5.3-Codex-Spark`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NamedRateLimit {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary: Option<RateLimitWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<RateLimitWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +219,7 @@ impl LlmClient for NoneLlmClient {
                 request.prompt.chars().take(80).collect::<String>()
             ),
             latency_ms: started.elapsed().as_millis() as u64,
+            usage: None,
         })
     }
 }
@@ -148,12 +242,24 @@ impl LlmClient for MockLlmClient {
 
     async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, ApiError> {
         let started = Instant::now();
+        let text = format!(
+            "mock summary: {}",
+            request.prompt.chars().take(160).collect::<String>()
+        );
+        // Deterministic synthetic counts so downstream usage plumbing is
+        // testable without a live provider.
+        let input_tokens = (request.prompt.chars().count() as u64 / 4).max(1);
+        let output_tokens = (text.chars().count() as u64 / 4).max(1);
         Ok(LlmTextResponse {
-            text: format!(
-                "mock summary: {}",
-                request.prompt.chars().take(160).collect::<String>()
-            ),
+            text,
             latency_ms: started.elapsed().as_millis() as u64,
+            usage: Some(LlmTokenUsage {
+                input_tokens: Some(input_tokens),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(output_tokens),
+                reasoning_output_tokens: Some(0),
+                total_tokens: Some(input_tokens + output_tokens),
+            }),
         })
     }
 }
@@ -201,12 +307,14 @@ impl LlmClient for OpenAiResponsesClient {
             self.reasoning_effort.as_deref(),
             api_key,
             &request.prompt,
+            &self.provider,
         )
         .await?;
         Ok(LlmTextResponse {
             text: extract_response_text(&body)
                 .unwrap_or_else(|| "LLM response did not contain output text".to_string()),
             latency_ms: started.elapsed().as_millis() as u64,
+            usage: token_usage_from_value(body.get("usage")),
         })
     }
 }
@@ -235,12 +343,14 @@ impl LlmClient for CodexResponsesClient {
                 self.reasoning_effort.as_deref(),
                 &credentials.token,
                 &request.prompt,
+                "codex_auth",
             )
             .await?;
             return Ok(LlmTextResponse {
                 text: extract_response_text(&body)
                     .unwrap_or_else(|| "LLM response did not contain output text".to_string()),
                 latency_ms: started.elapsed().as_millis() as u64,
+                usage: token_usage_from_value(body.get("usage")),
             });
         }
 
@@ -265,6 +375,7 @@ impl LlmClient for CodexResponsesClient {
             .await
             .map_err(|e| ApiError::Upstream(e.to_string()))?;
         let status = response.status();
+        record_rate_limit_snapshot("codex_auth", &rate_limits_from_headers(response.headers()));
         let body = response
             .text()
             .await
@@ -280,6 +391,7 @@ impl LlmClient for CodexResponsesClient {
             text: extract_codex_sse_text(&body)
                 .unwrap_or_else(|| "LLM response did not contain output text".to_string()),
             latency_ms: started.elapsed().as_millis() as u64,
+            usage: extract_codex_sse_usage(&body),
         })
     }
 }
@@ -290,6 +402,7 @@ async fn complete_openai_responses(
     reasoning_effort: Option<&str>,
     api_key: &str,
     prompt: &str,
+    provider_label: &str,
 ) -> Result<Value, ApiError> {
     let mut payload = json!({
         "model": model,
@@ -307,6 +420,10 @@ async fn complete_openai_responses(
         .map_err(|e| ApiError::Upstream(e.to_string()))?;
 
     let status = response.status();
+    record_rate_limit_snapshot(
+        provider_label,
+        &rate_limits_from_headers(response.headers()),
+    );
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         let message = extract_error_message(&body).unwrap_or_else(|| status.to_string());
@@ -503,8 +620,7 @@ async fn probe_now(config: &Config) -> LlmHealthProbeResult {
             RateLimitSnapshot {
                 remaining_requests: Some("1000".to_string()),
                 remaining_tokens: Some("100000".to_string()),
-                reset_requests: None,
-                reset_tokens: None,
+                ..RateLimitSnapshot::default()
             },
         ),
         "mock_auth_failure" => auth_failure_probe(provider, model, "mock auth failure"),
@@ -518,6 +634,7 @@ async fn probe_now(config: &Config) -> LlmHealthProbeResult {
                 remaining_tokens: Some("0".to_string()),
                 reset_requests: Some("1s".to_string()),
                 reset_tokens: Some("1s".to_string()),
+                ..RateLimitSnapshot::default()
             },
             "mock short rate limit",
         ),
@@ -592,6 +709,7 @@ async fn probe_openai_responses(
     let status = response.status();
     let headers = response.headers().clone();
     let rate_limits = rate_limits_from_headers(&headers);
+    record_rate_limit_snapshot(&provider, &rate_limits);
     let body = response.text().await.unwrap_or_default();
 
     if status.is_success() {
@@ -651,6 +769,7 @@ async fn probe_codex_responses(
     let status = response.status();
     let headers = response.headers().clone();
     let rate_limits = rate_limits_from_headers(&headers);
+    record_rate_limit_snapshot(&provider, &rate_limits);
     let body = response.text().await.unwrap_or_default();
 
     if status.is_success() {
@@ -782,6 +901,9 @@ fn ok_probe_with_latency(
     rate_limits: RateLimitSnapshot,
     latency_ms: u64,
 ) -> LlmHealthProbeResult {
+    // A successful call can still be close to the budget ceiling; surface
+    // that as a soft state so dashboards can warn before hard 429s begin.
+    let rate_limit_state = codex_rate_limit_state(&rate_limits).unwrap_or("ok");
     probe_result(ProbeResultInput {
         provider,
         model,
@@ -789,7 +911,7 @@ fn ok_probe_with_latency(
         can_call: true,
         auth_valid: true,
         quota_state: "available",
-        rate_limit_state: "ok",
+        rate_limit_state,
         error_kind: None,
         message: None,
         rate_limits,
@@ -965,13 +1087,130 @@ fn is_threshold_failure(result: &LlmHealthProbeResult) -> bool {
     )
 }
 
+/// Last live rate-limit snapshot per provider, updated on every upstream
+/// response (health probes and real completions alike). LLM clients are
+/// constructed per call, so this is the one shared place status surfaces can
+/// read the freshest "left available usage" from without issuing a new call.
+static LATEST_RATE_LIMITS: OnceLock<RwLock<HashMap<String, RateLimitSnapshot>>> = OnceLock::new();
+
+fn latest_rate_limits_store() -> &'static RwLock<HashMap<String, RateLimitSnapshot>> {
+    LATEST_RATE_LIMITS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn record_rate_limit_snapshot(provider: &str, snapshot: &RateLimitSnapshot) {
+    if !snapshot.has_data() {
+        return;
+    }
+    let stamped = RateLimitSnapshot {
+        captured_at: Some(Utc::now()),
+        ..snapshot.clone()
+    };
+    if let Ok(mut store) = latest_rate_limits_store().write() {
+        store.insert(provider.to_string(), stamped);
+    }
+}
+
+pub fn latest_rate_limit_snapshot(provider: &str) -> Option<RateLimitSnapshot> {
+    latest_rate_limits_store()
+        .read()
+        .ok()
+        .and_then(|store| store.get(provider).cloned())
+}
+
+/// Rate limits to render on status surfaces: the freshest live snapshot for
+/// the probe's provider, falling back to whatever the probe itself captured
+/// (mock providers synthesize snapshots without touching the live store).
+pub fn effective_rate_limits(probe: &LlmHealthProbeResult) -> RateLimitSnapshot {
+    latest_rate_limit_snapshot(&probe.provider).unwrap_or_else(|| probe.rate_limits.clone())
+}
+
 fn rate_limits_from_headers(headers: &HeaderMap) -> RateLimitSnapshot {
     RateLimitSnapshot {
         remaining_requests: header_value(headers, "x-ratelimit-remaining-requests"),
         remaining_tokens: header_value(headers, "x-ratelimit-remaining-tokens"),
         reset_requests: header_value(headers, "x-ratelimit-reset-requests"),
         reset_tokens: header_value(headers, "x-ratelimit-reset-tokens"),
+        captured_at: None,
+        plan_type: header_value(headers, "x-codex-plan-type"),
+        active_limit: header_value(headers, "x-codex-active-limit"),
+        primary: codex_window_from_headers(headers, "x-codex-primary"),
+        secondary: codex_window_from_headers(headers, "x-codex-secondary"),
+        credits: codex_credits_from_headers(headers),
+        additional_limits: codex_named_limits_from_headers(headers),
     }
+}
+
+fn codex_window_from_headers(headers: &HeaderMap, prefix: &str) -> Option<RateLimitWindow> {
+    let used_percent = header_f64(headers, &format!("{prefix}-used-percent"))?;
+    Some(RateLimitWindow {
+        used_percent,
+        remaining_percent: (100.0 - used_percent).clamp(0.0, 100.0),
+        window_minutes: header_u64(headers, &format!("{prefix}-window-minutes")),
+        resets_in_seconds: header_u64(headers, &format!("{prefix}-reset-after-seconds")),
+        resets_at: header_u64(headers, &format!("{prefix}-reset-at"))
+            .and_then(|ts| DateTime::<Utc>::from_timestamp(ts as i64, 0)),
+    })
+}
+
+fn codex_credits_from_headers(headers: &HeaderMap) -> Option<CodexCredits> {
+    let has_credits = header_bool(headers, "x-codex-credits-has-credits");
+    let unlimited = header_bool(headers, "x-codex-credits-unlimited");
+    let balance =
+        header_value(headers, "x-codex-credits-balance").filter(|value| !value.trim().is_empty());
+    if has_credits.is_none() && unlimited.is_none() && balance.is_none() {
+        return None;
+    }
+    Some(CodexCredits {
+        has_credits,
+        unlimited,
+        balance,
+    })
+}
+
+fn codex_named_limits_from_headers(headers: &HeaderMap) -> Vec<NamedRateLimit> {
+    let mut names: Vec<String> = headers
+        .keys()
+        .filter_map(|name| {
+            let rest = name.as_str().strip_prefix("x-codex-")?;
+            let bucket = rest
+                .strip_suffix("-primary-used-percent")
+                .or_else(|| rest.strip_suffix("-secondary-used-percent"))?;
+            if bucket.is_empty() {
+                None
+            } else {
+                Some(bucket.to_string())
+            }
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|name| NamedRateLimit {
+            limit_name: header_value(headers, &format!("x-codex-{name}-limit-name")),
+            primary: codex_window_from_headers(headers, &format!("x-codex-{name}-primary")),
+            secondary: codex_window_from_headers(headers, &format!("x-codex-{name}-secondary")),
+            name,
+        })
+        .collect()
+}
+
+/// Worst-case state across the plain Codex windows; `None` means the snapshot
+/// carries no window data (OpenAI-key style or mock providers).
+fn codex_rate_limit_state(snapshot: &RateLimitSnapshot) -> Option<&'static str> {
+    let mut worst = None;
+    for window in [snapshot.primary.as_ref(), snapshot.secondary.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if window.used_percent >= 100.0 {
+            return Some("limited");
+        }
+        if window.used_percent >= 90.0 {
+            worst = Some("near_limit");
+        }
+    }
+    worst
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -979,6 +1218,59 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string)
+}
+
+fn header_f64(headers: &HeaderMap, name: &str) -> Option<f64> {
+    header_value(headers, name)?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
+    header_value(headers, name)?.trim().parse::<u64>().ok()
+}
+
+fn header_bool(headers: &HeaderMap, name: &str) -> Option<bool> {
+    match header_value(headers, name)?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Extract token counts from a Responses API `usage` object
+/// (`input_tokens` / `output_tokens` / `total_tokens` plus cached and
+/// reasoning detail counters).
+pub fn token_usage_from_value(usage: Option<&Value>) -> Option<LlmTokenUsage> {
+    let usage = usage?;
+    let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+    let output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+    let total_tokens = usage.get("total_tokens").and_then(Value::as_u64);
+    if input_tokens.is_none() && output_tokens.is_none() && total_tokens.is_none() {
+        return None;
+    }
+    Some(LlmTokenUsage {
+        input_tokens,
+        cached_input_tokens: usage
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(Value::as_u64),
+        output_tokens,
+        reasoning_output_tokens: usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64),
+        total_tokens: total_tokens.or(match (input_tokens, output_tokens) {
+            (Some(input), Some(output)) => Some(input + output),
+            _ => None,
+        }),
+    })
 }
 
 fn extract_error_message(body: &str) -> Option<String> {
@@ -1134,6 +1426,30 @@ fn extract_codex_sse_text(body: &str) -> Option<String> {
     }
 }
 
+/// Pull real token counts out of the terminal `response.completed` SSE event.
+fn extract_codex_sse_usage(body: &str) -> Option<LlmTokenUsage> {
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("response.completed") {
+            return token_usage_from_value(
+                value
+                    .get("response")
+                    .and_then(|response| response.get("usage")),
+            );
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,5 +1514,159 @@ mod tests {
         let payload = codex_responses_payload("gpt-5.5", "hello", Some(" "));
 
         assert!(payload.get("reasoning").is_none());
+    }
+
+    fn codex_headers() -> HeaderMap {
+        use reqwest::header::HeaderValue;
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-codex-primary-used-percent", "0"),
+            ("x-codex-secondary-used-percent", "55"),
+            ("x-codex-primary-window-minutes", "300"),
+            ("x-codex-secondary-window-minutes", "10080"),
+            ("x-codex-primary-reset-after-seconds", "18000"),
+            ("x-codex-secondary-reset-after-seconds", "18058"),
+            ("x-codex-primary-reset-at", "1783414681"),
+            ("x-codex-secondary-reset-at", "1783414739"),
+            ("x-codex-plan-type", "prolite"),
+            ("x-codex-active-limit", "premium"),
+            ("x-codex-credits-has-credits", "False"),
+            ("x-codex-credits-unlimited", "False"),
+            ("x-codex-credits-balance", ""),
+            ("x-codex-bengalfox-primary-used-percent", "4"),
+            ("x-codex-bengalfox-secondary-used-percent", "49"),
+            ("x-codex-bengalfox-limit-name", "GPT-5.3-Codex-Spark"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[test]
+    fn codex_rate_limit_headers_parse_into_windows() {
+        let snapshot = rate_limits_from_headers(&codex_headers());
+
+        let primary = snapshot.primary.as_ref().expect("primary window");
+        assert_eq!(primary.used_percent, 0.0);
+        assert_eq!(primary.remaining_percent, 100.0);
+        assert_eq!(primary.window_minutes, Some(300));
+        assert_eq!(primary.resets_in_seconds, Some(18000));
+        assert!(primary.resets_at.is_some());
+
+        let secondary = snapshot.secondary.as_ref().expect("secondary window");
+        assert_eq!(secondary.used_percent, 55.0);
+        assert_eq!(secondary.remaining_percent, 45.0);
+        assert_eq!(secondary.window_minutes, Some(10080));
+
+        assert_eq!(snapshot.plan_type.as_deref(), Some("prolite"));
+        assert_eq!(snapshot.active_limit.as_deref(), Some("premium"));
+        let credits = snapshot.credits.as_ref().expect("credits");
+        assert_eq!(credits.has_credits, Some(false));
+        assert_eq!(credits.unlimited, Some(false));
+        assert_eq!(credits.balance, None);
+
+        assert_eq!(snapshot.additional_limits.len(), 1);
+        let bucket = &snapshot.additional_limits[0];
+        assert_eq!(bucket.name, "bengalfox");
+        assert_eq!(bucket.limit_name.as_deref(), Some("GPT-5.3-Codex-Spark"));
+        assert_eq!(
+            bucket
+                .primary
+                .as_ref()
+                .map(|window| window.remaining_percent),
+            Some(96.0)
+        );
+        assert!(snapshot.has_data());
+    }
+
+    #[test]
+    fn rate_limit_state_reflects_window_pressure() {
+        let calm = rate_limits_from_headers(&codex_headers());
+        assert_eq!(codex_rate_limit_state(&calm), None);
+
+        let near = RateLimitSnapshot {
+            secondary: Some(RateLimitWindow {
+                used_percent: 92.0,
+                remaining_percent: 8.0,
+                ..RateLimitWindow::default()
+            }),
+            ..RateLimitSnapshot::default()
+        };
+        assert_eq!(codex_rate_limit_state(&near), Some("near_limit"));
+
+        let exhausted = RateLimitSnapshot {
+            primary: Some(RateLimitWindow {
+                used_percent: 100.0,
+                remaining_percent: 0.0,
+                ..RateLimitWindow::default()
+            }),
+            ..RateLimitSnapshot::default()
+        };
+        assert_eq!(codex_rate_limit_state(&exhausted), Some("limited"));
+
+        let probe = ok_probe_with_latency("codex_auth".to_string(), "gpt-5.5".to_string(), near, 5);
+        assert_eq!(probe.rate_limit_state, "near_limit");
+        assert!(probe.can_call);
+    }
+
+    #[test]
+    fn codex_sse_usage_comes_from_response_completed() {
+        let body = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({
+                "type": "response.output_text.done",
+                "text": "ok"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 21,
+                        "input_tokens_details": {"cached_tokens": 3},
+                        "output_tokens": 5,
+                        "output_tokens_details": {"reasoning_tokens": 2},
+                        "total_tokens": 26
+                    }
+                }
+            })
+        );
+
+        let usage = extract_codex_sse_usage(&body).expect("usage");
+        assert_eq!(usage.input_tokens, Some(21));
+        assert_eq!(usage.cached_input_tokens, Some(3));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.reasoning_output_tokens, Some(2));
+        assert_eq!(usage.total_tokens, Some(26));
+    }
+
+    #[test]
+    fn token_usage_total_falls_back_to_sum() {
+        let usage = token_usage_from_value(Some(&json!({
+            "input_tokens": 10,
+            "output_tokens": 6
+        })))
+        .expect("usage");
+        assert_eq!(usage.total_tokens, Some(16));
+
+        assert!(token_usage_from_value(Some(&json!({}))).is_none());
+        assert!(token_usage_from_value(None).is_none());
+    }
+
+    #[test]
+    fn latest_snapshot_store_records_only_real_data() {
+        let provider = "test-provider-latest-snapshot";
+        record_rate_limit_snapshot(provider, &RateLimitSnapshot::default());
+        assert!(latest_rate_limit_snapshot(provider).is_none());
+
+        record_rate_limit_snapshot(provider, &rate_limits_from_headers(&codex_headers()));
+        let stored = latest_rate_limit_snapshot(provider).expect("stored snapshot");
+        assert!(stored.captured_at.is_some());
+        assert_eq!(
+            stored
+                .secondary
+                .as_ref()
+                .map(|window| window.remaining_percent),
+            Some(45.0)
+        );
     }
 }
