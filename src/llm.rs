@@ -471,6 +471,13 @@ fn codex_responses_endpoint(base_url: &str) -> String {
 }
 
 pub fn llm_client_from_config(config: &Config) -> Box<dyn LlmClient> {
+    llm_client_from_config_with_credentials(config, config.codex_auth_credentials())
+}
+
+pub(crate) fn llm_client_from_config_with_credentials(
+    config: &Config,
+    codex_credentials: Option<CodexAuthCredentials>,
+) -> Box<dyn LlmClient> {
     let model = config
         .llm_model
         .clone()
@@ -492,10 +499,7 @@ pub fn llm_client_from_config(config: &Config) -> Box<dyn LlmClient> {
                 .codex_auth_path
                 .clone()
                 .unwrap_or_else(|| "explicit_path_missing".to_string()),
-            credentials: config
-                .codex_auth_path
-                .as_deref()
-                .and_then(read_codex_auth_credentials),
+            credentials: codex_credentials,
             base_url: config.codex_base_url.clone(),
             client: reqwest::Client::new(),
         }),
@@ -647,10 +651,10 @@ async fn probe_now(config: &Config) -> LlmHealthProbeResult {
             probe_openai_responses(config, provider, model, api_key).await
         }
         "codex_auth" => {
-            let Some(path) = config.codex_auth_path.as_deref() else {
+            if config.codex_auth_path.is_none() {
                 return auth_failure_probe(provider, model, "Codex auth path is not configured");
-            };
-            let Some(credentials) = read_codex_auth_credentials(path) else {
+            }
+            let Some(credentials) = config.codex_auth_credentials() else {
                 return auth_failure_probe(provider, model, "Codex auth token could not be read");
             };
             if credentials.token_kind == CodexAuthTokenKind::OpenAiApiKey {

@@ -27,9 +27,9 @@ Schema: `LivezResponse`
 | git_rev | string | Short git revision of the build, `-dirty` suffix when built from a modified tree, `unknown` outside a git checkout. |
 
 ## Errors and Access Rules
-- Malformed JSON or missing required runtime fields returns 400.
-- Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
-- Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
+- Public; no bearer token is required.
+- This endpoint performs no store, Meilisearch, parser, or LLM checks.
+- A serving process returns 200. Connection-level failures occur before an HTTP response exists.
 
 ## Internal Logic Call Graph
 ```mermaid

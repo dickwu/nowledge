@@ -6,11 +6,11 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     config::Config,
-    error::ApiError,
+    error::{safe_cause_diagnostic, safe_value_fingerprint, ApiError},
     meili::{MeiliAdmin, SearchResponse},
     models::*,
     resolver::EventIndexResolver,
-    util::{hmac_hex, text_score, truncate_chars},
+    util::{hmac_hex, text_score},
 };
 
 #[derive(Debug, Clone)]
@@ -847,11 +847,14 @@ impl KnowledgeRepository for MeiliRepository {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    let diagnostic = safe_cause_diagnostic(&e);
+                    let source_fingerprint = safe_value_fingerprint("company_source_id", source_id);
                     tracing::warn!(
                         target: "nowledge::delete_company_source",
-                        index = aux_uid,
-                        source_id = source_id,
-                        error = %e,
+                        index_kind = aux_uid,
+                        %source_fingerprint,
+                        cause_category = diagnostic.category,
+                        cause_fingerprint = %diagnostic.fingerprint,
                         "auxiliary cleanup failed; continuing"
                     );
                 }
@@ -1014,11 +1017,13 @@ impl KnowledgeRepository for MeiliRepository {
                     let _ = self.maybe_wait(&task).await;
                 }
                 Err(e) => {
+                    let diagnostic = safe_cause_diagnostic(&e);
                     tracing::warn!(
                         target: "nowledge::ingest_cleanup",
-                        index = index_uid,
-                        count = task_ids.len(),
-                        error = %e,
+                        index_kind = index_uid,
+                        document_count = task_ids.len(),
+                        cause_category = diagnostic.category,
+                        cause_fingerprint = %diagnostic.fingerprint,
                         "failed to delete expired ingest documents"
                     );
                 }
@@ -1775,7 +1780,7 @@ fn context_stage(
         "latency_ms": latency_ms,
         "selected_uris": hits
             .iter()
-            .map(|node| truncate_chars(&node.uri, 240))
+            .map(|node| node.uri.clone())
             .collect::<Vec<_>>()
     })
 }

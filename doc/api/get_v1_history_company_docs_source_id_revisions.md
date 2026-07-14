@@ -27,8 +27,8 @@ Schema: `JsonValue`
 | ... | object or array | Endpoint-specific JSON returned by the store or debug helper. |
 
 ## Errors and Access Rules
-- Malformed JSON or missing required runtime fields returns 400.
-- Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Missing or invalid bearer authentication returns 401.
+- Company-document revision history is tenant-shared: authenticated owner, tenant-service, company-writer, and admin principals may read it.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph

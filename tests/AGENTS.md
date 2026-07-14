@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-20 | Updated: 2026-05-20 -->
+<!-- Generated: 2026-05-20 | Updated: 2026-07-13 -->
 
 # tests
 
@@ -18,6 +18,8 @@ evidence exposed through `score_breakdown`.
 | File | Description |
 |------|-------------|
 | `api_spec.rs` (~86 KB) | Primary integration suite. Builds the router with `Config::test()` and several auth variants (`authed_app`, `bearer_user_app`, `mock_llm_app`, `analysis_llm_app`, `codex_import_app`, `stale_llm_health_app`, `llm_health_app(provider)`) and exercises every public route group — state, history, context, rag, links, analysis, ingest, sessions, harness, eval, debug, llm, and admin. |
+| `authz_characterization.rs` | Explicit Owner/TenantService/company-writer/Admin policy matrix, shared-write auditing, protected diagnostics, route-manifest guard classification, global typed-JSON response redaction, and legacy/rotation split-secret fragment regressions. |
+| `error_contract.rs` | Stable error-envelope, request-correlation, and safe cause-log regressions. Tests serialize access to the shared tracing callsite to avoid subscriber-interest races. |
 | `meili_integration.rs` (~19 KB) | Meili-backed integration tests. Gated by `RAG_TEST_MEILI_URL` (and `RAG_TEST_MEILI_API_KEY` when the server is keyed). Verifies dynamic per-user index creation and the Meili-search path through the repository backend. |
 | `mineru_integration.rs` (~5 KB) | Live MinerU integration test. Gated by `RAG_TEST_MINERU_API_URL`. Performs a multipart PDF upload through `/v1/ingest/uploads:sync`, asserts task `state=completed`, then runs `/v1/context/search` plus `/v1/context/traceback` to confirm fragment provenance survives the round trip. |
 
@@ -29,14 +31,15 @@ None.
 ### Working In This Directory
 - Tests run as separate binaries (Cargo `[[test]]` convention). They link
   against the library through `use nowledge::{build_router, AppState, Config};`
-  and `use nowledge::config::AuthUserConfig;`.
+  and the explicit auth types under `nowledge::config`.
 - Use `Config::test()` as the baseline — it sets `allow_unsafe_unauthenticated=true`,
   `store_backend=memory`, and an in-memory `index_hash_secret`. Override fields
   on the returned `Config` before wrapping it in `Arc::new` and passing to
   `AppState::new`.
-- For auth coverage, mirror `authed_app()` in `api_spec.rs`: three users
-  (`u1-token`, `u2-token`, `admin-token`) with `u1`/`u2`/`admin` roles. This
-  pattern is what proves owner isolation in the regression suite.
+- For auth coverage, construct `AuthUserConfig` with an explicit
+  `AuthUserScope`. Mirror `authed_app()` for owner/admin tests and
+  `authz_characterization.rs` for the Owner/TenantService/company_writer/Admin
+  policy matrix. Roles grant features; only scope grants private-data reach.
 - For optional integration tests, follow the existing skip-on-unreachable
   pattern (`eprintln!` and `return`) so the suite still passes in environments
   without Meili or MinerU running locally.
@@ -44,8 +47,8 @@ None.
   to avoid colliding with previous test debris when the same Meili server is reused.
 
 ### Testing Requirements
-- `cargo test` runs `api_spec.rs` only by default. The two gated integration
-  tests are surfaced via `cargo test --test meili_integration` and
+- `cargo test` runs every integration-test binary. The two live-service suites
+  are environment-gated and can be targeted via `cargo test --test meili_integration` and
   `cargo test --test mineru_integration`.
 - Helper scripts under `scripts/` (`gfit_meili_test.sh`) run the Meili
   integration test through an SSH tunnel to the `gfit` host.
@@ -65,8 +68,9 @@ None.
 ## Dependencies
 
 ### Internal
-- `nowledge` crate (library re-exports `build_router`, `AppState`, `Config`,
-  and `config::AuthUserConfig`).
+- `nowledge` crate (library re-exports `build_router`, `AppState`, and `Config`;
+  auth fixture types live under `config::{AuthUserConfig, AuthUserScope,
+  BearerTokenScope}`).
 
 ### External
 - `tower` 0.5 (dev) — `ServiceExt::oneshot` for direct router dispatch.

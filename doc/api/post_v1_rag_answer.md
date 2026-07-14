@@ -32,8 +32,8 @@ Schema: `RagAnswerResponse`
 | --- | --- | --- |
 | answer_id | string | Answer id. |
 | trace_id | string | Retrieval trace id. |
-| answer | string | Generated or store-provided answer. |
-| citations | Citation[] | Grounding citations from retrieval fragments. |
+| answer | string | Generated or store-provided answer after configured-secret redaction. |
+| citations | Citation[] | Grounding citations from retrieval fragments after configured-secret redaction. |
 | usage | object | LLM/backend usage metadata. |
 
 ### Usage Fields
@@ -83,7 +83,7 @@ consumers should fall back to estimation only when they are absent.
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Default RAG retrieval searches only active fragments; source documents are not directly searched.
-- The generated prompt includes each citation's source title, `page_idx`, `block_type`, `section_path`, URI, and quote; secret redaction still applies to debug/preview surfaces.
+- The generated prompt includes each citation's source title, `page_idx`, `block_type`, `section_path`, URI, and quote. Configured secrets are redacted before provider submission and from the complete response.
 - Citation `source_document_uri` is metadata only. Full source document bodies are readable only through explicit `GET /v1/fs/read` with ACL checks.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
@@ -93,8 +93,8 @@ flowchart TD
   n0["UserGuard authenticates caller"]
   n1["apply_owner_default fills owner_user_id when possible"]
   n2["answer_rag_with_llm calls Store.answer_rag_async for fragment-grounded citations"]
-  n3["If llm_provider is not none, build_prompt and call llm_client.complete_text"]
-  n4["Return answer with citations and usage"]
+  n3["If llm_provider is not none, redact configured secrets and call llm_client.complete_text"]
+  n4["Redact configured secrets and return answer with citations and usage"]
   n0 --> n1
   n1 --> n2
   n2 --> n3

@@ -32,8 +32,8 @@ Schema: `JsonValue`
 | sources[].revision_count | integer | Number of stored revisions for the source. |
 
 ## Errors and Access Rules
-- Malformed JSON or missing required runtime fields returns 400.
-- Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Missing or invalid bearer authentication returns 401.
+- Company documents are tenant-shared: authenticated owner, tenant-service, company-writer, and admin principals may list them.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph

@@ -10,6 +10,14 @@ JSON `IngestTaskRequest`.
 
 `IngestTaskResult` with a completed task, source document URI, parse artifacts, parsed blocks, fragment URIs, and context URIs.
 
+Configured secrets are masked with equal character counts before retrieval
+fragmentation, preserving offsets. Canonical source and parsed-block records may
+retain original content internally, but the final JSON boundary redacts them
+from this response. Codex tokens observed during the process lifetime remain in
+the redaction inventory; operators must carry revoked values across restarts in
+`RAG_REDACTION_PREVIOUS_SECRETS` until persisted records are reingested or
+scrubbed.
+
 ## Rules
 
 - Kept for tests and caller flows that need immediate completion.

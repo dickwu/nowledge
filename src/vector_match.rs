@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 use turbovec::IdMapIndex;
 
-use crate::config::Config;
+use crate::{config::Config, error::safe_cause_diagnostic};
 
 /// Embedding dimensionality. turbovec requires a positive multiple of 8;
 /// 512 keeps hashed lexical features sparse enough while the quantized
@@ -301,7 +301,13 @@ impl VectorMatcher {
                     // Vector matching is an enhancement layer over
                     // text_score; degrade to text-only rather than failing
                     // the search.
-                    tracing::warn!(?error, "vector index add failed; text-only scoring");
+                    let diagnostic = safe_cause_diagnostic(&error);
+                    tracing::warn!(
+                        target: "nowledge::vector_match",
+                        cause_category = diagnostic.category,
+                        cause_fingerprint = %diagnostic.fingerprint,
+                        "vector index add failed; text-only scoring"
+                    );
                 }
             }
         }

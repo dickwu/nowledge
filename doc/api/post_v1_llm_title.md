@@ -29,7 +29,7 @@ Schema: `LlmTitleResponse`
 
 | Field | Type | Description |
 | --- | --- | --- |
-| title | string | Cleaned single-line title: quote/markdown/"Title:" artifacts stripped, trailing period removed, capped at `max_chars`, `Untitled` fallback when the model returns nothing usable. |
+| title | string | Configured-secret-redacted single-line title: quote/markdown/"Title:" artifacts stripped, trailing period removed, capped at `max_chars`, `Untitled` fallback when the model returns nothing usable. |
 | model | string | Model reported by the provider status probe. |
 | latency_ms | integer | Provider completion latency in milliseconds. |
 | usage | object? | Real provider token counts (`input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`) when reported. |
@@ -38,6 +38,8 @@ Schema: `LlmTitleResponse`
 - Malformed JSON or missing required runtime fields returns 400.
 - Empty or whitespace-only `content` returns 400 (`content is required`).
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Configured secrets are redacted from the bounded prompt before provider
+  submission and from the complete response before serialization.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph
@@ -45,12 +47,12 @@ Schema: `LlmTitleResponse`
 flowchart TD
   n0["UserGuard authenticates caller"]
   n1["Validate content and clamp max_chars"]
-  n2["Build bounded prompt: first 2000 chars, language and hint lines"]
+  n2["Build bounded prompt and redact configured secrets"]
   n3["llm_client_from_config(effective_config)"]
   n4["client.status captures model metadata"]
   n5["client.complete_text generates the title"]
-  n6["Post-process: strip artifacts, single line, cap length"]
-  n7["Return title, model, latency_ms"]
+  n6["Redact and post-process: strip artifacts, single line, cap length"]
+  n7["Redact configured secrets and return title, model, latency_ms"]
   n0 --> n1
   n1 --> n2
   n2 --> n3

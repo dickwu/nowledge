@@ -71,6 +71,8 @@ Schema: `StateItemResponse`
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Tenant-service principals must provide `owner_user_id`; the service never
+  infers a write target from existing tenant data.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph

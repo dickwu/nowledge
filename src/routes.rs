@@ -7,9 +7,11 @@ use std::{
 };
 
 use axum::{
-    extract::{Multipart, Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    body::{to_bytes, Body},
+    extract::{MatchedPath, Multipart, Path, Query, Request, State},
+    http::{header::CONTENT_LENGTH, header::CONTENT_TYPE, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, patch, post, put},
     Json, Router,
 };
@@ -18,16 +20,21 @@ use serde_json::{json, Value};
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
-    auth::{AdminGuard, UserGuard},
+    auth::{AdminGuard, CompanyWriterGuard, Principal, UserGuard},
     config::Config,
-    error::ApiError,
-    llm::{llm_client_from_config, LlmHealthProbe, LlmHealthProbeResult, LlmRequest},
+    error::{safe_cause_diagnostic, safe_value_fingerprint, ApiError},
+    llm::{
+        llm_client_from_config, llm_client_from_config_with_credentials, LlmHealthProbe,
+        LlmHealthProbeResult, LlmRequest,
+    },
     meili::MeiliAdmin,
     models::*,
     parser::parser_health_status,
+    request_context::{self, RequestContextState, RequestId},
     store::Store,
     util::{
-        redact_secrets, redact_string, require_string, sanitize_slug, text_score, truncate_chars,
+        hmac_hex, redact_egress_text, redact_locator, redact_secrets, redact_string,
+        require_string, sanitize_slug, text_score,
     },
 };
 
@@ -73,7 +80,15 @@ impl IngestTaskManager {
                         .run_ingest_task_async(&job.tenant_id, &job.task_id, job.req, &job.config)
                         .await
                     {
-                        tracing::warn!(task_id = %job.task_id, error = %err, "ingest task failed");
+                        let diagnostic = safe_cause_diagnostic(&err);
+                        let task_fingerprint =
+                            safe_value_fingerprint("ingest_task_id", &job.task_id);
+                        tracing::warn!(
+                            %task_fingerprint,
+                            cause_category = diagnostic.category,
+                            cause_fingerprint = %diagnostic.fingerprint,
+                            "ingest task failed"
+                        );
                     }
                 });
             }
@@ -116,6 +131,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Arc<Config>) -> Self {
         let store = Store::new(&config);
+        config.start_codex_secret_refresh_task();
         let ingest_manager = IngestTaskManager::new(store.clone(), config.clone());
         spawn_ingest_task_cleanup(store.clone(), &config);
         Self {
@@ -159,7 +175,12 @@ fn spawn_ingest_task_cleanup(store: Store, config: &Arc<Config>) {
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    tracing::warn!(error = %err, "ingest task cleanup pass failed");
+                    let diagnostic = safe_cause_diagnostic(&err);
+                    tracing::warn!(
+                        cause_category = diagnostic.category,
+                        cause_fingerprint = %diagnostic.fingerprint,
+                        "ingest task cleanup pass failed"
+                    );
                 }
             }
         }
@@ -359,10 +380,90 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/debug/traces/{trace_id}", get(get_trace))
         .route("/v1/debug/meili/search", post(debug_meili_search))
         .route("/v1/debug/prompt/preview", post(prompt_preview))
+        .layer(middleware::from_fn_with_state(
+            state.config.clone(),
+            redact_json_response,
+        ))
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                let request_id = request
+                    .extensions()
+                    .get::<RequestId>()
+                    .map(RequestId::as_str)
+                    .unwrap_or("missing");
+                let route = request
+                    .extensions()
+                    .get::<MatchedPath>()
+                    .map(MatchedPath::as_str)
+                    .unwrap_or("unmatched");
+                tracing::info_span!(
+                    "http_request",
+                    %request_id,
+                    method = %request.method(),
+                    route
+                )
+            },
+        ))
+        .layer(middleware::from_fn_with_state(
+            RequestContextState::from_shared_config(state.config.clone()),
+            request_context::assign,
+        ))
         .with_state(state)
+}
+
+async fn redact_json_response(
+    State(config): State<Arc<Config>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    let is_json = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|media_type| {
+            media_type.eq_ignore_ascii_case("application/json")
+                || media_type.to_ascii_lowercase().ends_with("+json")
+        });
+    if !is_json {
+        return response;
+    }
+
+    sanitize_json_response(response, &config, MAX_REDACTABLE_JSON_RESPONSE_BYTES).await
+}
+
+const MAX_REDACTABLE_JSON_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+async fn sanitize_json_response(response: Response, config: &Config, limit: usize) -> Response {
+    let (mut parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, limit).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return ApiError::Internal("JSON response exceeded the redaction limit".to_string())
+                .into_response();
+        }
+    };
+    let value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return ApiError::Internal("failed to parse JSON response for redaction".to_string())
+                .into_response();
+        }
+    };
+    let sanitized = redact_secrets(&value, &config.configured_secret_values());
+    let bytes = match serde_json::to_vec(&sanitized) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return ApiError::Internal("failed to sanitize JSON response".to_string())
+                .into_response();
+        }
+    };
+    parts.headers.remove(CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(bytes))
 }
 
 /// Crate version and git revision baked in at compile time so every health
@@ -378,25 +479,71 @@ async fn livez() -> Json<Value> {
     }))
 }
 
-async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
-    operational_health(state).await
-}
-
-async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    operational_health(state).await
-}
-
-async fn operational_health(state: AppState) -> impl IntoResponse {
-    let config = state.effective_config();
-    let meili = state.meili.health_status().await;
-    let llm = state.llm_health.check(&config).await;
-    let parser = parser_health_status(&config).await;
+async fn healthz(_admin: AdminGuard, State(state): State<AppState>) -> impl IntoResponse {
+    let check = operational_check(&state).await;
     let usage = compact_usage_summary(
         state
             .store
             .usage_snapshot(state.tenant_id(), None, true)
-            .unwrap_or_else(|err| json!({ "error": err.to_string() })),
+            .unwrap_or_else(|_| json!({ "error": "usage snapshot unavailable" })),
     );
+    let body = json!({
+        "status": check.status,
+        "ready": check.ready,
+        "version": SERVICE_VERSION,
+        "git_rev": SERVICE_GIT_REV,
+        "store_backend": state.store.backend_name(),
+        "meilisearch": sanitize_dependency_health(check.meili, "Meilisearch health check failed"),
+        "llm": llm_health_json(&check.llm),
+        "parser": sanitize_dependency_health(check.parser, "parser health check failed"),
+        "usage": usage
+    });
+    health_response(check.ready, redact_for_state(&state, body))
+}
+
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    let check = operational_check(&state).await;
+    let meili_status = dependency_status(&check.meili);
+    let parser_status = dependency_status(&check.parser);
+    let llm_status = if check.llm.status == "unhealthy"
+        || check.llm.quota_state == "exhausted"
+        || (!check.llm.auth_valid && state.config.health_require_llm)
+    {
+        "unhealthy"
+    } else if check.llm.status == "degraded" || check.llm.stale {
+        "degraded"
+    } else {
+        "ok"
+    };
+    health_response(
+        check.ready,
+        json!({
+            "status": check.status,
+            "ready": check.ready,
+            "version": SERVICE_VERSION,
+            "git_rev": SERVICE_GIT_REV,
+            "dependencies": {
+                "meilisearch": meili_status,
+                "llm": llm_status,
+                "parser": parser_status
+            }
+        }),
+    )
+}
+
+struct OperationalCheck {
+    meili: Value,
+    llm: LlmHealthProbeResult,
+    parser: Value,
+    ready: bool,
+    status: &'static str,
+}
+
+async fn operational_check(state: &AppState) -> OperationalCheck {
+    let config = state.effective_config();
+    let meili = state.meili.health_status().await;
+    let llm = state.llm_health.check(&config).await;
+    let parser = parser_health_status(&config).await;
     let meili_healthy = meili
         .get("healthy")
         .and_then(Value::as_bool)
@@ -418,17 +565,16 @@ async fn operational_health(state: AppState) -> impl IntoResponse {
     } else {
         "ok"
     };
-    let body = json!({
-        "status": status,
-        "ready": ready,
-        "version": SERVICE_VERSION,
-        "git_rev": SERVICE_GIT_REV,
-        "store_backend": state.store.backend_name(),
-        "meilisearch": meili,
-        "llm": llm_health_json(&llm),
-        "parser": parser,
-        "usage": usage
-    });
+    OperationalCheck {
+        meili,
+        llm,
+        parser,
+        ready,
+        status,
+    }
+}
+
+fn health_response(ready: bool, body: Value) -> impl IntoResponse {
     (
         if ready {
             StatusCode::OK
@@ -437,6 +583,28 @@ async fn operational_health(state: AppState) -> impl IntoResponse {
         },
         Json(body),
     )
+}
+
+fn dependency_status(value: &Value) -> &'static str {
+    if value
+        .get("healthy")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "ok"
+    } else {
+        "unhealthy"
+    }
+}
+
+fn sanitize_dependency_health(mut value: Value, failure_message: &str) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        if object.contains_key("error") {
+            object.insert("error".to_string(), json!(failure_message));
+        }
+        object.remove("mineru");
+    }
+    value
 }
 
 async fn llm_health_false_ready(state: &AppState) -> bool {
@@ -461,6 +629,10 @@ async fn llm_health_false_ready(state: &AppState) -> bool {
 }
 
 fn llm_health_json(llm: &LlmHealthProbeResult) -> Value {
+    let public_message = llm
+        .message
+        .as_ref()
+        .map(|_| "LLM health probe reported a failure");
     json!({
         "provider": &llm.provider,
         "model": &llm.model,
@@ -479,7 +651,7 @@ fn llm_health_json(llm: &LlmHealthProbeResult) -> Value {
         "age_seconds": llm.age_seconds,
         "consecutive_failures": llm.consecutive_failures,
         "error_kind": &llm.error_kind,
-        "message": &llm.message
+        "message": public_message
     })
 }
 
@@ -515,73 +687,70 @@ async fn usage(
     Query(mut query): Query<OwnerQuery>,
 ) -> Result<Json<Value>, ApiError> {
     user.apply_owner_default(&mut query.owner_user_id)?;
-    if !user.principal.is_admin() && user.principal.owner_user_id.is_none() {
-        return Err(ApiError::forbidden(
-            "owner-bound auth is required for usage",
-        ));
-    }
     let include_global = user.principal.is_admin() && query.owner_user_id.is_none();
     if !include_global && query.owner_user_id.is_none() {
         return Err(ApiError::forbidden(
             "owner_user_id is required for non-admin usage",
         ));
     }
-    let config = state.effective_config();
-    let llm =
-        state
-            .llm_health
-            .cached(&config)
-            .unwrap_or_else(|| crate::llm::LlmHealthProbeResult {
-                provider: config.llm_provider.clone(),
-                model: config
-                    .llm_model
-                    .clone()
-                    .unwrap_or_else(|| "none".to_string()),
-                reasoning_effort: config.llm_reasoning_effort.clone(),
-                status: "unknown".to_string(),
-                can_call: false,
-                auth_valid: false,
-                quota_state: "unknown".to_string(),
-                rate_limit_state: "unknown".to_string(),
-                checked_at: chrono::Utc::now(),
-                latency_ms: 0,
-                stale: true,
-                age_seconds: 0,
-                consecutive_failures: 0,
-                rate_limits: crate::llm::RateLimitSnapshot::default(),
-                error_kind: Some("not_probed".to_string()),
-                message: Some("LLM health has not been probed yet".to_string()),
-            });
     let mut snapshot = state.store.usage_snapshot(
         state.tenant_id(),
         query.owner_user_id.as_deref(),
         include_global,
     )?;
     if let Some(providers) = snapshot.get_mut("providers").and_then(Value::as_object_mut) {
-        providers.insert(
-            "meilisearch".to_string(),
-            json!({
-                "configured": state.meili.configured(),
-                "store_backend": state.store.backend_name()
-            }),
-        );
-        providers.insert(
-            "parser".to_string(),
-            json!({
-                "provider": &config.parser_provider,
-                "mineru_api_url": if config.parser_provider == "mineru" {
-                    Some(config.mineru_api_url.clone())
-                } else {
-                    None
-                },
-                "backend": if config.parser_provider == "mineru" {
-                    config.mineru_backend.clone()
-                } else {
-                    "text".to_string()
+        if user.principal.is_admin() {
+            let config = state.effective_config();
+            let llm = state.llm_health.cached(&config).unwrap_or_else(|| {
+                crate::llm::LlmHealthProbeResult {
+                    provider: config.llm_provider.clone(),
+                    model: config
+                        .llm_model
+                        .clone()
+                        .unwrap_or_else(|| "none".to_string()),
+                    reasoning_effort: config.llm_reasoning_effort.clone(),
+                    status: "unknown".to_string(),
+                    can_call: false,
+                    auth_valid: false,
+                    quota_state: "unknown".to_string(),
+                    rate_limit_state: "unknown".to_string(),
+                    checked_at: chrono::Utc::now(),
+                    latency_ms: 0,
+                    stale: true,
+                    age_seconds: 0,
+                    consecutive_failures: 0,
+                    rate_limits: crate::llm::RateLimitSnapshot::default(),
+                    error_kind: Some("not_probed".to_string()),
+                    message: Some("LLM health has not been probed yet".to_string()),
                 }
-            }),
-        );
-        providers.insert("llm".to_string(), llm_health_json(&llm));
+            });
+            providers.insert(
+                "meilisearch".to_string(),
+                json!({
+                    "configured": state.meili.configured(),
+                    "store_backend": state.store.backend_name()
+                }),
+            );
+            providers.insert(
+                "parser".to_string(),
+                json!({
+                    "provider": &config.parser_provider,
+                    "mineru_api_url": if config.parser_provider == "mineru" {
+                        Some(config.mineru_api_url.clone())
+                    } else {
+                        None
+                    },
+                    "backend": if config.parser_provider == "mineru" {
+                        config.mineru_backend.clone()
+                    } else {
+                        "text".to_string()
+                    }
+                }),
+            );
+            providers.insert("llm".to_string(), llm_health_json(&llm));
+        } else {
+            providers.remove("nowledge_api");
+        }
     }
     Ok(Json(snapshot))
 }
@@ -855,6 +1024,7 @@ async fn append_event_alias(
     Json(mut req): Json<AppendHistoryEventRequest>,
 ) -> Result<Json<HistoryEventResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
+    require_owner_for_write(&user, req.owner_user_id.as_deref())?;
     Ok(Json(
         state
             .store
@@ -932,6 +1102,7 @@ async fn upsert_state_fact(
     Json(mut req): Json<UpsertStateFactRequest>,
 ) -> Result<Json<StateItemResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
+    require_owner_for_write(&user, req.owner_user_id.as_deref())?;
     Ok(Json(
         state
             .store
@@ -947,6 +1118,7 @@ async fn patch_state_fact(
     Json(mut req): Json<PatchStateFactRequest>,
 ) -> Result<Json<StateItemResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
+    require_owner_for_write(&user, req.owner_user_id.as_deref())?;
     Ok(Json(
         state
             .store
@@ -962,6 +1134,7 @@ async fn get_state_fact(
     Query(mut query): Query<OwnerQuery>,
 ) -> Result<Json<StateItemResponse>, ApiError> {
     user.apply_owner_default(&mut query.owner_user_id)?;
+    require_explicit_owner_for_unbound_private_read(&user, query.owner_user_id.as_deref())?;
     Ok(Json(state.store.get_state_fact(
         state.tenant_id(),
         &fact_key,
@@ -975,6 +1148,7 @@ async fn search_state(
     Json(mut req): Json<StateSearchRequest>,
 ) -> Result<Json<StateSearchResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
+    require_explicit_owner_for_unbound_private_read(&user, req.owner_user_id.as_deref())?;
     Ok(Json(state.store.search_state(state.tenant_id(), req)?))
 }
 
@@ -1014,6 +1188,7 @@ async fn search_insights(
     Json(mut req): Json<InsightSearchRequest>,
 ) -> Result<Json<InsightSearchResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
+    require_explicit_owner_for_unbound_private_read(&user, req.owner_user_id.as_deref())?;
     Ok(Json(state.store.search_insights(req)?))
 }
 
@@ -1049,7 +1224,12 @@ async fn analyze_insights(
     user: UserGuard,
     State(state): State<AppState>,
     Json(mut req): Json<AnalysisInsightRequest>,
-) -> Result<Json<AnalysisInsightResponse>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
+    if req.debug && !user.principal.is_admin() {
+        return Err(ApiError::forbidden(
+            "admin permission is required for analysis debug output",
+        ));
+    }
     user.apply_owner_default(&mut req.owner_user_id)?;
     require_owner_for_write(&user, req.owner_user_id.as_deref())?;
     if req.history_event_id.is_some() && req.owner_user_id.is_none() {
@@ -1057,45 +1237,71 @@ async fn analyze_insights(
             "owner_user_id is required for history_event_id analysis",
         ));
     }
-    Ok(Json(
-        run_analysis_insights(&state, req, user.principal.is_admin()).await?,
-    ))
+    let response = run_analysis_insights(&state, req, user.principal.is_admin()).await?;
+    let response =
+        serde_json::to_value(response).map_err(|error| ApiError::Internal(error.to_string()))?;
+    Ok(Json(redact_for_state(&state, response)))
 }
 
 async fn preflight_doc(
-    _user: UserGuard,
+    user: CompanyWriterGuard,
     State(state): State<AppState>,
     Json(req): Json<CompanyDocPreflightRequest>,
 ) -> Result<Json<CompanyDocPreflightResponse>, ApiError> {
-    Ok(Json(state.store.preflight_company_doc(req)?))
+    let result = state.store.preflight_company_doc(req);
+    Ok(Json(audit_shared_write(
+        result,
+        &user.principal,
+        &state,
+        "company_doc.preflight",
+        "company-doc:preflight",
+        "preflight_requested",
+    )?))
 }
 
 async fn create_revision(
-    _user: UserGuard,
+    user: CompanyWriterGuard,
     State(state): State<AppState>,
     Path(source_id): Path<String>,
     Json(req): Json<CreateRevisionRequest>,
 ) -> Result<Json<CreateRevisionResponse>, ApiError> {
-    Ok(Json(
-        state
-            .store
-            .create_revision_async(state.tenant_id(), &source_id, req)
-            .await?,
-    ))
+    let result = state
+        .store
+        .create_revision_async(state.tenant_id(), &source_id, req)
+        .await;
+    Ok(Json(audit_shared_write(
+        result,
+        &user.principal,
+        &state,
+        "company_doc.create_revision",
+        &source_id,
+        "revision_create_requested",
+    )?))
 }
 
 async fn activate_revision(
-    _user: UserGuard,
+    user: CompanyWriterGuard,
     State(state): State<AppState>,
     Path((source_id, revision_id)): Path<(String, String)>,
     Json(req): Json<ActivateRevisionRequest>,
 ) -> Result<Json<ActivateRevisionResponse>, ApiError> {
-    Ok(Json(
-        state
-            .store
-            .activate_revision_async(state.tenant_id(), &source_id, &revision_id, req)
-            .await?,
-    ))
+    let audit_reason = req
+        .reason
+        .as_deref()
+        .unwrap_or("activation_reason_unspecified")
+        .to_string();
+    let result = state
+        .store
+        .activate_revision_async(state.tenant_id(), &source_id, &revision_id, req)
+        .await;
+    Ok(Json(audit_shared_write(
+        result,
+        &user.principal,
+        &state,
+        "company_doc.activate_revision",
+        &format!("{source_id}:{revision_id}"),
+        &audit_reason,
+    )?))
 }
 
 async fn list_company_docs(
@@ -1114,16 +1320,22 @@ async fn get_company_doc(
 }
 
 async fn delete_company_doc(
-    _user: UserGuard,
+    admin: AdminGuard,
     State(state): State<AppState>,
     Path(source_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        state
-            .store
-            .delete_company_doc(state.tenant_id(), &source_id)
-            .await?,
-    ))
+    let result = state
+        .store
+        .delete_company_doc(state.tenant_id(), &source_id)
+        .await;
+    Ok(Json(audit_shared_write(
+        result,
+        &admin.principal,
+        &state,
+        "company_doc.delete",
+        &source_id,
+        "admin_delete",
+    )?))
 }
 
 async fn list_revisions(
@@ -1135,12 +1347,20 @@ async fn list_revisions(
 }
 
 async fn upsert_dataset(
-    _user: UserGuard,
+    user: CompanyWriterGuard,
     State(state): State<AppState>,
     Path(dataset_key): Path<String>,
     Json(req): Json<DatasetSchemaUpsertRequest>,
 ) -> Result<Json<DatasetSchemaResponse>, ApiError> {
-    Ok(Json(state.store.upsert_dataset(&dataset_key, req)?))
+    let result = state.store.upsert_dataset(&dataset_key, req);
+    Ok(Json(audit_shared_write(
+        result,
+        &user.principal,
+        &state,
+        "dataset.upsert_schema",
+        &dataset_key,
+        "schema_upsert",
+    )?))
 }
 
 async fn apply_snapshot(
@@ -1346,7 +1566,7 @@ async fn context_reveal(
     if let Some(owner) = &owner {
         user.require_owner_access(owner)?;
     }
-    let owner_scope = owner.or_else(|| user.principal.owner_user_id.clone());
+    let owner_scope = owner.or_else(|| user.principal.owner_user_id().map(ToString::to_string));
     Ok(Json(state.store.reveal_context(
         state.tenant_id(),
         req,
@@ -1601,34 +1821,44 @@ async fn rag_answer(
     user: UserGuard,
     State(state): State<AppState>,
     Json(mut req): Json<RagAnswerRequest>,
-) -> Result<Json<RagAnswerResponse>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
-    Ok(Json(
-        answer_rag_with_llm(&state, req, user.principal.is_admin()).await?,
-    ))
+    let answer = answer_rag_with_llm(&state, req, user.principal.is_admin()).await?;
+    let answer =
+        serde_json::to_value(answer).map_err(|error| ApiError::Internal(error.to_string()))?;
+    Ok(Json(redact_for_state(&state, answer)))
 }
 
 async fn rag_stream(
     user: UserGuard,
     state: State<AppState>,
     req: Json<RagAnswerRequest>,
-) -> Result<Json<RagAnswerResponse>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     rag_answer(user, state, req).await
 }
 
 async fn rag_debug(
-    user: UserGuard,
+    admin: AdminGuard,
     State(state): State<AppState>,
     Json(mut req): Json<RagAnswerRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    user.apply_owner_default(&mut req.owner_user_id)?;
-    let answer = answer_rag_with_llm(&state, req.clone(), user.principal.is_admin()).await?;
+    admin
+        .principal
+        .apply_owner_default(&mut req.owner_user_id)?;
+    let answer = answer_rag_with_llm(&state, req.clone(), true).await?;
     let trace = state.store.get_trace_async(&answer.trace_id).await?;
-    Ok(Json(json!({
-        "answer": answer,
-        "trace": trace,
-        "prompt": build_prompt(&req.question.unwrap_or_default(), &answer.citations)
-    })))
+    Ok(Json(redact_for_state(
+        &state,
+        json!({
+            "answer": answer,
+            "trace": trace,
+            "prompt": build_prompt(
+                &req.question.unwrap_or_default(),
+                &answer.citations,
+                &known_secrets_for_state(&state),
+            )
+        }),
+    )))
 }
 
 async fn create_eval_case(
@@ -1738,37 +1968,56 @@ async fn commit_session(
     ))
 }
 
-async fn llm_status(State(state): State<AppState>) -> Json<LlmStatusResponse> {
+async fn llm_status(_user: UserGuard, State(state): State<AppState>) -> Json<LlmStatusResponse> {
     let config = state.effective_config();
     let status = llm_client_from_config(&config).status().await;
     Json(LlmStatusResponse {
+        auth_source: sanitized_llm_auth_source(&status.provider, &status.auth_source),
         provider: status.provider,
         model: status.model,
-        auth_source: status.auth_source,
         healthy: status.healthy,
     })
+}
+
+fn sanitized_llm_auth_source(provider: &str, auth_source: &str) -> String {
+    match provider {
+        "none" => "none",
+        "mock" => "mock",
+        "codex_auth" if auth_source == "explicit_path_missing" => "missing",
+        "codex_auth" => "codex_file",
+        _ if auth_source.is_empty() => "missing",
+        _ => "environment",
+    }
+    .to_string()
 }
 
 async fn llm_test(
     _admin: AdminGuard,
     State(state): State<AppState>,
     Json(req): Json<LlmTestRequest>,
-) -> Result<Json<LlmTestResponse>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let config = state.effective_config();
-    let client = llm_client_from_config(&config);
+    let security = state.config.provider_security_snapshot();
+    let client = llm_client_from_config_with_credentials(&config, security.credentials);
     let status = client.status().await;
     let response = client
         .complete_text(LlmRequest {
-            prompt: req.prompt.unwrap_or_else(|| "ping".to_string()),
+            prompt: redact_egress_text(
+                &req.prompt.unwrap_or_else(|| "ping".to_string()),
+                &security.secrets,
+            ),
         })
         .await?;
-    Ok(Json(LlmTestResponse {
+    let response = LlmTestResponse {
         ok: true,
         model: status.model,
         latency_ms: response.latency_ms,
         usage: response.usage,
         sample: response.text,
-    }))
+    };
+    let response =
+        serde_json::to_value(response).map_err(|error| ApiError::Internal(error.to_string()))?;
+    Ok(Json(redact_for_state(&state, response)))
 }
 
 /// Summarize `content` into a short title via the configured LLM. Available
@@ -1778,7 +2027,7 @@ async fn llm_title(
     _user: UserGuard,
     State(state): State<AppState>,
     Json(req): Json<LlmTitleRequest>,
-) -> Result<Json<LlmTitleResponse>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let content = req.content.trim();
     if content.is_empty() {
         return Err(ApiError::bad_request("content is required"));
@@ -1799,26 +2048,35 @@ async fn llm_title(
         .map(|s| format!("\nThe user proposed this draft to refine: \"{s}\""))
         .unwrap_or_default();
 
-    // Keep prompt size bounded — only the first ~2000 chars are needed to
-    // pick a good title, and longer prompts inflate latency / cost.
-    let truncated: String = content.chars().take(2000).collect();
+    let config = state.effective_config();
+    let security = state.config.provider_security_snapshot();
+    let client = llm_client_from_config_with_credentials(&config, security.credentials.clone());
 
-    let prompt = format!(
-        "You are a precise editor. Produce a single concise title{language_hint} \
+    // Redact before truncating so a credential crossing the 2,000-character
+    // boundary cannot be sent upstream as an unrecognizable partial value.
+    let truncated = redact_egress_text(content, &security.secrets)
+        .chars()
+        .take(2_000)
+        .collect::<String>();
+
+    let prompt = redact_egress_text(
+        &format!(
+            "You are a precise editor. Produce a single concise title{language_hint} \
 that captures the main topic of the document below. Constraints: max {max_chars} \
 characters; no surrounding quotes; no trailing period; no leading numbering or \
 emoji; do NOT wrap in markdown. Return ONLY the title text on one line.{hint_line}\n\n\
 Document:\n{truncated}"
+        ),
+        &security.secrets,
     );
 
-    let config = state.effective_config();
-    let client = llm_client_from_config(&config);
     let status = client.status().await;
     let response = client.complete_text(LlmRequest { prompt }).await?;
 
     // Clean up common LLM artifacts: surrounding quotes, leading "Title:",
     // trailing punctuation, newlines, and enforce the soft length cap.
-    let mut title = response.text.trim().to_string();
+    let safe_response = redact_text_for_state(&state, &response.text);
+    let mut title = safe_response.trim().to_string();
     title = title.trim_start_matches('#').trim().to_string();
     for prefix in ["Title:", "title:", "TITLE:", "Title -", "title -"] {
         if let Some(rest) = title.strip_prefix(prefix) {
@@ -1839,20 +2097,26 @@ Document:\n{truncated}"
         title = "Untitled".to_string();
     }
 
-    Ok(Json(LlmTitleResponse {
+    let response = LlmTitleResponse {
         title,
         model: status.model,
         latency_ms: response.latency_ms,
         usage: response.usage,
-    }))
+    };
+    let response =
+        serde_json::to_value(response).map_err(|error| ApiError::Internal(error.to_string()))?;
+    Ok(Json(redact_for_state(&state, response)))
 }
 
 async fn get_trace(
     _admin: AdminGuard,
     State(state): State<AppState>,
     Path(trace_id): Path<String>,
-) -> Result<Json<TraceRecord>, ApiError> {
-    Ok(Json(state.store.get_trace_async(&trace_id).await?))
+) -> Result<Json<Value>, ApiError> {
+    let trace = state.store.get_trace_async(&trace_id).await?;
+    let trace =
+        serde_json::to_value(trace).map_err(|error| ApiError::Internal(error.to_string()))?;
+    Ok(Json(redact_for_state(&state, trace)))
 }
 
 async fn debug_meili_search(
@@ -1880,7 +2144,11 @@ async fn prompt_preview(
     Json(req): Json<RagAnswerRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let answer = answer_rag_with_llm(&state, req.clone(), true).await?;
-    let prompt = build_prompt(&req.question.unwrap_or_default(), &answer.citations);
+    let prompt = build_prompt(
+        &req.question.unwrap_or_default(),
+        &answer.citations,
+        &known_secrets_for_state(&state),
+    );
     Ok(Json(redact_for_state(
         &state,
         json!({
@@ -1902,22 +2170,16 @@ async fn answer_rag_with_llm(
         .await?;
     let config = state.effective_config();
     if config.llm_provider != "none" {
-        let client = llm_client_from_config(&config);
+        let security = state.config.provider_security_snapshot();
+        let client = llm_client_from_config_with_credentials(&config, security.credentials.clone());
         let status = client.status().await;
-        let prompt = build_prompt(&req.question.unwrap_or_default(), &answer.citations);
-        let prompt = redact_string(
-            &prompt,
-            &[
-                config.openai_api_key.clone().unwrap_or_default(),
-                config
-                    .codex_auth_path
-                    .as_deref()
-                    .and_then(crate::llm::read_codex_auth_token)
-                    .unwrap_or_default(),
-            ],
+        let prompt = build_prompt(
+            &req.question.unwrap_or_default(),
+            &answer.citations,
+            &security.secrets,
         );
         let llm = client.complete_text(LlmRequest { prompt }).await?;
-        answer.answer = llm.text;
+        answer.answer = redact_text_for_state(state, &llm.text);
         let mut usage = json!({
             "provider": status.provider,
             "model": status.model,
@@ -1996,9 +2258,18 @@ async fn run_analysis_insights(
             )
         };
 
-    let prompt = build_analysis_prompt(&query, &context_hits, &existing_links, &seed_uris);
     let analysis_config = state.config.analysis_llm_config();
-    let client = llm_client_from_config(&analysis_config);
+    let security = state.config.provider_security_snapshot();
+    let client =
+        llm_client_from_config_with_credentials(&analysis_config, security.credentials.clone());
+    let known_secrets = security.secrets;
+    let prompt = build_analysis_prompt(
+        &query,
+        &context_hits,
+        &existing_links,
+        &seed_uris,
+        &known_secrets,
+    );
     let status = client.status().await;
     let mut usage = json!({
         "provider": status.provider,
@@ -2013,25 +2284,30 @@ async fn run_analysis_insights(
         });
     }
 
-    let mut draft = deterministic_analysis_draft(&query, &context_hits);
+    let allowed_uris =
+        analysis_allowed_uris(&context_hits, &existing_links, &seed_uris, &known_secrets);
+    let mut draft = sanitize_analysis_draft(
+        deterministic_analysis_draft(&query, &context_hits),
+        &allowed_uris,
+        &known_secrets,
+    );
     if analysis_config.llm_provider != "none" {
-        let prompt = redact_string(
-            &prompt,
-            &[
-                analysis_config.openai_api_key.clone().unwrap_or_default(),
-                analysis_config
-                    .codex_auth_path
-                    .as_deref()
-                    .and_then(crate::llm::read_codex_auth_token)
-                    .unwrap_or_default(),
-            ],
-        );
-        let llm = client.complete_text(LlmRequest { prompt }).await?;
+        let llm = client
+            .complete_text(LlmRequest {
+                prompt: prompt.clone(),
+            })
+            .await?;
         if let Some(parsed) = parse_analysis_draft(&llm.text) {
+            let parsed = sanitize_analysis_draft(parsed, &allowed_uris, &known_secrets);
             draft = merge_analysis_drafts(parsed, draft);
         }
         usage["latency_ms"] = json!(llm.latency_ms);
-        usage["raw_response_preview"] = json!(truncate_for_json(&llm.text, 500));
+        if req.debug {
+            usage["raw_response_preview"] = json!(truncate_for_json(
+                &redact_text_for_state(state, &llm.text),
+                500
+            ));
+        }
         if let Some(tokens) = llm.usage.as_ref() {
             merge_token_usage(&mut usage, tokens);
         }
@@ -2169,7 +2445,7 @@ async fn history_analysis_scope(
 
     let context_hits = events
         .iter()
-        .map(|event| history_event_context_hit(event, query))
+        .map(|event| history_event_context_hit(state, event, query))
         .collect::<Vec<_>>();
     let allowed_uris = context_hits
         .iter()
@@ -2206,7 +2482,7 @@ async fn history_analysis_scope(
     })
 }
 
-fn history_event_context_hit(event: &HistoryEvent, query: &str) -> ContextHit {
+fn history_event_context_hit(state: &AppState, event: &HistoryEvent, query: &str) -> ContextHit {
     let uri = format!(
         "ctx://user/history/{}/{}/detail",
         sanitize_slug(&event.event_type),
@@ -2240,30 +2516,41 @@ fn history_event_context_hit(event: &HistoryEvent, query: &str) -> ContextHit {
         neighbor_fragments: Vec::new(),
         related_links: Vec::new(),
         score_breakdown: None,
-        snippet: truncate_chars(&event.text, 240),
+        snippet: redact_and_truncate_text_for_state(state, &event.text, 240),
     }
 }
 
-fn build_prompt(question: &str, citations: &[Citation]) -> String {
+fn build_prompt(question: &str, citations: &[Citation], known_secrets: &[String]) -> String {
     let context = citations
         .iter()
         .enumerate()
         .map(|(idx, citation)| {
-            let source_title = citation
-                .source_title
-                .as_deref()
-                .unwrap_or(citation.title.as_str());
+            let source_title = redact_egress_text(
+                citation
+                    .source_title
+                    .as_deref()
+                    .unwrap_or(citation.title.as_str()),
+                known_secrets,
+            );
             let mut location = Vec::new();
             if let Some(page_idx) = citation.page_idx {
                 location.push(format!("page_idx={page_idx}"));
             }
             if let Some(block_type) = citation.block_type.as_deref() {
-                location.push(format!("block_type={block_type}"));
+                location.push(format!(
+                    "block_type={}",
+                    redact_string(block_type, known_secrets)
+                ));
             }
             if !citation.section_path.is_empty() {
                 location.push(format!(
                     "section_path={}",
-                    citation.section_path.join(" > ")
+                    citation
+                        .section_path
+                        .iter()
+                        .map(|part| redact_egress_text(part, known_secrets))
+                        .collect::<Vec<_>>()
+                        .join(" > ")
                 ));
             }
             let location = if location.is_empty() {
@@ -2276,13 +2563,16 @@ fn build_prompt(question: &str, citations: &[Citation]) -> String {
                 idx + 1,
                 source_title,
                 location,
-                citation.uri,
-                citation.quote
+                redact_locator(&citation.uri, known_secrets),
+                redact_egress_text(&citation.quote, known_secrets)
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    format!("Question:\n{question}\n\nContextFS staged context:\n{context}")
+    format!(
+        "Question:\n{}\n\nContextFS staged context:\n{context}",
+        redact_egress_text(question, known_secrets)
+    )
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2298,13 +2588,16 @@ fn build_analysis_prompt(
     hits: &[ContextHit],
     links: &[KnowledgeLink],
     seed_uris: &[String],
+    known_secrets: &[String],
 ) -> String {
     let context = hits
         .iter()
         .map(|hit| {
             format!(
                 "- uri: {}\n  title: {}\n  snippet: {}",
-                hit.uri, hit.title, hit.snippet
+                redact_locator(&hit.uri, known_secrets),
+                redact_egress_text(&hit.title, known_secrets),
+                redact_egress_text(&hit.snippet, known_secrets)
             )
         })
         .collect::<Vec<_>>()
@@ -2314,21 +2607,29 @@ fn build_analysis_prompt(
         .map(|link| {
             format!(
                 "- {} --{}--> {} ({})",
-                link.source_uri,
-                link.relation,
-                link.target_uri,
-                link.rationale.as_deref().unwrap_or("no rationale")
+                redact_locator(&link.source_uri, known_secrets),
+                redact_string(&link.relation, known_secrets),
+                redact_locator(&link.target_uri, known_secrets),
+                redact_egress_text(
+                    link.rationale.as_deref().unwrap_or("no rationale"),
+                    known_secrets,
+                )
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
     format!(
         "Analyze ingested Nowledge context and propose Obsidian-style bidirectional associations plus durable insights.\n\
-Return strict JSON with this shape: {{\"links\":[{{\"source_uri\":\"ctx://...\",\"target_uri\":\"ctx://...\",\"relation\":\"related\",\"rationale\":\"why\",\"confidence\":0.7}}],\"insights\":[{{\"insight_type\":\"analysis\",\"title\":\"short title\",\"statement\":\"grounded statement\",\"confidence\":0.7,\"salience\":0.5,\"source_uris\":[\"ctx://...\"]}}]}}.\n\
-Query: {query}\n\
-Seed URIs: {seed_uris:?}\n\
-Context hits:\n{context}\n\
-Existing links:\n{existing_links}"
+    Return strict JSON with this shape: {{\"links\":[{{\"source_uri\":\"ctx://...\",\"target_uri\":\"ctx://...\",\"relation\":\"related\",\"rationale\":\"why\",\"confidence\":0.7}}],\"insights\":[{{\"insight_type\":\"analysis\",\"title\":\"short title\",\"statement\":\"grounded statement\",\"confidence\":0.7,\"salience\":0.5,\"source_uris\":[\"ctx://...\"]}}]}}.\n\
+    Query: {query}\n\
+    Seed URIs: {seed_uris:?}\n\
+    Context hits:\n{context}\n\
+    Existing links:\n{existing_links}",
+        query = redact_egress_text(query, known_secrets),
+        seed_uris = seed_uris
+            .iter()
+            .map(|uri| redact_locator(uri, known_secrets))
+            .collect::<Vec<_>>(),
     )
 }
 
@@ -2390,6 +2691,71 @@ fn parse_analysis_draft(text: &str) -> Option<AnalysisDraft> {
         .filter(|draft| !draft.links.is_empty() || !draft.insights.is_empty())
 }
 
+fn analysis_allowed_uris(
+    hits: &[ContextHit],
+    links: &[KnowledgeLink],
+    seed_uris: &[String],
+    known_secrets: &[String],
+) -> HashSet<String> {
+    hits.iter()
+        .map(|hit| hit.uri.as_str())
+        .chain(seed_uris.iter().map(String::as_str))
+        .chain(
+            links
+                .iter()
+                .flat_map(|link| [link.source_uri.as_str(), link.target_uri.as_str()].into_iter()),
+        )
+        .map(canonical_analysis_uri)
+        .filter(|uri| redact_locator(uri, known_secrets) == *uri)
+        .collect()
+}
+
+fn sanitize_analysis_draft(
+    draft: AnalysisDraft,
+    allowed_uris: &HashSet<String>,
+    known_secrets: &[String],
+) -> AnalysisDraft {
+    let links = draft
+        .links
+        .into_iter()
+        .filter_map(|candidate| {
+            let source_uri = canonical_analysis_uri(&candidate.source_uri);
+            let target_uri = canonical_analysis_uri(&candidate.target_uri);
+            if !allowed_uris.contains(&source_uri) || !allowed_uris.contains(&target_uri) {
+                return None;
+            }
+            Some(LinkCandidate {
+                source_uri,
+                target_uri,
+                relation: redact_string(&candidate.relation, known_secrets),
+                rationale: candidate
+                    .rationale
+                    .as_deref()
+                    .map(|value| redact_egress_text(value, known_secrets)),
+                confidence: candidate.confidence,
+            })
+        })
+        .collect();
+    let insights = draft
+        .insights
+        .into_iter()
+        .map(|candidate| InsightCandidate {
+            insight_type: redact_string(&candidate.insight_type, known_secrets),
+            title: redact_egress_text(&candidate.title, known_secrets),
+            statement: redact_egress_text(&candidate.statement, known_secrets),
+            confidence: candidate.confidence,
+            salience: candidate.salience,
+            source_uris: candidate
+                .source_uris
+                .into_iter()
+                .map(|uri| canonical_analysis_uri(&uri))
+                .filter(|uri| allowed_uris.contains(uri))
+                .collect(),
+        })
+        .collect();
+    AnalysisDraft { links, insights }
+}
+
 fn merge_analysis_drafts(primary: AnalysisDraft, fallback: AnalysisDraft) -> AnalysisDraft {
     AnalysisDraft {
         links: if primary.links.is_empty() {
@@ -2434,19 +2800,461 @@ fn require_owner_for_write(user: &UserGuard, owner_user_id: Option<&str>) -> Res
     }
 }
 
+fn require_explicit_owner_for_unbound_private_read(
+    user: &UserGuard,
+    owner_user_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let is_tenant_service = !user.principal.is_admin() && user.principal.owner_user_id().is_none();
+    if is_tenant_service && owner_user_id.is_none() {
+        Err(ApiError::forbidden(
+            "owner_user_id is required for tenant-service private access",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn audit_shared_write<T>(
+    result: Result<T, ApiError>,
+    principal: &Principal,
+    state: &AppState,
+    action: &str,
+    resource_id: &str,
+    reason: &str,
+) -> Result<T, ApiError> {
+    match &result {
+        Ok(_) => emit_shared_mutation_audit(
+            Some(principal),
+            state,
+            action,
+            resource_id,
+            reason,
+            "success",
+            None,
+        ),
+        Err(error) => emit_shared_mutation_audit(
+            Some(principal),
+            state,
+            action,
+            resource_id,
+            reason,
+            "failure",
+            Some(api_error_kind(error)),
+        ),
+    }
+    result
+}
+
+pub(crate) fn audit_shared_write_denial(
+    principal: Option<&Principal>,
+    state: &AppState,
+    method: &Method,
+    path: &str,
+    reason: &str,
+    error: &ApiError,
+) {
+    let Some((action, resource_id)) = shared_mutation_audit_target(method, path) else {
+        return;
+    };
+    emit_shared_mutation_audit(
+        principal,
+        state,
+        action,
+        &resource_id,
+        reason,
+        "denied",
+        Some(api_error_kind(error)),
+    );
+}
+
+fn shared_mutation_audit_target(method: &Method, path: &str) -> Option<(&'static str, String)> {
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match (method, segments.as_slice()) {
+        (&Method::POST, ["v1", "state", "company-docs", "preflight"]) => {
+            Some(("company_doc.preflight", "company-doc:preflight".to_string()))
+        }
+        (&Method::POST, ["v1", "state", "company-docs", source_id, "revisions"]) => {
+            Some(("company_doc.create_revision", (*source_id).to_string()))
+        }
+        (
+            &Method::POST,
+            ["v1", "state", "company-docs", source_id, "revisions", revision_id, "activate"],
+        ) => Some((
+            "company_doc.activate_revision",
+            format!("{source_id}:{revision_id}"),
+        )),
+        (&Method::PUT, ["v1", "state", "structured", "datasets", dataset_key]) => {
+            Some(("dataset.upsert_schema", (*dataset_key).to_string()))
+        }
+        (&Method::DELETE, ["v1", "state", "company-docs", source_id]) => {
+            Some(("company_doc.delete", (*source_id).to_string()))
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_shared_mutation_audit(
+    principal: Option<&Principal>,
+    state: &AppState,
+    action: &str,
+    resource_id: &str,
+    reason: &str,
+    outcome: &str,
+    error_kind: Option<&str>,
+) {
+    let request_id = request_context::current_or_new_id();
+    let resource_id = audit_identifier(&state.config, "resource", resource_id);
+    let tenant_id = audit_identifier(&state.config, "tenant", state.tenant_id());
+    let principal_scope = principal
+        .map(Principal::scope_label)
+        .unwrap_or("unauthenticated");
+    let owner_user_id = principal
+        .and_then(Principal::owner_user_id)
+        .map(|owner| audit_identifier(&state.config, "principal-owner", owner))
+        .unwrap_or_else(|| "none".to_string());
+    let (reason_code, reason_fingerprint) = audit_reason(&state.config, reason);
+    if outcome == "success" {
+        tracing::info!(
+            target: "nowledge::audit",
+            %request_id,
+            %tenant_id,
+            principal_scope,
+            principal_owner_user_id = %owner_user_id,
+            action,
+            %resource_id,
+            reason = reason_code,
+            %reason_fingerprint,
+            outcome,
+            "shared knowledge mutation"
+        );
+    } else {
+        tracing::warn!(
+            target: "nowledge::audit",
+            %request_id,
+            %tenant_id,
+            principal_scope,
+            principal_owner_user_id = %owner_user_id,
+            action,
+            %resource_id,
+            reason = reason_code,
+            %reason_fingerprint,
+            outcome,
+            error_kind = error_kind.unwrap_or("unknown"),
+            "shared knowledge mutation"
+        );
+    }
+}
+
+fn audit_identifier(config: &Config, namespace: &str, value: &str) -> String {
+    format!(
+        "hmac:{}",
+        hmac_hex(&config.index_hash_secret, namespace, value, 16)
+    )
+}
+
+fn audit_reason(config: &Config, reason: &str) -> (&'static str, String) {
+    let reason_code = match reason {
+        "authentication_failed" => "authentication_failed",
+        "company_writer_required" => "company_writer_required",
+        "admin_required" => "admin_required",
+        "preflight_requested" => "preflight_requested",
+        "revision_create_requested" => "revision_create_requested",
+        "activation_reason_unspecified" => "activation_reason_unspecified",
+        "admin_delete" => "admin_delete",
+        "schema_upsert" => "schema_upsert",
+        _ => "caller_supplied",
+    };
+    let reason_fingerprint = format!(
+        "hmac:{}",
+        hmac_hex(&config.index_hash_secret, "audit-reason", reason, 16,)
+    );
+    (reason_code, reason_fingerprint)
+}
+
+fn api_error_kind(error: &ApiError) -> &'static str {
+    match error {
+        ApiError::BadRequest(_) => "bad_request",
+        ApiError::Unauthorized(_) => "unauthorized",
+        ApiError::Forbidden(_) => "forbidden",
+        ApiError::NotFound(_) => "not_found",
+        ApiError::Conflict(_) => "conflict",
+        ApiError::Upstream(_) => "upstream_error",
+        ApiError::Internal(_) => "internal_error",
+    }
+}
+
 fn redact_for_state(state: &AppState, value: Value) -> Value {
-    let mut secrets = Vec::new();
-    if let Some(token) = &state.config.bearer_token {
-        secrets.push(token.clone());
+    redact_secrets(&value, &known_secrets_for_state(state))
+}
+
+fn redact_text_for_state(state: &AppState, value: &str) -> String {
+    redact_egress_text(value, &known_secrets_for_state(state))
+}
+
+fn redact_and_truncate_text_for_state(state: &AppState, value: &str, max: usize) -> String {
+    redact_text_for_state(state, value)
+        .chars()
+        .take(max)
+        .collect()
+}
+
+fn known_secrets_for_state(state: &AppState) -> Vec<String> {
+    state.config.configured_secret_values()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn json_response_redaction_fails_closed_for_oversized_or_malformed_bodies() {
+        let config = Config::test();
+        let oversized = (
+            [(CONTENT_TYPE, "application/json")],
+            json!({ "body": "x".repeat(128) }).to_string(),
+        )
+            .into_response();
+        let oversized = sanitize_json_response(oversized, &config, 64).await;
+        assert_eq!(oversized.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let oversized_body = to_bytes(oversized.into_body(), 1_024).await.unwrap();
+        let oversized_body: Value = serde_json::from_slice(&oversized_body).unwrap();
+        assert_eq!(oversized_body["error"]["code"], "internal_error");
+        assert_eq!(oversized_body["error"]["message"], "internal server error");
+
+        let malformed = ([(CONTENT_TYPE, "application/json")], "{not-json").into_response();
+        let malformed = sanitize_json_response(malformed, &config, 1_024).await;
+        assert_eq!(malformed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let malformed_body = to_bytes(malformed.into_body(), 1_024).await.unwrap();
+        assert!(!String::from_utf8_lossy(&malformed_body).contains("not-json"));
     }
-    if let Some(token) = &state.config.admin_token {
-        secrets.push(token.clone());
+
+    #[test]
+    fn rag_prompt_sanitizes_secret_projections_in_each_citation_field() {
+        let secret = "zxqv-provider-prompt-secret-private-value".to_string();
+        let left = &secret[..12];
+        let middle = &secret[12..27];
+        let right = &secret[27..];
+        let citation: Citation = serde_json::from_value(json!({
+            "uri": "ctx://document/stable-source",
+            "source_title": left,
+            "title": left,
+            "quote": right,
+            "score": 1.0,
+            "section_path": [middle]
+        }))
+        .unwrap();
+
+        let prompt = build_prompt(left, &[citation], std::slice::from_ref(&secret));
+
+        assert!(!prompt.contains(left), "{prompt}");
+        assert!(!prompt.contains(middle), "{prompt}");
+        assert!(!prompt.contains(right), "{prompt}");
+        assert!(!prompt.contains(&secret), "{prompt}");
     }
-    if let Some(key) = &state.config.meili_api_key {
-        secrets.push(key.clone());
+
+    #[test]
+    fn rag_prompt_preserves_short_words_that_overlap_human_readable_test_tokens() {
+        let known_secrets = vec!["owner-u1-token".to_string()];
+        let citation: Citation = serde_json::from_value(json!({
+            "uri": "ctx://document/owner-guide",
+            "title": "owner",
+            "quote": "owner guidance",
+            "score": 1.0
+        }))
+        .unwrap();
+
+        let prompt = build_prompt("owner", &[citation], &known_secrets);
+
+        assert!(prompt.contains("Question:\nowner"), "{prompt}");
+        assert!(prompt.contains("owner guidance"), "{prompt}");
     }
-    if let Some(key) = &state.config.openai_api_key {
-        secrets.push(key.clone());
+
+    #[test]
+    fn provider_prompts_preserve_locators_with_incidental_secret_windows() {
+        let known_secrets = vec!["old-token-with-boundary-private-value".to_string()];
+        let uri = "ctx://docs/snippet-boundary-source";
+        let citation: Citation = serde_json::from_value(json!({
+            "uri": uri,
+            "title": "Stable locator",
+            "quote": "ordinary context",
+            "score": 1.0
+        }))
+        .unwrap();
+        let hit: ContextHit = serde_json::from_value(json!({
+            "uri": uri,
+            "title": "Stable locator",
+            "layer": 2,
+            "score": 1.0,
+            "snippet": "ordinary context"
+        }))
+        .unwrap();
+
+        let rag_prompt = build_prompt("question", &[citation], &known_secrets);
+        let analysis_prompt =
+            build_analysis_prompt("query", &[hit], &[], &[uri.to_string()], &known_secrets);
+
+        assert!(rag_prompt.contains(uri), "{rag_prompt}");
+        assert!(
+            analysis_prompt.matches(uri).count() >= 2,
+            "{analysis_prompt}"
+        );
     }
-    redact_secrets(&value, &secrets)
+
+    #[test]
+    fn analysis_prompt_sanitizes_fields_without_corrupting_structural_enums() {
+        let secret = "zxqv-analysis-prompt-secret-private-value".to_string();
+        let enum_secret = "related-service-token".to_string();
+        let left = &secret[..13];
+        let middle = &secret[13..28];
+        let right = &secret[28..];
+        let hit: ContextHit = serde_json::from_value(json!({
+            "uri": "ctx://document/stable-source",
+            "title": left,
+            "layer": 2,
+            "score": 1.0,
+            "snippet": right
+        }))
+        .unwrap();
+        let link: KnowledgeLink = serde_json::from_value(json!({
+            "id": "link-test",
+            "tenant_id": "test-tenant",
+            "owner_user_id": "u1",
+            "source_uri": "ctx://source/stable-left",
+            "target_uri": "ctx://target/stable-right",
+            "relation": "related",
+            "rationale": format!("{middle} {right}"),
+            "confidence": 1.0,
+            "created_by": "test",
+            "status": "active",
+            "tags": [],
+            "created_at": "2026-07-13T00:00:00Z",
+            "updated_at": "2026-07-13T00:00:00Z"
+        }))
+        .unwrap();
+
+        let prompt = build_analysis_prompt(
+            left,
+            &[hit],
+            &[link],
+            &["ctx://seed/stable".to_string()],
+            &[secret.clone(), enum_secret],
+        );
+
+        assert!(prompt.contains("--related-->"), "{prompt}");
+        assert!(!prompt.contains(left), "{prompt}");
+        assert!(!prompt.contains(middle), "{prompt}");
+        assert!(!prompt.contains(right), "{prompt}");
+        assert!(!prompt.contains(&secret), "{prompt}");
+    }
+
+    #[test]
+    fn analysis_model_output_preserves_allowed_locators_and_rejects_unknown_ones() {
+        let known_secrets = vec!["old-token-with-boundary-private-value".to_string()];
+        let allowed = "ctx://docs/snippet-boundary-source".to_string();
+        let unknown = "ctx://docs/model-invented-source";
+        let raw = json!({
+            "links": [
+                {
+                    "source_uri": allowed,
+                    "target_uri": "ctx://docs/second-source",
+                    "relation": "related",
+                    "rationale": "ordinary rationale",
+                    "confidence": 0.8
+                },
+                {
+                    "source_uri": allowed,
+                    "target_uri": unknown,
+                    "relation": "related",
+                    "confidence": 0.5
+                }
+            ],
+            "insights": [{
+                "insight_type": "analysis",
+                "title": "Stable result",
+                "statement": "Grounded statement",
+                "source_uris": [allowed, unknown]
+            }]
+        })
+        .to_string();
+        let parsed = parse_analysis_draft(&raw).unwrap();
+        let allowed_uris = HashSet::from([allowed.clone(), "ctx://docs/second-source".to_string()]);
+
+        let sanitized = sanitize_analysis_draft(parsed, &allowed_uris, &known_secrets);
+
+        assert_eq!(sanitized.links.len(), 1);
+        assert_eq!(sanitized.links[0].source_uri, allowed);
+        assert_eq!(sanitized.links[0].target_uri, "ctx://docs/second-source");
+        assert_eq!(sanitized.insights[0].source_uris, vec![allowed]);
+    }
+
+    #[test]
+    fn rejected_model_links_do_not_discard_grounded_deterministic_fallbacks() {
+        let known_secrets = Vec::new();
+        let allowed_uris = HashSet::from([
+            "ctx://docs/first".to_string(),
+            "ctx://docs/second".to_string(),
+        ]);
+        let fallback = AnalysisDraft {
+            links: vec![LinkCandidate {
+                source_uri: "ctx://docs/first".to_string(),
+                target_uri: "ctx://docs/second".to_string(),
+                relation: "related".to_string(),
+                rationale: None,
+                confidence: 0.6,
+            }],
+            insights: Vec::new(),
+        };
+        let ungrounded_model = AnalysisDraft {
+            links: vec![LinkCandidate {
+                source_uri: "ctx://model/unknown-one".to_string(),
+                target_uri: "ctx://model/unknown-two".to_string(),
+                relation: "related".to_string(),
+                rationale: None,
+                confidence: 0.9,
+            }],
+            insights: Vec::new(),
+        };
+
+        let fallback = sanitize_analysis_draft(fallback, &allowed_uris, &known_secrets);
+        let model = sanitize_analysis_draft(ungrounded_model, &allowed_uris, &known_secrets);
+        let merged = merge_analysis_drafts(model, fallback);
+
+        assert_eq!(merged.links.len(), 1);
+        assert_eq!(merged.links[0].source_uri, "ctx://docs/first");
+        assert_eq!(merged.links[0].target_uri, "ctx://docs/second");
+    }
+
+    #[tokio::test]
+    async fn llm_title_redacts_configured_secrets_before_prompt_truncation() {
+        let secret = "private-boundary-secret-value";
+        let mut config = Config::test();
+        config.admin_token = Some(secret.to_string());
+        let state = AppState::new(Arc::new(config));
+        let content = format!("{}{secret}", "x".repeat(1_992));
+
+        let truncated = redact_and_truncate_text_for_state(&state, &content, 2_000);
+
+        assert_eq!(truncated.chars().count(), 2_000);
+        assert!(!truncated.contains("private-"));
+        assert!(!truncated.contains(secret));
+    }
+
+    #[test]
+    fn audit_identifiers_and_caller_reasons_are_never_logged_raw() {
+        let config = Config::test();
+        let raw_identifier = "tenant/private-owner/source-id";
+        let identifier = audit_identifier(&config, "resource", raw_identifier);
+        assert!(identifier.starts_with("hmac:"));
+        assert!(!identifier.contains(raw_identifier));
+
+        let raw_reason = "activate because /private/auth.json contains a provider token";
+        let (reason_code, reason_fingerprint) = audit_reason(&config, raw_reason);
+        assert_eq!(reason_code, "caller_supplied");
+        assert!(reason_fingerprint.starts_with("hmac:"));
+        assert!(!reason_fingerprint.contains(raw_reason));
+
+        let (system_code, _) = audit_reason(&config, "company_writer_required");
+        assert_eq!(system_code, "company_writer_required");
+    }
 }

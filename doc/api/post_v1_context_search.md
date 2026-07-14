@@ -101,6 +101,12 @@ Schema: `ContextSearchResponse`
 | score_breakdown | object? | Score details when requested: `lexical`, `vector`, `document_vector` (each when scored), and `combined`. |
 | snippet | string | Search snippet from the matching fragment. |
 
+Snippets are sanitized from the full fragment before truncation. Query-time
+projection masks exact secrets, four-character fragment pieces, and longer
+internal token windows in legacy fragments, adjacent parsed blocks, or data
+ingested before a credential rotation. General response and provider text uses
+an eight-character heuristic floor to avoid rewriting ordinary short words.
+
 ### ContextSourceGroup Fields
 | Field | Type | Description |
 | --- | --- | --- |

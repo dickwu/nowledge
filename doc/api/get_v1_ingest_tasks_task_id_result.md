@@ -19,6 +19,9 @@ Return the completed `IngestTaskResult` for a visible ingest task.
 ## Rules
 
 - Result ACL follows the task owner.
+- Failed tasks return the fixed conflict message `ingest task failed`; inspect
+  the task endpoint for its stable failure code. Raw upstream causes are
+  available only through bounded, redacted server diagnostics.
 - Parse artifacts and source documents are returned as metadata only; source docs are not part of default retrieval.
 
 ```mermaid

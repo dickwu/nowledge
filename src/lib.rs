@@ -7,6 +7,7 @@ pub mod meili;
 pub mod models;
 pub mod parser;
 pub mod repository;
+pub mod request_context;
 pub mod resolver;
 pub mod routes;
 pub mod store;

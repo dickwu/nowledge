@@ -44,11 +44,16 @@ Useful environment variables:
 RAG_HOST=127.0.0.1
 RAG_PORT=14242
 RAG_TENANT_ID=default
-RAG_INDEX_HASH_SECRET=change-me
+RAG_INDEX_HASH_SECRET=
+RAG_ALLOW_LEGACY_WEAK_INDEX_HASH_SECRET=false
 RAG_STORE_BACKEND=memory
 RAG_BEARER_TOKEN=optional-user-token
+RAG_BEARER_TOKEN_SCOPE=owner
+RAG_BEARER_TOKEN_OWNER_USER_ID=owner-user-id
+RAG_ALLOW_LEGACY_TENANT_SERVICE_BEARER=false
+RAG_ALLOW_LEGACY_SHARED_WRITER=false
 RAG_ADMIN_TOKEN=optional-admin-token
-RAG_AUTH_USERS=owner-user-id:user-token:user
+RAG_AUTH_USERS=owner-user-id:user-token:user,*:service-token:user,writer-owner:writer-token:user|company_writer
 RAG_RUN_MODE=development
 RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true
 RAG_MEILI_URL=http://127.0.0.1:7700
@@ -77,6 +82,7 @@ RAG_ANALYSIS_LLM_MODEL=gpt-5.3-codex-spark
 RAG_ANALYSIS_LLM_REASONING_EFFORT=optional-low-medium-high-xhigh
 RAG_OPENAI_API_KEY=optional-openai-key
 RAG_CODEX_AUTH_PATH=optional-explicit-codex-auth-json
+RAG_REDACTION_PREVIOUS_SECRETS=optional-revoked-token,optional-prior-token
 RAG_HEALTH_LLM_ENABLED=true
 RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS=30
 RAG_HEALTH_LLM_PROBE_TTL_SECONDS=60
@@ -85,21 +91,81 @@ RAG_HEALTH_LLM_TIMEOUT_MS=10000
 RAG_HEALTH_REQUIRE_LLM=true
 ```
 
+Production requires an independently generated `RAG_INDEX_HASH_SECRET` of at
+least 32 bytes with at least 12 distinct byte values. The public development
+default, the previously documented `change-me`, and literal documentation
+placeholders are rejected; do not reuse an authentication credential. Generate
+a new value once with `openssl rand -base64 48`, store it in the service's
+secret manager, and keep it stable. This key protects owner/index derivation
+plus audit and error fingerprints.
+
+Changing this key changes every per-user event and personal-context index UID.
+Before upgrading an existing Meilisearch deployment, classify its current key
+without printing it. If the deployment already uses a weak key, preserve that
+exact value and temporarily set
+`RAG_ALLOW_LEGACY_WEAK_INDEX_HASH_SECRET=true`; rotating it in place would make
+the existing indexes unreachable. New deployments must never enable this flag.
+Remove it only after the `index_hash_secret_v1` migration/reindex has completed
+and been verified. The compatibility path expires on 2026-10-01 / v0.13.0.
+
+`RAG_RUN_MODE` accepts only `development`, `test`, or `production`; unknown
+values are startup errors and never enable unauthenticated access by default.
+
 Use `RAG_STORE_BACKEND=meili` with `RAG_MEILI_URL` to mirror core writes to
 Meilisearch and search per-user event indexes through Meilisearch. Production
 mode requires configured auth unless `RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true` is
 set explicitly.
 
+Authentication data scope is explicit. A named owner in `RAG_AUTH_USERS` creates
+an owner-bound principal; the literal owner `*` creates a tenant-service
+principal. Feature roles do not widen data scope: an owner-bound
+`company_writer` can mutate shared company knowledge but still cannot read a
+different owner's private data. `*:token:admin` creates admin scope (the
+reserved `admin` value is a scope marker, not a feature role), while new admin
+credentials should prefer `RAG_ADMIN_TOKEN`. Legacy named-owner
+`owner:token:admin` entries temporarily retain admin scope and emit a startup
+warning; migrate them to `*:token:admin` or `RAG_ADMIN_TOKEN` before the
+compatibility window ends on 2026-10-01 in v0.13.0.
+
+Every bearer, admin, and `RAG_AUTH_USERS` credential must contain at least eight
+characters. Other configured secrets used by the response redactor—including
+Meilisearch/OpenAI keys, a readable index-HMAC key, Codex auth-file tokens, and
+explicit previous secrets—must contain at least four characters. Empty,
+whitespace-padded, duplicate authentication credentials and shorter values are
+startup errors; error text never echoes the rejected value.
+
+The legacy `RAG_BEARER_TOKEN` must set `RAG_BEARER_TOKEN_SCOPE=owner` together
+with `RAG_BEARER_TOKEN_OWNER_USER_ID`, or set
+`RAG_BEARER_TOKEN_SCOPE=tenant_service`. Existing intentional tenant-service
+clients may temporarily set `RAG_ALLOW_LEGACY_TENANT_SERVICE_BEARER=true`; that
+compatibility switch is removed on 2026-10-01 in v0.13.0. Company-document
+preflight, revision creation/activation, and dataset-schema upserts require the
+`company_writer` role or admin scope by default. Operators may temporarily set
+`RAG_ALLOW_LEGACY_SHARED_WRITER=true` to preserve ordinary authenticated access
+to those shared writes while clients migrate; it emits a startup warning and
+has the same removal deadline. Company-document deletion remains admin-only.
+See [ADR 0002](doc/adr/0002-principal-scope-and-diagnostics.md) for rollout and
+rollback details.
+
+Tenant-service principals must select `owner_user_id` for private state-fact,
+state-search, and insight-search reads; omission returns 403 instead of
+implicitly searching whichever private owner happens to exist.
+
 Health endpoints split process liveness from operational readiness:
 
-- `GET /livez` returns only `{"status":"ok"}` and does not query Meilisearch or
-  LLM providers.
-- `GET /healthz` checks Meilisearch plus the configured LLM provider/model,
-  including auth validity, quota/rate-limit state, stale probe state, and a
-  compact usage summary. If `RAG_HEALTH_REQUIRE_LLM=true`, an unconfigured or
-  exhausted LLM makes the service unhealthy.
-- The `llm.rate_limits` block carries the freshest live provider budget
-  snapshot. For `codex_auth` it is parsed from the ChatGPT Codex `x-codex-*`
+- `GET /livez` returns process status plus build version/revision and does not
+  query Meilisearch or LLM providers.
+- `GET /readyz` is public for load balancers. It preserves the operational
+  readiness decision and 200/503 status semantics while returning only coarse
+  dependency state; it does not expose raw provider payloads, usage/private
+  counts, plan data, credits, or credential sources.
+- `GET /healthz` requires an admin bearer and checks Meilisearch plus the
+  configured parser and LLM provider/model, including auth validity,
+  quota/rate-limit state, stale probe state, and a compact usage summary. If
+  `RAG_HEALTH_REQUIRE_LLM=true`, an unconfigured or exhausted LLM makes the
+  service unhealthy.
+- The protected health `llm.rate_limits` block carries the freshest live
+  provider budget snapshot. For `codex_auth` it is parsed from the ChatGPT Codex `x-codex-*`
   response headers on every health probe and real completion: `primary` (5h)
   and `secondary` (weekly) windows with `used_percent` / `remaining_percent` /
   reset times, `plan_type`, credits, and model-scoped `additional_limits`.
@@ -110,9 +176,46 @@ Health endpoints split process liveness from operational readiness:
   their `usage` blocks (`input_tokens`, `cached_input_tokens`,
   `output_tokens`, `reasoning_output_tokens`, `total_tokens`) whenever the
   upstream reports them, so consumers no longer need char-based estimates.
-- `GET /readyz` uses the same readiness decision as `/healthz`.
-- `GET /v1/usage` returns owner-scoped provider snapshots for ordinary users and
-  global provider snapshots for admins.
+  Configured secrets are redacted before provider submission, model-output
+  persistence/materialization, and response serialization. Analysis parses the
+  provider JSON before redaction, validates proposed link locators against the
+  prompt's context/seed/existing-link locator set, and then sanitizes free text.
+- `GET /v1/usage` returns only the selected owner's usage counters to owner and
+  tenant-service principals. Global counters and service-wide Meilisearch,
+  parser, and LLM provider diagnostics are admin-only.
+- `GET /v1/llm/status` requires authentication and reports `auth_source` as a
+  category such as `codex_file` or `environment`, never as a filesystem path.
+- Every JSON response passes through a final configured-secret sanitizer,
+  including typed state/history/link responses, sync ingest results, parsed
+  blocks, and explicit ContextFS source-document reads. Object keys and values
+  are covered. JSON bodies above 16 MiB or malformed JSON bodies fail closed
+  instead of bypassing the sanitizer. A background task reads the Codex auth
+  file at most once per second on the blocking pool and atomically publishes one
+  credential snapshot to both LLM clients and redaction; request and liveness
+  paths never read the file. Observed tokens remain in the in-process inventory
+  across rotations and transient auth-file errors. Structural locators remove
+  complete configured secrets but
+  do not apply heuristic fragment/token-shape rewriting, preserving stable
+  `ctx://` navigation when an ordinary slug overlaps part of a credential.
+- Provider previews are redacted before truncation. New ingest masks configured
+  secrets with equal-length placeholders before fragmenting so provenance
+  offsets remain stable; retrieval also masks configured-secret pieces at
+  fragment boundaries. That second boundary prevents legacy data or a
+  post-ingest credential rotation from sending split token halves to a provider
+  or returning them in content-bearing JSON fields.
+
+Before restarting after a credential rotation, place any revoked value that
+can still occur in persisted documents in the comma-separated
+`RAG_REDACTION_PREVIOUS_SECRETS` secret-manager value. Retain it until those
+records are reingested or scrubbed. This bridges process restarts without
+logging or returning the prior credential; remove entries only after verifying
+that persisted data no longer contains them.
+
+Every response carries a server-generated `X-Request-Id`. Generic 500 and 502
+error bodies include that safe correlation ID without returning the underlying
+cause. Request failures and best-effort background failures record only an
+allowlisted cause category plus a keyed fingerprint; dynamic task/source IDs
+are omitted or fingerprinted. Raw causes and identifiers are never emitted.
 
 Document parser ingestion is an additive layer in front of the existing RAG
 backend. Use `RAG_PARSER_PROVIDER=builtin` for plain text fallback or

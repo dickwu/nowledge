@@ -32,8 +32,8 @@ Schema: `RagAnswerResponse`
 | --- | --- | --- |
 | answer_id | string | Answer id. |
 | trace_id | string | Retrieval trace id. |
-| answer | string | Generated or store-provided answer. |
-| citations | Citation[] | Grounding citations from retrieval fragments. |
+| answer | string | Generated or store-provided answer after configured-secret redaction. |
+| citations | Citation[] | Grounding citations from retrieval fragments after configured-secret redaction. |
 | usage | object | LLM/backend usage metadata. |
 
 ### Citation Fields
@@ -66,6 +66,8 @@ Schema: `RagAnswerResponse`
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Default RAG retrieval searches only active fragments; source documents are not directly searched.
 - The response shape is currently identical to `/v1/rag/answer`; citations include source/location/block provenance when available.
+- Configured secrets are redacted before provider submission and from the
+  complete response before serialization.
 - Citation `source_document_uri` is metadata only. Full source document bodies are readable only through explicit `GET /v1/fs/read` with ACL checks.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
@@ -75,7 +77,7 @@ flowchart TD
   n0["UserGuard authenticates caller"]
   n1["rag_stream delegates to rag_answer"]
   n2["rag_answer executes fragment retrieval and optional LLM completion"]
-  n3["Return answer response"]
+  n3["Redact configured secrets and return answer response"]
   n0 --> n1
   n1 --> n2
   n2 --> n3

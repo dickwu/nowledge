@@ -6,7 +6,7 @@ Delete a company document source, its revisions, and every company-context fragm
 ## Handler
 - Rust handler: `delete_company_doc`
 - Route registration: `src/routes.rs::build_router`
-- Authentication: UserGuard
+- Authentication: AdminGuard required
 
 ## Path Parameters
 | Name | Type | Description |
@@ -32,15 +32,16 @@ Schema: `JsonValue` (task fields mirror `DeleteSourceReport`)
 | auxiliary_tasks | string[] | Meilisearch task uids for auxiliary tracking-row cleanup; empty on the memory backend. |
 
 ## Errors and Access Rules
-- Malformed JSON or missing required runtime fields returns 400.
+- Missing or invalid bearer authentication returns 401.
+- Authenticated non-admin principals, including `company_writer` and callers admitted by legacy shared-writer mode, return 403.
 - Unknown `source_id` returns 404 (`source not found`) before any Meilisearch call.
-- Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Authorization denials and store success/failure emit structured audit events with keyed identifiers correlated by the response `X-Request-Id`.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope; a Meilisearch rejection leaves in-memory state unchanged.
 
 ## Internal Logic Call Graph
 ```mermaid
 flowchart TD
-  n0["UserGuard authenticates caller"]
+  n0["AdminGuard authenticates admin principal"]
   n1["Existence check on source_id (404 before mutation)"]
   n2["KnowledgeRepository.delete_company_source cascades Meilisearch deletes"]
   n3["Remove source, revisions, and referencing company-context fragments in memory"]

@@ -30,11 +30,13 @@ Schema: `LlmTestResponse`
 | model | string | Model used. |
 | latency_ms | integer | Provider latency. |
 | usage | object? | Real provider token counts (`input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`) when reported. |
-| sample | string | Generated text sample. |
+| sample | string | Generated text sample after configured-secret redaction. |
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Configured secrets are redacted from the prompt before provider submission
+  and from the complete response before serialization.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph
@@ -43,8 +45,8 @@ flowchart TD
   n0["AdminGuard authenticates caller"]
   n1["Build LLM client from effective config"]
   n2["client.status captures model metadata"]
-  n3["client.complete_text sends prompt"]
-  n4["Return latency and sample text"]
+  n3["Redact configured secrets and send prompt with client.complete_text"]
+  n4["Redact configured secrets and return latency plus sample text"]
   n0 --> n1
   n1 --> n2
   n2 --> n3

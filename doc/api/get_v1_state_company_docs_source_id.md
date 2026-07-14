@@ -34,9 +34,9 @@ Schema: `JsonValue`
 | active_revision_id | string or null | The source's canonical active-revision pointer. |
 
 ## Errors and Access Rules
-- Malformed JSON or missing required runtime fields returns 400.
+- Missing or invalid bearer authentication returns 401.
+- Company documents are tenant-shared: authenticated owner, tenant-service, company-writer, and admin principals may read them.
 - Unknown `source_id` returns 404 (`source not found`); a source with zero stored revisions returns 404 (`no revisions for source`).
-- Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph

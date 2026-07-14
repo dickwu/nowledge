@@ -238,10 +238,13 @@ async fn current_persistence_failure_leaves_the_failed_state_write_visible_in_me
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{failed}");
     assert_eq!(failed["error"]["code"], "upstream_error");
-    assert_eq!(failed["error"]["details"], json!({ "status": 502 }));
-    assert!(failed["error"]["message"]
+    assert_eq!(failed["error"]["details"]["status"], 502);
+    let request_id = failed["error"]["details"]["request_id"]
         .as_str()
-        .is_some_and(|message| message.contains("rag_state_items")));
+        .expect("upstream errors include a request correlation ID");
+    assert!(uuid::Uuid::parse_str(request_id).is_ok(), "{request_id}");
+    assert_eq!(failed["error"]["message"], "upstream service unavailable");
+    assert!(!failed.to_string().contains("rag_state_items"), "{failed}");
 
     let (status, visible) = call(
         app,
