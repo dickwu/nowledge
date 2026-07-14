@@ -67,6 +67,13 @@ resolved or governed by explicit policy in the final hygiene phase.
 
 ### Audit discrepancies established locally
 
+- GitHub Actions follows the rolling Rust `stable` channel, which advanced to
+  Rust/Clippy 1.97 after the 1.96.1 local baseline was recorded. The newer
+  `useless_borrows_in_formatting` lint rejected three redundant references in
+  one existing `format!` call. PR 1 removes only those references; formatting
+  macros borrow their arguments internally, so the emitted event text and
+  runtime behavior are unchanged. Toolchain pinning and minimum-supported-Rust
+  policy remain explicit PR 10 decisions rather than an incidental CI repair.
 - Axum 0.8 already imposes an implicit body limit near 2 MiB. Oversized JSON is
   rejected with a framework 413 outside Nowledge's error envelope; oversized
   multipart input is converted to a generic 400 envelope. The missing control is
@@ -244,7 +251,8 @@ do not satisfy a live-integration gate.
 
 ## Rollback policy
 
-PR 1 changes tests and documentation only. Its runtime rollback is a normal
+PR 1 changes tests and documentation plus one behavior-neutral formatting call
+needed by the rolling stable CI toolchain. Its runtime rollback is a normal
 revert; it carries no data migration or production configuration effect.
 
 For every later PR:

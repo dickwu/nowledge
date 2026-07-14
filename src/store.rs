@@ -3276,7 +3276,7 @@ impl Store {
                     &link.id,
                     format!(
                         "Link {} {} {}",
-                        &link.source_uri, &link.relation, &link.target_uri
+                        link.source_uri, link.relation, link.target_uri
                     ),
                     json!({
                         "link_id": &link.id,
