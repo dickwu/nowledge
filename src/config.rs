@@ -22,6 +22,9 @@ const MULTIPART_FRAMING_ALLOWANCE_PER_FIELD_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_BULK_EVENTS: usize = 500;
 const DEFAULT_MAX_BULK_ROWS: usize = 5_000;
 const DEFAULT_MAX_SEARCH_LIMIT: usize = 100;
+pub(crate) const DEFAULT_MEILI_SCAN_PAGE_SIZE: usize = 500;
+pub(crate) const DEFAULT_MEILI_SCAN_MAX_DOCUMENTS: usize = 100_000;
+const MAX_MEILI_SCAN_PAGE_SIZE: usize = 1_000;
 const DEFAULT_MAX_TAGS_PER_ITEM: usize = 64;
 const DEFAULT_MAX_TAG_BYTES: usize = 128;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
@@ -53,6 +56,8 @@ pub struct Config {
     pub meili_url: Option<String>,
     pub meili_api_key: Option<String>,
     pub meili_wait_for_tasks: bool,
+    pub meili_scan_page_size: usize,
+    pub meili_scan_max_documents: usize,
     pub parser_provider: String,
     pub mineru_api_url: String,
     pub mineru_backend: String,
@@ -243,6 +248,16 @@ impl Config {
             meili_wait_for_tasks: std::env::var("RAG_MEILI_WAIT_FOR_TASKS")
                 .map(|v| truthy(&v))
                 .unwrap_or(false),
+            meili_scan_page_size: parse_env_number(
+                "RAG_MEILI_SCAN_PAGE_SIZE",
+                DEFAULT_MEILI_SCAN_PAGE_SIZE,
+                &mut boundary_errors,
+            ),
+            meili_scan_max_documents: parse_env_number(
+                "RAG_MEILI_SCAN_MAX_DOCUMENTS",
+                DEFAULT_MEILI_SCAN_MAX_DOCUMENTS,
+                &mut boundary_errors,
+            ),
             parser_provider: std::env::var("RAG_PARSER_PROVIDER")
                 .unwrap_or_else(|_| "builtin".to_string()),
             mineru_api_url: std::env::var("RAG_MINERU_API_URL")
@@ -644,6 +659,14 @@ impl Config {
             ("RAG_MAX_BULK_EVENTS", self.max_bulk_events as u128),
             ("RAG_MAX_BULK_ROWS", self.max_bulk_rows as u128),
             ("RAG_MAX_SEARCH_LIMIT", self.max_search_limit as u128),
+            (
+                "RAG_MEILI_SCAN_PAGE_SIZE",
+                self.meili_scan_page_size as u128,
+            ),
+            (
+                "RAG_MEILI_SCAN_MAX_DOCUMENTS",
+                self.meili_scan_max_documents as u128,
+            ),
             ("RAG_MAX_TAGS_PER_ITEM", self.max_tags_per_item as u128),
             ("RAG_MAX_TAG_BYTES", self.max_tag_bytes as u128),
             ("RAG_REQUEST_TIMEOUT_MS", self.request_timeout_ms as u128),
@@ -691,6 +714,12 @@ impl Config {
             anyhow::bail!(
                 "RAG_SYNC_INGEST_TIMEOUT_MS must be greater than or equal to RAG_REQUEST_TIMEOUT_MS"
             );
+        }
+        if self.meili_scan_page_size > MAX_MEILI_SCAN_PAGE_SIZE {
+            anyhow::bail!("RAG_MEILI_SCAN_PAGE_SIZE must not exceed {MAX_MEILI_SCAN_PAGE_SIZE}");
+        }
+        if self.meili_scan_page_size > self.meili_scan_max_documents {
+            anyhow::bail!("RAG_MEILI_SCAN_PAGE_SIZE must not exceed RAG_MEILI_SCAN_MAX_DOCUMENTS");
         }
         if self.max_multipart_body_bytes().is_none() {
             anyhow::bail!(
@@ -963,6 +992,8 @@ impl Config {
             meili_url: None,
             meili_api_key: None,
             meili_wait_for_tasks: true,
+            meili_scan_page_size: DEFAULT_MEILI_SCAN_PAGE_SIZE,
+            meili_scan_max_documents: DEFAULT_MEILI_SCAN_MAX_DOCUMENTS,
             parser_provider: "builtin".to_string(),
             mineru_api_url: "http://127.0.0.1:8000".to_string(),
             mineru_backend: "hybrid-auto-engine".to_string(),
@@ -1773,6 +1804,8 @@ mod tests {
         assert_eq!(config.max_json_bytes, 2 * 1024 * 1024);
         assert_eq!(config.max_upload_bytes, 50 * 1024 * 1024);
         assert_eq!(config.ingest_queue_capacity, 16);
+        assert_eq!(config.meili_scan_page_size, 500);
+        assert_eq!(config.meili_scan_max_documents, 100_000);
         assert_eq!(
             config.max_multipart_body_bytes(),
             Some(52 * 1024 * 1024 + 32 * 16 * 1024)
@@ -1802,6 +1835,34 @@ mod tests {
         overflow.max_upload_bytes = usize::MAX;
         assert!(overflow.validate_http_boundaries().is_err());
         assert_eq!(overflow.max_multipart_body_bytes(), None);
+    }
+
+    #[test]
+    fn meili_scan_limits_reject_zero_oversized_and_inverted_values() {
+        let mut zero_page = Config::test();
+        zero_page.meili_scan_page_size = 0;
+        assert!(zero_page
+            .validate_http_boundaries()
+            .unwrap_err()
+            .to_string()
+            .contains("RAG_MEILI_SCAN_PAGE_SIZE"));
+
+        let mut oversized_page = Config::test();
+        oversized_page.meili_scan_page_size = MAX_MEILI_SCAN_PAGE_SIZE + 1;
+        assert!(oversized_page
+            .validate_http_boundaries()
+            .unwrap_err()
+            .to_string()
+            .contains("must not exceed 1000"));
+
+        let mut inverted = Config::test();
+        inverted.meili_scan_page_size = 10;
+        inverted.meili_scan_max_documents = 9;
+        assert!(inverted
+            .validate_http_boundaries()
+            .unwrap_err()
+            .to_string()
+            .contains("RAG_MEILI_SCAN_MAX_DOCUMENTS"));
     }
 
     #[test]

@@ -14,11 +14,12 @@ use axum::{
 };
 use nowledge::{
     build_router,
+    config::{AuthUserConfig, AuthUserScope},
     meili::{task_uid, MeiliAdmin, FIXED_INDEXES},
     models::{
         ContextNode, HarnessChangeManifest, IngestTask, IngestTaskResult, RagEvalCaseResult,
         RagEvalMetrics, RagEvalOverview, RagEvalRun, SourceDocument, StructuredSnapshot,
-        TraceRecord,
+        TraceRecord, UserEventIndex,
     },
     repository::{KnowledgeRepository, MeiliRepository},
     tenant_scope::{
@@ -121,6 +122,22 @@ async fn start_meili_app(config: &Config) -> (AppState, Value, Router) {
         .expect("startup repository hydration should succeed");
     let app = build_router(state.clone());
     (state, hydrated, app)
+}
+
+async fn try_start_meili_app(config: &Config) -> Result<(AppState, Value, Router), String> {
+    let state = AppState::new(Arc::new(config.clone()));
+    state
+        .meili
+        .bootstrap(false)
+        .await
+        .map_err(|error| format!("startup Meilisearch reconciliation failed: {error}"))?;
+    let hydrated = state
+        .store
+        .hydrate_from_repository(&config.tenant_id)
+        .await
+        .map_err(|error| format!("startup repository hydration failed: {error}"))?;
+    let app = build_router(state.clone());
+    Ok((state, hydrated, app))
 }
 
 async fn meili_fixture() -> Option<(Config, MeiliAdmin, AppState, Router)> {
@@ -281,6 +298,55 @@ async fn delete_index_and_wait(
     }
     let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
     wait_for_optional_task(admin, task_uid(&body)).await
+}
+
+async fn replace_index_settings_and_wait(
+    config: &Config,
+    admin: &MeiliAdmin,
+    index_uid: &str,
+    settings: Value,
+) -> Result<(), String> {
+    let Some(url) = config.meili_url.as_deref() else {
+        return Err("Meilisearch URL is unavailable".to_string());
+    };
+    let endpoint = format!("{}/indexes/{index_uid}/settings", url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let mut request = client.patch(endpoint).json(&settings);
+    if let Some(api_key) = config.meili_api_key.as_deref() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "legacy settings write for {index_uid} should be accepted: {}",
+            response.status()
+        ));
+    }
+    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    wait_for_optional_task(admin, task_uid(&body)).await
+}
+
+async fn read_index_settings(config: &Config, index_uid: &str) -> Result<Value, String> {
+    let Some(url) = config.meili_url.as_deref() else {
+        return Err("Meilisearch URL is unavailable".to_string());
+    };
+    let endpoint = format!("{}/indexes/{index_uid}/settings", url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let mut request = client.get(endpoint);
+    if let Some(api_key) = config.meili_api_key.as_deref() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "settings read for {index_uid} should succeed: {}",
+            response.status()
+        ));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn delete_tenant_rows_and_wait(
@@ -470,6 +536,54 @@ fn tenant_context_node(tenant_id: &str, uri: &str, source_id: &str, marker: &str
     }
 }
 
+fn personal_context_node(
+    tenant_id: &str,
+    index_uid: &str,
+    owner_user_id: &str,
+    base_uri: &str,
+    ordinal: usize,
+    marker: &str,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> ContextNode {
+    ContextNode {
+        uri: format!("{base_uri}/node-{ordinal}"),
+        title: format!("Legacy personal node {ordinal}"),
+        layer: 2,
+        body: format!("{marker} node {ordinal}"),
+        tenant_id: tenant_id.to_string(),
+        owner_user_id: Some(owner_user_id.to_string()),
+        index_uid: index_uid.to_string(),
+        index_kind: "personal".to_string(),
+        ancestor_uris: vec![
+            "ctx://user".to_string(),
+            "ctx://user/upgrade".to_string(),
+            base_uri.to_string(),
+        ],
+        node_kind: "fragment".to_string(),
+        retrieval_role: "fragment".to_string(),
+        retrieval_enabled: true,
+        parent_uri: Some(base_uri.to_string()),
+        source_document_uri: None,
+        fragment_index: Some(ordinal as u32),
+        char_start: None,
+        char_end: None,
+        token_estimate: None,
+        checksum: Some(format!("legacy-personal-checksum-{ordinal}")),
+        source_id: None,
+        revision_id: None,
+        block_type: Some("paragraph".to_string()),
+        page_idx: Some(ordinal as u32 + 1),
+        bbox: None,
+        section_path: Vec::new(),
+        heading_level: None,
+        asset_refs: Vec::new(),
+        artifact_refs: Vec::new(),
+        status: "active".to_string(),
+        privacy: "private".to_string(),
+        updated_at,
+    }
+}
+
 async fn try_call(
     app: Router,
     method: Method,
@@ -498,8 +612,38 @@ async fn try_call(
     Ok((status, value))
 }
 
+async fn try_call_with_token(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    token: &str,
+) -> Result<(StatusCode, Value), String> {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(CONTENT_TYPE, "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(body.to_string()))
+        .map_err(|error| format!("request construction failed: {error}"))?;
+    let response = app
+        .oneshot(request)
+        .await
+        .map_err(|error| format!("router request failed: {error}"))?;
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| format!("response body failed: {error}"))?;
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).map_err(|error| format!("response JSON failed: {error}"))?
+    };
+    Ok((status, value))
+}
+
 #[tokio::test]
-async fn meili_company_context_hydration_characterizes_silent_1000_cap() {
+async fn meili_company_context_hydration_reads_all_2001_documents() {
     let _guard = live_meili_test_guard().await;
     let tenant_id = format!("test-tenant-{}", uuid::Uuid::now_v7());
     let Some(config) = meili_config_with_tenant(tenant_id.clone()).await else {
@@ -509,7 +653,7 @@ async fn meili_company_context_hydration_characterizes_silent_1000_cap() {
     let admin = bootstrapped_meili_admin(&config).await;
     let repository = MeiliRepository::new(admin.clone(), true);
     let run_id = uuid::Uuid::now_v7().to_string();
-    let documents = (0..1001)
+    let documents = (0..2001)
         .map(|ordinal| company_context_document(&tenant_id, &run_id, ordinal))
         .collect::<Vec<_>>();
 
@@ -540,8 +684,8 @@ async fn meili_company_context_hydration_characterizes_silent_1000_cap() {
         .expect("Meili repository should return persisted company ContextNodes");
     assert_eq!(
         loaded.len(),
-        1000,
-        "the current repository scan silently truncates the 1001st company ContextNode"
+        2001,
+        "paginated hydration should return every persisted company ContextNode"
     );
     assert!(loaded.iter().all(|node| node.tenant_id == tenant_id));
 }
@@ -1544,7 +1688,7 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
 }
 
 #[tokio::test]
-async fn meili_restart_characterizes_state_link_and_session_durability_gaps() {
+async fn meili_restart_restores_registry_state_links_and_sessions() {
     let _guard = live_meili_test_guard().await;
     let tenant_id = format!("test-tenant-{}", uuid::Uuid::now_v7());
     let Some(config) = meili_config_with_tenant(tenant_id.clone()).await else {
@@ -1671,8 +1815,12 @@ async fn meili_restart_characterizes_state_link_and_session_durability_gaps() {
             json!({ "q": "", "filter": link_filter, "limit": 10 }),
         )
         .await;
+    let session_filter = tenant_logical_filter(&tenant_id, &session_id);
     let persisted_session_result = admin
-        .search::<Value>("rag_sessions", json!({ "q": session_id, "limit": 10 }))
+        .search::<Value>(
+            "rag_sessions",
+            json!({ "q": "", "filter": session_filter, "limit": 10 }),
+        )
         .await;
 
     let (fresh_state, hydration, fresh) = start_meili_app(&config).await;
@@ -1818,11 +1966,12 @@ async fn meili_restart_characterizes_state_link_and_session_durability_gaps() {
     assert_eq!(live_links["links"].as_array().unwrap().len(), 1);
     assert_eq!(live_session_status, StatusCode::OK, "{live_session}");
 
-    // Current per-user restart behavior is mixed: the registry and personal
-    // context are not startup-hydrated, while deterministic routing still lets
-    // event and context searches read through to their physical indexes.
     assert_eq!(fresh_registry_status, StatusCode::OK, "{fresh_registry}");
-    assert!(fresh_registry["indexes"].as_array().unwrap().is_empty());
+    assert_eq!(fresh_registry["indexes"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        fresh_registry["indexes"][0]["owner_user_id_hash"],
+        routing.owner_user_id_hash
+    );
     assert_eq!(fresh_event_status, StatusCode::OK, "{fresh_events}");
     assert_eq!(fresh_events["hits"].as_array().unwrap().len(), 1);
     assert_eq!(
@@ -1840,36 +1989,787 @@ async fn meili_restart_characterizes_state_link_and_session_durability_gaps() {
     assert_eq!(personal_source_document.uri, personal_source_document_uri);
     assert_eq!(personal_source_document.node_kind, "source_doc");
 
-    // State and links reach Meili but are not hydrated; sessions never reach
-    // Meili and are likewise absent after a fresh AppState. PR5 is expected to
-    // invert these characterizations.
     assert_eq!(persisted_state_count, 1);
     assert_eq!(persisted_link_count, 1);
-    assert_eq!(persisted_session_count, 0);
-    for missing_domain in [
-        "user_event_indexes",
-        "personal_context_nodes",
-        "state_items",
-        "links",
-        "sessions",
-    ] {
+    assert_eq!(persisted_session_count, 1);
+    for hydrated_domain in ["user_event_indexes", "state_items", "links", "sessions"] {
         assert!(
-            hydration.get(missing_domain).is_none(),
-            "current hydration unexpectedly reported {missing_domain}: {hydration}"
+            hydration[hydrated_domain].as_u64().unwrap_or_default() >= 1,
+            "hydration did not report {hydrated_domain}: {hydration}"
         );
     }
-    assert_eq!(
-        fresh_state_status,
-        StatusCode::NOT_FOUND,
-        "{fresh_state_body}"
-    );
+    assert_eq!(hydration["status"], "complete", "{hydration}");
+    assert_eq!(hydration["ready"], true, "{hydration}");
+    assert_eq!(fresh_state_status, StatusCode::OK, "{fresh_state_body}");
+    assert_eq!(fresh_state_body["item"]["id"], state_id);
     assert_eq!(fresh_link_status, StatusCode::OK, "{fresh_links}");
-    assert!(fresh_links["links"].as_array().unwrap().is_empty());
+    assert_eq!(fresh_links["links"].as_array().unwrap().len(), 1);
+    assert_eq!(fresh_links["links"][0]["id"], link_id);
+    assert_eq!(fresh_session_status, StatusCode::OK, "{fresh_session_body}");
+    assert_eq!(fresh_session_body["session_id"], session_id);
+}
+
+#[tokio::test]
+async fn meili_restart_restores_insights_structured_rows_summaries_and_trace_acl() {
+    let _guard = live_meili_test_guard().await;
+    let tenant_id = format!("test-tenant-{}", uuid::Uuid::now_v7());
+    let Some(mut config) = meili_config_with_tenant(tenant_id.clone()).await else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    let run_id = uuid::Uuid::now_v7().to_string();
+    let owner_a = format!("pr5-durable-owner-a-{run_id}");
+    let owner_b = format!("pr5-durable-owner-b-{run_id}");
+    let owner_a_token = "pr5-durable-owner-a-token";
+    let owner_b_token = "pr5-durable-owner-b-token";
+    let admin_token = "pr5-durable-admin-token";
+    config.allow_unsafe_unauthenticated = false;
+    config.auth_users = vec![
+        AuthUserConfig {
+            token: owner_a_token.to_string(),
+            scope: AuthUserScope::Owner {
+                owner_user_id: owner_a.clone(),
+            },
+            roles: vec!["user".to_string(), "company_writer".to_string()],
+        },
+        AuthUserConfig {
+            token: owner_b_token.to_string(),
+            scope: AuthUserScope::Owner {
+                owner_user_id: owner_b,
+            },
+            roles: vec!["user".to_string()],
+        },
+        AuthUserConfig {
+            token: admin_token.to_string(),
+            scope: AuthUserScope::Admin,
+            roles: vec!["admin".to_string()],
+        },
+    ];
+
+    let (state, _, app) = start_meili_app(&config).await;
+    let admin = state.meili.clone();
+    let routing = state
+        .store
+        .resolver()
+        .resolve(&tenant_id, &owner_a, false, true)
+        .expect("owner routing should resolve");
+    let dataset_key = format!("pr5-durable-dataset-{}", uuid::Uuid::now_v7().simple());
+    // Keep the durability marker lexically distinct from bearer tokens: the
+    // egress sanitizer intentionally masks every secret substring window.
+    let marker = format!("restart-insight-evidence-{run_id}");
+    let existing_row_id = format!("pr5-existing-row-{run_id}");
+    let new_row_id = format!("pr5-new-row-{run_id}");
+
+    let dataset_created_result = try_call_with_token(
+        app.clone(),
+        Method::PUT,
+        &format!("/v1/state/structured/datasets/{dataset_key}"),
+        json!({
+            "title": "PR5 durable dataset",
+            "description": "schema must survive a fresh AppState",
+            "granularity": "weekly",
+            "subject_type": "person",
+            "columns": [{
+                "name": "stress_score",
+                "kind": "number",
+                "required": true,
+                "semantic_role": "metric",
+                "trend_direction": "higher_is_worse"
+            }]
+        }),
+        owner_a_token,
+    )
+    .await;
+    let dataset_id = dataset_created_result
+        .as_ref()
+        .ok()
+        .and_then(|(_, body)| body["dataset"]["id"].as_str())
+        .unwrap_or("missing-dataset")
+        .to_string();
+
+    let insight_created_result = try_call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/state/insights",
+        json!({
+            "insight_type": "durability",
+            "title": "PR5 durable insight",
+            "statement": marker,
+            "evidence_text": marker,
+            "confidence": 0.91,
+            "salience": 0.73,
+            "privacy": "private"
+        }),
+        owner_a_token,
+    )
+    .await;
+    let insight_id = insight_created_result
+        .as_ref()
+        .ok()
+        .and_then(|(_, body)| body["insight"]["id"].as_str())
+        .unwrap_or("missing-insight")
+        .to_string();
+
+    let snapshot_created_result = try_call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/history/structured/snapshots",
+        json!({
+            "dataset_key": dataset_key,
+            "period_key": "2026-W29",
+            "period_start": "2026-07-13T00:00:00Z",
+            "period_end": "2026-07-19T23:59:59Z",
+            "granularity": "weekly",
+            "source_ref": { "kind": "test", "id": run_id }
+        }),
+        owner_a_token,
+    )
+    .await;
+    let snapshot_id = snapshot_created_result
+        .as_ref()
+        .ok()
+        .and_then(|(_, body)| body["snapshot"]["id"].as_str())
+        .unwrap_or("missing-snapshot")
+        .to_string();
+
+    let initial_rows_result = try_call_with_token(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/history/structured/snapshots/{snapshot_id}/rows:bulk"),
+        json!({ "rows": [{ "id": existing_row_id, "stress_score": 5.0 }] }),
+        owner_a_token,
+    )
+    .await;
+    let initial_apply_result = try_call_with_token(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/state/structured/datasets/{dataset_key}/apply-snapshot"),
+        json!({ "snapshot_id": snapshot_id, "materialize_context": true }),
+        owner_a_token,
+    )
+    .await;
+    let initial_summary_id = initial_apply_result
+        .as_ref()
+        .ok()
+        .and_then(|(_, body)| body["summary_ids"][0].as_str())
+        .unwrap_or("missing-summary")
+        .to_string();
+
+    let context_search_result = try_call_with_token(
+        app,
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": marker, "limit": 5 }),
+        owner_a_token,
+    )
+    .await;
+    let trace_id = context_search_result
+        .as_ref()
+        .ok()
+        .and_then(|(_, body)| body["trace_id"].as_str())
+        .unwrap_or("missing-trace")
+        .to_string();
+
+    let persisted_insight_result = admin
+        .search::<Value>(
+            "rag_insights",
+            json!({
+                "q": "",
+                "filter": tenant_logical_filter(&tenant_id, &insight_id),
+                "limit": 10
+            }),
+        )
+        .await;
+    let persisted_dataset_result = admin
+        .search::<Value>(
+            "rag_structured_datasets",
+            json!({
+                "q": "",
+                "filter": tenant_logical_filter(&tenant_id, &dataset_id),
+                "limit": 10
+            }),
+        )
+        .await;
+
+    // Use the fallible startup path after fixture creation so teardown still
+    // runs if hydration itself is the regression under test.
+    let fresh_start_result = try_start_meili_app(&config).await;
+    let fresh_results = if let Ok((_fresh_state, _hydration, fresh)) = &fresh_start_result {
+        let current_before = try_call_with_token(
+            fresh.clone(),
+            Method::GET,
+            "/v1/state/structured/current",
+            Value::Null,
+            owner_a_token,
+        )
+        .await;
+        let insight_owner_a = try_call_with_token(
+            fresh.clone(),
+            Method::POST,
+            "/v1/state/insights/search",
+            json!({ "query": marker }),
+            owner_a_token,
+        )
+        .await;
+        let insight_owner_b = try_call_with_token(
+            fresh.clone(),
+            Method::POST,
+            "/v1/state/insights/search",
+            json!({ "query": marker }),
+            owner_b_token,
+        )
+        .await;
+        let cross_owner_patch = try_call_with_token(
+            fresh.clone(),
+            Method::PATCH,
+            &format!("/v1/state/insights/{insight_id}"),
+            json!({ "statement": "cross-owner mutation must be rejected" }),
+            owner_b_token,
+        )
+        .await;
+        let dataset_updated = try_call_with_token(
+            fresh.clone(),
+            Method::PUT,
+            &format!("/v1/state/structured/datasets/{dataset_key}"),
+            json!({
+                "title": "PR5 durable dataset after restart",
+                "granularity": "weekly",
+                "subject_type": "person",
+                "columns": [
+                    { "name": "stress_score", "kind": "number", "required": true },
+                    { "name": "energy_score", "kind": "number", "required": false }
+                ]
+            }),
+            owner_a_token,
+        )
+        .await;
+        let snapshot = try_call_with_token(
+            fresh.clone(),
+            Method::GET,
+            &format!("/v1/history/structured/snapshots/{snapshot_id}"),
+            Value::Null,
+            owner_a_token,
+        )
+        .await;
+        // No row read precedes this write. The duplicate result therefore
+        // proves bulk mutation lazily reloaded the pre-restart row IDs.
+        let rows = try_call_with_token(
+            fresh.clone(),
+            Method::POST,
+            &format!("/v1/history/structured/snapshots/{snapshot_id}/rows:bulk"),
+            json!({
+                "rows": [
+                    { "id": existing_row_id, "stress_score": 5.0 },
+                    { "id": new_row_id, "stress_score": 7.0 }
+                ]
+            }),
+            owner_a_token,
+        )
+        .await;
+        let applied = try_call_with_token(
+            fresh.clone(),
+            Method::POST,
+            &format!("/v1/state/structured/datasets/{dataset_key}/apply-snapshot"),
+            json!({ "snapshot_id": snapshot_id, "materialize_context": true }),
+            owner_a_token,
+        )
+        .await;
+        let current_after = try_call_with_token(
+            fresh.clone(),
+            Method::GET,
+            "/v1/state/structured/current",
+            Value::Null,
+            owner_a_token,
+        )
+        .await;
+        let reveal_owner_a = try_call_with_token(
+            fresh.clone(),
+            Method::POST,
+            "/v1/context/reveal",
+            json!({ "trace_id": trace_id, "next_layer": 2 }),
+            owner_a_token,
+        )
+        .await;
+        let reveal_owner_b = try_call_with_token(
+            fresh.clone(),
+            Method::POST,
+            "/v1/context/reveal",
+            json!({ "trace_id": trace_id, "next_layer": 2 }),
+            owner_b_token,
+        )
+        .await;
+        let debug_trace = try_call_with_token(
+            fresh.clone(),
+            Method::GET,
+            &format!("/v1/debug/traces/{trace_id}"),
+            Value::Null,
+            admin_token,
+        )
+        .await;
+        Some((
+            current_before,
+            insight_owner_a,
+            insight_owner_b,
+            cross_owner_patch,
+            dataset_updated,
+            snapshot,
+            rows,
+            applied,
+            current_after,
+            reveal_owner_a,
+            reveal_owner_b,
+            debug_trace,
+        ))
+    } else {
+        None
+    };
+
+    // Every test-owned fixed row and dynamic index is removed before any
+    // behavioral assertion, including on a failed fresh-start attempt.
+    let tenant_filter = equality_filter("tenant_id", &tenant_id);
+    let cleanup_results = vec![
+        (
+            "insights",
+            delete_by_filter_and_wait(&admin, "rag_insights", &tenant_filter).await,
+        ),
+        (
+            "structured datasets",
+            delete_by_filter_and_wait(&admin, "rag_structured_datasets", &tenant_filter).await,
+        ),
+        (
+            "structured snapshots",
+            delete_by_filter_and_wait(&admin, "rag_structured_snapshots", &tenant_filter).await,
+        ),
+        (
+            "structured rows",
+            delete_by_filter_and_wait(&admin, "rag_structured_rows", &tenant_filter).await,
+        ),
+        (
+            "structured summaries",
+            delete_by_filter_and_wait(&admin, "rag_structured_summaries", &tenant_filter).await,
+        ),
+        (
+            "state items",
+            delete_by_filter_and_wait(&admin, "rag_state_items", &tenant_filter).await,
+        ),
+        (
+            "links",
+            delete_by_filter_and_wait(&admin, "rag_links", &tenant_filter).await,
+        ),
+        (
+            "traces",
+            delete_by_filter_and_wait(&admin, "rag_traces", &tenant_filter).await,
+        ),
+        (
+            "user index registry",
+            delete_by_filter_and_wait(&admin, "rag_user_event_indexes", &tenant_filter).await,
+        ),
+        (
+            "owner event index",
+            delete_index_and_wait(&config, &admin, &routing.event_index_uid).await,
+        ),
+        (
+            "owner context index",
+            delete_index_and_wait(&config, &admin, &routing.personal_context_index_uid).await,
+        ),
+    ];
+    assert_cleanup_results(cleanup_results);
+
+    let (dataset_created_status, dataset_created) =
+        dataset_created_result.expect("dataset creation call should finish");
+    let (insight_created_status, insight_created) =
+        insight_created_result.expect("insight creation call should finish");
+    let (snapshot_created_status, snapshot_created) =
+        snapshot_created_result.expect("snapshot creation call should finish");
+    let (initial_rows_status, initial_rows) =
+        initial_rows_result.expect("initial row write should finish");
+    let (initial_apply_status, initial_apply) =
+        initial_apply_result.expect("initial apply should finish");
+    let (context_search_status, context_search) =
+        context_search_result.expect("context search should finish");
+    assert_eq!(dataset_created_status, StatusCode::OK, "{dataset_created}");
+    assert_eq!(dataset_created["dataset"]["schema_version"], 1);
+    assert_ne!(dataset_id, "missing-dataset");
+    assert_eq!(insight_created_status, StatusCode::OK, "{insight_created}");
+    assert_ne!(insight_id, "missing-insight");
     assert_eq!(
-        fresh_session_status,
-        StatusCode::NOT_FOUND,
-        "{fresh_session_body}"
+        snapshot_created_status,
+        StatusCode::OK,
+        "{snapshot_created}"
     );
+    assert_ne!(snapshot_id, "missing-snapshot");
+    assert_eq!(initial_rows_status, StatusCode::OK, "{initial_rows}");
+    assert_eq!(initial_rows["inserted"], 1);
+    assert_eq!(initial_apply_status, StatusCode::OK, "{initial_apply}");
+    assert_ne!(initial_summary_id, "missing-summary");
+    assert_eq!(context_search_status, StatusCode::OK, "{context_search}");
+    assert_ne!(trace_id, "missing-trace");
+    assert!(!context_search["hits"].as_array().unwrap().is_empty());
+    assert_eq!(
+        persisted_insight_result
+            .expect("persisted insight lookup should succeed")
+            .hits
+            .len(),
+        1
+    );
+    assert_eq!(
+        persisted_dataset_result
+            .expect("persisted dataset lookup should succeed")
+            .hits
+            .len(),
+        1
+    );
+
+    let (_, hydration, _) = fresh_start_result.expect("fresh AppState startup should succeed");
+    for hydrated_domain in [
+        "insights",
+        "datasets",
+        "structured_snapshots",
+        "structured_summaries",
+        "traces",
+    ] {
+        assert!(
+            hydration[hydrated_domain].as_u64().unwrap_or_default() >= 1,
+            "hydration did not report {hydrated_domain}: {hydration}"
+        );
+    }
+    assert_eq!(hydration["status"], "complete", "{hydration}");
+    assert_eq!(hydration["ready"], true, "{hydration}");
+
+    let (
+        current_before_result,
+        insight_owner_a_result,
+        insight_owner_b_result,
+        cross_owner_patch_result,
+        dataset_updated_result,
+        fresh_snapshot_result,
+        fresh_rows_result,
+        fresh_apply_result,
+        current_after_result,
+        reveal_owner_a_result,
+        reveal_owner_b_result,
+        debug_trace_result,
+    ) = fresh_results.expect("fresh router calls should run");
+    let (current_before_status, current_before) =
+        current_before_result.expect("current structured read should finish");
+    let (insight_owner_a_status, insight_owner_a) =
+        insight_owner_a_result.expect("owner insight search should finish");
+    let (insight_owner_b_status, insight_owner_b) =
+        insight_owner_b_result.expect("cross-owner insight search should finish");
+    let (cross_owner_patch_status, cross_owner_patch) =
+        cross_owner_patch_result.expect("cross-owner insight patch should finish");
+    let (dataset_updated_status, dataset_updated) =
+        dataset_updated_result.expect("dataset update should finish");
+    let (fresh_snapshot_status, fresh_snapshot) =
+        fresh_snapshot_result.expect("snapshot metadata read should finish");
+    let (fresh_rows_status, fresh_rows) =
+        fresh_rows_result.expect("post-restart row write should finish");
+    let (fresh_apply_status, fresh_apply) =
+        fresh_apply_result.expect("post-restart apply should finish");
+    let (current_after_status, current_after) =
+        current_after_result.expect("post-apply structured read should finish");
+    let (reveal_owner_a_status, reveal_owner_a) =
+        reveal_owner_a_result.expect("trace owner reveal should finish");
+    let (reveal_owner_b_status, reveal_owner_b) =
+        reveal_owner_b_result.expect("cross-owner trace reveal should finish");
+    let (debug_trace_status, debug_trace) =
+        debug_trace_result.expect("admin trace read should finish");
+
+    assert_eq!(current_before_status, StatusCode::OK, "{current_before}");
+    assert!(current_before["summaries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|summary| summary["id"] == initial_summary_id));
+    assert_eq!(insight_owner_a_status, StatusCode::OK, "{insight_owner_a}");
+    assert_eq!(insight_owner_a["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(insight_owner_a["hits"][0]["id"], insight_id);
+    assert_eq!(insight_owner_b_status, StatusCode::OK, "{insight_owner_b}");
+    assert!(insight_owner_b["hits"].as_array().unwrap().is_empty());
+    assert_eq!(
+        cross_owner_patch_status,
+        StatusCode::FORBIDDEN,
+        "{cross_owner_patch}"
+    );
+
+    assert_eq!(dataset_updated_status, StatusCode::OK, "{dataset_updated}");
+    assert_eq!(dataset_updated["dataset"]["schema_version"], 2);
+    assert_eq!(
+        dataset_updated["dataset"]["columns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(fresh_snapshot_status, StatusCode::OK, "{fresh_snapshot}");
+    assert_eq!(fresh_snapshot["dataset_key"], dataset_key);
+    assert_eq!(fresh_snapshot["row_count"], 1);
+    assert_eq!(fresh_rows_status, StatusCode::OK, "{fresh_rows}");
+    assert_eq!(fresh_rows["inserted"], 1);
+    assert_eq!(fresh_rows["duplicates"], 1);
+    assert_eq!(fresh_apply_status, StatusCode::OK, "{fresh_apply}");
+    let fresh_summary_id = fresh_apply["summary_ids"][0]
+        .as_str()
+        .expect("post-restart apply should return a summary id");
+    assert_eq!(current_after_status, StatusCode::OK, "{current_after}");
+    assert!(current_after["summaries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|summary| {
+            summary["id"] == fresh_summary_id && summary["stats"]["row_count"] == 2
+        }));
+
+    assert_eq!(reveal_owner_a_status, StatusCode::OK, "{reveal_owner_a}");
+    assert!(reveal_owner_a["content"]
+        .as_str()
+        .is_some_and(|content| content.contains(&marker)));
+    assert_eq!(
+        reveal_owner_b_status,
+        StatusCode::FORBIDDEN,
+        "{reveal_owner_b}"
+    );
+    assert_eq!(debug_trace_status, StatusCode::OK, "{debug_trace}");
+    assert_eq!(debug_trace["id"], trace_id);
+    assert_eq!(debug_trace["owner_user_id"], owner_a);
+}
+
+#[tokio::test]
+async fn meili_restart_upgrades_legacy_dynamic_settings_before_paginated_fs_reads() {
+    let _guard = live_meili_test_guard().await;
+    let tenant_id = format!("test-tenant-{}", uuid::Uuid::now_v7());
+    let Some(mut config) = meili_config_with_tenant(tenant_id.clone()).await else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    // Three documents over two-document pages proves the first lazy owner
+    // load takes the stable paginated scan path instead of a single fetch.
+    config.meili_scan_page_size = 2;
+    config.meili_scan_max_documents = 20;
+
+    let admin = bootstrapped_meili_admin(&config).await;
+    let seed_state = AppState::new(Arc::new(config.clone()));
+    let run_id = uuid::Uuid::now_v7().to_string();
+    let owner = format!("pr5-upgrade-owner-{run_id}");
+    let marker = format!("pr5-upgrade-marker-{run_id}");
+    let base_uri = format!("ctx://user/upgrade/{run_id}");
+    let routing = seed_state
+        .store
+        .resolver()
+        .resolve(&tenant_id, &owner, false, true)
+        .expect("owner routing should resolve");
+    let tenant_hash = seed_state.store.resolver().tenant_hash(&tenant_id);
+    let registry = UserEventIndex {
+        id: format!("uei__t_{tenant_hash}__u_{}", routing.owner_user_id_hash),
+        tenant_id: tenant_id.clone(),
+        tenant_hash,
+        owner_user_id_hash: routing.owner_user_id_hash.clone(),
+        event_index_uid: routing.event_index_uid.clone(),
+        personal_context_index_uid: routing.personal_context_index_uid.clone(),
+        schema_version: routing.schema_version,
+        settings_hash: routing.settings_hash.clone(),
+        status: "active".to_string(),
+        created_at: chrono::Utc::now(),
+        last_event_at: None,
+        event_count_estimate: 0,
+    };
+    let shared_updated_at = chrono::Utc::now();
+    let context_nodes = (0..3)
+        .map(|ordinal| {
+            personal_context_node(
+                &tenant_id,
+                &routing.personal_context_index_uid,
+                &owner,
+                &base_uri,
+                ordinal,
+                &marker,
+                shared_updated_at,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let setup_result: Result<(Value, Value), String> = async {
+        admin
+            .ensure_index(&routing.event_index_uid, "id", false)
+            .await
+            .map_err(|error| error.to_string())?;
+        admin
+            .ensure_index(&routing.personal_context_index_uid, "id", false)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        // These are the pre-PR5 dynamic-index shapes: filtering works, but
+        // neither index permits the new stable physical `id` tie-breaker.
+        replace_index_settings_and_wait(
+            &config,
+            &admin,
+            &routing.event_index_uid,
+            json!({
+                "searchableAttributes": ["text", "event_type", "entity_type", "entity_id", "tags"],
+                "filterableAttributes": ["id", "tenant_id", "owner_user_id_hash", "event_type", "entity_type", "entity_id", "privacy", "occurred_at", "observed_at"],
+                "sortableAttributes": ["occurred_at", "observed_at"]
+            }),
+        )
+        .await?;
+        replace_index_settings_and_wait(
+            &config,
+            &admin,
+            &routing.personal_context_index_uid,
+            json!({
+                "searchableAttributes": ["title", "body", "uri"],
+                "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id", "node_kind", "retrieval_role", "retrieval_enabled", "parent_uri", "source_document_uri", "fragment_index", "block_type", "page_idx", "heading_level"],
+                "sortableAttributes": ["updated_at", "layer"]
+            }),
+        )
+        .await?;
+
+        let registry_document = tenant_document(
+            &tenant_id,
+            "rag_user_event_indexes",
+            &registry.id,
+            &registry,
+        )
+        .map_err(|error| error.to_string())?;
+        let registry_task = admin
+            .add_documents("rag_user_event_indexes", &[registry_document])
+            .await
+            .map_err(|error| error.to_string())?;
+        wait_for_optional_task(&admin, registry_task).await?;
+
+        let context_documents = context_nodes
+            .iter()
+            .map(|node| {
+                tenant_document(
+                    &tenant_id,
+                    &routing.personal_context_index_uid,
+                    &node.uri,
+                    node,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let context_task = admin
+            .add_documents(&routing.personal_context_index_uid, &context_documents)
+            .await
+            .map_err(|error| error.to_string())?;
+        wait_for_optional_task(&admin, context_task).await?;
+
+        let event_settings = read_index_settings(&config, &routing.event_index_uid).await?;
+        let context_settings =
+            read_index_settings(&config, &routing.personal_context_index_uid).await?;
+        Ok((event_settings, context_settings))
+    }
+    .await;
+
+    let fresh_start_result = if setup_result.is_ok() {
+        try_start_meili_app(&config).await
+    } else {
+        Err("legacy dynamic-index fixture setup failed".to_string())
+    };
+    let post_start_settings_result: Result<(Value, Value), String> = if fresh_start_result.is_ok() {
+        async {
+            let event_settings = read_index_settings(&config, &routing.event_index_uid).await?;
+            let context_settings =
+                read_index_settings(&config, &routing.personal_context_index_uid).await?;
+            Ok((event_settings, context_settings))
+        }
+        .await
+    } else {
+        Err("fresh startup did not complete".to_string())
+    };
+
+    let fs_results = if let Ok((fresh_state, _, _)) = &fresh_start_result {
+        let listing = fresh_state
+            .store
+            .fs_ls_async(&tenant_id, Some(&base_uri), Some(&owner), false)
+            .await;
+        let tree = fresh_state
+            .store
+            .fs_tree_async(&tenant_id, Some(&base_uri), Some(3), Some(&owner), false)
+            .await;
+        let read = fresh_state
+            .store
+            .fs_read_async(
+                &tenant_id,
+                &format!("{base_uri}/node-1"),
+                Some(&owner),
+                false,
+            )
+            .await;
+        Some((listing, tree, read))
+    } else {
+        None
+    };
+
+    // Teardown remains independent of startup reconciliation and lazy-read
+    // behavior. Both dynamic indexes and the registry row are attempted even
+    // when fixture setup or hydration returns an error.
+    let tenant_filter = equality_filter("tenant_id", &tenant_id);
+    let cleanup_results = vec![
+        (
+            "user index registry",
+            delete_by_filter_and_wait(&admin, "rag_user_event_indexes", &tenant_filter).await,
+        ),
+        (
+            "legacy owner event index",
+            delete_index_and_wait(&config, &admin, &routing.event_index_uid).await,
+        ),
+        (
+            "legacy owner context index",
+            delete_index_and_wait(&config, &admin, &routing.personal_context_index_uid).await,
+        ),
+    ];
+    assert_cleanup_results(cleanup_results);
+
+    let (legacy_event_settings, legacy_context_settings) =
+        setup_result.expect("legacy dynamic-index fixture setup should succeed");
+    for (index_kind, settings) in [
+        ("event", legacy_event_settings),
+        ("personal context", legacy_context_settings),
+    ] {
+        assert!(
+            settings["sortableAttributes"]
+                .as_array()
+                .is_some_and(|sortable| !sortable.iter().any(|value| value == "id")),
+            "legacy {index_kind} settings unexpectedly permitted id sorting: {settings}"
+        );
+    }
+
+    let (_, hydration, _) = fresh_start_result
+        .expect("fresh startup should reconcile legacy dynamic-index settings before reads");
+    assert_eq!(hydration["status"], "complete", "{hydration}");
+    assert_eq!(hydration["ready"], true, "{hydration}");
+    assert_eq!(hydration["user_event_indexes"], 1, "{hydration}");
+
+    let (upgraded_event_settings, upgraded_context_settings) = post_start_settings_result
+        .expect("startup should wait until upgraded dynamic settings are observable");
+    for (index_kind, settings) in [
+        ("event", upgraded_event_settings),
+        ("personal context", upgraded_context_settings),
+    ] {
+        assert!(
+            settings["sortableAttributes"]
+                .as_array()
+                .is_some_and(|sortable| sortable.iter().any(|value| value == "id")),
+            "startup did not reconcile {index_kind} id sorting: {settings}"
+        );
+    }
+
+    let (listing_result, tree_result, read_result) =
+        fs_results.expect("first owner filesystem reads should run after startup");
+    let listing = listing_result.expect("first owner fs_ls should paginate successfully");
+    let tree = tree_result.expect("first owner fs_tree should succeed from hydrated context");
+    let read = read_result.expect("first owner fs_read should succeed from hydrated context");
+    assert_eq!(
+        listing["children"].as_array().unwrap().len(),
+        3,
+        "{listing}"
+    );
+    assert_eq!(tree["children"].as_array().unwrap().len(), 3, "{tree}");
+    assert_eq!(tree["depth"], 3, "{tree}");
+    assert_eq!(read.uri, format!("{base_uri}/node-1"));
+    assert!(read.body.contains(&marker));
+    assert_eq!(read.owner_user_id.as_deref(), Some(owner.as_str()));
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::{
     config::Config,
-    error::ApiError,
+    error::{safe_cause_diagnostic, ApiError},
     fragmenter::{BlockAwareFragmenter, FragmentChunk},
     models::*,
     parser::{parser_from_config, ParserInput, ParserOutput, StagedUpload},
@@ -37,35 +37,79 @@ pub struct Store {
     redaction_config: Arc<Config>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SourceDocumentKey {
+    tenant_id: String,
+    owner_user_id: Option<String>,
+    uri: String,
+}
+
+impl SourceDocumentKey {
+    fn new(tenant_id: &str, owner_user_id: Option<&str>, uri: &str) -> Self {
+        Self {
+            tenant_id: tenant_id.to_string(),
+            owner_user_id: owner_user_id.map(ToString::to_string),
+            uri: uri.to_string(),
+        }
+    }
+
+    fn from_document(document: &SourceDocument) -> Self {
+        Self::new(
+            &document.tenant_id,
+            document.owner_user_id.as_deref(),
+            &document.uri,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ParseArtifactKey {
+    tenant_id: String,
+    owner_user_id: Option<String>,
+    artifact_id: String,
+}
+
+impl ParseArtifactKey {
+    fn from_artifact(artifact: &ParseArtifact) -> Self {
+        Self {
+            tenant_id: artifact.tenant_id.clone(),
+            owner_user_id: artifact.owner_user_id.clone(),
+            artifact_id: artifact.id.clone(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct StoreData {
+    hydration_report: Option<HydrationReport>,
     user_indexes: HashMap<(String, String), UserEventIndex>,
     events_by_index: HashMap<String, Vec<HistoryEvent>>,
     event_by_id: HashMap<String, HistoryEvent>,
     event_idempotency: HashMap<(String, String), String>,
     personal_context: HashMap<String, Vec<ContextNode>>,
+    personal_context_loaded: HashSet<String>,
     company_context: Vec<ContextNode>,
     state_items: HashMap<(String, String, String), StateItem>,
     insights: HashMap<String, InsightRecord>,
-    insight_idempotency: HashMap<(String, String), String>,
+    insight_idempotency: HashMap<(String, String, String), String>,
     sources: HashMap<String, CompanySource>,
     source_revisions: HashMap<String, Vec<SourceRevision>>,
-    source_documents: HashMap<String, SourceDocument>,
-    parse_artifacts: HashMap<String, ParseArtifact>,
-    parsed_blocks: HashMap<String, Vec<ParsedBlock>>,
+    source_documents: HashMap<SourceDocumentKey, SourceDocument>,
+    parse_artifacts: HashMap<ParseArtifactKey, ParseArtifact>,
+    parsed_blocks: HashMap<SourceDocumentKey, Vec<ParsedBlock>>,
     ingest_tasks: HashMap<String, IngestTask>,
     ingest_results: HashMap<String, IngestTaskResult>,
     preflight_decisions: HashMap<String, CompanyDocPreflightResponse>,
     datasets: HashMap<String, DatasetRecord>,
     snapshots: HashMap<String, StructuredSnapshot>,
-    snapshot_idempotency: HashMap<String, String>,
+    snapshot_idempotency: HashMap<(String, String), String>,
     rows_by_snapshot: HashMap<String, Vec<Value>>,
     row_idempotency: HashSet<(String, String)>,
     structured_summaries: HashMap<String, Value>,
     sessions: HashMap<String, SessionRecord>,
     traces: HashMap<String, TraceRecord>,
     links: HashMap<String, KnowledgeLink>,
-    link_idempotency: HashMap<(String, String), String>,
+    link_idempotency: HashMap<(String, String, String), String>,
     harness_components: HashMap<String, HarnessComponent>,
     harness_revisions: HashMap<String, Vec<HarnessComponentRevision>>,
     harness_changes: HashMap<String, HarnessChangeManifest>,
@@ -76,19 +120,50 @@ struct StoreData {
     eval_overviews: HashMap<String, RagEvalOverview>,
 }
 
+#[derive(Default)]
+struct HydrationStage {
+    user_indexes: Vec<UserEventIndex>,
+    company_context: Vec<ContextNode>,
+    state_items: Vec<StateItem>,
+    insights: Vec<InsightRecord>,
+    links: Vec<KnowledgeLink>,
+    sources: Vec<CompanySource>,
+    source_revisions: Vec<SourceRevision>,
+    datasets: Vec<DatasetRecord>,
+    snapshots: Vec<StructuredSnapshot>,
+    structured_summaries: Vec<Value>,
+    sessions: Vec<SessionRecord>,
+    traces: Vec<TraceRecord>,
+    harness_components: Vec<HarnessComponent>,
+    harness_revisions: Vec<HarnessComponentRevision>,
+    harness_changes: Vec<HarnessChangeManifest>,
+    harness_verdicts: Vec<HarnessChangeVerdict>,
+    eval_cases: Vec<RagEvalCase>,
+    eval_runs: Vec<RagEvalRun>,
+    eval_case_results: Vec<RagEvalCaseResult>,
+    eval_overviews: Vec<RagEvalOverview>,
+    ingest_tasks: Vec<IngestTask>,
+    ingest_results: Vec<IngestTaskResult>,
+    parse_artifacts: Vec<ParseArtifact>,
+    recovered_ingest_tasks: usize,
+    recovered_parse_artifacts: usize,
+}
+
+struct HydrationFailure {
+    domain: &'static str,
+    error: ApiError,
+}
+
 impl StoreData {
     fn seed_harness_components(&mut self, tenant_id: &str) {
         let created_at = now();
         for (component_id, display_name, component_kind, description) in
             default_harness_components()
         {
-            if self.harness_components.contains_key(component_id) {
-                continue;
-            }
             let revision_id = bootstrap_harness_revision_id(component_id);
-            self.harness_components.insert(
-                component_id.to_string(),
-                HarnessComponent {
+            self.harness_components
+                .entry(component_id.to_string())
+                .or_insert_with(|| HarnessComponent {
                     id: component_id.to_string(),
                     tenant_id: tenant_id.to_string(),
                     display_name: display_name.to_string(),
@@ -98,32 +173,232 @@ impl StoreData {
                     current_revision_id: Some(revision_id.clone()),
                     created_at,
                     updated_at: created_at,
-                },
-            );
-            self.harness_revisions.insert(
-                component_id.to_string(),
-                vec![HarnessComponentRevision {
-                    id: revision_id,
-                    tenant_id: tenant_id.to_string(),
-                    component_id: component_id.to_string(),
-                    iteration: 0,
-                    manifest_id: "bootstrap".to_string(),
-                    files: Vec::new(),
-                    content: json!({
-                        "source": "built_in_registry",
-                        "invariants": [
-                            "preserve public API behavior",
-                            "preserve fragment-first retrieval",
-                            "preserve source-document traceback"
-                        ]
-                    }),
-                    status: "active".to_string(),
-                    created_by: "system_bootstrap".to_string(),
-                    created_at,
-                }],
-            );
+                });
+            let revisions = self
+                .harness_revisions
+                .entry(component_id.to_string())
+                .or_default();
+            if revisions
+                .iter()
+                .any(|revision| revision.tenant_id == tenant_id && revision.id == revision_id)
+            {
+                continue;
+            }
+            revisions.push(HarnessComponentRevision {
+                id: revision_id,
+                tenant_id: tenant_id.to_string(),
+                component_id: component_id.to_string(),
+                iteration: 0,
+                manifest_id: "bootstrap".to_string(),
+                files: Vec::new(),
+                content: json!({
+                    "source": "built_in_registry",
+                    "invariants": [
+                        "preserve public API behavior",
+                        "preserve fragment-first retrieval",
+                        "preserve source-document traceback"
+                    ]
+                }),
+                status: "active".to_string(),
+                created_by: "system_bootstrap".to_string(),
+                created_at,
+            });
         }
     }
+}
+
+fn durability_contract() -> BTreeMap<&'static str, (DurabilityClass, HydrationStrategy, bool)> {
+    use DurabilityClass::{DerivedDurable, DurableCanonical, Ephemeral};
+    use HydrationStrategy::{
+        Ephemeral as EphemeralStrategy, LazySnapshot, ReadThrough, Regenerate, Startup,
+    };
+
+    [
+        ("user_event_indexes", (DurableCanonical, Startup, true)),
+        ("user_events", (DurableCanonical, ReadThrough, false)),
+        ("personal_context", (DerivedDurable, ReadThrough, false)),
+        ("company_context_nodes", (DerivedDurable, Startup, true)),
+        ("state_items", (DurableCanonical, Startup, true)),
+        ("insights", (DurableCanonical, Startup, true)),
+        ("links", (DurableCanonical, Startup, true)),
+        ("company_sources", (DurableCanonical, Startup, true)),
+        ("source_revisions", (DurableCanonical, Startup, true)),
+        ("source_documents", (DurableCanonical, ReadThrough, false)),
+        ("parse_artifacts", (DerivedDurable, Startup, true)),
+        ("parsed_blocks", (Ephemeral, EphemeralStrategy, false)),
+        ("datasets", (DurableCanonical, Startup, true)),
+        ("structured_snapshots", (DurableCanonical, Startup, true)),
+        ("structured_rows", (DurableCanonical, LazySnapshot, false)),
+        ("structured_summaries", (DerivedDurable, Startup, true)),
+        ("sessions", (DurableCanonical, Startup, true)),
+        ("traces", (DurableCanonical, Startup, true)),
+        ("harness_components", (DurableCanonical, Startup, true)),
+        ("harness_revisions", (DurableCanonical, Startup, true)),
+        ("harness_changes", (DurableCanonical, Startup, true)),
+        ("harness_verdicts", (DurableCanonical, Startup, true)),
+        ("eval_cases", (DurableCanonical, Startup, true)),
+        ("eval_runs", (DurableCanonical, Startup, true)),
+        ("eval_case_results", (DurableCanonical, Startup, true)),
+        ("eval_overviews", (DerivedDurable, Startup, true)),
+        ("ingest_tasks", (DurableCanonical, Startup, true)),
+        ("ingest_results", (DurableCanonical, Startup, true)),
+        ("preflight_decisions", (Ephemeral, EphemeralStrategy, false)),
+        ("vector_embeddings", (Ephemeral, Regenerate, false)),
+        ("queue_permits", (Ephemeral, EphemeralStrategy, false)),
+        ("provider_health", (Ephemeral, Regenerate, false)),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn initial_hydration_report(config: &Config) -> HydrationReport {
+    let required = config.store_backend == "meili";
+    let domains = durability_contract()
+        .into_iter()
+        .map(|(name, (durability, strategy, mandatory))| {
+            let status = if !required {
+                "not_required"
+            } else {
+                match strategy {
+                    HydrationStrategy::Startup => "pending",
+                    HydrationStrategy::ReadThrough => "read_through",
+                    HydrationStrategy::LazySnapshot => "lazy",
+                    HydrationStrategy::Regenerate => "regenerable",
+                    HydrationStrategy::Ephemeral => "ephemeral",
+                }
+            };
+            (
+                name.to_string(),
+                HydrationDomainReport {
+                    durability,
+                    strategy,
+                    mandatory,
+                    status: status.to_string(),
+                    expected: 0,
+                    loaded: 0,
+                    skipped: usize::from(!required),
+                    quarantined: 0,
+                    recovered: 0,
+                    error_category: None,
+                    error_fingerprint: None,
+                },
+            )
+        })
+        .collect();
+    let timestamp = now();
+    HydrationReport {
+        tenant_id: config.tenant_id.clone(),
+        backend: config.store_backend.clone(),
+        status: if required {
+            HydrationStatus::Pending
+        } else {
+            HydrationStatus::NotRequired
+        },
+        ready: !required,
+        started_at: timestamp,
+        completed_at: (!required).then_some(timestamp),
+        domains,
+    }
+}
+
+fn required_hydration_rows<T>(
+    domain: &'static str,
+    result: Result<Option<Vec<T>>, ApiError>,
+) -> Result<Vec<T>, HydrationFailure> {
+    match result {
+        Ok(Some(rows)) => Ok(rows),
+        Ok(None) => Err(HydrationFailure {
+            domain,
+            error: ApiError::Internal(format!(
+                "mandatory hydration domain {domain} is unavailable for the configured backend"
+            )),
+        }),
+        Err(error) => Err(HydrationFailure { domain, error }),
+    }
+}
+
+fn hydration_result<T>(
+    domain: &'static str,
+    result: Result<T, ApiError>,
+) -> Result<T, HydrationFailure> {
+    result.map_err(|error| HydrationFailure { domain, error })
+}
+
+fn completed_hydration_report(
+    config: &Config,
+    tenant_id: &str,
+    stage: &HydrationStage,
+) -> HydrationReport {
+    let mut report = initial_hydration_report(config);
+    report.tenant_id = tenant_id.to_string();
+    report.status = HydrationStatus::Complete;
+    report.ready = true;
+    report.completed_at = Some(now());
+
+    let counts = [
+        ("user_event_indexes", stage.user_indexes.len(), 0),
+        ("company_context_nodes", stage.company_context.len(), 0),
+        ("state_items", stage.state_items.len(), 0),
+        ("insights", stage.insights.len(), 0),
+        ("links", stage.links.len(), 0),
+        ("company_sources", stage.sources.len(), 0),
+        ("source_revisions", stage.source_revisions.len(), 0),
+        ("datasets", stage.datasets.len(), 0),
+        ("structured_snapshots", stage.snapshots.len(), 0),
+        ("structured_summaries", stage.structured_summaries.len(), 0),
+        ("sessions", stage.sessions.len(), 0),
+        ("traces", stage.traces.len(), 0),
+        ("harness_components", stage.harness_components.len(), 0),
+        ("harness_revisions", stage.harness_revisions.len(), 0),
+        ("harness_changes", stage.harness_changes.len(), 0),
+        ("harness_verdicts", stage.harness_verdicts.len(), 0),
+        ("eval_cases", stage.eval_cases.len(), 0),
+        ("eval_runs", stage.eval_runs.len(), 0),
+        ("eval_case_results", stage.eval_case_results.len(), 0),
+        ("eval_overviews", stage.eval_overviews.len(), 0),
+        (
+            "ingest_tasks",
+            stage.ingest_tasks.len(),
+            stage.recovered_ingest_tasks,
+        ),
+        ("ingest_results", stage.ingest_results.len(), 0),
+        (
+            "parse_artifacts",
+            stage.parse_artifacts.len(),
+            stage.recovered_parse_artifacts,
+        ),
+    ];
+    for (domain_name, count, recovered) in counts {
+        if let Some(domain) = report.domains.get_mut(domain_name) {
+            domain.status = "complete".to_string();
+            domain.expected = count;
+            domain.loaded = count;
+            domain.recovered = recovered;
+        }
+    }
+    report
+}
+
+fn hydration_response(report: &HydrationReport) -> Value {
+    let mut response = serde_json::Map::new();
+    for (domain_name, domain) in &report.domains {
+        response.insert(domain_name.clone(), json!(domain.loaded));
+    }
+    let recovered = report
+        .domains
+        .get("ingest_tasks")
+        .map(|domain| domain.recovered)
+        .unwrap_or_default();
+    response.insert("interrupted_ingest_tasks".to_string(), json!(recovered));
+    response.insert("hydration".to_string(), json!(report));
+    response.insert("tenant_id".to_string(), json!(report.tenant_id));
+    response.insert("backend".to_string(), json!(report.backend));
+    response.insert("status".to_string(), json!(report.status));
+    response.insert("ready".to_string(), json!(report.ready));
+    response.insert("started_at".to_string(), json!(report.started_at));
+    response.insert("completed_at".to_string(), json!(report.completed_at));
+    response.insert("domains".to_string(), json!(report.domains));
+    Value::Object(response)
 }
 
 #[derive(Debug, Clone)]
@@ -145,7 +420,10 @@ impl Store {
         // Capture the current dynamic Codex credential before any later
         // rotation so response and provider-boundary redaction retain it.
         let _ = config.refresh_configured_secret_values();
-        let mut data = StoreData::default();
+        let mut data = StoreData {
+            hydration_report: Some(initial_hydration_report(config)),
+            ..StoreData::default()
+        };
         data.seed_harness_components(&config.tenant_id);
         Self {
             inner: Arc::new(RwLock::new(data)),
@@ -205,190 +483,653 @@ impl Store {
         self.repository.backend_name()
     }
 
+    pub fn hydration_report(&self) -> Result<HydrationReport, ApiError> {
+        self.read()?
+            .hydration_report
+            .clone()
+            .ok_or_else(|| ApiError::Internal("hydration report is unavailable".to_string()))
+    }
+
+    pub fn hydration_ready(&self) -> bool {
+        self.hydration_report()
+            .map(|report| report.ready)
+            .unwrap_or(false)
+    }
+
     pub async fn hydrate_from_repository(&self, tenant_id: &str) -> Result<Value, ApiError> {
-        let mut counts = serde_json::Map::new();
+        let mut pending = initial_hydration_report(&self.redaction_config);
+        pending.tenant_id = tenant_id.to_string();
+        pending.started_at = now();
+        pending.completed_at = None;
+        {
+            let mut data = self.write()?;
+            data.hydration_report = Some(pending.clone());
+        }
 
-        if let Some(components) = self.repository.list_harness_components(tenant_id).await? {
-            let mut data = self.write()?;
-            let count = components.len();
-            for component in components {
-                data.harness_components
-                    .insert(component.id.clone(), component);
-            }
-            counts.insert("harness_components".to_string(), json!(count));
+        if pending.status == HydrationStatus::NotRequired {
+            return Ok(hydration_response(&pending));
         }
-        if let Some(revisions) = self
-            .repository
-            .list_harness_component_revisions(tenant_id, None)
-            .await?
-        {
-            let mut data = self.write()?;
-            let count = revisions.len();
-            if !revisions.is_empty() {
-                data.harness_revisions.clear();
-                for revision in revisions {
-                    data.harness_revisions
-                        .entry(revision.component_id.clone())
-                        .or_default()
-                        .push(revision);
-                }
-                for revisions in data.harness_revisions.values_mut() {
-                    revisions.sort_by_key(|revision| revision.iteration);
-                }
+
+        let stage = match self.load_hydration_stage(tenant_id).await {
+            Ok(stage) => stage,
+            Err(failure) => {
+                self.publish_hydration_failure(tenant_id, &failure)?;
+                return Err(failure.error);
             }
-            counts.insert("harness_revisions".to_string(), json!(count));
-        }
-        if let Some(changes) = self.repository.list_harness_changes(tenant_id).await? {
-            let mut data = self.write()?;
-            let count = changes.len();
-            for change in changes {
-                data.harness_changes.insert(change.id.clone(), change);
-            }
-            counts.insert("harness_changes".to_string(), json!(count));
-        }
-        if let Some(verdicts) = self
-            .repository
-            .list_harness_verdicts(tenant_id, None)
-            .await?
-        {
-            let mut data = self.write()?;
-            let count = verdicts.len();
-            for verdict in verdicts {
-                data.harness_verdicts.insert(verdict.id.clone(), verdict);
-            }
-            counts.insert("harness_verdicts".to_string(), json!(count));
-        }
-        if let Some(cases) = self.repository.list_eval_cases(tenant_id).await? {
-            let mut data = self.write()?;
-            let count = cases.len();
-            for case in cases {
-                data.eval_cases.insert(case.id.clone(), case);
-            }
-            counts.insert("eval_cases".to_string(), json!(count));
-        }
-        if let Some(runs) = self.repository.list_eval_runs(tenant_id).await? {
-            let mut data = self.write()?;
-            let count = runs.len();
-            for run in runs {
-                data.eval_runs.insert(run.id.clone(), run);
-            }
-            counts.insert("eval_runs".to_string(), json!(count));
-        }
-        let run_ids = {
-            let data = self.read()?;
-            data.eval_runs.keys().cloned().collect::<Vec<_>>()
         };
-        let mut eval_result_count = 0usize;
-        let mut eval_overview_count = 0usize;
-        for run_id in run_ids {
-            if let Some(results) = self
-                .repository
-                .list_eval_case_results(tenant_id, &run_id)
-                .await?
-            {
-                eval_result_count += results.len();
-                let mut data = self.write()?;
-                for result in results {
-                    data.eval_case_results.insert(result.id.clone(), result);
-                }
-            }
-            if let Some(overview) = self
-                .repository
-                .get_eval_overview(tenant_id, &run_id)
-                .await?
-            {
-                eval_overview_count += 1;
-                let mut data = self.write()?;
-                data.eval_overviews.insert(run_id.clone(), overview);
-            }
-        }
-        counts.insert("eval_case_results".to_string(), json!(eval_result_count));
-        counts.insert("eval_overviews".to_string(), json!(eval_overview_count));
+        let report = completed_hydration_report(&self.redaction_config, tenant_id, &stage);
+        self.publish_hydration_stage(tenant_id, stage, report.clone())?;
+        Ok(hydration_response(&report))
+    }
 
-        let mut restored_nonterminal_tasks = Vec::new();
-        if let Some(tasks) = self.repository.list_ingest_tasks(tenant_id).await? {
-            let mut data = self.write()?;
-            let count = tasks.len();
-            for task in tasks {
-                if data.ingest_tasks.contains_key(&task.task_id) {
-                    continue;
-                }
-                if is_nonterminal_ingest_state(&task.state) {
-                    restored_nonterminal_tasks.push(task.task_id.clone());
-                }
-                data.ingest_tasks.insert(task.task_id.clone(), task);
+    async fn load_hydration_stage(
+        &self,
+        tenant_id: &str,
+    ) -> Result<HydrationStage, HydrationFailure> {
+        let mut user_indexes = required_hydration_rows(
+            "user_event_indexes",
+            self.repository.list_user_event_indexes(tenant_id).await,
+        )?;
+        let tenant_hash = self.resolver.tenant_hash(tenant_id);
+        let mut reconciliation_task_uids = Vec::new();
+        for index in &mut user_indexes {
+            let expected_event_index_uid = format!(
+                "rag_events__t_{tenant_hash}__u_{}",
+                index.owner_user_id_hash
+            );
+            let expected_context_index_uid = format!(
+                "rag_context__t_{tenant_hash}__u_{}",
+                index.owner_user_id_hash
+            );
+            let expected_id = user_event_index_id(&tenant_hash, &index.owner_user_id_hash);
+            if index.tenant_id != tenant_id
+                || index.tenant_hash != tenant_hash
+                || index.id != expected_id
+                || index.event_index_uid != expected_event_index_uid
+                || index.personal_context_index_uid != expected_context_index_uid
+            {
+                return Err(HydrationFailure {
+                    domain: "user_event_indexes",
+                    error: ApiError::Internal(
+                        "user event-index registry identity does not match its tenant scope"
+                            .to_string(),
+                    ),
+                });
             }
-            counts.insert("ingest_tasks".to_string(), json!(count));
+            index.schema_version = EVENT_INDEX_SCHEMA_VERSION;
+            index.settings_hash = EVENT_SETTINGS_HASH.to_string();
+            let mut task_uids = hydration_result(
+                "user_event_indexes",
+                self.repository
+                    .reconcile_registered_user_event_index(index)
+                    .await,
+            )?;
+            reconciliation_task_uids.append(&mut task_uids);
         }
-        let mut interrupted = 0usize;
-        for task_id in restored_nonterminal_tasks {
-            if self.mark_ingest_task_interrupted_async(&task_id).await? {
-                interrupted += 1;
+        if !reconciliation_task_uids.is_empty() {
+            hydration_result(
+                "user_event_indexes",
+                self.repository
+                    .wait_for_tasks(&reconciliation_task_uids)
+                    .await,
+            )?;
+        }
+
+        let mut stage = HydrationStage {
+            user_indexes,
+            company_context: required_hydration_rows(
+                "company_context_nodes",
+                self.repository.list_company_context_nodes(tenant_id).await,
+            )?,
+            state_items: required_hydration_rows(
+                "state_items",
+                self.repository.list_state_items(tenant_id).await,
+            )?,
+            insights: required_hydration_rows(
+                "insights",
+                self.repository.list_insights(tenant_id).await,
+            )?,
+            links: required_hydration_rows("links", self.repository.list_links(tenant_id).await)?,
+            sources: required_hydration_rows(
+                "company_sources",
+                self.repository.list_company_sources(tenant_id).await,
+            )?,
+            source_revisions: required_hydration_rows(
+                "source_revisions",
+                self.repository.list_source_revisions(tenant_id).await,
+            )?,
+            datasets: required_hydration_rows(
+                "datasets",
+                self.repository.list_datasets(tenant_id).await,
+            )?,
+            snapshots: required_hydration_rows(
+                "structured_snapshots",
+                self.repository.list_structured_snapshots(tenant_id).await,
+            )?,
+            structured_summaries: required_hydration_rows(
+                "structured_summaries",
+                self.repository.list_structured_summaries(tenant_id).await,
+            )?,
+            sessions: required_hydration_rows(
+                "sessions",
+                self.repository.list_sessions(tenant_id).await,
+            )?,
+            traces: required_hydration_rows(
+                "traces",
+                self.repository.list_traces(tenant_id).await,
+            )?,
+            harness_components: required_hydration_rows(
+                "harness_components",
+                self.repository.list_harness_components(tenant_id).await,
+            )?,
+            harness_revisions: required_hydration_rows(
+                "harness_revisions",
+                self.repository
+                    .list_harness_component_revisions(tenant_id, None)
+                    .await,
+            )?,
+            harness_changes: required_hydration_rows(
+                "harness_changes",
+                self.repository.list_harness_changes(tenant_id).await,
+            )?,
+            harness_verdicts: required_hydration_rows(
+                "harness_verdicts",
+                self.repository.list_harness_verdicts(tenant_id, None).await,
+            )?,
+            eval_cases: required_hydration_rows(
+                "eval_cases",
+                self.repository.list_eval_cases(tenant_id).await,
+            )?,
+            eval_runs: required_hydration_rows(
+                "eval_runs",
+                self.repository.list_eval_runs(tenant_id).await,
+            )?,
+            ingest_tasks: required_hydration_rows(
+                "ingest_tasks",
+                self.repository.list_ingest_tasks(tenant_id).await,
+            )?,
+            ingest_results: required_hydration_rows(
+                "ingest_results",
+                self.repository.list_ingest_results(tenant_id).await,
+            )?,
+            parse_artifacts: required_hydration_rows(
+                "parse_artifacts",
+                self.repository.list_tenant_parse_artifacts(tenant_id).await,
+            )?,
+            ..HydrationStage::default()
+        };
+
+        if stage
+            .parse_artifacts
+            .iter()
+            .any(|artifact| artifact.tenant_id != tenant_id)
+        {
+            return Err(HydrationFailure {
+                domain: "parse_artifacts",
+                error: ApiError::Internal(
+                    "parse artifact row does not match its tenant scope".to_string(),
+                ),
+            });
+        }
+        for run in &stage.eval_runs {
+            let mut results = required_hydration_rows(
+                "eval_case_results",
+                self.repository
+                    .list_eval_case_results(tenant_id, &run.id)
+                    .await,
+            )?;
+            stage.eval_case_results.append(&mut results);
+            if let Some(overview) = hydration_result(
+                "eval_overviews",
+                self.repository.get_eval_overview(tenant_id, &run.id).await,
+            )? {
+                stage.eval_overviews.push(overview);
             }
         }
-        if interrupted > 0 {
-            tracing::info!(
-                interrupted_tasks = interrupted,
-                "terminalized non-replayable ingest tasks during hydration"
+
+        let mut recovered_ids = HashSet::new();
+        for task in &mut stage.ingest_tasks {
+            if is_nonterminal_ingest_state(&task.state) {
+                apply_ingest_task_transition(task, "failed", Some(INGEST_ERROR_INTERRUPTED));
+                recovered_ids.insert(task.task_id.clone());
+            }
+        }
+        stage.recovered_ingest_tasks = recovered_ids.len();
+        let mut corrected_result_ids = HashSet::new();
+        for result in &mut stage.ingest_results {
+            if let Some(task) = stage
+                .ingest_tasks
+                .iter()
+                .find(|task| task.task_id == result.task.task_id)
+            {
+                if result.task != *task {
+                    result.task = task.clone();
+                    corrected_result_ids.insert(result.task.task_id.clone());
+                }
+            }
+        }
+
+        let mut artifact_by_key = stage
+            .parse_artifacts
+            .drain(..)
+            .map(|artifact| (ParseArtifactKey::from_artifact(&artifact), artifact))
+            .collect::<HashMap<_, _>>();
+        let mut recovered_artifacts = Vec::new();
+        for result in &stage.ingest_results {
+            for artifact in &result.parse_artifacts {
+                if artifact.tenant_id != tenant_id
+                    || artifact.owner_user_id != result.task.owner_user_id
+                {
+                    return Err(HydrationFailure {
+                        domain: "parse_artifacts",
+                        error: ApiError::Internal(
+                            "ingest-result artifact does not match its task scope".to_string(),
+                        ),
+                    });
+                }
+                let key = ParseArtifactKey::from_artifact(artifact);
+                artifact_by_key.entry(key).or_insert_with(|| {
+                    recovered_artifacts.push(artifact.clone());
+                    artifact.clone()
+                });
+            }
+        }
+        stage.recovered_parse_artifacts = recovered_artifacts.len();
+        stage.parse_artifacts = artifact_by_key.into_values().collect();
+        stage.parse_artifacts.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+                .then_with(|| left.owner_user_id.cmp(&right.owner_user_id))
+        });
+        if !recovered_artifacts.is_empty() {
+            let task_uid = hydration_result(
+                "parse_artifacts",
+                self.repository
+                    .upsert_parse_artifacts(&recovered_artifacts)
+                    .await,
+            )?;
+            if let Some(task_uid) = task_uid {
+                hydration_result(
+                    "parse_artifacts",
+                    self.repository.wait_for_tasks(&[task_uid]).await,
+                )?;
+            }
+        }
+
+        let recovered_tasks = stage
+            .ingest_tasks
+            .iter()
+            .filter(|task| recovered_ids.contains(&task.task_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !recovered_tasks.is_empty() {
+            let task_uids = hydration_result(
+                "ingest_tasks",
+                self.repository.upsert_ingest_tasks(&recovered_tasks).await,
+            )?;
+            hydration_result(
+                "ingest_tasks",
+                self.repository.wait_for_tasks(&task_uids).await,
+            )?;
+        }
+        let mut result_task_uids = Vec::new();
+        for result in stage
+            .ingest_results
+            .iter()
+            .filter(|result| corrected_result_ids.contains(&result.task.task_id))
+        {
+            if let Some(task_uid) = hydration_result(
+                "ingest_results",
+                self.repository.upsert_ingest_result(result).await,
+            )? {
+                result_task_uids.push(task_uid);
+            }
+        }
+        if !result_task_uids.is_empty() {
+            hydration_result(
+                "ingest_results",
+                self.repository.wait_for_tasks(&result_task_uids).await,
+            )?;
+        }
+
+        Ok(stage)
+    }
+
+    fn publish_hydration_failure(
+        &self,
+        tenant_id: &str,
+        failure: &HydrationFailure,
+    ) -> Result<(), ApiError> {
+        let diagnostic = safe_cause_diagnostic(&failure.error);
+        let mut report = initial_hydration_report(&self.redaction_config);
+        report.tenant_id = tenant_id.to_string();
+        report.status = HydrationStatus::Incomplete;
+        report.ready = false;
+        report.completed_at = Some(now());
+        if let Some(domain) = report.domains.get_mut(failure.domain) {
+            domain.status = "incomplete".to_string();
+            domain.error_category = Some(diagnostic.category.to_string());
+            domain.error_fingerprint = Some(diagnostic.fingerprint.clone());
+        }
+        tracing::error!(
+            domain = failure.domain,
+            cause_category = diagnostic.category,
+            cause_fingerprint = %diagnostic.fingerprint,
+            "mandatory repository hydration failed"
+        );
+        self.write()?.hydration_report = Some(report);
+        Ok(())
+    }
+
+    fn publish_hydration_stage(
+        &self,
+        tenant_id: &str,
+        stage: HydrationStage,
+        report: HydrationReport,
+    ) -> Result<(), ApiError> {
+        let HydrationStage {
+            user_indexes,
+            company_context,
+            state_items,
+            insights,
+            links,
+            sources,
+            source_revisions,
+            datasets,
+            snapshots,
+            structured_summaries,
+            sessions,
+            traces,
+            harness_components,
+            harness_revisions,
+            harness_changes,
+            harness_verdicts,
+            eval_cases,
+            eval_runs,
+            eval_case_results,
+            eval_overviews,
+            ingest_tasks,
+            ingest_results,
+            parse_artifacts,
+            recovered_ingest_tasks: _,
+            recovered_parse_artifacts: _,
+        } = stage;
+
+        let mut revisions_by_source: HashMap<String, Vec<SourceRevision>> = HashMap::new();
+        for revision in source_revisions {
+            revisions_by_source
+                .entry(revision.source_id.clone())
+                .or_default()
+                .push(revision);
+        }
+        for revisions in revisions_by_source.values_mut() {
+            revisions.sort_by_key(|revision| revision.created_at);
+        }
+
+        let mut harness_revisions_by_component: HashMap<String, Vec<HarnessComponentRevision>> =
+            HashMap::new();
+        for revision in harness_revisions {
+            harness_revisions_by_component
+                .entry(revision.component_id.clone())
+                .or_default()
+                .push(revision);
+        }
+        for revisions in harness_revisions_by_component.values_mut() {
+            revisions.sort_by_key(|revision| revision.iteration);
+        }
+
+        let mut data = self.write()?;
+        let stale_event_index_uids = data
+            .user_indexes
+            .values()
+            .filter(|index| index.tenant_id == tenant_id)
+            .map(|index| index.event_index_uid.clone())
+            .collect::<HashSet<_>>();
+        let stale_personal_index_uids = data
+            .user_indexes
+            .values()
+            .filter(|index| index.tenant_id == tenant_id)
+            .map(|index| index.personal_context_index_uid.clone())
+            .collect::<Vec<_>>();
+        data.event_by_id
+            .retain(|_, event| event.tenant_id != tenant_id);
+        data.event_idempotency
+            .retain(|(index_uid, _), _| !stale_event_index_uids.contains(index_uid));
+        for index_uid in stale_event_index_uids {
+            data.events_by_index.remove(&index_uid);
+        }
+        for index_uid in stale_personal_index_uids {
+            data.personal_context.remove(&index_uid);
+            data.personal_context_loaded.remove(&index_uid);
+        }
+        data.user_indexes
+            .retain(|(tenant, _), _| tenant != tenant_id);
+        for index in user_indexes {
+            data.events_by_index
+                .entry(index.event_index_uid.clone())
+                .or_default();
+            data.user_indexes.insert(
+                (index.tenant_id.clone(), index.owner_user_id_hash.clone()),
+                index,
             );
         }
-        if let Some(results) = self.repository.list_ingest_results(tenant_id).await? {
-            let mut data = self.write()?;
-            let count = results.len();
-            for result in results {
-                data.ingest_results
-                    .insert(result.task.task_id.clone(), result);
+
+        data.company_context
+            .retain(|node| node.tenant_id != tenant_id);
+        data.company_context.extend(company_context);
+
+        data.state_items
+            .retain(|(tenant, _, _), _| tenant != tenant_id);
+        for item in state_items {
+            data.state_items.insert(
+                (
+                    item.tenant_id.clone(),
+                    item.owner_user_id.clone(),
+                    item.natural_key.clone(),
+                ),
+                item,
+            );
+        }
+        data.insights
+            .retain(|_, insight| insight.tenant_id != tenant_id);
+        data.insight_idempotency
+            .retain(|(tenant, _, _), _| tenant != tenant_id);
+        data.insights
+            .extend(insights.into_iter().map(|item| (item.id.clone(), item)));
+        data.links.retain(|_, link| link.tenant_id != tenant_id);
+        data.link_idempotency
+            .retain(|(tenant, _, _), _| tenant != tenant_id);
+        data.links
+            .extend(links.into_iter().map(|link| (link.id.clone(), link)));
+
+        data.sources
+            .retain(|_, source| source.tenant_id != tenant_id);
+        data.source_documents
+            .retain(|_, document| document.tenant_id != tenant_id);
+        data.sources.extend(
+            sources
+                .into_iter()
+                .map(|source| (source.id.clone(), source)),
+        );
+        for revisions in data.source_revisions.values_mut() {
+            revisions.retain(|revision| revision.tenant_id != tenant_id);
+        }
+        data.source_revisions
+            .retain(|_, revisions| !revisions.is_empty());
+        for (source_id, mut revisions) in revisions_by_source {
+            data.source_revisions
+                .entry(source_id)
+                .or_default()
+                .append(&mut revisions);
+        }
+
+        data.datasets
+            .retain(|_, dataset| dataset.tenant_id != tenant_id);
+        data.datasets.extend(
+            datasets
+                .into_iter()
+                .map(|dataset| (dataset.dataset_key.clone(), dataset)),
+        );
+        let stale_snapshot_ids = data
+            .snapshots
+            .values()
+            .filter(|snapshot| snapshot.tenant_id == tenant_id)
+            .map(|snapshot| snapshot.id.clone())
+            .collect::<HashSet<_>>();
+        for snapshot_id in &stale_snapshot_ids {
+            data.rows_by_snapshot.remove(snapshot_id);
+        }
+        data.row_idempotency
+            .retain(|(snapshot_id, _)| !stale_snapshot_ids.contains(snapshot_id));
+        data.snapshot_idempotency
+            .retain(|(tenant, _), _| tenant != tenant_id);
+        data.snapshots
+            .retain(|_, snapshot| snapshot.tenant_id != tenant_id);
+        data.snapshots.extend(
+            snapshots
+                .into_iter()
+                .map(|snapshot| (snapshot.id.clone(), snapshot)),
+        );
+        data.structured_summaries.retain(|_, summary| {
+            summary.get("tenant_id").and_then(Value::as_str) != Some(tenant_id)
+        });
+        for summary in structured_summaries {
+            if let Some(id) = summary.get("id").and_then(Value::as_str) {
+                data.structured_summaries.insert(id.to_string(), summary);
             }
-            counts.insert("ingest_results".to_string(), json!(count));
         }
+        data.sessions
+            .retain(|_, session| session.tenant_id != tenant_id);
+        data.sessions.extend(
+            sessions
+                .into_iter()
+                .map(|session| (session.id.clone(), session)),
+        );
+        data.traces.retain(|_, trace| trace.tenant_id != tenant_id);
+        data.traces
+            .extend(traces.into_iter().map(|trace| (trace.id.clone(), trace)));
 
-        // Rehydrate company-scoped context nodes from the persistent store.
-        // Without this, every restart left fs_ls / context_search staring at
-        // an empty in-memory cache even though Meili kept the documents.
-        if let Some(nodes) = self
-            .repository
-            .list_company_context_nodes(tenant_id)
-            .await?
-        {
-            let count = nodes.len();
-            let mut data = self.write()?;
-            data.company_context = nodes;
-            counts.insert("company_context_nodes".to_string(), json!(count));
-        }
+        let default_component_ids = default_harness_components()
+            .into_iter()
+            .map(|(component_id, _, _, _)| component_id.to_string())
+            .collect::<HashSet<_>>();
+        let persisted_component_ids = harness_components
+            .iter()
+            .map(|component| component.id.clone())
+            .collect::<HashSet<_>>();
+        data.harness_components.retain(|component_id, component| {
+            component.tenant_id != tenant_id
+                || default_component_ids.contains(component_id)
+                || persisted_component_ids.contains(component_id)
+        });
 
-        // Rehydrate the source registry. Without these two, fs_read of
-        // ctx://company/docs/{source_id} 404s after a restart, the
-        // /v1/history/.../revisions endpoint returns []`, and create_revision
-        // would silently spawn a fresh source row (clobbering the old
-        // active_revision_id pointer) because `sources.entry().or_insert_with`
-        // never sees the existing entry.
-        if let Some(sources) = self.repository.list_company_sources(tenant_id).await? {
-            let count = sources.len();
-            let mut data = self.write()?;
-            data.sources = sources.into_iter().map(|s| (s.id.clone(), s)).collect();
-            counts.insert("company_sources".to_string(), json!(count));
+        let persisted_revision_ids = harness_revisions_by_component
+            .values()
+            .flatten()
+            .map(|revision| revision.id.clone())
+            .collect::<HashSet<_>>();
+        for (component_id, revisions) in &mut data.harness_revisions {
+            let bootstrap_id = bootstrap_harness_revision_id(component_id);
+            revisions.retain(|revision| {
+                revision.tenant_id != tenant_id
+                    || (default_component_ids.contains(component_id) && revision.id == bootstrap_id)
+                    || persisted_revision_ids.contains(&revision.id)
+            });
         }
-        if let Some(revisions) = self.repository.list_source_revisions(tenant_id).await? {
-            let count = revisions.len();
-            let mut by_source: HashMap<String, Vec<SourceRevision>> = HashMap::new();
+        data.harness_revisions
+            .retain(|_, revisions| !revisions.is_empty());
+        data.seed_harness_components(tenant_id);
+        data.harness_components.extend(
+            harness_components
+                .into_iter()
+                .map(|component| (component.id.clone(), component)),
+        );
+        for (component_id, revisions) in harness_revisions_by_component {
+            let target = data.harness_revisions.entry(component_id).or_default();
             for revision in revisions {
-                by_source
-                    .entry(revision.source_id.clone())
-                    .or_default()
-                    .push(revision);
+                if let Some(existing) = target.iter_mut().find(|existing| {
+                    existing.tenant_id == revision.tenant_id && existing.id == revision.id
+                }) {
+                    *existing = revision;
+                } else {
+                    target.push(revision);
+                }
             }
-            // Keep revisions in chronological order so callers iterating
-            // `source_revisions[source_id]` see the latest at the back, the
-            // same shape create_revision produces at runtime.
-            for revs in by_source.values_mut() {
-                revs.sort_by_key(|rev| rev.created_at);
+            target.sort_by_key(|revision| revision.iteration);
+        }
+        data.harness_changes
+            .retain(|_, change| change.tenant_id != tenant_id);
+        data.harness_changes.extend(
+            harness_changes
+                .into_iter()
+                .map(|change| (change.id.clone(), change)),
+        );
+        data.harness_verdicts
+            .retain(|_, verdict| verdict.tenant_id != tenant_id);
+        data.harness_verdicts.extend(
+            harness_verdicts
+                .into_iter()
+                .map(|verdict| (verdict.id.clone(), verdict)),
+        );
+
+        data.eval_cases
+            .retain(|_, case| case.tenant_id != tenant_id);
+        data.eval_cases
+            .extend(eval_cases.into_iter().map(|case| (case.id.clone(), case)));
+        data.eval_runs.retain(|_, run| run.tenant_id != tenant_id);
+        data.eval_runs
+            .extend(eval_runs.into_iter().map(|run| (run.id.clone(), run)));
+        data.eval_case_results
+            .retain(|_, result| result.tenant_id != tenant_id);
+        data.eval_case_results.extend(
+            eval_case_results
+                .into_iter()
+                .map(|result| (result.id.clone(), result)),
+        );
+        data.eval_overviews
+            .retain(|_, overview| overview.tenant_id != tenant_id);
+        data.eval_overviews.extend(
+            eval_overviews
+                .into_iter()
+                .map(|overview| (overview.run_id.clone(), overview)),
+        );
+
+        data.ingest_tasks
+            .retain(|_, task| task.tenant_id != tenant_id);
+        data.ingest_results
+            .retain(|_, result| result.task.tenant_id != tenant_id);
+        data.parse_artifacts
+            .retain(|_, artifact| artifact.tenant_id != tenant_id);
+        data.parsed_blocks
+            .retain(|key, _| key.tenant_id != tenant_id);
+        for artifact in parse_artifacts {
+            data.parse_artifacts
+                .insert(ParseArtifactKey::from_artifact(&artifact), artifact);
+        }
+        data.ingest_tasks.extend(
+            ingest_tasks
+                .into_iter()
+                .map(|task| (task.task_id.clone(), task)),
+        );
+        for result in ingest_results {
+            for artifact in &result.parse_artifacts {
+                data.parse_artifacts
+                    .insert(ParseArtifactKey::from_artifact(artifact), artifact.clone());
             }
-            let mut data = self.write()?;
-            data.source_revisions = by_source;
-            counts.insert("source_revisions".to_string(), json!(count));
+            let source_document_key = SourceDocumentKey::new(
+                &result.task.tenant_id,
+                result.task.owner_user_id.as_deref(),
+                &result.source_document_uri,
+            );
+            data.parsed_blocks
+                .insert(source_document_key, result.parsed_blocks.clone());
+            data.ingest_results
+                .insert(result.task.task_id.clone(), result);
         }
 
-        Ok(Value::Object(counts))
+        data.hydration_report = Some(report);
+        Ok(())
     }
 
     pub fn list_harness_components(&self) -> Result<Vec<HarnessComponent>, ApiError> {
@@ -1149,10 +1890,17 @@ impl Store {
         let tenant_matches = |value: &str| value == tenant_id;
 
         let event_count = data
-            .event_by_id
+            .user_indexes
             .values()
-            .filter(|event| event.tenant_id == tenant_id && owner_matches(&event.owner_user_id))
-            .count();
+            .filter(|index| index.tenant_id == tenant_id)
+            .filter(|index| {
+                include_global
+                    || owner_hash
+                        .as_deref()
+                        .is_some_and(|hash| hash == index.owner_user_id_hash)
+            })
+            .map(|index| index.event_count_estimate)
+            .sum::<usize>();
         let event_index_count = data
             .user_indexes
             .values()
@@ -1199,10 +1947,10 @@ impl Store {
             .collect::<HashSet<_>>();
         let snapshot_count = snapshot_ids.len();
         let row_count = data
-            .rows_by_snapshot
-            .iter()
-            .filter(|(snapshot_id, _)| snapshot_ids.contains(*snapshot_id))
-            .map(|(_, rows)| rows.len())
+            .snapshots
+            .values()
+            .filter(|snapshot| snapshot_ids.contains(&snapshot.id))
+            .map(|snapshot| snapshot.row_count)
             .sum::<usize>();
         let summary_count = data
             .structured_summaries
@@ -1276,11 +2024,8 @@ impl Store {
         let parsed_block_count = data
             .parsed_blocks
             .iter()
-            .filter(|(uri, _)| {
-                data.source_documents.get(*uri).is_some_and(|document| {
-                    document.tenant_id == tenant_id
-                        && owner_option_matches(document.owner_user_id.as_deref())
-                })
+            .filter(|(key, _)| {
+                key.tenant_id == tenant_id && owner_option_matches(key.owner_user_id.as_deref())
             })
             .map(|(_, blocks)| blocks.len())
             .sum::<usize>();
@@ -1491,6 +2236,29 @@ impl Store {
         self.search_events(tenant_id, path_owner_user_id, req)
     }
 
+    pub async fn timeline_async(
+        &self,
+        tenant_id: &str,
+        path_owner_user_id: Option<&str>,
+        req: TimelineQueryRequest,
+    ) -> Result<TimelineResponse, ApiError> {
+        let owner_user_id =
+            self.owner_from_path_or_body(path_owner_user_id, req.owner_user_id.as_deref())?;
+        let search = HistorySearchRequest {
+            owner_user_id: Some(owner_user_id.clone()),
+            from: req.from,
+            to: req.to,
+            limit: req.limit,
+            ..HistorySearchRequest::default()
+        };
+        let mut events = self
+            .search_events_async(tenant_id, Some(&owner_user_id), search)
+            .await?
+            .hits;
+        events.sort_by_key(|event| event.occurred_at);
+        Ok(TimelineResponse { events })
+    }
+
     pub async fn upsert_state_fact_async(
         &self,
         tenant_id: &str,
@@ -1553,6 +2321,7 @@ impl Store {
         req: InsightUpsertRequest,
     ) -> Result<InsightResponse, ApiError> {
         let response = self.upsert_insight(tenant_id, req)?;
+        let _ = self.repository.upsert_insight(&response.insight).await?;
         let routing =
             self.resolver
                 .resolve(tenant_id, &response.insight.owner_user_id, false, true)?;
@@ -1576,6 +2345,7 @@ impl Store {
         req: InsightPatchRequest,
     ) -> Result<InsightResponse, ApiError> {
         let response = self.patch_insight(tenant_id, insight_id, req)?;
+        let _ = self.repository.upsert_insight(&response.insight).await?;
         let routing =
             self.resolver
                 .resolve(tenant_id, &response.insight.owner_user_id, false, true)?;
@@ -1703,7 +2473,13 @@ impl Store {
             let mut data = self.write()?;
             for task_id in &expired {
                 data.ingest_tasks.remove(task_id);
-                data.ingest_results.remove(task_id);
+                if let Some(result) = data.ingest_results.remove(task_id) {
+                    data.parsed_blocks.remove(&SourceDocumentKey::new(
+                        &result.task.tenant_id,
+                        result.task.owner_user_id.as_deref(),
+                        &result.source_document_uri,
+                    ));
+                }
             }
         }
         self.repository
@@ -1978,7 +2754,8 @@ impl Store {
         let ingest = {
             let mut data = self.write()?;
             for artifact in artifacts.iter().cloned() {
-                data.parse_artifacts.insert(artifact.uri.clone(), artifact);
+                data.parse_artifacts
+                    .insert(ParseArtifactKey::from_artifact(&artifact), artifact);
             }
             self.write_source_document_fragments_locked(
                 &mut data,
@@ -2118,12 +2895,25 @@ impl Store {
         Ok(response)
     }
 
+    pub async fn upsert_dataset_async(
+        &self,
+        tenant_id: &str,
+        dataset_key: &str,
+        req: DatasetSchemaUpsertRequest,
+    ) -> Result<DatasetSchemaResponse, ApiError> {
+        let response = self.upsert_dataset(tenant_id, dataset_key, req)?;
+        let _ = self.repository.upsert_dataset(&response.dataset).await?;
+        Ok(response)
+    }
+
     pub async fn bulk_rows_async(
         &self,
         tenant_id: &str,
         snapshot_id: &str,
         req: BulkStructuredRowsRequest,
     ) -> Result<BulkStructuredRowsResponse, ApiError> {
+        self.ensure_snapshot_rows_loaded(tenant_id, snapshot_id)
+            .await?;
         let response = self.bulk_rows(tenant_id, snapshot_id, req)?;
         let rows = self.snapshot_rows(snapshot_id)?;
         let _ = self
@@ -2148,6 +2938,38 @@ impl Store {
         dataset_key: &str,
         req: ApplySnapshotRequest,
     ) -> Result<ApplySnapshotResponse, ApiError> {
+        let snapshot_id = req
+            .snapshot_id
+            .as_deref()
+            .ok_or_else(|| ApiError::bad_request("snapshot_id is required"))?;
+        let snapshot = self
+            .ensure_snapshot_rows_loaded(tenant_id, snapshot_id)
+            .await?;
+        let prior_snapshot_ids = {
+            let data = self.read()?;
+            let mut prior = data
+                .snapshots
+                .values()
+                .filter(|candidate| {
+                    candidate.id != snapshot.id
+                        && candidate.tenant_id == tenant_id
+                        && candidate.dataset_key == snapshot.dataset_key
+                        && candidate.owner_user_id == snapshot.owner_user_id
+                        && candidate.period_start < snapshot.period_start
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            prior.sort_by_key(|candidate| Reverse(candidate.period_start));
+            prior
+                .into_iter()
+                .take(4)
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>()
+        };
+        for prior_snapshot_id in prior_snapshot_ids {
+            self.ensure_snapshot_rows_loaded(tenant_id, &prior_snapshot_id)
+                .await?;
+        }
         let response = self.apply_snapshot(tenant_id, dataset_key, req)?;
         for summary in self.structured_summaries(&response.summary_ids)? {
             let _ = self
@@ -2191,7 +3013,7 @@ impl Store {
         let structured_filters = parse_context_filters(&req.filters)?;
         let include = ContextIncludeSet::from_request(&req.include)?;
         let profile = ContextReturnProfile::from_request(&req.return_profile)?;
-        if let Some(result) = self
+        if let Some(mut result) = self
             .repository
             .search_context(RepositoryContextSearchQuery {
                 tenant_id,
@@ -2204,6 +3026,10 @@ impl Store {
             })
             .await?
         {
+            result.nodes.retain(|node| {
+                self.validate_repository_context_node(node, tenant_id, owner_user_id.as_deref())
+                    .is_ok()
+            });
             // Hybrid re-rank of the repository's candidates: Meilisearch
             // decided membership, the blended text+vector score decides the
             // final order. Repository matches are never dropped here — a
@@ -2337,6 +3163,8 @@ impl Store {
         req: SessionCommitRequest,
     ) -> Result<SessionCommitResponse, ApiError> {
         let response = self.commit_session(tenant_id, session_id, req)?;
+        let session = self.session_record(session_id)?;
+        let _ = self.repository.upsert_session(&session).await?;
         if let Some(uri) = &response.archive_uri {
             let owner = self.session_owner_id(session_id)?;
             let node = self.fs_read(tenant_id, uri, Some(&owner), false)?;
@@ -2361,6 +3189,8 @@ impl Store {
         req: SessionMessageRequest,
     ) -> Result<Value, ApiError> {
         let response = self.add_session_message(tenant_id, session_id, req)?;
+        let session = self.session_record(session_id)?;
+        let _ = self.repository.upsert_session(&session).await?;
         if let Some(event_id) = response
             .get("history_event_id")
             .and_then(Value::as_str)
@@ -2368,6 +3198,17 @@ impl Store {
         {
             let _ = self.persist_history_event_by_id(event_id).await?;
         }
+        Ok(response)
+    }
+
+    pub async fn create_session_async(
+        &self,
+        tenant_id: &str,
+        req: SessionCreateRequest,
+    ) -> Result<SessionResponse, ApiError> {
+        let response = self.create_session(tenant_id, req)?;
+        let session = self.session_record(&response.session_id)?;
+        let _ = self.repository.upsert_session(&session).await?;
         Ok(response)
     }
 
@@ -2414,6 +3255,9 @@ impl Store {
             return Ok(snapshot);
         }
         if let Some(snapshot) = self.repository.get_snapshot(tenant_id, snapshot_id).await? {
+            self.write()?
+                .snapshots
+                .insert(snapshot.id.clone(), snapshot.clone());
             return Ok(snapshot);
         }
         Err(ApiError::not_found("snapshot not found"))
@@ -2424,14 +3268,10 @@ impl Store {
         tenant_id: &str,
         snapshot_id: &str,
     ) -> Result<String, ApiError> {
-        if let Ok(owner) = self.snapshot_owner(tenant_id, snapshot_id) {
-            return Ok(owner);
-        }
-        self.repository
-            .get_snapshot(tenant_id, snapshot_id)
+        Ok(self
+            .get_snapshot_async(tenant_id, snapshot_id)
             .await?
-            .map(|snapshot| snapshot.owner_user_id)
-            .ok_or_else(|| ApiError::not_found("snapshot not found"))
+            .owner_user_id)
     }
 
     pub async fn list_rows_async(
@@ -2439,20 +3279,44 @@ impl Store {
         tenant_id: &str,
         snapshot_id: &str,
     ) -> Result<Value, ApiError> {
-        let memory_rows = {
-            let data = self.read()?;
-            data.snapshots
-                .get(snapshot_id)
-                .filter(|snapshot| snapshot.tenant_id == tenant_id)
-                .and_then(|_| data.rows_by_snapshot.get(snapshot_id).cloned())
-        };
-        if let Some(rows) = memory_rows {
-            return Ok(json!({ "snapshot_id": snapshot_id, "rows": rows }));
+        self.ensure_snapshot_rows_loaded(tenant_id, snapshot_id)
+            .await?;
+        let rows = self
+            .read()?
+            .rows_by_snapshot
+            .get(snapshot_id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(json!({ "snapshot_id": snapshot_id, "rows": rows }))
+    }
+
+    async fn ensure_snapshot_rows_loaded(
+        &self,
+        tenant_id: &str,
+        snapshot_id: &str,
+    ) -> Result<StructuredSnapshot, ApiError> {
+        let snapshot = self.get_snapshot_async(tenant_id, snapshot_id).await?;
+        let already_loaded = self.read()?.rows_by_snapshot.contains_key(snapshot_id);
+        if already_loaded {
+            return Ok(snapshot);
         }
-        if let Some(rows) = self.repository.list_rows(tenant_id, snapshot_id).await? {
-            return Ok(json!({ "snapshot_id": snapshot_id, "rows": rows }));
+        let rows = self
+            .repository
+            .list_rows(tenant_id, snapshot_id)
+            .await?
+            .unwrap_or_default();
+        let mut data = self.write()?;
+        if !data.rows_by_snapshot.contains_key(snapshot_id) {
+            for row_id in rows
+                .iter()
+                .filter_map(|row| row.get("id").and_then(Value::as_str))
+            {
+                data.row_idempotency
+                    .insert((snapshot_id.to_string(), row_id.to_string()));
+            }
+            data.rows_by_snapshot.insert(snapshot_id.to_string(), rows);
         }
-        Ok(json!({ "snapshot_id": snapshot_id, "rows": [] }))
+        Ok(snapshot)
     }
 
     pub async fn get_trace_async(
@@ -2464,9 +3328,129 @@ impl Store {
             return Ok(trace);
         }
         if let Some(trace) = self.repository.get_trace(tenant_id, trace_id).await? {
+            self.write()?.traces.insert(trace.id.clone(), trace.clone());
             return Ok(trace);
         }
         Err(ApiError::not_found("trace not found"))
+    }
+
+    pub async fn trace_owner_id_async(
+        &self,
+        tenant_id: &str,
+        trace_id: &str,
+    ) -> Result<Option<String>, ApiError> {
+        Ok(self
+            .get_trace_async(tenant_id, trace_id)
+            .await?
+            .owner_user_id)
+    }
+
+    async fn ensure_personal_context_loaded(
+        &self,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<(), ApiError> {
+        let index_scopes = if let Some(owner_user_id) = owner_user_id {
+            let owner_hash = self.resolver.user_hash(owner_user_id);
+            if self
+                .read()?
+                .user_indexes
+                .contains_key(&(tenant_id.to_string(), owner_hash))
+            {
+                vec![(
+                    self.resolver
+                        .resolve(tenant_id, owner_user_id, false, true)?
+                        .personal_context_index_uid,
+                    self.resolver.user_hash(owner_user_id),
+                    Some(owner_user_id.to_string()),
+                )]
+            } else {
+                Vec::new()
+            }
+        } else if include_all_private {
+            self.read()?
+                .user_indexes
+                .values()
+                .filter(|index| index.tenant_id == tenant_id)
+                .map(|index| {
+                    (
+                        index.personal_context_index_uid.clone(),
+                        index.owner_user_id_hash.clone(),
+                        None,
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        for (index_uid, owner_hash, expected_owner) in index_scopes {
+            if self.read()?.personal_context_loaded.contains(&index_uid) {
+                continue;
+            }
+            let nodes = self
+                .repository
+                .list_personal_context_nodes(tenant_id, &index_uid)
+                .await?
+                .unwrap_or_default();
+            let loaded_count = nodes.len();
+            let nodes = nodes
+                .into_iter()
+                .filter(|node| {
+                    node.tenant_id == tenant_id
+                        && node.index_uid == index_uid
+                        && node.index_kind == "personal"
+                        && node.privacy == "private"
+                        && node.owner_user_id.as_deref().is_some_and(|owner| {
+                            self.resolver.user_hash(owner) == owner_hash
+                                && expected_owner
+                                    .as_deref()
+                                    .is_none_or(|expected| owner == expected)
+                        })
+                })
+                .collect::<Vec<_>>();
+            let quarantined = loaded_count.saturating_sub(nodes.len());
+            if quarantined > 0 {
+                tracing::warn!(
+                    index_uid,
+                    quarantined,
+                    "ignored personal-context rows outside the registry owner scope"
+                );
+            }
+            let mut data = self.write()?;
+            upsert_context_nodes(
+                data.personal_context.entry(index_uid.clone()).or_default(),
+                nodes,
+            );
+            data.personal_context_loaded.insert(index_uid);
+        }
+        Ok(())
+    }
+
+    pub async fn fs_ls_async(
+        &self,
+        tenant_id: &str,
+        uri: Option<&str>,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<Value, ApiError> {
+        self.ensure_personal_context_loaded(tenant_id, owner_user_id, include_all_private)
+            .await?;
+        self.fs_ls(tenant_id, uri, owner_user_id, include_all_private)
+    }
+
+    pub async fn fs_tree_async(
+        &self,
+        tenant_id: &str,
+        uri: Option<&str>,
+        depth: Option<usize>,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<Value, ApiError> {
+        self.ensure_personal_context_loaded(tenant_id, owner_user_id, include_all_private)
+            .await?;
+        self.fs_tree(tenant_id, uri, depth, owner_user_id, include_all_private)
     }
 
     pub async fn fs_read_async(
@@ -2476,28 +3460,38 @@ impl Store {
         owner_user_id: Option<&str>,
         include_all_private: bool,
     ) -> Result<ContextNode, ApiError> {
-        if let Ok(node) = self.fs_read(tenant_id, uri, owner_user_id, include_all_private) {
+        self.ensure_personal_context_loaded(tenant_id, owner_user_id, include_all_private)
+            .await?;
+        match self.fs_read(tenant_id, uri, owner_user_id, include_all_private) {
+            Ok(node) => return Ok(self.sanitize_context_node_for_egress(node)),
+            Err(ApiError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(node) = self
+            .repository
+            .read_context_node(tenant_id, owner_user_id, uri, None, &self.resolver)
+            .await?
+        {
+            self.validate_repository_context_node(&node, tenant_id, owner_user_id)?;
+            self.cache_context_node(node.clone())?;
             return Ok(self.sanitize_context_node_for_egress(node));
         }
-        if !include_all_private {
-            if let Some(node) = self
+        let source_document = if owner_user_id.is_none() && include_all_private {
+            let documents = self
                 .repository
-                .read_context_node(tenant_id, owner_user_id, uri, None, &self.resolver)
+                .list_source_documents_by_uri(tenant_id, uri)
                 .await?
-            {
-                return Ok(self.sanitize_context_node_for_egress(node));
-            }
-            if let Some(source_document) = self
-                .repository
+                .unwrap_or_default();
+            select_admin_source_document(documents)?
+        } else {
+            self.repository
                 .read_source_document(tenant_id, owner_user_id, uri)
                 .await?
-            {
-                return Ok(
-                    self.sanitize_context_node_for_egress(source_document_context_node(
-                        source_document,
-                    )),
-                );
-            }
+        };
+        if let Some(source_document) = source_document {
+            self.cache_source_document(source_document.clone())?;
+            return Ok(self
+                .sanitize_context_node_for_egress(source_document_context_node(source_document)));
         }
         Err(ApiError::not_found("context uri not found"))
     }
@@ -2510,19 +3504,182 @@ impl Store {
         owner_user_id: Option<&str>,
         include_all_private: bool,
     ) -> Result<ContextNode, ApiError> {
-        if let Ok(node) = self.fs_layer(tenant_id, uri, layer, owner_user_id, include_all_private) {
+        self.ensure_personal_context_loaded(tenant_id, owner_user_id, include_all_private)
+            .await?;
+        match self.fs_layer(tenant_id, uri, layer, owner_user_id, include_all_private) {
+            Ok(node) => return Ok(self.sanitize_context_node_for_egress(node)),
+            Err(ApiError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        if let Some(node) = self
+            .repository
+            .read_context_node(tenant_id, owner_user_id, uri, Some(layer), &self.resolver)
+            .await?
+        {
+            self.validate_repository_context_node(&node, tenant_id, owner_user_id)?;
+            self.cache_context_node(node.clone())?;
             return Ok(self.sanitize_context_node_for_egress(node));
         }
-        if !include_all_private {
-            if let Some(node) = self
-                .repository
-                .read_context_node(tenant_id, owner_user_id, uri, Some(layer), &self.resolver)
-                .await?
-            {
-                return Ok(self.sanitize_context_node_for_egress(node));
+        Err(ApiError::not_found("context layer not found"))
+    }
+
+    pub async fn traceback_async(
+        &self,
+        tenant_id: &str,
+        req: ContextTracebackRequest,
+        include_all_private: bool,
+    ) -> Result<ContextTracebackResponse, ApiError> {
+        let uri = req
+            .uri
+            .as_deref()
+            .ok_or_else(|| ApiError::bad_request("uri is required"))?;
+        let owner_user_id = req.owner_user_id.as_deref();
+        let fragment = self
+            .fs_read_async(tenant_id, uri, owner_user_id, include_all_private)
+            .await?;
+        let source_owner_user_id = fragment.owner_user_id.clone();
+        let source_document_uri = fragment.source_document_uri.clone().or_else(|| {
+            self.read().ok().and_then(|data| {
+                data.links
+                    .values()
+                    .find(|link| {
+                        link.tenant_id == tenant_id
+                            && link.status == "active"
+                            && link.relation == "part_of"
+                            && link.source_uri == fragment.uri
+                    })
+                    .map(|link| link.target_uri.clone())
+            })
+        });
+        if let Some(source_document_uri) = source_document_uri {
+            let source_document_key = SourceDocumentKey::new(
+                tenant_id,
+                source_owner_user_id.as_deref(),
+                &source_document_uri,
+            );
+            let cached = self
+                .read()?
+                .source_documents
+                .get(&source_document_key)
+                .is_some_and(|document| document.status == "active");
+            if !cached {
+                if let Some(document) = self
+                    .repository
+                    .read_source_document(
+                        tenant_id,
+                        source_owner_user_id.as_deref(),
+                        &source_document_uri,
+                    )
+                    .await?
+                {
+                    self.cache_source_document(document)?;
+                }
             }
         }
-        Err(ApiError::not_found("context layer not found"))
+        self.traceback(tenant_id, req, include_all_private)
+    }
+
+    pub async fn reveal_context_async(
+        &self,
+        tenant_id: &str,
+        req: ContextRevealRequest,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+    ) -> Result<ContextRevealResponse, ApiError> {
+        let layer = req.next_layer.unwrap_or(1);
+        let uri = if let Some(uri) = req.uri {
+            uri
+        } else if let Some(trace_id) = req.trace_id {
+            self.get_trace_async(tenant_id, &trace_id)
+                .await?
+                .context_uris
+                .into_iter()
+                .next()
+                .ok_or_else(|| ApiError::not_found("trace has no context to reveal"))?
+        } else {
+            return Err(ApiError::bad_request("uri or trace_id is required"));
+        };
+        let node = self
+            .fs_layer_async(tenant_id, &uri, layer, owner_user_id, include_all_private)
+            .await?;
+        Ok(ContextRevealResponse {
+            uri: node.uri,
+            layer: node.layer,
+            content: node.body,
+            source_ref: SourceRef {
+                kind: node.index_kind,
+                id: node.source_id.unwrap_or_default(),
+                uri: Some(uri),
+                meta: None,
+            },
+        })
+    }
+
+    fn cache_context_node(&self, node: ContextNode) -> Result<(), ApiError> {
+        let mut data = self.write()?;
+        let nodes = if node.index_kind == "company" || node.index_uid == "rag_company_context" {
+            &mut data.company_context
+        } else {
+            data.personal_context
+                .entry(node.index_uid.clone())
+                .or_default()
+        };
+        if let Some(existing) = nodes
+            .iter_mut()
+            .find(|existing| existing.tenant_id == node.tenant_id && existing.uri == node.uri)
+        {
+            *existing = node;
+        } else {
+            nodes.push(node);
+        }
+        Ok(())
+    }
+
+    fn validate_repository_context_node(
+        &self,
+        node: &ContextNode,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let company_scope = node.tenant_id == tenant_id
+            && node.owner_user_id.is_none()
+            && node.privacy == "company"
+            && node.index_kind == "company"
+            && node.index_uid == "rag_company_context"
+            && node.status == "active";
+        let personal_scope = if let Some(owner_user_id) = owner_user_id {
+            let routing = self
+                .resolver
+                .resolve(tenant_id, owner_user_id, false, true)?;
+            node.tenant_id == tenant_id
+                && node.owner_user_id.as_deref() == Some(owner_user_id)
+                && node.privacy == "private"
+                && node.index_kind == "personal"
+                && node.index_uid == routing.personal_context_index_uid
+                && node.status == "active"
+        } else {
+            false
+        };
+
+        if company_scope || personal_scope {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            tenant_id,
+            uri = %node.uri,
+            index_uid = %node.index_uid,
+            "repository context row failed scope validation"
+        );
+        Err(ApiError::Internal(
+            "repository context row does not match its requested scope".to_string(),
+        ))
+    }
+
+    fn cache_source_document(&self, document: SourceDocument) -> Result<(), ApiError> {
+        let key = SourceDocumentKey::from_document(&document);
+        self.write()?.source_documents.insert(key, document);
+        Ok(())
     }
 
     fn sanitize_context_node_for_egress(&self, mut node: ContextNode) -> ContextNode {
@@ -2579,9 +3736,17 @@ impl Store {
         )
     }
 
-    pub fn list_user_indexes(&self) -> Result<ListUserEventIndexesResponse, ApiError> {
+    pub fn list_user_indexes(
+        &self,
+        tenant_id: &str,
+    ) -> Result<ListUserEventIndexesResponse, ApiError> {
         let data = self.read()?;
-        let mut indexes: Vec<_> = data.user_indexes.values().cloned().collect();
+        let mut indexes: Vec<_> = data
+            .user_indexes
+            .values()
+            .filter(|index| index.tenant_id == tenant_id)
+            .cloned()
+            .collect();
         indexes.sort_by_key(|index| index.created_at);
         Ok(ListUserEventIndexesResponse {
             indexes,
@@ -2598,17 +3763,33 @@ impl Store {
         let mut created = 0;
         let mut updated_settings = 0;
         let mut indexes = Vec::new();
-        let owners = if req.owner_user_ids.is_empty() {
-            data.user_indexes
-                .keys()
-                .filter(|(tenant, _)| tenant == tenant_id)
-                .map(|(_, owner)| owner.clone())
-                .collect()
-        } else {
-            req.owner_user_ids.clone()
-        };
+        if req.owner_user_ids.is_empty() {
+            indexes = data
+                .user_indexes
+                .iter()
+                .filter(|((tenant, _), _)| tenant == tenant_id)
+                .map(|(_, index)| {
+                    let mut index = index.clone();
+                    if req.dry_run {
+                        index.status = "dry_run".to_string();
+                    }
+                    index
+                })
+                .collect();
+            indexes.sort_by_key(|index| index.created_at);
+            if req.reapply_settings && !req.dry_run {
+                updated_settings = indexes.len();
+            }
+            return Ok(ReconcileUserEventIndexesResponse {
+                checked: indexes.len(),
+                created,
+                updated_settings,
+                errors: Vec::new(),
+                indexes,
+            });
+        }
 
-        for owner in owners {
+        for owner in req.owner_user_ids {
             if req.dry_run {
                 let routing = self.resolver.resolve(tenant_id, &owner, false, true)?;
                 let tenant_hash = self.resolver.tenant_hash(tenant_id);
@@ -2629,9 +3810,10 @@ impl Store {
                 continue;
             }
 
+            let owner_hash = self.resolver.user_hash(&owner);
             let existed = data
                 .user_indexes
-                .contains_key(&(tenant_id.to_string(), owner.clone()));
+                .contains_key(&(tenant_id.to_string(), owner_hash));
             if req.create_missing || existed {
                 let (index, _) = self.ensure_user_index_locked(
                     &mut data,
@@ -2656,6 +3838,21 @@ impl Store {
             errors: Vec::new(),
             indexes,
         })
+    }
+
+    pub async fn reconcile_user_indexes_async(
+        &self,
+        tenant_id: &str,
+        req: ReconcileUserEventIndexesRequest,
+    ) -> Result<ReconcileUserEventIndexesResponse, ApiError> {
+        let dry_run = req.dry_run;
+        let response = self.reconcile_user_indexes(tenant_id, req)?;
+        if !dry_run {
+            for index in &response.indexes {
+                let _ = self.repository.ensure_user_event_index(index).await?;
+            }
+        }
+        Ok(response)
     }
 
     pub fn append_event(
@@ -3209,14 +4406,16 @@ impl Store {
             let hash = self.resolver.idempotency_hash(key);
             if let Some(id) = data
                 .insight_idempotency
-                .get(&(owner_user_id.clone(), hash.clone()))
+                .get(&(tenant_id.to_string(), owner_user_id.clone(), hash.clone()))
                 .cloned()
             {
                 id
             } else {
                 let id = new_id("insight");
-                data.insight_idempotency
-                    .insert((owner_user_id.clone(), hash), id.clone());
+                data.insight_idempotency.insert(
+                    (tenant_id.to_string(), owner_user_id.clone(), hash),
+                    id.clone(),
+                );
                 id
             }
         } else {
@@ -3393,7 +4592,7 @@ impl Store {
             if let Some(hash) = &idempotency_hash {
                 if let Some(existing_id) = data
                     .link_idempotency
-                    .get(&(owner_scope.clone(), hash.clone()))
+                    .get(&(tenant_id.to_string(), owner_scope.clone(), hash.clone()))
                     .cloned()
                 {
                     if let Some(link) = data.links.get(&existing_id).cloned() {
@@ -3451,7 +4650,7 @@ impl Store {
             };
             if let Some(hash) = idempotency_hash {
                 data.link_idempotency
-                    .insert((owner_scope, hash), id.clone());
+                    .insert((tenant_id.to_string(), owner_scope, hash), id.clone());
             }
             data.links.insert(id, link.clone());
             (link, decision)
@@ -3926,11 +5125,12 @@ impl Store {
         let id = if let Some(key) = req.idempotency_key {
             let hash = self.resolver.idempotency_hash(&key);
             let mut data = self.write()?;
-            if let Some(id) = data.snapshot_idempotency.get(&hash).cloned() {
+            let key = (tenant_id.to_string(), hash);
+            if let Some(id) = data.snapshot_idempotency.get(&key).cloned() {
                 id
             } else {
                 let id = new_id("snapshot");
-                data.snapshot_idempotency.insert(hash, id.clone());
+                data.snapshot_idempotency.insert(key, id.clone());
                 id
             }
         } else {
@@ -4329,11 +5529,13 @@ impl Store {
         include_all_private: bool,
     ) -> Result<ContextNode, ApiError> {
         let data = self.read()?;
-        if let Some(node) = self
-            .context_scope_for_acl_locked(&data, tenant_id, owner_user_id, include_all_private)?
-            .into_iter()
-            .find(|node| node.uri == uri && node.status == "active")
-        {
+        if let Some(node) = self.context_node_for_acl_locked(
+            &data,
+            tenant_id,
+            owner_user_id,
+            include_all_private,
+            |node| node.uri == uri && node.status == "active",
+        )? {
             return Ok(node);
         }
         self.source_document_for_acl_locked(
@@ -4342,7 +5544,7 @@ impl Store {
             uri,
             owner_user_id,
             include_all_private,
-        )
+        )?
         .map(source_document_context_node)
         .ok_or_else(|| ApiError::not_found("context uri not found"))
     }
@@ -4357,14 +5559,18 @@ impl Store {
     ) -> Result<ContextNode, ApiError> {
         let target = strip_layer_suffix(uri);
         let data = self.read()?;
-        self.context_scope_for_acl_locked(&data, tenant_id, owner_user_id, include_all_private)?
-            .into_iter()
-            .find(|node| {
+        self.context_node_for_acl_locked(
+            &data,
+            tenant_id,
+            owner_user_id,
+            include_all_private,
+            |node| {
                 strip_layer_suffix(&node.uri) == target
                     && node.layer == layer
                     && node.status == "active"
-            })
-            .ok_or_else(|| ApiError::not_found("context layer not found"))
+            },
+        )?
+        .ok_or_else(|| ApiError::not_found("context layer not found"))
     }
 
     pub fn traceback(
@@ -4377,9 +5583,13 @@ impl Store {
         let owner_user_id = req.owner_user_id.as_deref();
         let data = self.read()?;
         let fragment = self
-            .context_scope_for_acl_locked(&data, tenant_id, owner_user_id, include_all_private)?
-            .into_iter()
-            .find(|node| node.uri == uri && node.status == "active")
+            .context_node_for_acl_locked(
+                &data,
+                tenant_id,
+                owner_user_id,
+                include_all_private,
+                |node| node.uri == uri && node.status == "active",
+            )?
             .ok_or_else(|| ApiError::not_found("fragment uri not found"))?;
         if fragment.node_kind != "fragment" {
             return Err(ApiError::bad_request(
@@ -4409,7 +5619,7 @@ impl Store {
                 &source_document_uri,
                 owner_user_id,
                 include_all_private,
-            )
+            )?
             .ok_or_else(|| ApiError::not_found("source document not found"))?;
 
         Ok(ContextTracebackResponse {
@@ -5129,30 +6339,29 @@ impl Store {
                 32,
             );
             let now = now();
-            data.source_documents.insert(
-                uri.clone(),
-                SourceDocument {
-                    id: source_document_id(
-                        tenant_id,
-                        result.owner_user_id.as_deref(),
-                        &format!("eval-case:{}", result.id),
-                        &run.id,
-                    ),
-                    tenant_id: tenant_id.to_string(),
-                    owner_user_id: result.owner_user_id.clone(),
-                    source_kind: "eval_case_report".to_string(),
-                    source_id: format!("eval-case:{}", result.id),
-                    revision_id: run.id.clone(),
-                    uri: uri.clone(),
-                    title: format!("Eval case {} report", result.case_id),
-                    content,
-                    checksum,
-                    status: "active".to_string(),
-                    retrieval_enabled: false,
-                    created_at: now,
-                    updated_at: now,
-                },
-            );
+            let document = SourceDocument {
+                id: source_document_id(
+                    tenant_id,
+                    result.owner_user_id.as_deref(),
+                    &format!("eval-case:{}", result.id),
+                    &run.id,
+                ),
+                tenant_id: tenant_id.to_string(),
+                owner_user_id: result.owner_user_id.clone(),
+                source_kind: "eval_case_report".to_string(),
+                source_id: format!("eval-case:{}", result.id),
+                revision_id: run.id.clone(),
+                uri: uri.clone(),
+                title: format!("Eval case {} report", result.case_id),
+                content,
+                checksum,
+                status: "active".to_string(),
+                retrieval_enabled: false,
+                created_at: now,
+                updated_at: now,
+            };
+            data.source_documents
+                .insert(SourceDocumentKey::from_document(&document), document);
             run.report_source_document_uris.push(uri.clone());
             overview.case_report_uris.push(uri);
         }
@@ -5452,6 +6661,14 @@ impl Store {
             .map(|session| session.owner_user_id.clone()))
     }
 
+    fn session_record(&self, session_id: &str) -> Result<SessionRecord, ApiError> {
+        self.read()?
+            .sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("session not found"))
+    }
+
     fn insert_trace(&self, trace: TraceRecord) -> Result<(), ApiError> {
         let mut data = self.write()?;
         data.traces.insert(trace.id.clone(), trace);
@@ -5480,7 +6697,10 @@ impl Store {
         owner_user_id: &str,
         schema_version: u32,
     ) -> Result<(UserEventIndex, EventIndexRouting), ApiError> {
-        let key = (tenant_id.to_string(), owner_user_id.to_string());
+        let key = (
+            tenant_id.to_string(),
+            self.resolver.user_hash(owner_user_id),
+        );
         let existed = data.user_indexes.contains_key(&key);
         let routing = self
             .resolver
@@ -5827,9 +7047,11 @@ impl Store {
         let now = now();
         let source_document_id =
             source_document_id(tenant_id, owner_user_id.as_deref(), source_id, revision_id);
+        let source_document_key =
+            SourceDocumentKey::new(tenant_id, owner_user_id.as_deref(), source_document_uri);
         let created_at = data
             .source_documents
-            .get(source_document_uri)
+            .get(&source_document_key)
             .map(|document| document.created_at)
             .unwrap_or(now);
         let source_document = SourceDocument {
@@ -5849,11 +7071,11 @@ impl Store {
             updated_at: now,
         };
         data.source_documents
-            .insert(source_document.uri.clone(), source_document);
+            .insert(source_document_key.clone(), source_document);
 
         if !blocks.is_empty() {
             data.parsed_blocks
-                .insert(source_document_uri.to_string(), blocks.to_vec());
+                .insert(source_document_key, blocks.to_vec());
         }
 
         let redaction_secrets = self.redaction_config.configured_secret_values();
@@ -6104,7 +7326,13 @@ impl Store {
         let mut nodes: Vec<_> = data
             .company_context
             .iter()
-            .filter(|node| node.tenant_id == tenant_id)
+            .filter(|node| {
+                node.tenant_id == tenant_id
+                    && node.owner_user_id.is_none()
+                    && node.privacy == "company"
+                    && node.index_kind == "company"
+                    && node.index_uid == "rag_company_context"
+            })
             .cloned()
             .collect();
         if let Some(owner) = owner_user_id {
@@ -6112,8 +7340,16 @@ impl Store {
             nodes.extend(
                 data.personal_context
                     .get(&routing.personal_context_index_uid)
-                    .cloned()
-                    .unwrap_or_default(),
+                    .into_iter()
+                    .flatten()
+                    .filter(|node| {
+                        node.tenant_id == tenant_id
+                            && node.owner_user_id.as_deref() == Some(owner)
+                            && node.privacy == "private"
+                            && node.index_kind == "personal"
+                            && node.index_uid == routing.personal_context_index_uid
+                    })
+                    .cloned(),
             );
         }
         Ok(nodes)
@@ -6127,13 +7363,81 @@ impl Store {
         include_all_private: bool,
     ) -> Result<Vec<ContextNode>, ApiError> {
         if include_all_private && owner_user_id.is_none() {
-            return Ok(self
-                .all_context_nodes_locked(data)
-                .into_iter()
-                .filter(|node| node.tenant_id == tenant_id)
-                .collect());
+            let mut nodes = self.context_scope_locked(data, tenant_id, None)?;
+            for index in data
+                .user_indexes
+                .values()
+                .filter(|index| index.tenant_id == tenant_id)
+            {
+                nodes.extend(
+                    data.personal_context
+                        .get(&index.personal_context_index_uid)
+                        .into_iter()
+                        .flatten()
+                        .filter(|node| {
+                            node.tenant_id == tenant_id
+                                && node.privacy == "private"
+                                && node.index_kind == "personal"
+                                && node.index_uid == index.personal_context_index_uid
+                                && node.owner_user_id.as_deref().is_some_and(|owner| {
+                                    self.resolver.user_hash(owner) == index.owner_user_id_hash
+                                })
+                        })
+                        .cloned(),
+                );
+            }
+            return Ok(nodes);
         }
         self.context_scope_locked(data, tenant_id, owner_user_id)
+    }
+
+    fn context_node_for_acl_locked(
+        &self,
+        data: &StoreData,
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        include_all_private: bool,
+        predicate: impl Fn(&ContextNode) -> bool,
+    ) -> Result<Option<ContextNode>, ApiError> {
+        let nodes = self
+            .context_scope_for_acl_locked(data, tenant_id, owner_user_id, include_all_private)?
+            .into_iter()
+            .filter(predicate)
+            .collect::<Vec<_>>();
+
+        if let Some(owner) = owner_user_id {
+            return Ok(nodes
+                .iter()
+                .find(|node| node.owner_user_id.as_deref() == Some(owner))
+                .cloned()
+                .or_else(|| {
+                    nodes
+                        .iter()
+                        .find(|node| node.owner_user_id.is_none())
+                        .cloned()
+                }));
+        }
+        if !include_all_private {
+            return Ok(nodes.into_iter().find(|node| node.owner_user_id.is_none()));
+        }
+        if let Some(company) = nodes
+            .iter()
+            .find(|node| node.owner_user_id.is_none())
+            .cloned()
+        {
+            return Ok(Some(company));
+        }
+        let private_nodes = nodes
+            .into_iter()
+            .filter(|node| node.owner_user_id.is_some())
+            .collect::<Vec<_>>();
+        match private_nodes.len() {
+            0 => Ok(None),
+            1 => Ok(private_nodes.into_iter().next()),
+            _ => Err(ApiError::bad_request(
+                "owner_user_id is required because the context uri is ambiguous",
+            )),
+        }
     }
 
     fn source_document_for_acl_locked(
@@ -6143,22 +7447,46 @@ impl Store {
         uri: &str,
         owner_user_id: Option<&str>,
         include_all_private: bool,
-    ) -> Option<SourceDocument> {
-        data.source_documents
-            .get(uri)
-            .filter(|document| document.status == "active")
-            .filter(|document| document.tenant_id == tenant_id)
-            .filter(|document| {
-                if include_all_private {
-                    true
-                } else if let Some(owner) = owner_user_id {
-                    document.owner_user_id.as_deref().is_none()
-                        || document.owner_user_id.as_deref() == Some(owner)
-                } else {
-                    document.owner_user_id.is_none()
-                }
-            })
-            .cloned()
+    ) -> Result<Option<SourceDocument>, ApiError> {
+        let document = if owner_user_id.is_some() {
+            owner_user_id
+                .and_then(|owner| {
+                    data.source_documents
+                        .get(&SourceDocumentKey::new(tenant_id, Some(owner), uri))
+                        .filter(|document| document.status == "active")
+                })
+                .or_else(|| {
+                    data.source_documents
+                        .get(&SourceDocumentKey::new(tenant_id, None, uri))
+                        .filter(|document| document.status == "active")
+                })
+        } else if include_all_private {
+            let private_count = data
+                .source_documents
+                .iter()
+                .filter(|(key, document)| {
+                    key.tenant_id == tenant_id
+                        && key.uri == uri
+                        && key.owner_user_id.is_some()
+                        && document.status == "active"
+                })
+                .count();
+            let has_active_company = data
+                .source_documents
+                .get(&SourceDocumentKey::new(tenant_id, None, uri))
+                .is_some_and(|document| document.status == "active");
+            if !has_active_company && private_count > 1 {
+                return Err(ApiError::bad_request(
+                    "owner_user_id is required because the source-document uri is ambiguous",
+                ));
+            }
+            source_document_for_admin_without_owner_locked(data, tenant_id, uri)
+        } else {
+            data.source_documents
+                .get(&SourceDocumentKey::new(tenant_id, None, uri))
+                .filter(|document| document.status == "active")
+        };
+        Ok(document.cloned())
     }
 
     fn supersede_source_artifacts_locked(
@@ -6229,14 +7557,6 @@ impl Store {
         }
     }
 
-    fn all_context_nodes_locked(&self, data: &StoreData) -> Vec<ContextNode> {
-        let mut nodes = data.company_context.clone();
-        for personal in data.personal_context.values() {
-            nodes.extend(personal.clone());
-        }
-        nodes
-    }
-
     fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, StoreData>, ApiError> {
         self.inner
             .read()
@@ -6248,6 +7568,70 @@ impl Store {
             .write()
             .map_err(|_| ApiError::Internal("store write lock poisoned".to_string()))
     }
+}
+
+fn source_document_for_owner_locked<'a>(
+    data: &'a StoreData,
+    tenant_id: &str,
+    owner_user_id: Option<&str>,
+    uri: &str,
+) -> Option<&'a SourceDocument> {
+    owner_user_id
+        .and_then(|owner| {
+            data.source_documents
+                .get(&SourceDocumentKey::new(tenant_id, Some(owner), uri))
+        })
+        .or_else(|| {
+            data.source_documents
+                .get(&SourceDocumentKey::new(tenant_id, None, uri))
+        })
+}
+
+fn select_admin_source_document(
+    documents: Vec<SourceDocument>,
+) -> Result<Option<SourceDocument>, ApiError> {
+    if let Some(company_document) = documents
+        .iter()
+        .find(|document| document.owner_user_id.is_none() && document.status == "active")
+        .cloned()
+    {
+        return Ok(Some(company_document));
+    }
+    let private_documents = documents
+        .into_iter()
+        .filter(|document| document.owner_user_id.is_some() && document.status == "active")
+        .collect::<Vec<_>>();
+    match private_documents.len() {
+        0 => Ok(None),
+        1 => Ok(private_documents.into_iter().next()),
+        _ => Err(ApiError::bad_request(
+            "owner_user_id is required because the source-document uri is ambiguous",
+        )),
+    }
+}
+
+fn source_document_for_admin_without_owner_locked<'a>(
+    data: &'a StoreData,
+    tenant_id: &str,
+    uri: &str,
+) -> Option<&'a SourceDocument> {
+    if let Some(company_document) = data
+        .source_documents
+        .get(&SourceDocumentKey::new(tenant_id, None, uri))
+        .filter(|document| document.status == "active")
+    {
+        return Some(company_document);
+    }
+
+    let mut private_documents = data.source_documents.iter().filter_map(|(key, document)| {
+        (key.tenant_id == tenant_id
+            && key.uri == uri
+            && key.owner_user_id.is_some()
+            && document.status == "active")
+            .then_some(document)
+    });
+    let document = private_documents.next()?;
+    private_documents.next().is_none().then_some(document)
 }
 
 fn default_harness_components() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
@@ -6706,10 +8090,13 @@ fn part_of_links_guard_locked(data: &StoreData, tenant_id: &str) -> (bool, Value
     for link in data.links.values().filter(|link| {
         link.tenant_id == tenant_id && link.status == "active" && link.relation == "part_of"
     }) {
-        if data
-            .source_documents
-            .get(&link.target_uri)
-            .is_some_and(|document| document.status != "active")
+        if source_document_for_owner_locked(
+            data,
+            tenant_id,
+            link.owner_user_id.as_deref(),
+            &link.target_uri,
+        )
+        .is_some_and(|document| document.status != "active")
         {
             stale_links.push(link.id.clone());
         }
@@ -6731,7 +8118,14 @@ fn superseded_fragments_guard_locked(data: &StoreData, tenant_id: &str) -> (bool
         let source_superseded = node
             .source_document_uri
             .as_ref()
-            .and_then(|uri| data.source_documents.get(uri))
+            .and_then(|uri| {
+                source_document_for_owner_locked(
+                    data,
+                    tenant_id,
+                    node.owner_user_id.as_deref(),
+                    uri,
+                )
+            })
             .is_some_and(|document| document.status != "active");
         if (node.status == "superseded" && node.retrieval_enabled)
             || (node.status == "active" && source_superseded)
@@ -6843,7 +8237,12 @@ fn doc_candidates_locked(data: &StoreData, nodes: &[ContextNode]) -> Vec<(String
         if !seen.insert(key.clone()) {
             continue;
         }
-        let Some(document) = data.source_documents.get(uri) else {
+        let Some(document) = source_document_for_owner_locked(
+            data,
+            &node.tenant_id,
+            node.owner_user_id.as_deref(),
+            uri,
+        ) else {
             continue;
         };
         if document.status != "active" {
@@ -7572,11 +8971,8 @@ fn source_document_for_hit_locked(
                 })
                 .map(|link| link.target_uri.clone())
         })?;
-    data.source_documents
-        .get(&source_document_uri)
+    source_document_for_owner_locked(data, tenant_id, owner_user_id, &source_document_uri)
         .filter(|document| document.status == "active")
-        .filter(|document| document.tenant_id == tenant_id)
-        .filter(|document| owner_can_see_optional(document.owner_user_id.as_deref(), owner_user_id))
         .cloned()
 }
 
@@ -8052,6 +9448,71 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    #[test]
+    fn repository_context_validation_rejects_cross_scope_rows() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let routing = store
+            .resolver
+            .resolve("tenant-a", "owner-a", false, true)
+            .unwrap();
+        let personal = store.context_node(
+            "ctx://private/note",
+            "note",
+            2,
+            "body",
+            "personal",
+            &routing.personal_context_index_uid,
+            "tenant-a",
+            Some("owner-a".to_string()),
+            None,
+            None,
+        );
+        store
+            .validate_repository_context_node(&personal, "tenant-a", Some("owner-a"))
+            .expect("an exact personal row should pass");
+
+        let mut wrong_owner = personal.clone();
+        wrong_owner.owner_user_id = Some("owner-b".to_string());
+        assert!(store
+            .validate_repository_context_node(&wrong_owner, "tenant-a", Some("owner-a"))
+            .is_err());
+
+        let company = store.context_node(
+            "ctx://company/note",
+            "note",
+            2,
+            "body",
+            "company",
+            "rag_company_context",
+            "tenant-a",
+            None,
+            None,
+            None,
+        );
+        store
+            .validate_repository_context_node(&company, "tenant-a", None)
+            .expect("an exact company row should pass");
+
+        let mut forged_company = company;
+        forged_company.owner_user_id = Some("owner-a".to_string());
+        assert!(store
+            .validate_repository_context_node(&forged_company, "tenant-a", None)
+            .is_err());
+
+        let mut repository_search_rows = vec![personal, forged_company];
+        repository_search_rows.retain(|node| {
+            store
+                .validate_repository_context_node(node, "tenant-a", Some("owner-a"))
+                .is_ok()
+        });
+        assert_eq!(repository_search_rows.len(), 1);
+        assert_eq!(
+            repository_search_rows[0].owner_user_id.as_deref(),
+            Some("owner-a")
+        );
+    }
+
     fn ingest_task_fixture(
         task_id: &str,
         tenant_id: &str,
@@ -8077,6 +9538,280 @@ mod tests {
             result_url: None,
             queued_ahead: None,
         }
+    }
+
+    fn source_document_fixture(
+        tenant_id: &str,
+        owner_user_id: Option<&str>,
+        uri: &str,
+        marker: &str,
+    ) -> SourceDocument {
+        let stamp = now();
+        SourceDocument {
+            id: format!("source-document-{marker}"),
+            tenant_id: tenant_id.to_string(),
+            owner_user_id: owner_user_id.map(ToString::to_string),
+            source_kind: "test".to_string(),
+            source_id: format!("source-{marker}"),
+            revision_id: "v1".to_string(),
+            uri: uri.to_string(),
+            title: format!("{marker} title"),
+            content: format!("{marker} content"),
+            checksum: format!("{marker}-checksum"),
+            status: "active".to_string(),
+            retrieval_enabled: false,
+            created_at: stamp,
+            updated_at: stamp,
+        }
+    }
+
+    #[test]
+    fn same_uri_source_documents_remain_owner_scoped_in_cache() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant_id = config.tenant_id.as_str();
+        let uri = "ctx://user/shared/source/v1";
+
+        store
+            .cache_source_document(source_document_fixture(
+                tenant_id,
+                Some("owner-a"),
+                uri,
+                "owner-a",
+            ))
+            .unwrap();
+        store
+            .cache_source_document(source_document_fixture(
+                tenant_id,
+                Some("owner-b"),
+                uri,
+                "owner-b",
+            ))
+            .unwrap();
+
+        let owner_a = store
+            .fs_read(tenant_id, uri, Some("owner-a"), false)
+            .unwrap();
+        let owner_b = store
+            .fs_read(tenant_id, uri, Some("owner-b"), false)
+            .unwrap();
+        assert_eq!(owner_a.body, "owner-a content");
+        assert_eq!(owner_b.body, "owner-b content");
+        assert!(matches!(
+            store.fs_read(tenant_id, uri, None, true),
+            Err(ApiError::BadRequest(_))
+        ));
+
+        store
+            .cache_source_document(source_document_fixture(tenant_id, None, uri, "company"))
+            .unwrap();
+        let company = store.fs_read(tenant_id, uri, None, true).unwrap();
+        let owner_without_private = store
+            .fs_read(tenant_id, uri, Some("owner-c"), false)
+            .unwrap();
+        assert_eq!(company.body, "company content");
+        assert_eq!(owner_without_private.body, "company content");
+        assert_eq!(store.read().unwrap().source_documents.len(), 3);
+    }
+
+    #[test]
+    fn context_reads_are_owner_exact_and_admin_rejects_private_uri_ambiguity() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant_id = config.tenant_id.as_str();
+        let uri = "ctx://user/shared/fragments/0001";
+        let owner_a = store
+            .ensure_user_index(tenant_id, "owner-a", EnsureUserEventIndexRequest::default())
+            .unwrap()
+            .routing;
+        let owner_b = store
+            .ensure_user_index(tenant_id, "owner-b", EnsureUserEventIndexRequest::default())
+            .unwrap()
+            .routing;
+
+        let node_a = store.context_node(
+            uri,
+            "Owner A",
+            2,
+            "owner-a-body",
+            "personal",
+            &owner_a.personal_context_index_uid,
+            tenant_id,
+            Some("owner-a".to_string()),
+            None,
+            None,
+        );
+        let node_b = store.context_node(
+            uri,
+            "Owner B",
+            2,
+            "owner-b-body",
+            "personal",
+            &owner_b.personal_context_index_uid,
+            tenant_id,
+            Some("owner-b".to_string()),
+            None,
+            None,
+        );
+        let corrupt_owner_b_in_a = store.context_node(
+            "ctx://user/corrupt/fragments/0001",
+            "Misrouted owner B",
+            2,
+            "must-not-leak",
+            "personal",
+            &owner_a.personal_context_index_uid,
+            tenant_id,
+            Some("owner-b".to_string()),
+            None,
+            None,
+        );
+        {
+            let mut data = store.write().unwrap();
+            data.personal_context
+                .entry(owner_a.personal_context_index_uid.clone())
+                .or_default()
+                .extend([node_a, corrupt_owner_b_in_a]);
+            data.personal_context
+                .entry(owner_b.personal_context_index_uid.clone())
+                .or_default()
+                .push(node_b);
+        }
+
+        assert_eq!(
+            store
+                .fs_read(tenant_id, uri, Some("owner-a"), false)
+                .unwrap()
+                .body,
+            "owner-a-body"
+        );
+        assert_eq!(
+            store
+                .fs_read(tenant_id, uri, Some("owner-b"), false)
+                .unwrap()
+                .body,
+            "owner-b-body"
+        );
+        assert!(matches!(
+            store.fs_read(tenant_id, uri, None, true),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            store.fs_layer(tenant_id, uri, 2, None, true),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            store.traceback(
+                tenant_id,
+                ContextTracebackRequest {
+                    uri: Some(uri.to_string()),
+                    owner_user_id: None,
+                },
+                true,
+            ),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            store.fs_read(
+                tenant_id,
+                "ctx://user/corrupt/fragments/0001",
+                Some("owner-a"),
+                false,
+            ),
+            Err(ApiError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn document_vector_candidates_resolve_source_by_node_scope() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant_id = config.tenant_id.as_str();
+        let uri = "ctx://user/shared/source/v1";
+        store
+            .cache_source_document(source_document_fixture(
+                tenant_id,
+                Some("owner-a"),
+                uri,
+                "owner-a-vector-marker",
+            ))
+            .unwrap();
+        store
+            .cache_source_document(source_document_fixture(
+                tenant_id,
+                Some("owner-b"),
+                uri,
+                "owner-b-vector-marker",
+            ))
+            .unwrap();
+
+        let mut owner_a_node = store.context_node(
+            "ctx://user/shared/source/v1/fragments/0000",
+            "Owner A fragment",
+            2,
+            "owner-a fragment",
+            "personal",
+            "owner-a-context-index",
+            tenant_id,
+            Some("owner-a".to_string()),
+            Some("source-owner-a".to_string()),
+            Some("v1".to_string()),
+        );
+        owner_a_node.source_document_uri = Some(uri.to_string());
+
+        let data = store.read().unwrap();
+        let candidates = doc_candidates_locked(&data, &[owner_a_node]);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].1.contains("owner-a-vector-marker"));
+        assert!(!candidates[0].1.contains("owner-b-vector-marker"));
+    }
+
+    #[test]
+    fn parsed_block_usage_is_scoped_by_tenant_owner_and_uri() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant_id = config.tenant_id.as_str();
+        let uri = "ctx://user/shared/source/v1";
+        {
+            let mut data = store.write().unwrap();
+            data.parsed_blocks.insert(
+                SourceDocumentKey::new(tenant_id, Some("owner-a"), uri),
+                vec![
+                    ParsedBlock {
+                        block_id: "owner-a-1".to_string(),
+                        ..ParsedBlock::default()
+                    },
+                    ParsedBlock {
+                        block_id: "owner-a-2".to_string(),
+                        ..ParsedBlock::default()
+                    },
+                ],
+            );
+            data.parsed_blocks.insert(
+                SourceDocumentKey::new(tenant_id, Some("owner-b"), uri),
+                vec![ParsedBlock {
+                    block_id: "owner-b-1".to_string(),
+                    ..ParsedBlock::default()
+                }],
+            );
+            data.parsed_blocks.insert(
+                SourceDocumentKey::new("other-tenant", Some("owner-a"), uri),
+                vec![ParsedBlock {
+                    block_id: "other-tenant-1".to_string(),
+                    ..ParsedBlock::default()
+                }],
+            );
+        }
+
+        let owner_a = store
+            .usage_snapshot(tenant_id, Some("owner-a"), false)
+            .unwrap();
+        let owner_b = store
+            .usage_snapshot(tenant_id, Some("owner-b"), false)
+            .unwrap();
+        let tenant = store.usage_snapshot(tenant_id, None, true).unwrap();
+        assert_eq!(owner_a["providers"]["ingest"]["parsed_block_count"], 2);
+        assert_eq!(owner_b["providers"]["ingest"]["parsed_block_count"], 1);
+        assert_eq!(tenant["providers"]["ingest"]["parsed_block_count"], 3);
     }
 
     #[test]
@@ -8137,7 +9872,7 @@ mod tests {
                 tenant_neighbor.clone(),
             ]);
             data.source_documents.insert(
-                source_document_uri.to_string(),
+                SourceDocumentKey::new("default", None, source_document_uri),
                 SourceDocument {
                     id: "default-source-document".to_string(),
                     tenant_id: "default".to_string(),
@@ -8229,6 +9964,7 @@ mod tests {
         assert!(scoped.iter().all(|node| node.tenant_id == tenant_id));
         assert!(store
             .source_document_for_acl_locked(&data, tenant_id, source_document_uri, None, true)
+            .unwrap()
             .is_none());
 
         let hit = context_hit_from_node(&tenant_hit, 1.0, &[]);
@@ -8766,6 +10502,13 @@ mod tests {
                     context_uris: Vec::new(),
                 },
             );
+            data.parsed_blocks.insert(
+                SourceDocumentKey::new(tenant_id, None, "ctx://test/source-doc/task-old-done"),
+                vec![ParsedBlock {
+                    block_id: "expired-block".to_string(),
+                    ..ParsedBlock::default()
+                }],
+            );
         }
 
         let mut pruned = store
@@ -8782,6 +10525,11 @@ mod tests {
         assert!(!data.ingest_tasks.contains_key("task-old-done"));
         assert!(!data.ingest_tasks.contains_key("task-old-failed"));
         assert!(!data.ingest_results.contains_key("task-old-done"));
+        assert!(!data.parsed_blocks.contains_key(&SourceDocumentKey::new(
+            tenant_id,
+            None,
+            "ctx://test/source-doc/task-old-done",
+        )));
         assert!(data.ingest_tasks.contains_key("task-old-running"));
         assert!(data.ingest_tasks.contains_key("task-new-done"));
     }
@@ -8812,7 +10560,7 @@ mod tests {
             let mut data = store.write().unwrap();
             data.company_context.push(node);
             data.source_documents.insert(
-                uri.to_string(),
+                SourceDocumentKey::new(tenant_id, None, uri),
                 SourceDocument {
                     id: "source-doc-leak-fixture".to_string(),
                     tenant_id: tenant_id.to_string(),
@@ -8859,7 +10607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_acl_guard_fails_on_cross_owner_retrieval_and_blocks_run() {
+    async fn misrouted_personal_row_is_filtered_before_owner_retrieval() {
         let config = Config::test();
         let store = Store::new(&config);
         let tenant_id = config.tenant_id.as_str();
@@ -8915,7 +10663,7 @@ mod tests {
         assert!(run
             .guard_results
             .iter()
-            .any(|guard| guard.name == "owner_acl_never_leaks" && !guard.passed));
+            .any(|guard| guard.name == "owner_acl_never_leaks" && guard.passed));
     }
 
     #[tokio::test]

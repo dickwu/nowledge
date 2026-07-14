@@ -1,6 +1,64 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DurabilityClass {
+    DurableCanonical,
+    DerivedDurable,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HydrationStrategy {
+    Startup,
+    ReadThrough,
+    LazySnapshot,
+    Regenerate,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HydrationStatus {
+    Pending,
+    Complete,
+    Incomplete,
+    NotRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HydrationDomainReport {
+    pub durability: DurabilityClass,
+    pub strategy: HydrationStrategy,
+    pub mandatory: bool,
+    pub status: String,
+    pub expected: usize,
+    pub loaded: usize,
+    pub skipped: usize,
+    pub quarantined: usize,
+    pub recovered: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HydrationReport {
+    pub tenant_id: String,
+    pub backend: String,
+    pub status: HydrationStatus,
+    pub ready: bool,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    pub domains: BTreeMap<String, HydrationDomainReport>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SourceRef {
@@ -1291,7 +1349,7 @@ pub struct IngestTaskRequest {
     pub idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IngestTask {
     pub task_id: String,
     pub tenant_id: String,

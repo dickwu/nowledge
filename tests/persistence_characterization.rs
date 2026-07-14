@@ -10,9 +10,11 @@ use axum::{
     response::{IntoResponse, Response},
     Json, Router,
 };
+use chrono::Utc;
 use nowledge::{
     build_router,
-    meili::MeiliAdmin,
+    meili::{settings_for, MeiliAdmin, FIXED_INDEXES},
+    models::UserEventIndex,
     repository::{KnowledgeRepository, MeiliRepository},
     AppState, Config,
 };
@@ -86,6 +88,73 @@ struct ConcurrentCreateRecorder {
     index_checks: Arc<Mutex<usize>>,
 }
 
+#[derive(Clone, Default)]
+struct ExistingThenMissingRecorder {
+    requests: Arc<Mutex<Vec<String>>>,
+    index_checks: Arc<Mutex<std::collections::HashMap<String, usize>>>,
+}
+
+async fn partial_fixed_set_meili_stub(
+    State(recorder): State<ResetRecorder>,
+    request: AxumRequest,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    recorder
+        .requests
+        .lock()
+        .unwrap()
+        .push(format!("{method} {path}"));
+
+    if method == Method::GET && path.starts_with("/indexes/") {
+        let present = path == format!("/indexes/{}", FIXED_INDEXES[0]);
+        return (
+            if present {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            },
+            Json(json!({})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "message": format!("unexpected partial-set request: {method} {path}") })),
+    )
+        .into_response()
+}
+
+async fn existing_then_missing_meili_stub(
+    State(recorder): State<ExistingThenMissingRecorder>,
+    request: AxumRequest,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    recorder
+        .requests
+        .lock()
+        .unwrap()
+        .push(format!("{method} {path}"));
+
+    if method == Method::GET && path.starts_with("/indexes/") {
+        let mut checks = recorder.index_checks.lock().unwrap();
+        let count = checks.entry(path.clone()).or_default();
+        let status = if *count == 0 {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        *count += 1;
+        return (status, Json(json!({}))).into_response();
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "message": format!("unexpected recovery request: {method} {path}") })),
+    )
+        .into_response()
+}
+
 async fn concurrent_create_meili_stub(
     State(recorder): State<ConcurrentCreateRecorder>,
     request: AxumRequest,
@@ -107,6 +176,9 @@ async fn concurrent_create_meili_stub(
         };
         *checks += 1;
         return (status, Json(json!({ "uid": "concurrent-index" }))).into_response();
+    }
+    if method == Method::GET && path == "/indexes/concurrent-index/settings" {
+        return (StatusCode::OK, Json(json!({}))).into_response();
     }
     if method == Method::POST && path == "/indexes" {
         return (StatusCode::ACCEPTED, Json(json!({ "taskUid": 21 }))).into_response();
@@ -148,6 +220,9 @@ async fn reset_meili_stub(State(recorder): State<ResetRecorder>, request: AxumRe
     if method == Method::DELETE && path.starts_with("/indexes/") {
         return (StatusCode::ACCEPTED, Json(json!({ "taskUid": 10 }))).into_response();
     }
+    if method == Method::GET && path.ends_with("/settings") {
+        return (StatusCode::OK, Json(json!({}))).into_response();
+    }
     if method == Method::GET && path.starts_with("/indexes/") {
         return (StatusCode::NOT_FOUND, Json(json!({}))).into_response();
     }
@@ -167,55 +242,43 @@ async fn reset_meili_stub(State(recorder): State<ResetRecorder>, request: AxumRe
         .into_response()
 }
 
-#[derive(Clone)]
-struct SourceRevisionSearchRecorder {
-    requests: Arc<Mutex<Vec<Value>>>,
-    corpus_size: usize,
-}
-
-async fn source_revision_search_stub(
-    State(recorder): State<SourceRevisionSearchRecorder>,
+async fn matching_settings_meili_stub(
+    State(recorder): State<ResetRecorder>,
     request: AxumRequest,
 ) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
-    if method != Method::POST || path != "/indexes/rag_source_revisions/search" {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "message": format!("unexpected source revision request: {method} {path}")
-            })),
-        )
-            .into_response();
+    recorder
+        .requests
+        .lock()
+        .unwrap()
+        .push(format!("{method} {path}"));
+
+    if method == Method::GET && path == "/indexes/rag_sessions" {
+        return (StatusCode::OK, Json(json!({ "uid": "rag_sessions" }))).into_response();
     }
-
-    let body = to_bytes(request.into_body(), usize::MAX).await.unwrap();
-    let search: Value = serde_json::from_slice(&body).unwrap();
-    recorder.requests.lock().unwrap().push(search.clone());
-
-    let limit = search["limit"].as_u64().unwrap() as usize;
-    let hits = (0..recorder.corpus_size.min(limit))
-        .map(|index| {
-            json!({
-                "id": format!("revision-{index}"),
-                "source_id": "source-with-many-revisions",
-                "title": format!("Revision {index}"),
-                "source_uri": "ctx://company/sources/many-revisions",
-                "checksum": format!("checksum-{index}"),
-                "content": format!("content {index}"),
-                "status": "historical",
-                "created_at": "2026-07-13T00:00:00Z"
-            })
-        })
-        .collect::<Vec<_>>();
-
+    if method == Method::GET && path == "/indexes/rag_sessions/settings" {
+        let mut settings = settings_for("rag_sessions");
+        settings["filterableAttributes"] = json!([
+            "logical_id",
+            "revision_id",
+            "source_id",
+            "privacy",
+            "status",
+            "dataset_key",
+            "snapshot_id",
+            "owner_user_id",
+            "tenant_id",
+            "id"
+        ]);
+        settings["sortableAttributes"] = json!(["created_at", "id", "occurred_at", "updated_at"]);
+        return (StatusCode::OK, Json(settings)).into_response();
+    }
     (
-        StatusCode::OK,
-        Json(json!({
-            "hits": hits,
-            "estimatedTotalHits": recorder.corpus_size,
-            "processingTimeMs": 0
-        })),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(
+            json!({ "message": format!("unexpected matching-settings request: {method} {path}") }),
+        ),
     )
         .into_response()
 }
@@ -349,14 +412,170 @@ async fn bootstrap_reset_waits_for_delete_create_and_settings_tasks() {
     assert_eq!(requests[2], "GET /indexes/rag_company_context");
     assert_eq!(requests[3], "POST /indexes");
     assert_eq!(requests[4], "GET /tasks/11");
-    assert_eq!(requests[5], "PATCH /indexes/rag_company_context/settings");
+    assert_eq!(requests[5], "GET /indexes/rag_company_context/settings");
+    assert_eq!(requests[6], "PATCH /indexes/rag_company_context/settings");
     assert_eq!(
-        requests[6], "GET /tasks/12",
+        requests[7], "GET /tasks/12",
         "ensure_index returned before its settings were usable: {requests:?}"
     );
     assert!(
         requests.iter().any(|request| request == "GET /tasks/12"),
         "bootstrap did not wait for settings: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_provisions_all_fixed_indexes_only_when_the_managed_set_is_empty() {
+    let recorder = ResetRecorder::default();
+    let app = Router::new()
+        .fallback(reset_meili_stub)
+        .with_state(recorder.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut config = Config::test();
+    config.meili_url = Some(format!("http://{addr}"));
+    MeiliAdmin::from_config(&config)
+        .bootstrap(false)
+        .await
+        .expect("an entirely fresh backend should be provisioned");
+
+    let requests = recorder.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.as_str() == "POST /indexes")
+            .count(),
+        FIXED_INDEXES.len()
+    );
+    assert!(!requests
+        .iter()
+        .any(|request| request.starts_with("DELETE ")));
+}
+
+#[tokio::test]
+async fn bootstrap_refuses_to_recreate_a_partial_fixed_index_set() {
+    let recorder = ResetRecorder::default();
+    let app = Router::new()
+        .fallback(partial_fixed_set_meili_stub)
+        .with_state(recorder.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut config = Config::test();
+    config.meili_url = Some(format!("http://{addr}"));
+    let error = MeiliAdmin::from_config(&config)
+        .bootstrap(false)
+        .await
+        .expect_err("partial managed state must fail closed");
+
+    assert!(error.to_string().contains("incomplete"), "{error}");
+    let requests = recorder.requests.lock().unwrap().clone();
+    assert!(!requests.iter().any(|request| request == "POST /indexes"));
+    assert!(!requests.iter().any(|request| request.contains("/settings")));
+}
+
+#[tokio::test]
+async fn bootstrap_recovery_rechecks_existing_indexes_without_recreating_them() {
+    let recorder = ExistingThenMissingRecorder::default();
+    let app = Router::new()
+        .fallback(existing_then_missing_meili_stub)
+        .with_state(recorder.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut config = Config::test();
+    config.meili_url = Some(format!("http://{addr}"));
+    let error = MeiliAdmin::from_config(&config)
+        .bootstrap(false)
+        .await
+        .expect_err("an index lost after preflight must not be recreated empty");
+
+    assert!(
+        error.to_string().contains("refusing empty recreation"),
+        "{error}"
+    );
+    let requests = recorder.requests.lock().unwrap().clone();
+    assert!(!requests.iter().any(|request| request == "POST /indexes"));
+}
+
+#[tokio::test]
+async fn registered_dynamic_index_reconciliation_refuses_empty_recreation() {
+    let recorder = ResetRecorder::default();
+    let app = Router::new()
+        .fallback(reset_meili_stub)
+        .with_state(recorder.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut config = Config::test();
+    config.meili_url = Some(format!("http://{addr}"));
+    let repository = MeiliRepository::new(MeiliAdmin::from_config(&config), false);
+    let index = UserEventIndex {
+        id: "registry-row".to_string(),
+        tenant_id: "tenant-a".to_string(),
+        tenant_hash: "tenant-hash".to_string(),
+        owner_user_id_hash: "owner-hash".to_string(),
+        event_index_uid: "missing-event-index".to_string(),
+        personal_context_index_uid: "missing-context-index".to_string(),
+        schema_version: 1,
+        settings_hash: "events-v3".to_string(),
+        status: "active".to_string(),
+        created_at: Utc::now(),
+        last_event_at: None,
+        event_count_estimate: 0,
+    };
+    let error = repository
+        .reconcile_registered_user_event_index(&index)
+        .await
+        .expect_err("registered indexes are authoritative durable state");
+
+    assert!(
+        error.to_string().contains("refusing empty recreation"),
+        "{error}"
+    );
+    let requests = recorder.requests.lock().unwrap().clone();
+    assert_eq!(requests, ["GET /indexes/missing-event-index"]);
+}
+
+#[tokio::test]
+async fn settings_reconciliation_skips_an_identical_managed_configuration() {
+    let recorder = ResetRecorder::default();
+    let app = Router::new()
+        .fallback(matching_settings_meili_stub)
+        .with_state(recorder.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut config = Config::test();
+    config.meili_url = Some(format!("http://{addr}"));
+    let tasks = MeiliAdmin::from_config(&config)
+        .reconcile_existing_index("rag_sessions", true)
+        .await
+        .expect("identical settings should require no Meilisearch mutation");
+
+    assert!(tasks.is_empty());
+    assert_eq!(
+        recorder.requests.lock().unwrap().as_slice(),
+        [
+            "GET /indexes/rag_sessions",
+            "GET /indexes/rag_sessions/settings"
+        ]
     );
 }
 
@@ -387,51 +606,9 @@ async fn ensure_index_tolerates_a_concurrent_create_winner_and_still_waits_for_s
             "POST /indexes",
             "GET /tasks/21",
             "GET /indexes/concurrent-index",
+            "GET /indexes/concurrent-index/settings",
             "PATCH /indexes/concurrent-index/settings",
             "GET /tasks/22",
         ]
     );
-}
-
-#[tokio::test]
-async fn current_source_revision_rehydration_requests_at_most_two_thousand_rows() {
-    let recorder = SourceRevisionSearchRecorder {
-        requests: Arc::new(Mutex::new(Vec::new())),
-        corpus_size: 2001,
-    };
-    let app = Router::new()
-        .fallback(source_revision_search_stub)
-        .with_state(recorder.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    let mut config = Config::test();
-    config.meili_url = Some(format!("http://{addr}"));
-    let repository = MeiliRepository::new(MeiliAdmin::from_config(&config), false);
-
-    let revisions = repository
-        .list_source_revisions("tenant-a")
-        .await
-        .expect("source revision search should succeed")
-        .expect("Meilisearch repository should return persisted revisions");
-
-    let requests = recorder.requests.lock().unwrap().clone();
-    assert_eq!(
-        requests,
-        vec![json!({
-            "q": "",
-            "limit": 2000,
-            "filter": "tenant_id = \"tenant-a\""
-        })]
-    );
-    assert_eq!(recorder.corpus_size, 2001);
-    assert_eq!(revisions.len(), 2000);
-    assert_eq!(revisions.first().unwrap().id, "revision-0");
-    assert_eq!(revisions.last().unwrap().id, "revision-1999");
-    assert!(revisions
-        .iter()
-        .all(|revision| revision.id != "revision-2000"));
 }

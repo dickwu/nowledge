@@ -1030,6 +1030,7 @@ async fn healthz(_admin: AdminGuard, State(state): State<AppState>) -> impl Into
         "git_rev": SERVICE_GIT_REV,
         "store_backend": state.store.backend_name(),
         "meilisearch": sanitize_dependency_health(check.meili, "Meilisearch health check failed"),
+        "hydration": check.hydration,
         "llm": llm_health_json(&check.llm),
         "parser": sanitize_dependency_health(check.parser, "parser health check failed"),
         "usage": usage
@@ -1060,6 +1061,7 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
             "git_rev": SERVICE_GIT_REV,
             "dependencies": {
                 "meilisearch": meili_status,
+                "hydration": check.hydration.status,
                 "llm": llm_status,
                 "parser": parser_status
             }
@@ -1069,6 +1071,7 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 
 struct OperationalCheck {
     meili: Value,
+    hydration: HydrationReport,
     llm: LlmHealthProbeResult,
     parser: Value,
     ready: bool,
@@ -1078,6 +1081,18 @@ struct OperationalCheck {
 async fn operational_check(state: &AppState) -> OperationalCheck {
     let config = state.effective_config();
     let meili = state.meili.health_status().await;
+    let hydration = state
+        .store
+        .hydration_report()
+        .unwrap_or_else(|_| HydrationReport {
+            tenant_id: state.tenant_id().to_string(),
+            backend: state.store.backend_name().to_string(),
+            status: HydrationStatus::Incomplete,
+            ready: false,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            domains: Default::default(),
+        });
     let llm = state.llm_health.check(&config).await;
     let parser = parser_health_status(&config).await;
     let meili_healthy = meili
@@ -1093,7 +1108,7 @@ async fn operational_check(state: &AppState) -> OperationalCheck {
             .and_then(Value::as_bool)
             .unwrap_or(false);
     let degraded = llm.status == "degraded" || llm.stale;
-    let ready = meili_healthy && !llm_unhealthy && !parser_unhealthy;
+    let ready = meili_healthy && hydration.ready && !llm_unhealthy && !parser_unhealthy;
     let status = if !ready {
         "unhealthy"
     } else if degraded {
@@ -1103,6 +1118,7 @@ async fn operational_check(state: &AppState) -> OperationalCheck {
     };
     OperationalCheck {
         meili,
+        hydration,
         llm,
         parser,
         ready,
@@ -1450,7 +1466,7 @@ async fn list_user_event_indexes(
     _admin: AdminGuard,
     State(state): State<AppState>,
 ) -> Result<Json<ListUserEventIndexesResponse>, ApiError> {
-    Ok(Json(state.store.list_user_indexes()?))
+    Ok(Json(state.store.list_user_indexes(state.tenant_id())?))
 }
 
 async fn reconcile_user_event_indexes(
@@ -1459,7 +1475,10 @@ async fn reconcile_user_event_indexes(
     Json(req): Json<ReconcileUserEventIndexesRequest>,
 ) -> Result<Json<ReconcileUserEventIndexesResponse>, ApiError> {
     Ok(Json(
-        state.store.reconcile_user_indexes(state.tenant_id(), req)?,
+        state
+            .store
+            .reconcile_user_indexes_async(state.tenant_id(), req)
+            .await?,
     ))
 }
 
@@ -1534,11 +1553,12 @@ async fn user_timeline(
 ) -> Result<Json<TimelineResponse>, ApiError> {
     user.require_owner_access(&owner_user_id)?;
     validate_search_limit("limit", req.limit, &state.config)?;
-    Ok(Json(state.store.timeline(
-        state.tenant_id(),
-        Some(&owner_user_id),
-        req,
-    )?))
+    Ok(Json(
+        state
+            .store
+            .timeline_async(state.tenant_id(), Some(&owner_user_id), req)
+            .await?,
+    ))
 }
 
 async fn append_event_alias(
@@ -1619,7 +1639,12 @@ async fn timeline_alias(
 ) -> Result<Json<TimelineResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
     validate_search_limit("limit", req.limit, &state.config)?;
-    Ok(Json(state.store.timeline(state.tenant_id(), None, req)?))
+    Ok(Json(
+        state
+            .store
+            .timeline_async(state.tenant_id(), None, req)
+            .await?,
+    ))
 }
 
 async fn upsert_state_fact(
@@ -1888,7 +1913,8 @@ async fn upsert_dataset(
 ) -> Result<Json<DatasetSchemaResponse>, ApiError> {
     let result = state
         .store
-        .upsert_dataset(state.tenant_id(), &dataset_key, req);
+        .upsert_dataset_async(state.tenant_id(), &dataset_key, req)
+        .await;
     Ok(Json(audit_shared_write(
         result,
         &user.principal,
@@ -2013,12 +2039,17 @@ async fn fs_ls(
     Query(mut query): Query<FsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     user.apply_owner_default(&mut query.owner_user_id)?;
-    Ok(Json(state.store.fs_ls(
-        state.tenant_id(),
-        query.uri.as_deref(),
-        query.owner_user_id.as_deref(),
-        user.principal.is_admin(),
-    )?))
+    Ok(Json(
+        state
+            .store
+            .fs_ls_async(
+                state.tenant_id(),
+                query.uri.as_deref(),
+                query.owner_user_id.as_deref(),
+                user.principal.is_admin(),
+            )
+            .await?,
+    ))
 }
 
 async fn fs_tree(
@@ -2027,13 +2058,18 @@ async fn fs_tree(
     Query(mut query): Query<FsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     user.apply_owner_default(&mut query.owner_user_id)?;
-    Ok(Json(state.store.fs_tree(
-        state.tenant_id(),
-        query.uri.as_deref(),
-        query.depth,
-        query.owner_user_id.as_deref(),
-        user.principal.is_admin(),
-    )?))
+    Ok(Json(
+        state
+            .store
+            .fs_tree_async(
+                state.tenant_id(),
+                query.uri.as_deref(),
+                query.depth,
+                query.owner_user_id.as_deref(),
+                user.principal.is_admin(),
+            )
+            .await?,
+    ))
 }
 
 async fn fs_read(
@@ -2119,23 +2155,29 @@ async fn context_reveal(
     State(state): State<AppState>,
     Json(req): Json<ContextRevealRequest>,
 ) -> Result<Json<ContextRevealResponse>, ApiError> {
-    let owner = req.trace_id.as_ref().and_then(|trace_id| {
+    let owner = if let Some(trace_id) = req.trace_id.as_deref() {
         state
             .store
-            .trace_owner_id(state.tenant_id(), trace_id)
-            .ok()
-            .flatten()
-    });
+            .trace_owner_id_async(state.tenant_id(), trace_id)
+            .await?
+    } else {
+        None
+    };
     if let Some(owner) = &owner {
         user.require_owner_access(owner)?;
     }
     let owner_scope = owner.or_else(|| user.principal.owner_user_id().map(ToString::to_string));
-    Ok(Json(state.store.reveal_context(
-        state.tenant_id(),
-        req,
-        owner_scope.as_deref(),
-        user.principal.is_admin(),
-    )?))
+    Ok(Json(
+        state
+            .store
+            .reveal_context_async(
+                state.tenant_id(),
+                req,
+                owner_scope.as_deref(),
+                user.principal.is_admin(),
+            )
+            .await?,
+    ))
 }
 
 async fn context_traceback(
@@ -2144,11 +2186,12 @@ async fn context_traceback(
     Json(mut req): Json<ContextTracebackRequest>,
 ) -> Result<Json<ContextTracebackResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
-    Ok(Json(state.store.traceback(
-        state.tenant_id(),
-        req,
-        user.principal.is_admin(),
-    )?))
+    Ok(Json(
+        state
+            .store
+            .traceback_async(state.tenant_id(), req, user.principal.is_admin())
+            .await?,
+    ))
 }
 
 async fn create_ingest_task(
@@ -2733,7 +2776,12 @@ async fn create_session(
     Json(mut req): Json<SessionCreateRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
-    Ok(Json(state.store.create_session(state.tenant_id(), req)?))
+    Ok(Json(
+        state
+            .store
+            .create_session_async(state.tenant_id(), req)
+            .await?,
+    ))
 }
 
 async fn add_session_message(
