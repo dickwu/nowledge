@@ -6,7 +6,7 @@ Activate a company document revision, store the full source document, and publis
 ## Handler
 - Rust handler: `activate_revision`
 - Route registration: `src/routes.rs::build_router`
-- Authentication: UserGuard
+- Authentication: CompanyWriterGuard (`company_writer` or admin by default; temporary legacy shared-writer mode may apply)
 
 ## Path Parameters
 | Name | Type | Description |
@@ -39,8 +39,10 @@ Schema: `ActivateRevisionResponse`
 | context_uris | string[] | Alias of `fragment_uris` for compatibility. |
 
 ## Errors and Access Rules
-- Malformed JSON or missing required runtime fields returns 400.
-- Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Missing or invalid bearer authentication returns 401.
+- Authenticated principals without `company_writer` or admin permission return 403 unless the temporary `RAG_ALLOW_LEGACY_SHARED_WRITER=true` compatibility switch is active.
+- Malformed JSON or invalid request fields returns 400 after authorization.
+- Authorization denials and store success/failure emit structured audit events correlated by the response `X-Request-Id`; identifiers are keyed, and caller-provided activation reasons are represented only by an allowlisted code plus keyed fingerprint.
 - Activating a new revision supersedes old active source documents, fragments, and `part_of` links for the same `source_id`.
 - Retrieval searches the generated fragments only; the source document is stored for explicit read/traceback.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
@@ -48,7 +50,7 @@ Schema: `ActivateRevisionResponse`
 ## Internal Logic Call Graph
 ```mermaid
 flowchart TD
-  n0["UserGuard authenticates caller"]
+  n0["CompanyWriterGuard enforces current shared-writer policy"]
   n1["Path source_id and revision_id select revision"]
   n2["Store.activate_revision_async updates active revision state"]
   n3["Supersede old source artifacts for source_id"]

@@ -1,12 +1,12 @@
 # GET /healthz
 
 ## Summary
-Operational health probe for Meilisearch, LLM health, store backend, and compact usage.
+Admin-only operational diagnostics for Meilisearch, parser, LLM health, store backend, and compact usage.
 
 ## Handler
 - Rust handler: `healthz`
 - Route registration: `src/routes.rs::build_router`
-- Authentication: None
+- Authentication: AdminGuard required
 
 ## Path Parameters
 None.
@@ -28,6 +28,7 @@ Schema: `HealthResponse`
 | git_rev | string | Short git revision of the build, `-dirty` suffix when built from a modified tree, `unknown` outside a git checkout. |
 | store_backend | string | Active store backend name. |
 | meilisearch | object | Meilisearch health payload. |
+| parser | object | Parser health payload. |
 | llm | object | LLM health payload with provider, model, auth, quota, rate-limit, and stale status. |
 | usage | object | Compact usage summary. |
 
@@ -53,22 +54,25 @@ says when it was last observed. For `codex_auth` the windows come from the
 `remaining_percent` is the "left available usage" for dashboards.
 
 ## Errors and Access Rules
-- Malformed JSON or missing required runtime fields returns 400.
-- Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
-- Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
+- Missing or invalid bearer authentication returns 401.
+- Authenticated non-admin principals return 403.
+- Returns 200 when ready and 503 when mandatory dependency health makes the service unready.
+- This protected route may expose operational budgets and private aggregate counts to admins; public callers must use `/readyz`.
 
 ## Internal Logic Call Graph
 ```mermaid
 flowchart TD
   n0["Router dispatches GET /healthz"]
-  n1["healthz calls operational_health"]
-  n2["Store builds compact usage summary"]
-  n3["MeiliAdmin checks health"]
-  n4["LlmHealthProbe checks configured provider"]
-  n5["HTTP status is 200 when ready, 503 when unhealthy"]
+  n1["AdminGuard authenticates an admin principal"]
+  n2["healthz calls detailed operational health"]
+  n3["Store builds compact usage summary"]
+  n4["MeiliAdmin and parser health are checked"]
+  n5["LlmHealthProbe checks configured provider"]
+  n6["HTTP status is 200 when ready, 503 when unhealthy"]
   n0 --> n1
   n1 --> n2
   n2 --> n3
   n3 --> n4
   n4 --> n5
+  n5 --> n6
 ```

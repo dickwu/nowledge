@@ -6,7 +6,7 @@ Create a staged company document revision and optionally schedule ingest work. R
 ## Handler
 - Rust handler: `create_revision`
 - Route registration: `src/routes.rs::build_router`
-- Authentication: UserGuard
+- Authentication: CompanyWriterGuard (`company_writer` or admin by default; temporary legacy shared-writer mode may apply)
 
 ## Path Parameters
 | Name | Type | Description |
@@ -43,15 +43,17 @@ Schema: `CreateRevisionResponse`
 | ingest_job_id | string? | Ingest job id when ingest is true. |
 
 ## Errors and Access Rules
-- Malformed JSON or missing required runtime fields returns 400.
-- Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Missing or invalid bearer authentication returns 401.
+- Authenticated principals without `company_writer` or admin permission return 403 unless the temporary `RAG_ALLOW_LEGACY_SHARED_WRITER=true` compatibility switch is active.
+- Malformed JSON or invalid request fields returns 400 after authorization.
+- Authorization denials and store success/failure emit structured audit events with keyed identifiers correlated by the response `X-Request-Id`.
 - Use the activate endpoint to store the full `SourceDocument`, create retrieval fragments, and supersede older fragments for the same source.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph
 ```mermaid
 flowchart TD
-  n0["UserGuard authenticates caller"]
+  n0["CompanyWriterGuard enforces current shared-writer policy"]
   n1["Path source_id selects company source"]
   n2["Store.create_revision_async creates revision and optional ingest job"]
   n3["Return revision ids and status"]

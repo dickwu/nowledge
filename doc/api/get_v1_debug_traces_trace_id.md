@@ -24,11 +24,13 @@ Schema: `TraceRecord`
 
 | Field | Type | Description |
 | --- | --- | --- |
-| ... | TraceRecord | Trace record including query, mode, stages, context URIs, owner, and timestamps. |
+| ... | TraceRecord | Trace record including query, mode, stages, context URIs, owner, and timestamps after configured-secret redaction. |
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Configured auth, Meilisearch, OpenAI, and Codex credentials are redacted from
+  the trace before serialization.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph
@@ -37,7 +39,7 @@ flowchart TD
   n0["AdminGuard authenticates caller"]
   n1["Path trace_id selects trace"]
   n2["Store.get_trace_async reads trace record"]
-  n3["Return TraceRecord"]
+  n3["Redact configured secrets and return TraceRecord"]
   n0 --> n1
   n1 --> n2
   n2 --> n3

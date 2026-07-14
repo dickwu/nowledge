@@ -1,12 +1,12 @@
 # GET /v1/llm/status
 
 ## Summary
-Return status for the configured LLM client.
+Return authenticated, sanitized status for the configured LLM client.
 
 ## Handler
 - Rust handler: `llm_status`
 - Route registration: `src/routes.rs::build_router`
-- Authentication: None
+- Authentication: UserGuard
 
 ## Path Parameters
 None.
@@ -24,22 +24,26 @@ Schema: `LlmStatusResponse`
 | --- | --- | --- |
 | provider | string | Configured provider. |
 | model | string | Configured model. |
-| auth_source | string | Credential source. |
+| auth_source | string | Non-sensitive credential-source category such as `codex_file`, `environment`, `mock`, or `none`; never a path or secret. |
 | healthy | boolean | Client health result. |
 
 ## Errors and Access Rules
-- Malformed JSON or missing required runtime fields returns 400.
-- Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
-- Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
+- Missing or invalid bearer authentication returns 401.
+- Any authenticated owner, tenant-service, company-writer, or admin principal may read the sanitized status.
+- Provider failures use the shared ApiError JSON envelope without exposing raw upstream response bodies or credential paths.
 
 ## Internal Logic Call Graph
 ```mermaid
 flowchart TD
   n0["Router dispatches GET /v1/llm/status"]
-  n1["Build LLM client from effective config"]
-  n2["client.status checks provider/model/auth source"]
-  n3["Return LlmStatusResponse"]
+  n1["UserGuard authenticates caller"]
+  n2["Build LLM client from effective config"]
+  n3["client.status checks provider/model/auth source"]
+  n4["Map auth source to a non-sensitive category"]
+  n5["Return LlmStatusResponse"]
   n0 --> n1
   n1 --> n2
   n2 --> n3
+  n3 --> n4
+  n4 --> n5
 ```

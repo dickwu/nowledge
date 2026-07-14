@@ -6,7 +6,7 @@ Analyze context or a selected history event to propose and optionally persist li
 ## Handler
 - Rust handler: `analyze_insights`
 - Route registration: `src/routes.rs::build_router`
-- Authentication: UserGuard; owner write scope required
+- Authentication: UserGuard; owner write scope required; `debug=true` requires admin
 
 ## Path Parameters
 None.
@@ -27,7 +27,7 @@ Schema: `AnalysisInsightRequest`
 | link_limit | integer | optional, default 10 | Maximum existing links considered. |
 | create_links | boolean | optional, default true | Persist proposed link candidates. |
 | upsert_insights | boolean | optional, default true | Persist proposed insight candidates. |
-| debug | boolean | optional, default false | Include prompt and debug-stage data where available. |
+| debug | boolean | optional, default false | Include prompt and debug-stage data where available; admin-only. |
 
 ## Response
 Schema: `AnalysisInsightResponse`
@@ -44,12 +44,15 @@ Schema: `AnalysisInsightResponse`
 | insight_candidates | InsightCandidate[] | Proposed insights from deterministic or LLM analysis. |
 | created_links | KnowledgeLink[] | Links persisted when create_links is true. |
 | insights | InsightRecord[] | Insights persisted when upsert_insights is true. |
-| usage | object | Provider/model/backend metadata; includes history_scope same_index for history_event_id mode. |
-| prompt | string? | Prompt included only when debug is true. |
+| usage | object | Provider/model/backend metadata; includes history_scope same_index for history_event_id mode. Admin debug may include a configured-secret-redacted provider preview. |
+| prompt | string? | Configured-secret-redacted prompt included only when debug is true. |
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Authenticated non-admin principals receive 403 when `debug=true` because the response can contain a grounded prompt.
+- Configured secrets are redacted from the complete response. Provider previews
+  are redacted before they are truncated.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 - history_event_id analysis requires owner_user_id after auth defaults are applied.
 - Non-history context evidence uses the same default fragment-only context search as /v1/context/search.
@@ -60,15 +63,16 @@ flowchart TD
   n0["UserGuard authenticates caller"]
   n1["apply_owner_default fills owner_user_id when possible"]
   n2["require_owner_for_write enforces owner scope"]
-  n3["require_string validates query"]
-  n4["If history_event_id exists, history_analysis_scope loads selected event and same-owner same-index hits"]
-  n5["Otherwise Store.search_context_async collects fragment evidence and Store.search_links collects links"]
-  n6["build_analysis_prompt constructs grounded prompt"]
-  n7["analysis_llm_config selects analysis-specific provider/model"]
-  n8["deterministic or LLM draft yields link and insight candidates"]
-  n9["Optional Store.upsert_link_async persists links"]
-  n10["Optional Store.upsert_insight_async persists insights"]
-  n11["Return AnalysisInsightResponse"]
+  n3["Require admin scope when debug=true"]
+  n4["require_string validates query"]
+  n5["If history_event_id exists, history_analysis_scope loads selected event and same-owner same-index hits"]
+  n6["Otherwise Store.search_context_async collects fragment evidence and Store.search_links collects links"]
+  n7["build_analysis_prompt constructs grounded prompt"]
+  n8["analysis_llm_config selects analysis-specific provider/model"]
+  n9["deterministic or LLM draft yields link and insight candidates"]
+  n10["Optional Store.upsert_link_async persists links"]
+  n11["Optional Store.upsert_insight_async persists insights"]
+  n12["Redact configured secrets and return AnalysisInsightResponse; prompt only for admin debug"]
   n0 --> n1
   n1 --> n2
   n2 --> n3
@@ -80,6 +84,7 @@ flowchart TD
   n8 --> n9
   n9 --> n10
   n10 --> n11
+  n11 --> n12
 ```
 
 ## Internal Logic Notes

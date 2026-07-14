@@ -8,7 +8,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use nowledge::{build_router, AppState, Config};
+use nowledge::{
+    build_router,
+    config::{AuthUserConfig, AuthUserScope, BearerTokenScope},
+    AppState, Config,
+};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -21,19 +25,23 @@ fn app() -> Router {
 fn authed_app() -> Router {
     let mut config = Config::test();
     config.auth_users = vec![
-        nowledge::config::AuthUserConfig {
+        AuthUserConfig {
             token: "u1-token".to_string(),
-            owner_user_id: Some("u1".to_string()),
+            scope: AuthUserScope::Owner {
+                owner_user_id: "u1".to_string(),
+            },
             roles: vec!["user".to_string()],
         },
-        nowledge::config::AuthUserConfig {
+        AuthUserConfig {
             token: "u2-token".to_string(),
-            owner_user_id: Some("u2".to_string()),
+            scope: AuthUserScope::Owner {
+                owner_user_id: "u2".to_string(),
+            },
             roles: vec!["user".to_string()],
         },
-        nowledge::config::AuthUserConfig {
+        AuthUserConfig {
             token: "admin-token".to_string(),
-            owner_user_id: None,
+            scope: AuthUserScope::Admin,
             roles: vec!["admin".to_string()],
         },
     ];
@@ -42,19 +50,23 @@ fn authed_app() -> Router {
 
 fn authed_app_with_config(mut config: Config) -> Router {
     config.auth_users = vec![
-        nowledge::config::AuthUserConfig {
+        AuthUserConfig {
             token: "u1-token".to_string(),
-            owner_user_id: Some("u1".to_string()),
+            scope: AuthUserScope::Owner {
+                owner_user_id: "u1".to_string(),
+            },
             roles: vec!["user".to_string()],
         },
-        nowledge::config::AuthUserConfig {
+        AuthUserConfig {
             token: "u2-token".to_string(),
-            owner_user_id: Some("u2".to_string()),
+            scope: AuthUserScope::Owner {
+                owner_user_id: "u2".to_string(),
+            },
             roles: vec!["user".to_string()],
         },
-        nowledge::config::AuthUserConfig {
+        AuthUserConfig {
             token: "admin-token".to_string(),
-            owner_user_id: None,
+            scope: AuthUserScope::Admin,
             roles: vec!["admin".to_string()],
         },
     ];
@@ -63,9 +75,9 @@ fn authed_app_with_config(mut config: Config) -> Router {
 
 fn codex_import_app() -> Router {
     let mut config = Config::test();
-    config.auth_users = vec![nowledge::config::AuthUserConfig {
+    config.auth_users = vec![AuthUserConfig {
         token: "admin-token".to_string(),
-        owner_user_id: None,
+        scope: AuthUserScope::Admin,
         roles: vec!["admin".to_string()],
     }];
     build_router(AppState::new(Arc::new(config)))
@@ -75,12 +87,19 @@ fn llm_health_app(provider: &str) -> Router {
     let mut config = Config::test();
     config.llm_provider = provider.to_string();
     config.llm_model = Some("health-model".to_string());
+    config.auth_users = vec![AuthUserConfig {
+        token: "admin-token".to_string(),
+        scope: AuthUserScope::Admin,
+        roles: vec!["admin".to_string()],
+    }];
     build_router(AppState::new(Arc::new(config)))
 }
 
 fn bearer_user_app() -> Router {
     let mut config = Config::test();
     config.bearer_token = Some("user-token".to_string());
+    config.bearer_token_scope = Some(BearerTokenScope::Owner);
+    config.bearer_token_owner_user_id = Some("u2".to_string());
     config.admin_token = Some("admin-token".to_string());
     build_router(AppState::new(Arc::new(config)))
 }
@@ -92,6 +111,11 @@ fn stale_llm_health_app() -> Router {
     config.health_llm_probe_interval_seconds = 999;
     config.health_llm_probe_ttl_seconds = 0;
     config.health_llm_max_stale_seconds = 0;
+    config.auth_users = vec![AuthUserConfig {
+        token: "admin-token".to_string(),
+        scope: AuthUserScope::Admin,
+        roles: vec!["admin".to_string()],
+    }];
     build_router(AppState::new(Arc::new(config)))
 }
 
@@ -386,9 +410,16 @@ async fn livez_is_minimal_process_liveness() {
 }
 
 #[tokio::test]
-async fn healthz_includes_llm_health_and_usage() {
+async fn admin_healthz_includes_llm_health_and_usage() {
     let app = llm_health_app("mock");
-    let (status, body) = call(app, Method::GET, "/healthz", Value::Null).await;
+    let (status, body) = call_with_token(
+        app,
+        Method::GET,
+        "/healthz",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "ok");
     assert_eq!(body["ready"], true);
@@ -404,7 +435,14 @@ async fn healthz_includes_llm_health_and_usage() {
 #[tokio::test]
 async fn llm_auth_failure_makes_health_unhealthy() {
     let app = llm_health_app("mock_auth_failure");
-    let (status, body) = call(app, Method::GET, "/healthz", Value::Null).await;
+    let (status, body) = call_with_token(
+        app,
+        Method::GET,
+        "/healthz",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["ready"], false);
     assert_eq!(body["status"], "unhealthy");
@@ -415,7 +453,14 @@ async fn llm_auth_failure_makes_health_unhealthy() {
 #[tokio::test]
 async fn llm_quota_exhaustion_makes_health_unhealthy() {
     let app = llm_health_app("mock_quota_exhausted");
-    let (status, body) = call(app, Method::GET, "/healthz", Value::Null).await;
+    let (status, body) = call_with_token(
+        app,
+        Method::GET,
+        "/healthz",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["ready"], false);
     assert_eq!(body["status"], "unhealthy");
@@ -425,7 +470,14 @@ async fn llm_quota_exhaustion_makes_health_unhealthy() {
 #[tokio::test]
 async fn llm_short_rate_limit_is_degraded_by_default() {
     let app = llm_health_app("mock_rate_limited");
-    let (status, body) = call(app, Method::GET, "/healthz", Value::Null).await;
+    let (status, body) = call_with_token(
+        app,
+        Method::GET,
+        "/healthz",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["ready"], true);
     assert_eq!(body["status"], "degraded");
@@ -436,15 +488,34 @@ async fn llm_short_rate_limit_is_degraded_by_default() {
 #[tokio::test]
 async fn stale_llm_probe_beyond_max_stale_makes_health_unhealthy() {
     let app = stale_llm_health_app();
-    let (status, first) = call(app.clone(), Method::GET, "/healthz", Value::Null).await;
+    let (status, first) = call_with_token(
+        app.clone(),
+        Method::GET,
+        "/healthz",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{first}");
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let (status, body) = call(app, Method::GET, "/readyz", Value::Null).await;
+    let (status, body) = call(app.clone(), Method::GET, "/readyz", Value::Null).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["status"], "unhealthy");
     assert_eq!(body["ready"], false);
-    assert_eq!(body["llm"]["stale"], true);
-    assert_eq!(body["llm"]["error_kind"], "stale_probe");
+    assert!(body.get("llm").is_none(), "{body}");
+    assert!(body.get("usage").is_none(), "{body}");
+
+    let (status, detail) = call_with_token(
+        app,
+        Method::GET,
+        "/healthz",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{detail}");
+    assert_eq!(detail["llm"]["stale"], true);
+    assert_eq!(detail["llm"]["error_kind"], "stale_probe");
 }
 
 #[tokio::test]
@@ -955,10 +1026,8 @@ async fn multipart_builtin_binary_failure_sets_task_failed() {
     assert_eq!(task["state"], "queued");
     let task_id = task["task_id"].as_str().unwrap();
     let task = wait_for_task_state(app.clone(), task_id, "u1-token", "failed").await;
-    assert!(task["error"]
-        .as_str()
-        .unwrap()
-        .contains("UTF-8 text uploads"));
+    assert_eq!(task["error"], "parser_failed");
+    assert!(!task.to_string().contains("UTF-8 text uploads"), "{task}");
 
     let (status, result) = call_with_token(
         app,
@@ -969,6 +1038,56 @@ async fn multipart_builtin_binary_failure_sets_task_failed() {
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{result}");
+    assert_eq!(result["error"]["message"], "ingest task failed");
+    assert!(
+        !result.to_string().contains("UTF-8 text uploads"),
+        "{result}"
+    );
+}
+
+#[tokio::test]
+async fn async_mineru_failure_never_exposes_private_upstream_urls() {
+    const PRIVATE_MARKER: &str = "private-runtime-auth-marker";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let mut config = Config::test();
+    config.mineru_api_url = format!("http://{addr}/{PRIVATE_MARKER}");
+    let app = authed_app_with_config(config);
+    let (status, task) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/tasks",
+        json!({
+            "owner_user_id": "u1",
+            "source_id": "private-mineru-failure",
+            "parser_provider": "mineru",
+            "content": "content sent to a deliberately unavailable parser"
+        }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{task}");
+    let task_id = task["task_id"].as_str().unwrap();
+
+    let failed = wait_for_task_state(app.clone(), task_id, "u1-token", "failed").await;
+    assert_eq!(failed["error"], "parser_failed");
+    assert!(!failed.to_string().contains(PRIVATE_MARKER), "{failed}");
+    assert!(!failed.to_string().contains(&addr.to_string()), "{failed}");
+
+    let (status, result) = call_with_token(
+        app,
+        Method::GET,
+        &format!("/v1/ingest/tasks/{task_id}/result"),
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{result}");
+    assert_eq!(result["error"]["message"], "ingest task failed");
+    assert!(!result.to_string().contains(PRIVATE_MARKER), "{result}");
+    assert!(!result.to_string().contains(&addr.to_string()), "{result}");
 }
 
 #[tokio::test]
@@ -1986,7 +2105,7 @@ async fn usage_returns_full_provider_snapshots_and_owner_scope() {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
-    let (status, owner_usage) = call_with_token(
+    let (status, owner_usage_before_shared_writes) = call_with_token(
         app.clone(),
         Method::GET,
         "/v1/usage",
@@ -1994,24 +2113,116 @@ async fn usage_returns_full_provider_snapshots_and_owner_scope() {
         Some("u1-token"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{owner_usage}");
-    assert_eq!(owner_usage["scope"]["owner_user_id"], "u1");
-    assert_eq!(owner_usage["scope"]["global"], false);
-    let providers = owner_usage["providers"].as_object().unwrap();
+    assert_eq!(status, StatusCode::OK, "{owner_usage_before_shared_writes}");
+    assert_eq!(
+        owner_usage_before_shared_writes["scope"]["owner_user_id"],
+        "u1"
+    );
+    assert_eq!(owner_usage_before_shared_writes["scope"]["global"], false);
+    let providers = owner_usage_before_shared_writes["providers"]
+        .as_object()
+        .unwrap();
     for provider in [
-        "nowledge_api",
-        "meilisearch",
-        "llm",
         "rag",
         "link_graph",
         "history_events",
         "contextfs",
+        "ingest",
         "structured_data",
         "sessions",
     ] {
         assert!(providers.contains_key(provider), "missing {provider}");
     }
-    assert_eq!(owner_usage["providers"]["history_events"]["event_count"], 1);
+    for diagnostic in ["nowledge_api", "meilisearch", "parser", "llm"] {
+        assert!(
+            !providers.contains_key(diagnostic),
+            "owner usage exposed {diagnostic}: {owner_usage_before_shared_writes}"
+        );
+    }
+    assert_eq!(
+        owner_usage_before_shared_writes["providers"]["history_events"]["event_count"],
+        1
+    );
+    assert_eq!(
+        owner_usage_before_shared_writes["providers"]["contextfs"]["company_context_node_count"],
+        0
+    );
+    assert_eq!(
+        owner_usage_before_shared_writes["providers"]["link_graph"]["link_count"],
+        0
+    );
+    assert_eq!(
+        owner_usage_before_shared_writes["providers"]["structured_data"]["dataset_count"],
+        0
+    );
+
+    let (status, shared_link) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/links",
+        json!({
+            "source_uri": "ctx://company/usage/shared-source",
+            "target_uri": "ctx://company/usage/shared-target",
+            "relation": "related",
+            "rationale": "tenant-global usage isolation regression"
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{shared_link}");
+    assert!(shared_link["link"].get("owner_user_id").is_none());
+
+    let (status, dataset) = call_with_token(
+        app.clone(),
+        Method::PUT,
+        "/v1/state/structured/datasets/usage-global-schema",
+        json!({ "title": "Usage Global Schema", "columns": [] }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dataset}");
+
+    let (status, revision) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/state/company-docs/usage-global-doc/revisions",
+        json!({
+            "title": "Usage Global Document",
+            "source_uri": "https://example.test/usage/global",
+            "content": "Tenant-global company context must not change an owner usage snapshot.",
+            "checksum": "usage-global-doc-v1"
+        }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{revision}");
+    let revision_id = revision["revision_id"].as_str().unwrap();
+    let (status, activated) = call_with_token(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/state/company-docs/usage-global-doc/revisions/{revision_id}/activate"),
+        json!({ "reason": "usage isolation regression" }),
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{activated}");
+
+    let (status, owner_usage_after_shared_writes) = call_with_token(
+        app.clone(),
+        Method::GET,
+        "/v1/usage",
+        Value::Null,
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{owner_usage_after_shared_writes}");
+    for provider in ["contextfs", "link_graph", "structured_data"] {
+        assert_eq!(
+            owner_usage_after_shared_writes["providers"][provider],
+            owner_usage_before_shared_writes["providers"][provider],
+            "shared tenant records changed owner provider {provider}: {owner_usage_after_shared_writes}"
+        );
+    }
 
     let (status, admin_usage) = call_with_token(
         app,
@@ -2023,7 +2234,34 @@ async fn usage_returns_full_provider_snapshots_and_owner_scope() {
     .await;
     assert_eq!(status, StatusCode::OK, "{admin_usage}");
     assert_eq!(admin_usage["scope"]["global"], true);
-    assert_eq!(admin_usage["providers"]["history_events"]["event_count"], 2);
+    assert!(
+        admin_usage["providers"]["history_events"]["event_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 2),
+        "{admin_usage}"
+    );
+    assert!(
+        admin_usage["providers"]["contextfs"]["company_context_node_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "{admin_usage}"
+    );
+    assert!(
+        admin_usage["providers"]["link_graph"]["link_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "{admin_usage}"
+    );
+    assert_eq!(
+        admin_usage["providers"]["structured_data"]["dataset_count"],
+        1
+    );
+    for diagnostic in ["nowledge_api", "meilisearch", "parser", "llm"] {
+        assert!(
+            admin_usage["providers"].get(diagnostic).is_some(),
+            "admin usage missing {diagnostic}: {admin_usage}"
+        );
+    }
 }
 
 #[tokio::test]

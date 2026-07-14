@@ -16,11 +16,16 @@ use crate::{
     repository::{repository_from_config, KnowledgeRepository, RepositoryContextSearchQuery},
     resolver::{EventIndexResolver, EVENT_INDEX_SCHEMA_VERSION, EVENT_SETTINGS_HASH},
     util::{
-        ancestor_uris, hmac_hex, new_id, now, require_string, sanitize_slug, text_score,
-        truncate_chars,
+        ancestor_uris, hmac_hex, mask_secret_egress_projection_preserving_chars,
+        mask_secret_fragment_projection_preserving_chars, new_id, now, require_string,
+        sanitize_slug, text_score, truncate_chars,
     },
     vector_match::{VectorMatcher, VectorScoreMap},
 };
+
+const INGEST_ERROR_PARSER_FAILED: &str = "parser_failed";
+const INGEST_ERROR_INDEXING_FAILED: &str = "indexing_failed";
+const INGEST_ERROR_FAILED: &str = "ingest_failed";
 
 #[derive(Clone)]
 pub struct Store {
@@ -28,6 +33,7 @@ pub struct Store {
     resolver: EventIndexResolver,
     repository: Arc<dyn KnowledgeRepository>,
     vector: Arc<Mutex<VectorMatcher>>,
+    redaction_config: Arc<Config>,
 }
 
 #[derive(Default)]
@@ -135,6 +141,9 @@ struct DocumentIngestResult {
 
 impl Store {
     pub fn new(config: &Config) -> Self {
+        // Capture the current dynamic Codex credential before any later
+        // rotation so response and provider-boundary redaction retain it.
+        let _ = config.refresh_configured_secret_values();
         let mut data = StoreData::default();
         data.seed_harness_components(&config.tenant_id);
         Self {
@@ -142,6 +151,7 @@ impl Store {
             resolver: EventIndexResolver::new(config.index_hash_secret.clone()),
             repository: repository_from_config(config),
             vector: Arc::new(Mutex::new(VectorMatcher::from_config(config))),
+            redaction_config: Arc::new(config.clone()),
         }
     }
 
@@ -1126,11 +1136,14 @@ impl Store {
                         .is_some_and(|hash| hash == index.owner_user_id_hash)
             })
             .count();
-        let company_nodes = data
-            .company_context
-            .iter()
-            .filter(|node| tenant_matches(&node.tenant_id) && node.status == "active")
-            .count();
+        let company_nodes = if include_global {
+            data.company_context
+                .iter()
+                .filter(|node| tenant_matches(&node.tenant_id) && node.status == "active")
+                .count()
+        } else {
+            0
+        };
         let private_nodes = if include_global {
             data.personal_context
                 .values()
@@ -1203,10 +1216,15 @@ impl Store {
                 } else {
                     link.owner_user_id
                         .as_deref()
-                        .is_none_or(|owner| owner_user_id == Some(owner))
+                        .is_some_and(|owner| owner_user_id == Some(owner))
                 }
             })
             .count();
+        let dataset_count = if include_global {
+            data.datasets.len()
+        } else {
+            0
+        };
         let owner_option_matches = |owner: Option<&str>| {
             include_global || owner_user_id.is_some_and(|target| owner == Some(target))
         };
@@ -1283,7 +1301,7 @@ impl Store {
                     "parsed_block_count": parsed_block_count
                 },
                 "structured_data": {
-                    "dataset_count": data.datasets.len(),
+                    "dataset_count": dataset_count,
                     "snapshot_count": snapshot_count,
                     "row_count": row_count,
                     "summary_count": summary_count,
@@ -1811,7 +1829,11 @@ impl Store {
             Ok(parsed) => parsed,
             Err(err) => {
                 let _ = self
-                    .transition_ingest_task_async(task_id, "failed", Some(err.to_string()))
+                    .transition_ingest_task_async(
+                        task_id,
+                        "failed",
+                        Some(INGEST_ERROR_PARSER_FAILED.to_string()),
+                    )
                     .await;
                 return Err(err);
             }
@@ -1886,7 +1908,11 @@ impl Store {
             .await
         {
             let _ = self
-                .transition_ingest_task_async(task_id, "failed", Some(err.to_string()))
+                .transition_ingest_task_async(
+                    task_id,
+                    "failed",
+                    Some(INGEST_ERROR_INDEXING_FAILED.to_string()),
+                )
                 .await;
             return Err(err);
         }
@@ -1924,6 +1950,7 @@ impl Store {
             .get(task_id)
             .filter(|task| ingest_task_visible(task, owner_user_id, include_all_private))
             .cloned()
+            .map(sanitize_ingest_task)
             .ok_or_else(|| ApiError::not_found("ingest task not found"))
     }
 
@@ -1938,6 +1965,10 @@ impl Store {
             .get(task_id)
             .filter(|result| ingest_task_visible(&result.task, owner_user_id, include_all_private))
             .cloned()
+            .map(|mut result| {
+                result.task = sanitize_ingest_task(result.task);
+                result
+            })
             .map(Ok)
             .unwrap_or_else(|| {
                 let Some(task) = data
@@ -1948,12 +1979,7 @@ impl Store {
                     return Err(ApiError::not_found("ingest result not found"));
                 };
                 if task.state == "failed" {
-                    Err(ApiError::conflict(format!(
-                        "ingest task failed: {}",
-                        task.error
-                            .clone()
-                            .unwrap_or_else(|| "unknown error".to_string())
-                    )))
+                    Err(ApiError::conflict("ingest task failed"))
                 } else {
                     Err(ApiError::conflict("ingest result is not ready"))
                 }
@@ -2079,10 +2105,11 @@ impl Store {
             scored_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             let nodes: Vec<ContextNode> =
                 scored_nodes.iter().map(|(node, _)| node.clone()).collect();
+            let redaction_secrets = self.redaction_config.configured_secret_values();
             let mut hits = scored_nodes
                 .iter()
                 .map(|(node, score)| {
-                    let mut hit = context_hit_from_node(node, *score);
+                    let mut hit = context_hit_from_node(node, *score, &redaction_secrets);
                     hit.score_breakdown = Some(score_breakdown_value(
                         node,
                         &query,
@@ -2307,7 +2334,7 @@ impl Store {
         include_all_private: bool,
     ) -> Result<ContextNode, ApiError> {
         if let Ok(node) = self.fs_read(tenant_id, uri, owner_user_id, include_all_private) {
-            return Ok(node);
+            return Ok(self.sanitize_context_node_for_egress(node));
         }
         if !include_all_private {
             if let Some(node) = self
@@ -2315,14 +2342,18 @@ impl Store {
                 .read_context_node(tenant_id, owner_user_id, uri, None, &self.resolver)
                 .await?
             {
-                return Ok(node);
+                return Ok(self.sanitize_context_node_for_egress(node));
             }
             if let Some(source_document) = self
                 .repository
                 .read_source_document(tenant_id, owner_user_id, uri)
                 .await?
             {
-                return Ok(source_document_context_node(source_document));
+                return Ok(
+                    self.sanitize_context_node_for_egress(source_document_context_node(
+                        source_document,
+                    )),
+                );
             }
         }
         Err(ApiError::not_found("context uri not found"))
@@ -2337,7 +2368,7 @@ impl Store {
         include_all_private: bool,
     ) -> Result<ContextNode, ApiError> {
         if let Ok(node) = self.fs_layer(tenant_id, uri, layer, owner_user_id, include_all_private) {
-            return Ok(node);
+            return Ok(self.sanitize_context_node_for_egress(node));
         }
         if !include_all_private {
             if let Some(node) = self
@@ -2345,10 +2376,26 @@ impl Store {
                 .read_context_node(tenant_id, owner_user_id, uri, Some(layer), &self.resolver)
                 .await?
             {
-                return Ok(node);
+                return Ok(self.sanitize_context_node_for_egress(node));
             }
         }
         Err(ApiError::not_found("context layer not found"))
+    }
+
+    fn sanitize_context_node_for_egress(&self, mut node: ContextNode) -> ContextNode {
+        let secrets = self.redaction_config.configured_secret_values();
+        node.title = mask_secret_egress_projection_preserving_chars(&node.title, &secrets);
+        node.body = if matches!(node.node_kind.as_str(), "fragment" | "abstract") {
+            mask_secret_fragment_projection_preserving_chars(&node.body, &secrets)
+        } else {
+            mask_secret_egress_projection_preserving_chars(&node.body, &secrets)
+        };
+        node.section_path = node
+            .section_path
+            .into_iter()
+            .map(|part| mask_secret_egress_projection_preserving_chars(&part, &secrets))
+            .collect();
+        node
     }
 
     pub fn ensure_user_index(
@@ -4253,11 +4300,12 @@ impl Store {
             .map(|(node, _)| node.clone())
             .take(limit)
             .collect();
+        let redaction_secrets = self.redaction_config.configured_secret_values();
         let mut hits: Vec<_> = fragments
             .iter()
             .take(limit)
             .map(|(node, score)| {
-                let mut hit = context_hit_from_node(node, *score);
+                let mut hit = context_hit_from_node(node, *score, &redaction_secrets);
                 hit.score_breakdown = Some(score_breakdown_value(
                     node,
                     &query,
@@ -4995,7 +5043,7 @@ impl Store {
             .get_mut(task_id)
             .ok_or_else(|| ApiError::not_found("ingest task not found"))?;
         task.state = state.to_string();
-        task.error = error;
+        task.error = sanitize_ingest_error(state, error.as_deref()).map(ToString::to_string);
         task.updated_at = now();
         if matches!(state, "completed" | "failed") {
             task.completed_at = Some(task.updated_at);
@@ -5216,7 +5264,11 @@ impl Store {
             sanitize_slug(&event.id)
         );
         let title = format!("{} {}", event.event_type, event.entity_id);
-        let abstract_body = truncate_chars(&event.text, 500);
+        let secrets = self.redaction_config.configured_secret_values();
+        let abstract_body = truncate_chars(
+            &mask_secret_fragment_projection_preserving_chars(&event.text, &secrets),
+            500,
+        );
         let overview_body = json!({
             "event_type": event.event_type,
             "entity_type": event.entity_type,
@@ -5279,13 +5331,21 @@ impl Store {
         item: &StateItem,
     ) {
         let base = item.context_uri.clone();
-        let body = format!("{}: {}", item.title, item.statement);
+        let secrets = self.redaction_config.configured_secret_values();
+        let safe_title = mask_secret_fragment_projection_preserving_chars(&item.title, &secrets);
+        let safe_statement =
+            mask_secret_fragment_projection_preserving_chars(&item.statement, &secrets);
+        let body = format!("{safe_title}: {safe_statement}");
+        let abstract_body = truncate_chars(
+            &mask_secret_fragment_projection_preserving_chars(&body, &secrets),
+            500,
+        );
         let nodes = vec![
             self.context_node(
                 &format!("{base}/.abstract"),
                 &item.title,
                 0,
-                &truncate_chars(&body, 500),
+                &abstract_body,
                 "personal",
                 &routing.personal_context_index_uid,
                 &item.tenant_id,
@@ -5323,12 +5383,17 @@ impl Store {
         evidence_text: Option<String>,
     ) {
         let base = insight.context_uri.clone();
+        let secrets = self.redaction_config.configured_secret_values();
+        let abstract_body = truncate_chars(
+            &mask_secret_fragment_projection_preserving_chars(&insight.statement, &secrets),
+            500,
+        );
         let nodes = vec![
             self.context_node(
                 &format!("{base}/.abstract"),
                 &insight.title,
                 0,
-                &truncate_chars(&insight.statement, 500),
+                &abstract_body,
                 "personal",
                 &routing.personal_context_index_uid,
                 tenant_id,
@@ -5498,8 +5563,18 @@ impl Store {
                 .insert(source_document_uri.to_string(), blocks.to_vec());
         }
 
+        let redaction_secrets = self.redaction_config.configured_secret_values();
+        let retrieval_title =
+            mask_secret_egress_projection_preserving_chars(title, &redaction_secrets);
+        let retrieval_content =
+            mask_secret_fragment_projection_preserving_chars(content, &redaction_secrets);
+        let retrieval_blocks = blocks
+            .iter()
+            .cloned()
+            .map(|block| mask_parsed_block_for_retrieval(block, &redaction_secrets))
+            .collect::<Vec<_>>();
         let fragmenter = BlockAwareFragmenter::from_policy(policy);
-        let fragments = fragmenter.fragment(content, blocks);
+        let fragments = fragmenter.fragment(&retrieval_content, &retrieval_blocks);
         let fragment_uris = fragments
             .iter()
             .map(|fragment| {
@@ -5515,7 +5590,7 @@ impl Store {
             .map(|(fragment, uri)| {
                 self.fragment_context_node(
                     uri,
-                    title,
+                    &retrieval_title,
                     index_kind,
                     index_uid,
                     tenant_id,
@@ -5536,7 +5611,7 @@ impl Store {
         let mut warm_entries = Vec::with_capacity(nodes.len() + 1);
         warm_entries.push((
             vector_doc_key(index_uid, source_document_uri),
-            format!("{title} {content}"),
+            format!("{retrieval_title} {retrieval_content}"),
         ));
         warm_entries.extend(
             nodes
@@ -5572,10 +5647,10 @@ impl Store {
                     target_uri: source_document_uri.to_string(),
                     source_title: Some(format!(
                         "{} fragment {}",
-                        title,
+                        retrieval_title,
                         fragment.fragment_index + 1
                     )),
-                    target_title: Some(title.to_string()),
+                    target_title: Some(retrieval_title.clone()),
                     relation: "part_of".to_string(),
                     rationale: Some("fragment generated from source document".to_string()),
                     evidence_text: None,
@@ -6559,7 +6634,12 @@ fn retrieval_candidate(node: &ContextNode) -> bool {
     node.status == "active" && node.retrieval_enabled && node.retrieval_role == "fragment"
 }
 
-fn context_hit_from_node(node: &ContextNode, score: f32) -> ContextHit {
+fn context_hit_from_node(
+    node: &ContextNode,
+    score: f32,
+    redaction_secrets: &[String],
+) -> ContextHit {
+    let safe_body = mask_secret_fragment_projection_preserving_chars(&node.body, redaction_secrets);
     ContextHit {
         uri: node.uri.clone(),
         title: node.title.clone(),
@@ -6587,7 +6667,7 @@ fn context_hit_from_node(node: &ContextNode, score: f32) -> ContextHit {
         neighbor_fragments: Vec::new(),
         related_links: Vec::new(),
         score_breakdown: None,
-        snippet: truncate_chars(&node.body, 240),
+        snippet: truncate_chars(&safe_body, 240),
     }
 }
 
@@ -6852,6 +6932,52 @@ fn parse_artifact_id(uri: &str) -> String {
             .take(24)
             .collect::<String>()
     )
+}
+
+fn sanitize_ingest_error(state: &str, error: Option<&str>) -> Option<&'static str> {
+    if state != "failed" {
+        return None;
+    }
+    match error {
+        Some(INGEST_ERROR_PARSER_FAILED) => Some(INGEST_ERROR_PARSER_FAILED),
+        Some(INGEST_ERROR_INDEXING_FAILED) => Some(INGEST_ERROR_INDEXING_FAILED),
+        Some(_) | None => Some(INGEST_ERROR_FAILED),
+    }
+}
+
+fn sanitize_ingest_task(mut task: IngestTask) -> IngestTask {
+    task.error = sanitize_ingest_error(&task.state, task.error.as_deref()).map(ToString::to_string);
+    task
+}
+
+fn mask_parsed_block_for_retrieval(
+    mut block: ParsedBlock,
+    redaction_secrets: &[String],
+) -> ParsedBlock {
+    block.text = block
+        .text
+        .map(|value| mask_secret_fragment_projection_preserving_chars(&value, redaction_secrets));
+    block.html = block
+        .html
+        .map(|value| mask_secret_fragment_projection_preserving_chars(&value, redaction_secrets));
+    block.latex = block
+        .latex
+        .map(|value| mask_secret_fragment_projection_preserving_chars(&value, redaction_secrets));
+    block.image_ref = block
+        .image_ref
+        .map(|value| mask_secret_fragment_projection_preserving_chars(&value, redaction_secrets));
+    block.caption = block
+        .caption
+        .map(|value| mask_secret_fragment_projection_preserving_chars(&value, redaction_secrets));
+    block.footnote = block
+        .footnote
+        .map(|value| mask_secret_fragment_projection_preserving_chars(&value, redaction_secrets));
+    block.section_path = block
+        .section_path
+        .into_iter()
+        .map(|value| mask_secret_egress_projection_preserving_chars(&value, redaction_secrets))
+        .collect();
+    block
 }
 
 fn ingest_task_visible(
@@ -7657,6 +7783,333 @@ mod tests {
             result_url: None,
             queued_ahead: None,
         }
+    }
+
+    #[test]
+    fn ingest_polling_sanitizes_legacy_persisted_failure_causes() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let task_id = "task-legacy-private-error";
+        let private_cause =
+            "request failed for http://127.0.0.1/private-runtime-auth-marker/file_parse";
+        let mut task = ingest_task_fixture(task_id, &config.tenant_id, "failed", 10);
+        task.error = Some(private_cause.to_string());
+        store
+            .write()
+            .unwrap()
+            .ingest_tasks
+            .insert(task_id.to_string(), task);
+
+        let visible = store.get_ingest_task(task_id, None, true).unwrap();
+        assert_eq!(visible.error.as_deref(), Some(INGEST_ERROR_FAILED));
+
+        let error = store
+            .get_ingest_task_result(task_id, None, true)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "ingest task failed");
+        assert!(!error.to_string().contains(private_cause));
+    }
+
+    #[test]
+    fn context_search_rereads_rotated_codex_secrets_before_snippet_truncation() {
+        const OLD_TOKEN: &str = "codex-old-rotation-token-private-value";
+        const NEW_TOKEN: &str = "zxqv-rotated-codex-token-private-value";
+        const ANCHOR: &str = "rotated-secret-boundary-anchor";
+        let auth_path = std::env::temp_dir().join(format!(
+            "nowledge-store-redaction-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(&auth_path, json!({ "access_token": OLD_TOKEN }).to_string()).unwrap();
+
+        let mut config = Config::test();
+        config.codex_auth_path = Some(auth_path.to_string_lossy().to_string());
+        let store = Store::new(&config);
+        std::fs::write(&auth_path, json!({ "access_token": NEW_TOKEN }).to_string()).unwrap();
+        let _ = config.refresh_configured_secret_values();
+
+        let prefix = format!("{ANCHOR} ");
+        let body = format!("{}{}{NEW_TOKEN}", prefix, "x".repeat(229 - prefix.len()));
+        let mut node = store.context_node(
+            "ctx://test/company/rotated-secret/fragments/0001",
+            "Rotated secret boundary",
+            2,
+            &body,
+            "company",
+            "rag_company_context",
+            &config.tenant_id,
+            None,
+            Some("rotated-secret-source".to_string()),
+            Some("v1".to_string()),
+        );
+        node.node_kind = "fragment".to_string();
+        node.retrieval_role = "fragment".to_string();
+        node.retrieval_enabled = true;
+        store.write().unwrap().company_context.push(node);
+
+        let outcome = store
+            .search_context(
+                &config.tenant_id,
+                ContextSearchRequest {
+                    query: Some(ANCHOR.to_string()),
+                    limit: 1,
+                    ..ContextSearchRequest::default()
+                },
+                false,
+            )
+            .unwrap();
+        let snippet = &outcome.response.hits[0].snippet;
+        // Retrieval snippets preserve character offsets, so masking uses
+        // fixed-width `*` characters instead of the JSON egress marker.
+        assert!(snippet.contains('*'), "{snippet}");
+        assert!(!snippet.contains("zxqv-"), "{snippet}");
+        assert!(!snippet.contains(NEW_TOKEN), "{snippet}");
+
+        let _ = std::fs::remove_file(auth_path);
+    }
+
+    #[test]
+    fn raw_source_egress_preserves_short_words_while_fragments_break_reconstruction() {
+        let mut config = Config::test();
+        config.admin_token = Some("owner-u1-token".to_string());
+        let store = Store::new(&config);
+        let mut source = store.context_node(
+            "ctx://test/source",
+            "owner",
+            2,
+            "owner guidance",
+            "company",
+            "rag_source_documents",
+            &config.tenant_id,
+            None,
+            Some("source".to_string()),
+            Some("v1".to_string()),
+        );
+        source.node_kind = "source_doc".to_string();
+        source.retrieval_role = "none".to_string();
+        let safe_source = store.sanitize_context_node_for_egress(source);
+        assert_eq!(safe_source.title, "owner");
+        assert_eq!(safe_source.body, "owner guidance");
+
+        let mut fragment = store.context_node(
+            "ctx://test/source/fragments/0001",
+            "owner",
+            2,
+            "owner",
+            "company",
+            "rag_company_context",
+            &config.tenant_id,
+            None,
+            Some("source".to_string()),
+            Some("v1".to_string()),
+        );
+        fragment.node_kind = "fragment".to_string();
+        fragment.retrieval_role = "fragment".to_string();
+        let safe_fragment = store.sanitize_context_node_for_egress(fragment);
+        assert_eq!(safe_fragment.title, "owner");
+        assert_eq!(safe_fragment.body, "*****");
+    }
+
+    #[test]
+    fn parsed_block_retrieval_masking_prevents_cross_fragment_secret_splitting() {
+        const SECRET: &str = "zxqv-mineru-secret-token-private-value";
+        let mut config = Config::test();
+        config.admin_token = Some(SECRET.to_string());
+        let secrets = config.configured_secret_values();
+        let prefix = "parsed-block-boundary ";
+        let body = format!("{}{}{SECRET}", prefix, "x".repeat(229 - prefix.len()));
+        let block = ParsedBlock {
+            block_id: "boundary-block".to_string(),
+            block_type: "paragraph".to_string(),
+            text: Some(body.clone()),
+            ..ParsedBlock::default()
+        };
+        let masked = mask_parsed_block_for_retrieval(block, &secrets);
+        assert_eq!(
+            masked.text.as_deref().unwrap().chars().count(),
+            body.chars().count()
+        );
+
+        let fragments = BlockAwareFragmenter::from_policy(Some(&FragmentPolicy {
+            chunk_size_chars: Some(240),
+            overlap_chars: Some(0),
+            min_chunk_chars: Some(240),
+        }))
+        .fragment("ignored when parsed blocks exist", &[masked]);
+        assert_eq!(fragments.len(), 2);
+        let joined = fragments
+            .iter()
+            .map(|fragment| fragment.content.as_str())
+            .collect::<String>();
+        assert!(joined.contains('*'));
+        assert!(!joined.contains("zxqv-"));
+        assert!(!joined.contains(SECRET));
+    }
+
+    #[test]
+    fn parsed_block_retrieval_masks_secret_projections_across_block_fields() {
+        const SECRET: &str = "zxqv-parsed-block-field-secret-private-value";
+        let left = &SECRET[..14];
+        let middle = &SECRET[14..30];
+        let right = &SECRET[30..];
+        let mut config = Config::test();
+        config.admin_token = Some(SECRET.to_string());
+        let secrets = config.configured_secret_values();
+        let masked = mask_parsed_block_for_retrieval(
+            ParsedBlock {
+                block_id: "multi-field-secret".to_string(),
+                block_type: "image".to_string(),
+                text: Some(left.to_string()),
+                image_ref: Some(middle.to_string()),
+                caption: Some(right.to_string()),
+                ..ParsedBlock::default()
+            },
+            &secrets,
+        );
+
+        for field in [
+            masked.text.as_deref().unwrap(),
+            masked.image_ref.as_deref().unwrap(),
+            masked.caption.as_deref().unwrap(),
+        ] {
+            assert!(field.chars().all(|ch| ch == '*'), "{field}");
+        }
+        let fragments = BlockAwareFragmenter::from_policy(None)
+            .fragment("ignored when parsed blocks exist", &[masked]);
+        let prompt_projection = fragments
+            .iter()
+            .map(|fragment| fragment.content.as_str())
+            .collect::<String>();
+        assert!(!prompt_projection.contains(left));
+        assert!(!prompt_projection.contains(middle));
+        assert!(!prompt_projection.contains(right));
+        assert!(!prompt_projection.contains(SECRET));
+    }
+
+    #[test]
+    fn query_time_masking_hides_a_configured_secret_split_between_parsed_blocks() {
+        const OLD_SECRET: &str = "codex-old-parsed-block-token-private-value";
+        const SECRET: &str = "zxqv-split-between-parsed-blocks-private-value";
+        let split = 18;
+        let auth_path = std::env::temp_dir().join(format!(
+            "nowledge-store-parsed-block-redaction-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(
+            &auth_path,
+            json!({ "access_token": OLD_SECRET }).to_string(),
+        )
+        .unwrap();
+        let mut config = Config::test();
+        config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
+        let store = Store::new(&config);
+        let ingress_secrets = config.configured_secret_values();
+        let blocks = vec![
+            ParsedBlock {
+                block_id: "left-block".to_string(),
+                block_type: "paragraph".to_string(),
+                text: Some(format!("parsed-block-anchor {}", &SECRET[..split])),
+                reading_order: 1,
+                ..ParsedBlock::default()
+            },
+            ParsedBlock {
+                block_id: "right-block".to_string(),
+                block_type: "paragraph".to_string(),
+                text: Some(format!("{} trailing text", &SECRET[split..])),
+                reading_order: 2,
+                ..ParsedBlock::default()
+            },
+        ];
+        let masked_blocks = blocks
+            .into_iter()
+            .map(|block| mask_parsed_block_for_retrieval(block, &ingress_secrets))
+            .collect::<Vec<_>>();
+        let fragments = BlockAwareFragmenter::from_policy(None)
+            .fragment("ignored when parsed blocks exist", &masked_blocks);
+        assert!(fragments
+            .iter()
+            .any(|fragment| fragment.content.contains("zxqv-")));
+
+        std::fs::write(&auth_path, json!({ "access_token": SECRET }).to_string()).unwrap();
+        let query_secrets = config.refresh_configured_secret_values();
+
+        assert_eq!(fragments.len(), 2);
+        let snippets = fragments
+            .iter()
+            .enumerate()
+            .map(|(index, fragment)| {
+                let mut node = store.context_node(
+                    &format!("ctx://test/source/fragments/{index:04}"),
+                    "Parsed block split",
+                    2,
+                    &fragment.content,
+                    "company",
+                    "rag_company_context",
+                    &config.tenant_id,
+                    None,
+                    Some("source".to_string()),
+                    Some("v1".to_string()),
+                );
+                node.node_kind = "fragment".to_string();
+                node.retrieval_role = "fragment".to_string();
+                context_hit_from_node(&node, 1.0, &query_secrets).snippet
+            })
+            .collect::<Vec<_>>();
+
+        assert!(snippets.iter().all(|snippet| snippet.contains('*')));
+        assert!(!snippets[0].contains(&SECRET[..split]));
+        assert!(!snippets[1].contains(&SECRET[split..]));
+        assert!(!snippets.concat().contains(SECRET));
+
+        let _ = std::fs::remove_file(auth_path);
+    }
+
+    #[test]
+    fn query_time_masking_breaks_three_piece_rotated_secret_reconstruction() {
+        const OLD_SECRET: &str = "codex-old-three-piece-token";
+        const SECRET: &str = "abcdefghij";
+        let auth_path = std::env::temp_dir().join(format!(
+            "nowledge-store-three-piece-redaction-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(
+            &auth_path,
+            json!({ "access_token": OLD_SECRET }).to_string(),
+        )
+        .unwrap();
+        let mut config = Config::test();
+        config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
+        let store = Store::new(&config);
+
+        std::fs::write(&auth_path, json!({ "access_token": SECRET }).to_string()).unwrap();
+        let query_secrets = config.refresh_configured_secret_values();
+        let snippets = ["Xabc", "defg", "hij"]
+            .iter()
+            .enumerate()
+            .map(|(index, body)| {
+                let mut node = store.context_node(
+                    &format!("ctx://test/source/fragments/{index:04}"),
+                    "Three piece split",
+                    2,
+                    body,
+                    "company",
+                    "rag_company_context",
+                    &config.tenant_id,
+                    None,
+                    Some("source".to_string()),
+                    Some("v1".to_string()),
+                );
+                node.node_kind = "fragment".to_string();
+                node.retrieval_role = "fragment".to_string();
+                context_hit_from_node(&node, 1.0, &query_secrets).snippet
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(snippets[0], "Xabc");
+        assert_eq!(snippets[1], "****");
+        assert_eq!(snippets[2], "hij");
+        assert!(!snippets.concat().contains(SECRET));
+
+        let _ = std::fs::remove_file(auth_path);
     }
 
     #[tokio::test]

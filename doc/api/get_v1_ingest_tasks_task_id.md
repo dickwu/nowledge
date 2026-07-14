@@ -15,7 +15,9 @@ Return current task metadata for an ingest task visible to the caller.
 ## Rules
 
 - Private owner tasks are hidden from other owners.
-- `failed` tasks retain the error string for polling/debugging.
+- `failed` tasks expose only a stable failure code (`parser_failed`,
+  `indexing_failed`, or the legacy-safe fallback `ingest_failed`). Raw parser,
+  provider, URL, filesystem, and repository causes are never returned.
 - Terminal (`completed`/`failed`) tasks expire after
   `RAG_INGEST_TASK_RETENTION_SECONDS` (default 86400, 0 = never) and then
   return 404; poll or fetch results within the retention window.

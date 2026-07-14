@@ -6,7 +6,7 @@ Return a fragment-grounded RAG answer plus its trace and prompt preview for debu
 ## Handler
 - Rust handler: `rag_debug`
 - Route registration: `src/routes.rs::build_router`
-- Authentication: UserGuard; owner default may apply
+- Authentication: AdminGuard required
 
 ## Path Parameters
 None.
@@ -30,27 +30,30 @@ Schema: `JsonValue`
 
 | Field | Type | Description |
 | --- | --- | --- |
-| answer | RagAnswerResponse | Fragment-grounded answer payload. |
-| trace | TraceRecord | Retrieval trace used for the answer. |
-| prompt | string | Grounded prompt preview built from fragment citations. |
+| answer | RagAnswerResponse | Fragment-grounded answer payload after configured-secret redaction. |
+| trace | TraceRecord | Retrieval trace used for the answer after configured-secret redaction. |
+| prompt | string | Grounded prompt preview built from fragment citations after configured-secret redaction. |
 
 ## Errors and Access Rules
-- Malformed JSON or missing required runtime fields returns 400.
-- Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
+- Missing or invalid bearer authentication returns 401.
+- Authenticated non-admin principals return 403 because the response contains a grounded prompt and detailed trace.
+- Malformed JSON or invalid request fields returns 400 after authorization.
 - Debug output is based on the same default fragment-only RAG retrieval as /v1/rag/answer.
 - The prompt preview includes citation source title, `page_idx`, `block_type`, `section_path`, URI, and quote.
-- Trace stages follow the same redaction behavior as `/v1/context/search`: non-admin debug redacts personal index/filter details, while admin debug can expose raw stage details.
+- Trace stages may include admin-only raw index/filter details after ordinary secret redaction.
+- The complete response is redacted again before serialization, including
+  configured auth, Meilisearch, OpenAI, and Codex credentials.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph
 ```mermaid
 flowchart TD
-  n0["UserGuard authenticates caller"]
-  n1["apply_owner_default fills owner_user_id when possible"]
+  n0["AdminGuard authenticates admin principal"]
+  n1["Admin selects an explicit owner scope when needed"]
   n2["answer_rag_with_llm builds answer from fragment citations"]
   n3["Store.get_trace_async loads trace"]
   n4["build_prompt reconstructs grounded prompt"]
-  n5["Return answer, trace, and prompt"]
+  n5["Redact configured secrets and return answer, trace, and prompt"]
   n0 --> n1
   n1 --> n2
   n2 --> n3

@@ -51,6 +51,11 @@ Schema: `ContextNode`
 | privacy | string | Privacy scope. |
 | updated_at | RFC3339 datetime | Last update time. |
 
+The final JSON response boundary dynamically redacts configured secrets from
+the node body, including full source-document content. For fragment bodies it
+also masks recognizable configured-secret pieces at the start or end so legacy
+or post-ingest-rotation token halves are not returned.
+
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
