@@ -51,7 +51,7 @@ use crate::{
     store::Store,
     util::{
         hmac_hex, redact_egress_text, redact_locator, redact_secrets, redact_string,
-        require_string, sanitize_slug, text_score,
+        require_string, sanitize_slug, text_score, validate_meili_uid,
     },
 };
 
@@ -598,6 +598,7 @@ fn spawn_ingest_task_cleanup(store: Store, config: &Arc<Config>, runtime: &Runti
         return;
     }
     let interval_seconds = config.ingest_cleanup_interval_seconds.max(1);
+    let tenant_id = config.tenant_id.clone();
     let mut shutdown = runtime.subscribe();
     let _ = runtime.spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
@@ -615,7 +616,10 @@ fn spawn_ingest_task_cleanup(store: Store, config: &Arc<Config>, runtime: &Runti
                 }
                 _ = ticker.tick() => {}
             }
-            match store.cleanup_ingest_tasks_async(retention_seconds).await {
+            match store
+                .cleanup_ingest_tasks_async(&tenant_id, retention_seconds)
+                .await
+            {
                 Ok(pruned) if !pruned.is_empty() => {
                     tracing::info!(count = pruned.len(), "pruned expired ingest tasks");
                 }
@@ -1287,27 +1291,10 @@ async fn usage(
     Ok(Json(snapshot))
 }
 
-async fn bootstrap(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Json(req): Json<Value>,
-) -> Result<Json<Value>, ApiError> {
-    let reset = req.get("reset").and_then(Value::as_bool).unwrap_or(false);
-    let result = state.meili.bootstrap(reset).await?;
-    let hydrated = if reset {
-        json!({})
-    } else {
-        state
-            .store
-            .hydrate_from_repository(state.tenant_id())
-            .await?
-    };
-    Ok(Json(json!({
-        "indexes": result.indexes,
-        "tasks": result.tasks,
-        "dry_run": result.dry_run,
-        "hydrated": hydrated
-    })))
+async fn bootstrap(_admin: AdminGuard, Json(_req): Json<Value>) -> Result<Json<Value>, ApiError> {
+    Err(ApiError::bad_request(
+        "managed-index bootstrap is unavailable over HTTP; startup reconciles settings automatically",
+    ))
 }
 
 async fn list_harness_components(
@@ -1899,7 +1886,9 @@ async fn upsert_dataset(
     Path(dataset_key): Path<String>,
     Json(req): Json<DatasetSchemaUpsertRequest>,
 ) -> Result<Json<DatasetSchemaResponse>, ApiError> {
-    let result = state.store.upsert_dataset(&dataset_key, req);
+    let result = state
+        .store
+        .upsert_dataset(state.tenant_id(), &dataset_key, req);
     Ok(Json(audit_shared_write(
         result,
         &user.principal,
@@ -1917,7 +1906,10 @@ async fn apply_snapshot(
     Json(req): Json<ApplySnapshotRequest>,
 ) -> Result<Json<ApplySnapshotResponse>, ApiError> {
     if let Some(snapshot_id) = req.snapshot_id.as_deref() {
-        let owner = state.store.snapshot_owner_async(snapshot_id).await?;
+        let owner = state
+            .store
+            .snapshot_owner_async(state.tenant_id(), snapshot_id)
+            .await?;
         user.require_owner_access(&owner)?;
     }
     Ok(Json(
@@ -1960,9 +1952,17 @@ async fn get_snapshot(
     State(state): State<AppState>,
     Path(snapshot_id): Path<String>,
 ) -> Result<Json<StructuredSnapshot>, ApiError> {
-    let owner = state.store.snapshot_owner_async(&snapshot_id).await?;
+    let owner = state
+        .store
+        .snapshot_owner_async(state.tenant_id(), &snapshot_id)
+        .await?;
     user.require_owner_access(&owner)?;
-    Ok(Json(state.store.get_snapshot_async(&snapshot_id).await?))
+    Ok(Json(
+        state
+            .store
+            .get_snapshot_async(state.tenant_id(), &snapshot_id)
+            .await?,
+    ))
 }
 
 async fn bulk_rows(
@@ -1971,7 +1971,10 @@ async fn bulk_rows(
     Path(snapshot_id): Path<String>,
     Json(req): Json<BulkStructuredRowsRequest>,
 ) -> Result<Json<BulkStructuredRowsResponse>, ApiError> {
-    let owner = state.store.snapshot_owner_async(&snapshot_id).await?;
+    let owner = state
+        .store
+        .snapshot_owner_async(state.tenant_id(), &snapshot_id)
+        .await?;
     user.require_owner_access(&owner)?;
     validate_max_items("rows", req.rows.len(), state.config.max_bulk_rows)?;
     Ok(Json(
@@ -1987,9 +1990,17 @@ async fn list_rows(
     State(state): State<AppState>,
     Path(snapshot_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let owner = state.store.snapshot_owner_async(&snapshot_id).await?;
+    let owner = state
+        .store
+        .snapshot_owner_async(state.tenant_id(), &snapshot_id)
+        .await?;
     user.require_owner_access(&owner)?;
-    Ok(Json(state.store.list_rows_async(&snapshot_id).await?))
+    Ok(Json(
+        state
+            .store
+            .list_rows_async(state.tenant_id(), &snapshot_id)
+            .await?,
+    ))
 }
 
 async fn insight_events(_user: UserGuard, Path(insight_id): Path<String>) -> Json<Value> {
@@ -2108,10 +2119,13 @@ async fn context_reveal(
     State(state): State<AppState>,
     Json(req): Json<ContextRevealRequest>,
 ) -> Result<Json<ContextRevealResponse>, ApiError> {
-    let owner = req
-        .trace_id
-        .as_ref()
-        .and_then(|trace_id| state.store.trace_owner_id(trace_id).ok().flatten());
+    let owner = req.trace_id.as_ref().and_then(|trace_id| {
+        state
+            .store
+            .trace_owner_id(state.tenant_id(), trace_id)
+            .ok()
+            .flatten()
+    });
     if let Some(owner) = &owner {
         user.require_owner_access(owner)?;
     }
@@ -2628,7 +2642,10 @@ async fn rag_debug(
         .principal
         .apply_owner_default(&mut req.owner_user_id)?;
     let answer = answer_rag_with_llm(&state, req.clone(), true).await?;
-    let trace = state.store.get_trace_async(&answer.trace_id).await?;
+    let trace = state
+        .store
+        .get_trace_async(state.tenant_id(), &answer.trace_id)
+        .await?;
     Ok(Json(redact_for_state(
         &state,
         json!({
@@ -2716,7 +2733,7 @@ async fn create_session(
     Json(mut req): Json<SessionCreateRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
-    Ok(Json(state.store.create_session(req)?))
+    Ok(Json(state.store.create_session(state.tenant_id(), req)?))
 }
 
 async fn add_session_message(
@@ -2896,7 +2913,10 @@ async fn get_trace(
     State(state): State<AppState>,
     Path(trace_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let trace = state.store.get_trace_async(&trace_id).await?;
+    let trace = state
+        .store
+        .get_trace_async(state.tenant_id(), &trace_id)
+        .await?;
     let trace =
         serde_json::to_value(trace).map_err(|error| ApiError::Internal(error.to_string()))?;
     Ok(Json(redact_for_state(&state, trace)))
@@ -2913,10 +2933,12 @@ async fn debug_meili_search(
             .map(ToString::to_string),
         "index_uid",
     )?;
+    validate_meili_uid(&index_uid)
+        .map_err(|_| ApiError::bad_request("index_uid contains invalid characters"))?;
     let query = req.get("query").and_then(Value::as_str).unwrap_or("");
     let raw = state
         .store
-        .debug_meili_search_async(&index_uid, query)
+        .debug_meili_search_async(state.tenant_id(), &index_uid, query)
         .await?;
     Ok(Json(redact_for_state(&state, raw)))
 }

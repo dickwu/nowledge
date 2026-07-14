@@ -1,9 +1,12 @@
 use std::{
+    collections::BTreeMap,
+    fs,
     net::{TcpStream, ToSocketAddrs},
     sync::Arc,
     time::Duration,
 };
 
+use anyhow::{anyhow, ensure, Result as AnyResult};
 use axum::{
     body::{to_bytes, Body},
     http::{header::CONTENT_TYPE, Method, Request, StatusCode},
@@ -11,16 +14,28 @@ use axum::{
 };
 use nowledge::{
     build_router,
-    error::ApiError,
-    meili::{task_uid, MeiliAdmin},
-    models::ContextNode,
+    meili::{task_uid, MeiliAdmin, FIXED_INDEXES},
+    models::{
+        ContextNode, HarnessChangeManifest, IngestTask, IngestTaskResult, RagEvalCaseResult,
+        RagEvalMetrics, RagEvalOverview, RagEvalRun, SourceDocument, StructuredSnapshot,
+        TraceRecord,
+    },
     repository::{KnowledgeRepository, MeiliRepository},
+    tenant_scope::{
+        owner_scoped_storage_identity, tenant_document, tenant_document_with_storage_identity,
+        tenant_structured_row_document,
+    },
+    tenant_scope_v1::{
+        apply_plan, create_plan, create_rollback_plan, verify_plan, FileCheckpointStore,
+        LegacyTenantAssignment, LegacyTenantMapping, MIGRATION_NAME,
+    },
     AppState, Config,
 };
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 static LIVE_MEILI_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+type AuxiliaryInventory = (&'static str, Vec<Value>, Vec<Value>);
 
 async fn live_meili_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
     LIVE_MEILI_TEST_LOCK.lock().await
@@ -74,34 +89,65 @@ async fn meili_config_with_tenant(tenant_id: String) -> Option<Config> {
     config.meili_url = Some(url);
     config.meili_api_key = api_key;
     config.meili_wait_for_tasks = true;
+    // These tests exercise repository semantics through an SSH tunnel. Give
+    // task polling enough headroom that the HTTP boundary does not turn normal
+    // remote indexing latency into a persistence-test failure; timeout behavior
+    // has dedicated deterministic coverage in http_boundary_characterization.
+    config.request_timeout_ms = 180_000;
+    config.sync_ingest_timeout_ms = 180_000;
     Some(config)
 }
 
 async fn bootstrapped_meili_admin(config: &Config) -> MeiliAdmin {
     let admin = MeiliAdmin::from_config(config);
-    let bootstrap = admin
+    admin
         .bootstrap(false)
         .await
         .expect("Meilisearch bootstrap should succeed");
-    let task_uids = bootstrap
-        .tasks
-        .iter()
-        .filter_map(task_uid)
-        .collect::<Vec<_>>();
     admin
-        .wait_for_tasks(&task_uids)
+}
+
+async fn start_meili_app(config: &Config) -> (AppState, Value, Router) {
+    let state = AppState::new(Arc::new(config.clone()));
+    state
+        .meili
+        .bootstrap(false)
         .await
-        .expect("Meilisearch bootstrap tasks should complete");
-    admin
+        .expect("startup Meilisearch reconciliation should succeed");
+    let hydrated = state
+        .store
+        .hydrate_from_repository(&config.tenant_id)
+        .await
+        .expect("startup repository hydration should succeed");
+    let app = build_router(state.clone());
+    (state, hydrated, app)
 }
 
 async fn meili_fixture() -> Option<(Config, MeiliAdmin, AppState, Router)> {
     let tenant_id = format!("test-tenant-{}", uuid::Uuid::now_v7());
     let config = meili_config_with_tenant(tenant_id).await?;
-    let admin = bootstrapped_meili_admin(&config).await;
-    let state = AppState::new(Arc::new(config.clone()));
-    let app = build_router(state.clone());
+    let (state, _, app) = start_meili_app(&config).await;
+    let admin = state.meili.clone();
     Some((config, admin, state, app))
+}
+
+async fn two_tenant_meili_fixture() -> Option<(
+    Config,
+    Config,
+    MeiliAdmin,
+    AppState,
+    Router,
+    AppState,
+    Router,
+)> {
+    let fixture_id = uuid::Uuid::now_v7();
+    let config_a = meili_config_with_tenant(format!("test-tenant-a-{fixture_id}")).await?;
+    let mut config_b = config_a.clone();
+    config_b.tenant_id = format!("test-tenant-b-{fixture_id}");
+    let (state_a, _, app_a) = start_meili_app(&config_a).await;
+    let admin = state_a.meili.clone();
+    let (state_b, _, app_b) = start_meili_app(&config_b).await;
+    Some((config_a, config_b, admin, state_a, app_a, state_b, app_b))
 }
 
 fn equality_filter(field: &str, value: &str) -> String {
@@ -109,6 +155,64 @@ fn equality_filter(field: &str, value: &str) -> String {
         "{field} = {}",
         serde_json::to_string(value).expect("filter value should serialize")
     )
+}
+
+fn tenant_resource_filter(tenant_id: &str, field: &str, value: &str) -> String {
+    format!(
+        "{} AND {}",
+        equality_filter("tenant_id", tenant_id),
+        equality_filter(field, value)
+    )
+}
+
+fn tenant_logical_filter(tenant_id: &str, logical_id: &str) -> String {
+    let logical_id =
+        serde_json::to_string(logical_id).expect("logical ID filter value should serialize");
+    format!(
+        "{} AND (logical_id = {logical_id} OR ((logical_id IS NULL OR logical_id NOT EXISTS) AND id = {logical_id}))",
+        equality_filter("tenant_id", tenant_id)
+    )
+}
+
+fn auxiliary_document(
+    index_uid: &str,
+    tenant_id: &str,
+    logical_id: &str,
+    owner_user_id: Option<&str>,
+    source_id: &str,
+) -> Value {
+    let value = json!({
+        "id": logical_id,
+        "tenant_id": tenant_id,
+        "owner_user_id": owner_user_id,
+        "source_id": source_id,
+        "task_id": logical_id,
+        "source_document_uri": format!("ctx://company/{source_id}/{logical_id}"),
+        "status": "active",
+        "marker": logical_id
+    });
+    if index_uid == "rag_parse_artifacts" {
+        let storage_identity = owner_scoped_storage_identity(owner_user_id, logical_id)
+            .expect("test owner scope should be valid");
+        tenant_document_with_storage_identity(
+            tenant_id,
+            index_uid,
+            logical_id,
+            &storage_identity,
+            &value,
+        )
+    } else {
+        tenant_document(tenant_id, index_uid, logical_id, &value)
+    }
+    .expect("test auxiliary document should serialize")
+}
+
+fn two_tenant_logical_filter(tenant_a: &str, tenant_b: &str, logical_id: &str) -> String {
+    let tenant_a = serde_json::to_string(tenant_a).expect("tenant filter value should serialize");
+    let tenant_b = serde_json::to_string(tenant_b).expect("tenant filter value should serialize");
+    let logical_id =
+        serde_json::to_string(logical_id).expect("logical ID filter value should serialize");
+    format!("(tenant_id = {tenant_a} OR tenant_id = {tenant_b}) AND logical_id = {logical_id}")
 }
 
 async fn wait_for_optional_task(
@@ -131,18 +235,6 @@ async fn delete_by_filter_and_wait(
 ) -> Result<(), String> {
     let task_uid = admin
         .delete_documents_by_filter(index_uid, filter)
-        .await
-        .map_err(|error| error.to_string())?;
-    wait_for_optional_task(admin, task_uid).await
-}
-
-async fn delete_by_ids_and_wait(
-    admin: &MeiliAdmin,
-    index_uid: &str,
-    ids: &[String],
-) -> Result<(), String> {
-    let task_uid = admin
-        .delete_documents_by_ids(index_uid, ids)
         .await
         .map_err(|error| error.to_string())?;
     wait_for_optional_task(admin, task_uid).await
@@ -191,6 +283,25 @@ async fn delete_index_and_wait(
     wait_for_optional_task(admin, task_uid(&body)).await
 }
 
+async fn delete_tenant_rows_and_wait(
+    admin: &MeiliAdmin,
+    tenant_id: &str,
+    index_uids: &[&str],
+) -> Result<(), String> {
+    let tenant_filter = equality_filter("tenant_id", tenant_id);
+    let mut failures = Vec::new();
+    for index_uid in index_uids {
+        if let Err(error) = delete_by_filter_and_wait(admin, index_uid, &tenant_filter).await {
+            failures.push(format!("{index_uid}: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 fn assert_cleanup_results(results: Vec<(&'static str, Result<(), String>)>) {
     let failures = results
         .into_iter()
@@ -201,6 +312,79 @@ fn assert_cleanup_results(results: Vec<(&'static str, Result<(), String>)>) {
         "live Meilisearch fixture cleanup failed: {}",
         failures.join("; ")
     );
+}
+
+fn isolated_migration_test_enabled() -> bool {
+    std::env::var("RAG_TEST_MEILI_MIGRATION_ISOLATED").as_deref() == Ok("true")
+}
+
+async fn read_all_fixed_index_documents(
+    admin: &MeiliAdmin,
+) -> AnyResult<BTreeMap<String, Vec<Value>>> {
+    let mut inventory = BTreeMap::new();
+    for index_uid in FIXED_INDEXES {
+        let mut offset = 0;
+        let mut expected_total = None;
+        let mut documents = Vec::new();
+        loop {
+            let page = admin
+                .fetch_documents_page(index_uid, offset, 1_000)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            ensure!(
+                page.offset == offset,
+                "{index_uid} returned offset {} while {offset} was requested",
+                page.offset
+            );
+            if let Some(total) = expected_total {
+                ensure!(
+                    page.total == total,
+                    "{index_uid} changed while its test inventory was read"
+                );
+            } else {
+                expected_total = Some(page.total);
+            }
+            if page.results.is_empty() {
+                ensure!(
+                    offset >= page.total,
+                    "{index_uid} returned an incomplete document page"
+                );
+                break;
+            }
+            offset += page.results.len();
+            documents.extend(page.results);
+            if offset >= page.total {
+                break;
+            }
+        }
+        ensure!(
+            documents.len() == expected_total.unwrap_or_default(),
+            "{index_uid} inventory count changed while it was read"
+        );
+        documents.sort_by_key(|document| {
+            (
+                document["id"].as_str().unwrap_or_default().to_string(),
+                document.to_string(),
+            )
+        });
+        inventory.insert(index_uid.to_string(), documents);
+    }
+    Ok(inventory)
+}
+
+async fn require_empty_fixed_indexes(admin: &MeiliAdmin) -> AnyResult<()> {
+    for index_uid in FIXED_INDEXES {
+        let page = admin
+            .fetch_documents_page(index_uid, 0, 1)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        ensure!(
+            page.total == 0,
+            "isolated migration test refused to use {index_uid}: found {} existing documents",
+            page.total
+        );
+    }
+    Ok(())
 }
 
 fn company_context_document(tenant_id: &str, run_id: &str, ordinal: usize) -> Value {
@@ -248,6 +432,42 @@ fn company_context_document(tenant_id: &str, run_id: &str, ordinal: usize) -> Va
             json!(format!("pr1-cap-{run_id}-{ordinal}")),
         );
     document
+}
+
+fn tenant_context_node(tenant_id: &str, uri: &str, source_id: &str, marker: &str) -> ContextNode {
+    ContextNode {
+        uri: uri.to_string(),
+        title: format!("Tenant fixture {marker}"),
+        layer: 2,
+        body: marker.to_string(),
+        tenant_id: tenant_id.to_string(),
+        owner_user_id: None,
+        index_uid: "rag_company_context".to_string(),
+        index_kind: "company".to_string(),
+        ancestor_uris: vec!["ctx://company".to_string()],
+        node_kind: "fragment".to_string(),
+        retrieval_role: "fragment".to_string(),
+        retrieval_enabled: true,
+        parent_uri: Some("ctx://company".to_string()),
+        source_document_uri: None,
+        fragment_index: Some(0),
+        char_start: Some(0),
+        char_end: Some(marker.len()),
+        token_estimate: Some(1),
+        checksum: Some(format!("checksum-{marker}")),
+        source_id: Some(source_id.to_string()),
+        revision_id: Some("shared-revision".to_string()),
+        block_type: Some("paragraph".to_string()),
+        page_idx: Some(1),
+        bbox: None,
+        section_path: Vec::new(),
+        heading_level: None,
+        asset_refs: Vec::new(),
+        artifact_refs: Vec::new(),
+        status: "active".to_string(),
+        privacy: "company".to_string(),
+        updated_at: chrono::Utc::now(),
+    }
 }
 
 async fn try_call(
@@ -784,21 +1004,13 @@ async fn meili_backend_context_search_applies_structured_filters() {
 }
 
 #[tokio::test]
-async fn meili_bootstrap_creates_harness_indexes_and_indexes_changes() {
+async fn meili_reconciled_harness_indexes_accept_and_search_changes() {
     let _guard = live_meili_test_guard().await;
     let Some((config, admin, _state, app)) = meili_fixture().await else {
         eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
         return;
     };
     let tenant_id = config.tenant_id.clone();
-
-    let bootstrap_result = try_call(
-        app.clone(),
-        Method::POST,
-        "/v1/admin/bootstrap",
-        json!({ "reset": false }),
-    )
-    .await;
 
     let change_result = try_call(
         app.clone(),
@@ -840,18 +1052,8 @@ async fn meili_bootstrap_creates_harness_indexes_and_indexes_changes() {
     .await;
     assert_cleanup_results(vec![("harness changes", cleanup)]);
 
-    let (bootstrap_status, bootstrap) = bootstrap_result.expect("bootstrap call should finish");
     let (change_status, change) = change_result.expect("harness change call should finish");
     let (search_status, search) = search_result.expect("harness search call should finish");
-    assert_eq!(bootstrap_status, StatusCode::OK, "{bootstrap}");
-    let indexes = bootstrap["indexes"].as_array().unwrap();
-    for uid in [
-        "rag_harness_components",
-        "rag_harness_changes",
-        "rag_harness_verdicts",
-    ] {
-        assert!(indexes.iter().any(|index| index.as_str() == Some(uid)));
-    }
     assert_eq!(change_status, StatusCode::OK, "{change}");
     assert_eq!(search_status, StatusCode::OK, "{search}");
     assert!(search["hits"]
@@ -878,14 +1080,6 @@ async fn meili_hydrates_harness_eval_and_ingest_metadata_into_fresh_app() {
         .resolver()
         .resolve(&tenant_id, "company", false, true)
         .expect("company routing should resolve");
-
-    let bootstrap_result = try_call(
-        app.clone(),
-        Method::POST,
-        "/v1/admin/bootstrap",
-        json!({ "reset": false }),
-    )
-    .await;
 
     let change_result = try_call(
         app.clone(),
@@ -965,14 +1159,7 @@ async fn meili_hydrates_harness_eval_and_ingest_metadata_into_fresh_app() {
         .map(str::to_string)
         .unwrap_or_else(|| format!("missing-task-{fixture_id}"));
 
-    let fresh = build_router(AppState::new(Arc::new(config.clone())));
-    let hydrated_result = try_call(
-        fresh.clone(),
-        Method::POST,
-        "/v1/admin/bootstrap",
-        json!({ "reset": false }),
-    )
-    .await;
+    let (_, hydrated, fresh) = start_meili_app(&config).await;
 
     let hydrated_change_result = try_call(
         fresh.clone(),
@@ -1005,7 +1192,7 @@ async fn meili_hydrates_harness_eval_and_ingest_metadata_into_fresh_app() {
             json!({ "q": "", "filter": tenant_filter, "limit": 100 }),
         )
         .await;
-    let case_filter = equality_filter("case_id", &eval_case_id);
+    let case_filter = tenant_resource_filter(&tenant_id, "case_id", &eval_case_id);
     let persisted_case_result_inventory_result = admin
         .search::<Value>(
             "rag_eval_case_results",
@@ -1018,7 +1205,12 @@ async fn meili_hydrates_harness_eval_and_ingest_metadata_into_fresh_app() {
             response
                 .hits
                 .iter()
-                .filter_map(|run| run["id"].as_str().map(str::to_string))
+                .filter_map(|run| {
+                    run["logical_id"]
+                        .as_str()
+                        .or_else(|| run["id"].as_str())
+                        .map(str::to_string)
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -1106,7 +1298,7 @@ async fn meili_hydrates_harness_eval_and_ingest_metadata_into_fresh_app() {
         || !run_id.starts_with("missing-run-");
     let mut eval_children_clean = inventory_is_recoverable;
     for cleanup_run_id in &cleanup_run_ids {
-        let run_filter = equality_filter("run_id", cleanup_run_id);
+        let run_filter = tenant_resource_filter(&tenant_id, "run_id", cleanup_run_id);
         let overview_cleanup =
             delete_by_filter_and_wait(&admin, "rag_eval_overviews", &run_filter).await;
         eval_children_clean &= overview_cleanup.is_ok();
@@ -1126,24 +1318,17 @@ async fn meili_hydrates_harness_eval_and_ingest_metadata_into_fresh_app() {
     cleanup_results.push(("eval runs", eval_runs_cleanup));
 
     let eval_cases_cleanup = if eval_runs_clean {
-        delete_by_ids_and_wait(
-            &admin,
-            "rag_eval_cases",
-            std::slice::from_ref(&eval_case_id),
-        )
-        .await
+        delete_by_filter_and_wait(&admin, "rag_eval_cases", &tenant_filter).await
     } else {
         Err("preserved eval case because its run cleanup was incomplete".to_string())
     };
     cleanup_results.push(("eval cases", eval_cases_cleanup));
     assert_cleanup_results(cleanup_results);
 
-    let (bootstrap_status, bootstrap) = bootstrap_result.expect("bootstrap call should finish");
     let (change_status, change) = change_result.expect("harness change call should finish");
     let (eval_case_status, eval_case) = eval_case_result.expect("eval case call should finish");
     let (eval_run_status, eval_run) = eval_run_result.expect("eval run call should finish");
     let (ingest_status, ingest) = ingest_result.expect("ingest call should finish");
-    let (hydrated_status, hydrated) = hydrated_result.expect("hydration call should finish");
     let (hydrated_change_status, hydrated_change) =
         hydrated_change_result.expect("hydrated change call should finish");
     let (hydrated_report_status, hydrated_report) =
@@ -1151,19 +1336,12 @@ async fn meili_hydrates_harness_eval_and_ingest_metadata_into_fresh_app() {
     let (hydrated_ingest_status, hydrated_ingest) =
         hydrated_ingest_result.expect("hydrated ingest result call should finish");
 
-    assert_eq!(bootstrap_status, StatusCode::OK, "{bootstrap}");
     assert_eq!(change_status, StatusCode::OK, "{change}");
     assert_ne!(change_id, "missing-change");
     assert_eq!(eval_case_status, StatusCode::OK, "{eval_case}");
     assert_eq!(eval_run_status, StatusCode::OK, "{eval_run}");
     assert_eq!(ingest_status, StatusCode::OK, "{ingest}");
-    assert_eq!(hydrated_status, StatusCode::OK, "{hydrated}");
-    assert!(
-        hydrated["hydrated"]["harness_changes"]
-            .as_u64()
-            .unwrap_or_default()
-            >= 1
-    );
+    assert!(hydrated["harness_changes"].as_u64().unwrap_or_default() >= 1);
     assert_eq!(hydrated_change_status, StatusCode::OK, "{hydrated_change}");
     assert_eq!(hydrated_change["id"], change["id"]);
     assert_eq!(hydrated_report_status, StatusCode::OK, "{hydrated_report}");
@@ -1191,9 +1369,8 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
         eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
         return;
     };
-    let admin = bootstrapped_meili_admin(&config).await;
-    let state = AppState::new(Arc::new(config.clone()));
-    let app = build_router(state.clone());
+    let (state, _, app) = start_meili_app(&config).await;
+    let admin = state.meili.clone();
     let run_id = uuid::Uuid::now_v7().to_string();
     let source_id = format!("pr1-company-restart-{run_id}");
     let marker = format!("pr1-company-restart-marker-{run_id}");
@@ -1236,13 +1413,11 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
         .unwrap_or("ctx://missing-source-document")
         .to_string();
 
-    let fresh_state = AppState::new(Arc::new(config.clone()));
-    let hydration_result = fresh_state.store.hydrate_from_repository(&tenant_id).await;
+    let (fresh_state, hydration, fresh) = start_meili_app(&config).await;
     let source_document_result = fresh_state
         .store
         .fs_read_async(&tenant_id, &source_document_uri, None, false)
         .await;
-    let fresh = build_router(fresh_state);
     let document_result = try_call(
         fresh.clone(),
         Method::GET,
@@ -1268,7 +1443,7 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
     // attempted before any assertion so a failed hydration/read contract does
     // not strand shared-backend fixtures.
     let tenant_filter = equality_filter("tenant_id", &tenant_id);
-    let source_filter = equality_filter("source_id", &source_id);
+    let source_filter = tenant_resource_filter(&tenant_id, "source_id", &source_id);
     let cleanup_results = vec![
         (
             "company context",
@@ -1280,7 +1455,12 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
         ),
         (
             "source pointer",
-            delete_by_ids_and_wait(&admin, "rag_sources", std::slice::from_ref(&source_id)).await,
+            delete_by_filter_and_wait(
+                &admin,
+                "rag_sources",
+                &tenant_logical_filter(&tenant_id, &source_id),
+            )
+            .await,
         ),
         (
             "source documents",
@@ -1328,7 +1508,6 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
         activation_result.expect("company activation call should finish");
     assert_eq!(activation_status, StatusCode::OK, "{activation}");
     assert_ne!(source_document_uri, "ctx://missing-source-document");
-    let hydration = hydration_result.expect("fresh AppState hydration should succeed");
     let (document_status, document) = document_result.expect("company document call should finish");
     let (revisions_status, revisions) =
         revisions_result.expect("company revisions call should finish");
@@ -1358,12 +1537,10 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
         .unwrap()
         .iter()
         .any(|hit| hit["source_id"] == source_id));
-    match source_document_result {
-        Err(ApiError::NotFound(message)) => assert_eq!(message, "context uri not found"),
-        other => panic!(
-            "company source documents currently fail ownerless read-through with not_found: {other:?}"
-        ),
-    }
+    let source_document =
+        source_document_result.expect("company source document should read through after restart");
+    assert_eq!(source_document.uri, source_document_uri);
+    assert_eq!(source_document.tenant_id, tenant_id);
 }
 
 #[tokio::test]
@@ -1374,9 +1551,8 @@ async fn meili_restart_characterizes_state_link_and_session_durability_gaps() {
         eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
         return;
     };
-    let admin = bootstrapped_meili_admin(&config).await;
-    let state = AppState::new(Arc::new(config.clone()));
-    let app = build_router(state.clone());
+    let (state, _, app) = start_meili_app(&config).await;
+    let admin = state.meili.clone();
     let run_id = uuid::Uuid::now_v7().to_string();
     let owner = format!("pr1-restart-owner-{run_id}");
     let fact_key = format!("pr1-restart-fact-{run_id}");
@@ -1481,22 +1657,14 @@ async fn meili_restart_characterizes_state_link_and_session_durability_gaps() {
     )
     .await;
 
-    let state_filter = format!(
-        "{} AND {}",
-        equality_filter("id", &state_id),
-        equality_filter("tenant_id", &tenant_id)
-    );
+    let state_filter = tenant_logical_filter(&tenant_id, &state_id);
     let persisted_state_result = admin
         .search::<Value>(
             "rag_state_items",
             json!({ "q": "", "filter": state_filter, "limit": 10 }),
         )
         .await;
-    let link_filter = format!(
-        "{} AND {}",
-        equality_filter("id", &link_id),
-        equality_filter("tenant_id", &tenant_id)
-    );
+    let link_filter = tenant_logical_filter(&tenant_id, &link_id);
     let persisted_link_result = admin
         .search::<Value>(
             "rag_links",
@@ -1507,8 +1675,7 @@ async fn meili_restart_characterizes_state_link_and_session_durability_gaps() {
         .search::<Value>("rag_sessions", json!({ "q": session_id, "limit": 10 }))
         .await;
 
-    let fresh_state = AppState::new(Arc::new(config.clone()));
-    let hydration_result = fresh_state.store.hydrate_from_repository(&tenant_id).await;
+    let (fresh_state, hydration, fresh) = start_meili_app(&config).await;
     let personal_source_document_result = fresh_state
         .store
         .fs_read_async(
@@ -1518,7 +1685,6 @@ async fn meili_restart_characterizes_state_link_and_session_durability_gaps() {
             false,
         )
         .await;
-    let fresh = build_router(fresh_state);
     let fresh_registry_result = try_call(
         fresh.clone(),
         Method::GET,
@@ -1632,7 +1798,6 @@ async fn meili_restart_characterizes_state_link_and_session_durability_gaps() {
         .expect("persisted session lookup should succeed")
         .hits
         .len();
-    let hydration = hydration_result.expect("fresh AppState hydration should succeed");
     let personal_source_document = personal_source_document_result
         .expect("personal source document should read through after restart");
     let (fresh_registry_status, fresh_registry) =
@@ -1704,5 +1869,1642 @@ async fn meili_restart_characterizes_state_link_and_session_durability_gaps() {
         fresh_session_status,
         StatusCode::NOT_FOUND,
         "{fresh_session_body}"
+    );
+}
+
+#[tokio::test]
+async fn meili_same_company_identity_is_tenant_isolated_end_to_end() {
+    let _guard = live_meili_test_guard().await;
+    let Some((config_a, config_b, admin, state_a, app_a, state_b, app_b)) =
+        two_tenant_meili_fixture().await
+    else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    let tenant_a = config_a.tenant_id.clone();
+    let tenant_b = config_b.tenant_id.clone();
+    let fixture_id = uuid::Uuid::now_v7();
+    let source_id = format!("tenant-scope-company-{fixture_id}");
+    let shared_source_uri = format!("https://example.test/tenant-scope/{fixture_id}");
+    let marker_a = format!("tenantamarker{}", uuid::Uuid::now_v7().simple());
+    let marker_a_updated = format!("tenantaupdated{}", uuid::Uuid::now_v7().simple());
+    let marker_b = format!("tenantbmarker{}", uuid::Uuid::now_v7().simple());
+    let routing_a = state_a
+        .store
+        .resolver()
+        .resolve(&tenant_a, "company", false, true)
+        .expect("tenant A company routing should resolve");
+    let routing_b = state_b
+        .store
+        .resolver()
+        .resolve(&tenant_b, "company", false, true)
+        .expect("tenant B company routing should resolve");
+
+    let revision_a_result = try_call(
+        app_a.clone(),
+        Method::POST,
+        &format!("/v1/state/company-docs/{source_id}/revisions"),
+        json!({
+            "title": "Shared logical company source",
+            "source_uri": shared_source_uri,
+            "content": format!("# Tenant A\n\n{marker_a}"),
+            "checksum": format!("checksum-{marker_a}"),
+            "ingest": false
+        }),
+    )
+    .await;
+    let revision_b_result = try_call(
+        app_b.clone(),
+        Method::POST,
+        &format!("/v1/state/company-docs/{source_id}/revisions"),
+        json!({
+            "title": "Shared logical company source",
+            "source_uri": shared_source_uri,
+            "content": format!("# Tenant B\n\n{marker_b}"),
+            "checksum": format!("checksum-{marker_b}"),
+            "ingest": false
+        }),
+    )
+    .await;
+    let revision_a = revision_a_result
+        .as_ref()
+        .ok()
+        .and_then(|(_, body)| body["revision_id"].as_str())
+        .unwrap_or("missing-revision-a")
+        .to_string();
+    let revision_b = revision_b_result
+        .as_ref()
+        .ok()
+        .and_then(|(_, body)| body["revision_id"].as_str())
+        .unwrap_or("missing-revision-b")
+        .to_string();
+
+    let activation_a_result = try_call(
+        app_a.clone(),
+        Method::POST,
+        &format!("/v1/state/company-docs/{source_id}/revisions/{revision_a}/activate"),
+        json!({ "reason": "tenant isolation fixture A" }),
+    )
+    .await;
+    let activation_b_result = try_call(
+        app_b.clone(),
+        Method::POST,
+        &format!("/v1/state/company-docs/{source_id}/revisions/{revision_b}/activate"),
+        json!({ "reason": "tenant isolation fixture B" }),
+    )
+    .await;
+
+    let revision_a_updated_result = try_call(
+        app_a.clone(),
+        Method::POST,
+        &format!("/v1/state/company-docs/{source_id}/revisions"),
+        json!({
+            "title": "Shared logical company source updated only in A",
+            "source_uri": shared_source_uri,
+            "content": format!("# Tenant A updated\n\n{marker_a_updated}"),
+            "checksum": format!("checksum-{marker_a_updated}"),
+            "ingest": false
+        }),
+    )
+    .await;
+    let revision_a_updated = revision_a_updated_result
+        .as_ref()
+        .ok()
+        .and_then(|(_, body)| body["revision_id"].as_str())
+        .unwrap_or("missing-revision-a-updated")
+        .to_string();
+    let activation_a_updated_result = try_call(
+        app_a,
+        Method::POST,
+        &format!("/v1/state/company-docs/{source_id}/revisions/{revision_a_updated}/activate"),
+        json!({ "reason": "tenant A update isolation fixture" }),
+    )
+    .await;
+
+    let raw_sources_before_delete = admin
+        .search::<Value>(
+            "rag_sources",
+            json!({
+                "q": "",
+                "filter": two_tenant_logical_filter(&tenant_a, &tenant_b, &source_id),
+                "limit": 10
+            }),
+        )
+        .await;
+
+    let (_, hydration_a, fresh_app_a) = start_meili_app(&config_a).await;
+    let (_, hydration_b, fresh_app_b) = start_meili_app(&config_b).await;
+
+    let document_a_result = try_call(
+        fresh_app_a.clone(),
+        Method::GET,
+        &format!("/v1/state/company-docs/{source_id}"),
+        Value::Null,
+    )
+    .await;
+    let document_b_result = try_call(
+        fresh_app_b.clone(),
+        Method::GET,
+        &format!("/v1/state/company-docs/{source_id}"),
+        Value::Null,
+    )
+    .await;
+    let revisions_a_result = try_call(
+        fresh_app_a.clone(),
+        Method::GET,
+        &format!("/v1/history/company-docs/{source_id}/revisions"),
+        Value::Null,
+    )
+    .await;
+    let revisions_b_result = try_call(
+        fresh_app_b.clone(),
+        Method::GET,
+        &format!("/v1/history/company-docs/{source_id}/revisions"),
+        Value::Null,
+    )
+    .await;
+    let context_a_result = try_call(
+        fresh_app_a.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": marker_a_updated, "limit": 10 }),
+    )
+    .await;
+    let context_b_result = try_call(
+        fresh_app_b.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": marker_b, "limit": 10 }),
+    )
+    .await;
+    let debug_a_result = try_call(
+        fresh_app_a.clone(),
+        Method::POST,
+        "/v1/debug/meili/search",
+        json!({ "index_uid": "rag_sources", "query": "" }),
+    )
+    .await;
+    let debug_b_result = try_call(
+        fresh_app_b.clone(),
+        Method::POST,
+        "/v1/debug/meili/search",
+        json!({ "index_uid": "rag_sources", "query": "" }),
+    )
+    .await;
+
+    let delete_a_result = try_call(
+        fresh_app_a.clone(),
+        Method::DELETE,
+        &format!("/v1/state/company-docs/{source_id}"),
+        Value::Null,
+    )
+    .await;
+    let document_a_after_delete_result = try_call(
+        fresh_app_a,
+        Method::GET,
+        &format!("/v1/state/company-docs/{source_id}"),
+        Value::Null,
+    )
+    .await;
+    let document_b_after_delete_result = try_call(
+        fresh_app_b.clone(),
+        Method::GET,
+        &format!("/v1/state/company-docs/{source_id}"),
+        Value::Null,
+    )
+    .await;
+    let debug_b_after_delete_result = try_call(
+        fresh_app_b,
+        Method::POST,
+        "/v1/debug/meili/search",
+        json!({ "index_uid": "rag_sources", "query": "" }),
+    )
+    .await;
+    let raw_source_a_after_delete = admin
+        .search::<Value>(
+            "rag_sources",
+            json!({
+                "q": "",
+                "filter": tenant_logical_filter(&tenant_a, &source_id),
+                "limit": 10
+            }),
+        )
+        .await;
+    let raw_source_b_after_delete = admin
+        .search::<Value>(
+            "rag_sources",
+            json!({
+                "q": "",
+                "filter": tenant_logical_filter(&tenant_b, &source_id),
+                "limit": 10
+            }),
+        )
+        .await;
+
+    let fixed_indexes = [
+        "rag_sources",
+        "rag_source_revisions",
+        "rag_company_context",
+        "rag_source_documents",
+        "rag_links",
+        "rag_traces",
+        "rag_user_event_indexes",
+    ];
+    let cleanup_results = vec![
+        (
+            "tenant A fixed rows",
+            delete_tenant_rows_and_wait(&admin, &tenant_a, &fixed_indexes).await,
+        ),
+        (
+            "tenant B fixed rows",
+            delete_tenant_rows_and_wait(&admin, &tenant_b, &fixed_indexes).await,
+        ),
+        (
+            "tenant A company event index",
+            delete_index_and_wait(&config_a, &admin, &routing_a.event_index_uid).await,
+        ),
+        (
+            "tenant A company context index",
+            delete_index_and_wait(&config_a, &admin, &routing_a.personal_context_index_uid).await,
+        ),
+        (
+            "tenant B company event index",
+            delete_index_and_wait(&config_b, &admin, &routing_b.event_index_uid).await,
+        ),
+        (
+            "tenant B company context index",
+            delete_index_and_wait(&config_b, &admin, &routing_b.personal_context_index_uid).await,
+        ),
+    ];
+    assert_cleanup_results(cleanup_results);
+
+    for (status, body) in [
+        revision_a_result.expect("tenant A revision request should finish"),
+        revision_b_result.expect("tenant B revision request should finish"),
+        activation_a_result.expect("tenant A activation request should finish"),
+        activation_b_result.expect("tenant B activation request should finish"),
+        revision_a_updated_result.expect("tenant A update request should finish"),
+        activation_a_updated_result.expect("tenant A updated activation should finish"),
+    ] {
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_ne!(revision_a, "missing-revision-a");
+    assert_ne!(revision_b, "missing-revision-b");
+    assert_ne!(revision_a_updated, "missing-revision-a-updated");
+
+    let raw_sources = raw_sources_before_delete.expect("raw source inventory should succeed");
+    assert_eq!(raw_sources.hits.len(), 2, "{raw_sources:?}");
+    assert_ne!(raw_sources.hits[0]["id"], raw_sources.hits[1]["id"]);
+    assert!(raw_sources.hits.iter().all(|source| {
+        source["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("ts1_"))
+            && source["logical_id"] == source_id
+    }));
+
+    for hydration in [&hydration_a, &hydration_b] {
+        assert!(hydration["company_sources"]
+            .as_u64()
+            .is_some_and(|count| count >= 1));
+        assert!(hydration["source_revisions"]
+            .as_u64()
+            .is_some_and(|count| count >= 1));
+        assert!(hydration["company_context_nodes"]
+            .as_u64()
+            .is_some_and(|count| count >= 1));
+    }
+
+    let (document_a_status, document_a) =
+        document_a_result.expect("tenant A document read should finish");
+    let (document_b_status, document_b) =
+        document_b_result.expect("tenant B document read should finish");
+    assert_eq!(document_a_status, StatusCode::OK, "{document_a}");
+    assert_eq!(document_b_status, StatusCode::OK, "{document_b}");
+    assert_eq!(document_a["source_id"], source_id);
+    assert_eq!(document_b["source_id"], source_id);
+    assert_eq!(document_a["source_uri"], shared_source_uri);
+    assert_eq!(document_b["source_uri"], shared_source_uri);
+    assert_eq!(document_a["revision_id"], revision_a_updated);
+    assert_eq!(document_b["revision_id"], revision_b);
+    assert!(
+        document_a["content"].as_str().is_some_and(
+            |content| content.contains(&marker_a_updated) && !content.contains(&marker_b)
+        )
+    );
+    assert!(
+        document_b["content"].as_str().is_some_and(
+            |content| content.contains(&marker_b) && !content.contains(&marker_a_updated)
+        )
+    );
+
+    let (revisions_a_status, revisions_a) =
+        revisions_a_result.expect("tenant A revisions read should finish");
+    let (revisions_b_status, revisions_b) =
+        revisions_b_result.expect("tenant B revisions read should finish");
+    assert_eq!(revisions_a_status, StatusCode::OK, "{revisions_a}");
+    assert_eq!(revisions_b_status, StatusCode::OK, "{revisions_b}");
+    assert_eq!(revisions_a["revisions"].as_array().unwrap().len(), 2);
+    assert_eq!(revisions_b["revisions"].as_array().unwrap().len(), 1);
+
+    for (result, marker, tenant_id) in [
+        (
+            context_a_result,
+            marker_a_updated.as_str(),
+            tenant_a.as_str(),
+        ),
+        (context_b_result, marker_b.as_str(), tenant_b.as_str()),
+    ] {
+        let (status, body) = result.expect("tenant context search should finish");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["hits"].as_array().is_some_and(|hits| {
+                !hits.is_empty()
+                    && hits.iter().all(|hit| {
+                        hit["snippet"]
+                            .as_str()
+                            .is_some_and(|snippet| snippet.contains(marker))
+                    })
+            }),
+            "tenant {tenant_id} context search leaked or missed its marker: {body}"
+        );
+    }
+    for (result, tenant_id) in [(debug_a_result, &tenant_a), (debug_b_result, &tenant_b)] {
+        let (status, body) = result.expect("tenant debug search should finish");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body["hits"].as_array().is_some_and(|hits| {
+                !hits.is_empty()
+                    && hits
+                        .iter()
+                        .all(|hit| hit["tenant_id"].as_str() == Some(tenant_id.as_str()))
+            }),
+            "debug search was not tenant scoped: {body}"
+        );
+    }
+
+    let (delete_status, delete_body) = delete_a_result.expect("tenant A delete should finish");
+    assert_eq!(delete_status, StatusCode::OK, "{delete_body}");
+    let (document_a_after_status, document_a_after) =
+        document_a_after_delete_result.expect("tenant A post-delete read should finish");
+    assert_eq!(
+        document_a_after_status,
+        StatusCode::NOT_FOUND,
+        "{document_a_after}"
+    );
+    let (document_b_after_status, document_b_after) =
+        document_b_after_delete_result.expect("tenant B post-delete read should finish");
+    assert_eq!(
+        document_b_after_status,
+        StatusCode::OK,
+        "{document_b_after}"
+    );
+    assert_eq!(document_b_after["revision_id"], revision_b);
+    let (debug_b_after_status, debug_b_after) =
+        debug_b_after_delete_result.expect("tenant B post-delete debug should finish");
+    assert_eq!(debug_b_after_status, StatusCode::OK, "{debug_b_after}");
+    assert!(debug_b_after["hits"].as_array().is_some_and(|hits| {
+        hits.iter()
+            .any(|hit| hit["tenant_id"] == tenant_b && hit["id"] == source_id)
+    }));
+    assert!(raw_source_a_after_delete
+        .expect("tenant A post-delete inventory should succeed")
+        .hits
+        .is_empty());
+    assert_eq!(
+        raw_source_b_after_delete
+            .expect("tenant B post-delete inventory should succeed")
+            .hits
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn meili_same_point_ids_are_isolated_across_fixed_repository_paths() {
+    let _guard = live_meili_test_guard().await;
+    let Some((config_a, config_b, admin, state_a, _app_a, state_b, _app_b)) =
+        two_tenant_meili_fixture().await
+    else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    let tenant_a = config_a.tenant_id.clone();
+    let tenant_b = config_b.tenant_id.clone();
+    let repository = MeiliRepository::new(admin.clone(), true);
+    let fixture_id = uuid::Uuid::now_v7();
+    let logical_id = format!("tenant-scope-point-{fixture_id}");
+    let source_id = format!("tenant-scope-source-{fixture_id}");
+    let source_document_uri = format!("ctx://company/tenant-scope/{fixture_id}/source");
+    let context_uri = format!("{source_document_uri}/chunks/0001");
+    let marker_a = format!("point-a-{}", uuid::Uuid::now_v7());
+    let marker_a_updated = format!("point-a-updated-{}", uuid::Uuid::now_v7());
+    let marker_b = format!("point-b-{}", uuid::Uuid::now_v7());
+    let now = chrono::Utc::now();
+
+    for (tenant_id, marker) in [(&tenant_a, &marker_a), (&tenant_b, &marker_b)] {
+        let mut context = tenant_context_node(tenant_id, &context_uri, &source_id, marker);
+        context.source_document_uri = Some(source_document_uri.clone());
+        repository
+            .upsert_context_nodes("rag_company_context", &[context])
+            .await
+            .expect("tenant context fixture should persist");
+        repository
+            .upsert_source_documents(&[SourceDocument {
+                id: logical_id.clone(),
+                tenant_id: tenant_id.clone(),
+                owner_user_id: None,
+                source_kind: "tenant_scope_test".to_string(),
+                source_id: source_id.clone(),
+                revision_id: "shared-revision".to_string(),
+                uri: source_document_uri.clone(),
+                title: format!("Source {marker}"),
+                content: marker.clone(),
+                checksum: format!("checksum-{marker}"),
+                status: "active".to_string(),
+                retrieval_enabled: false,
+                created_at: now,
+                updated_at: now,
+            }])
+            .await
+            .expect("tenant source-document fixture should persist");
+        repository
+            .upsert_trace(&TraceRecord {
+                id: logical_id.clone(),
+                tenant_id: tenant_id.clone(),
+                owner_user_id: None,
+                query: marker.clone(),
+                mode: "tenant-scope-test".to_string(),
+                stages: vec![json!({ "marker": marker })],
+                context_uris: vec![context_uri.clone()],
+                created_at: now,
+            })
+            .await
+            .expect("tenant trace fixture should persist");
+        repository
+            .upsert_structured_snapshot(&StructuredSnapshot {
+                id: logical_id.clone(),
+                tenant_id: tenant_id.clone(),
+                dataset_key: format!("dataset-{marker}"),
+                owner_user_id: "shared-owner".to_string(),
+                period_key: "2026-07".to_string(),
+                period_start: now,
+                period_end: now + chrono::Duration::hours(1),
+                row_count: 1,
+                status: marker.clone(),
+            })
+            .await
+            .expect("tenant snapshot fixture should persist");
+        repository
+            .upsert_structured_rows(
+                tenant_id,
+                &[json!({
+                    "id": logical_id,
+                    "tenant_id": tenant_id,
+                    "snapshot_id": logical_id,
+                    "marker": marker
+                })],
+            )
+            .await
+            .expect("tenant row fixture should persist");
+        repository
+            .upsert_eval_run(&RagEvalRun {
+                id: logical_id.clone(),
+                tenant_id: tenant_id.clone(),
+                change_id: None,
+                case_ids: vec![logical_id.clone()],
+                result_ids: vec![logical_id.clone()],
+                trace_ids: vec![logical_id.clone()],
+                status: marker.clone(),
+                metrics: RagEvalMetrics::default(),
+                guard_results: Vec::new(),
+                overview_source_document_uri: None,
+                report_source_document_uris: Vec::new(),
+                created_by: marker.clone(),
+                created_at: now,
+                completed_at: Some(now),
+            })
+            .await
+            .expect("tenant eval-run fixture should persist");
+        repository
+            .upsert_eval_case_results(&[RagEvalCaseResult {
+                id: logical_id.clone(),
+                tenant_id: tenant_id.clone(),
+                run_id: logical_id.clone(),
+                case_id: logical_id.clone(),
+                owner_user_id: None,
+                status: marker.clone(),
+                question: marker.clone(),
+                trace_id: logical_id.clone(),
+                answer: marker.clone(),
+                citations: Vec::new(),
+                retrieved_uris: Vec::new(),
+                source_document_uris: vec![source_document_uri.clone()],
+                failures: Vec::new(),
+                guard_failures: Vec::new(),
+                metrics: json!({ "marker": marker }),
+                latency_ms: 1,
+                created_at: now,
+            }])
+            .await
+            .expect("tenant eval-result fixture should persist");
+        repository
+            .upsert_eval_overview(&RagEvalOverview {
+                tenant_id: tenant_id.clone(),
+                run_id: logical_id.clone(),
+                status: marker.clone(),
+                metrics: RagEvalMetrics::default(),
+                failure_patterns: Vec::new(),
+                suggested_target_component: marker.clone(),
+                root_cause_notes: vec![marker.clone()],
+                overview_markdown: marker.clone(),
+                case_report_uris: Vec::new(),
+                overview_source_document_uri: None,
+                generated_at: now,
+            })
+            .await
+            .expect("tenant eval-overview fixture should persist");
+        let task = IngestTask {
+            task_id: logical_id.clone(),
+            tenant_id: tenant_id.clone(),
+            owner_user_id: None,
+            source_id: source_id.clone(),
+            revision_id: "shared-revision".to_string(),
+            source_document_uri: Some(source_document_uri.clone()),
+            parser_provider: "builtin".to_string(),
+            parser_backend: marker.clone(),
+            state: "completed".to_string(),
+            error: None,
+            created_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            status_url: None,
+            result_url: None,
+            queued_ahead: None,
+        };
+        repository
+            .upsert_ingest_task(&task)
+            .await
+            .expect("tenant ingest-task fixture should persist");
+        repository
+            .upsert_ingest_result(&IngestTaskResult {
+                task,
+                source_document_uri: source_document_uri.clone(),
+                source_id: source_id.clone(),
+                revision_id: "shared-revision".to_string(),
+                parse_artifacts: Vec::new(),
+                parsed_blocks: Vec::new(),
+                fragment_uris: vec![context_uri.clone()],
+                context_uris: vec![context_uri.clone()],
+            })
+            .await
+            .expect("tenant ingest-result fixture should persist");
+        repository
+            .upsert_harness_changes(&[HarnessChangeManifest {
+                id: logical_id.clone(),
+                tenant_id: tenant_id.clone(),
+                iteration: 1,
+                change_type: "tenant_scope_test".to_string(),
+                component_id: "retrieval.context_search".to_string(),
+                files: Vec::new(),
+                failure_pattern: marker.clone(),
+                root_cause: marker.clone(),
+                targeted_fix: marker.clone(),
+                predicted_fixes: Vec::new(),
+                risk_cases: Vec::new(),
+                expected_metric_deltas: json!({}),
+                baseline_eval_run_id: None,
+                candidate_eval_run_id: None,
+                why_this_component: marker.clone(),
+                created_by: marker.clone(),
+                created_at: now,
+                status: "proposed".to_string(),
+            }])
+            .await
+            .expect("tenant harness-change fixture should persist");
+    }
+
+    let mut updated_context =
+        tenant_context_node(&tenant_a, &context_uri, &source_id, &marker_a_updated);
+    updated_context.source_document_uri = Some(source_document_uri.clone());
+    repository
+        .upsert_context_nodes("rag_company_context", &[updated_context])
+        .await
+        .expect("tenant A context update should persist");
+    repository
+        .upsert_source_documents(&[SourceDocument {
+            id: logical_id.clone(),
+            tenant_id: tenant_a.clone(),
+            owner_user_id: None,
+            source_kind: "tenant_scope_test".to_string(),
+            source_id: source_id.clone(),
+            revision_id: "shared-revision".to_string(),
+            uri: source_document_uri.clone(),
+            title: format!("Source {marker_a_updated}"),
+            content: marker_a_updated.clone(),
+            checksum: format!("checksum-{marker_a_updated}"),
+            status: "active".to_string(),
+            retrieval_enabled: false,
+            created_at: now,
+            updated_at: chrono::Utc::now(),
+        }])
+        .await
+        .expect("tenant A source-document update should persist");
+    repository
+        .upsert_trace(&TraceRecord {
+            id: logical_id.clone(),
+            tenant_id: tenant_a.clone(),
+            owner_user_id: None,
+            query: marker_a_updated.clone(),
+            mode: "tenant-scope-test".to_string(),
+            stages: vec![json!({ "marker": marker_a_updated })],
+            context_uris: vec![context_uri.clone()],
+            created_at: now,
+        })
+        .await
+        .expect("tenant A trace update should persist");
+    repository
+        .upsert_structured_rows(
+            &tenant_a,
+            &[json!({
+                "id": logical_id,
+                "tenant_id": tenant_a,
+                "snapshot_id": logical_id,
+                "marker": marker_a_updated
+            })],
+        )
+        .await
+        .expect("tenant A row update should persist");
+
+    let context_a_result = repository
+        .read_context_node(
+            &tenant_a,
+            None,
+            &context_uri,
+            None,
+            state_a.store.resolver(),
+        )
+        .await;
+    let context_b_result = repository
+        .read_context_node(
+            &tenant_b,
+            None,
+            &context_uri,
+            None,
+            state_b.store.resolver(),
+        )
+        .await;
+    let source_a_result = repository
+        .read_source_document(&tenant_a, None, &source_document_uri)
+        .await;
+    let source_b_result = repository
+        .read_source_document(&tenant_b, None, &source_document_uri)
+        .await;
+    let trace_a_result = repository.get_trace(&tenant_a, &logical_id).await;
+    let trace_b_result = repository.get_trace(&tenant_b, &logical_id).await;
+    let snapshot_a_result = repository.get_snapshot(&tenant_a, &logical_id).await;
+    let snapshot_b_result = repository.get_snapshot(&tenant_b, &logical_id).await;
+    let rows_a_result = repository.list_rows(&tenant_a, &logical_id).await;
+    let rows_b_result = repository.list_rows(&tenant_b, &logical_id).await;
+    let run_a_result = repository.get_eval_run(&tenant_a, &logical_id).await;
+    let run_b_result = repository.get_eval_run(&tenant_b, &logical_id).await;
+    let eval_results_a_result = repository
+        .list_eval_case_results(&tenant_a, &logical_id)
+        .await;
+    let eval_results_b_result = repository
+        .list_eval_case_results(&tenant_b, &logical_id)
+        .await;
+    let overview_a_result = repository.get_eval_overview(&tenant_a, &logical_id).await;
+    let overview_b_result = repository.get_eval_overview(&tenant_b, &logical_id).await;
+    let task_a_result = repository.get_ingest_task(&tenant_a, &logical_id).await;
+    let task_b_result = repository.get_ingest_task(&tenant_b, &logical_id).await;
+    let ingest_result_a_result = repository.get_ingest_result(&tenant_a, &logical_id).await;
+    let ingest_result_b_result = repository.get_ingest_result(&tenant_b, &logical_id).await;
+    let harness_a_result = repository.get_harness_change(&tenant_a, &logical_id).await;
+    let harness_b_result = repository.get_harness_change(&tenant_b, &logical_id).await;
+    let debug_a_result = repository.debug_search(&tenant_a, "rag_traces", "").await;
+    let debug_b_result = repository.debug_search(&tenant_b, "rag_traces", "").await;
+
+    let raw_trace_inventory = admin
+        .search::<Value>(
+            "rag_traces",
+            json!({
+                "q": "",
+                "filter": two_tenant_logical_filter(&tenant_a, &tenant_b, &logical_id),
+                "limit": 10
+            }),
+        )
+        .await;
+    let delete_ingest_a_result = repository
+        .delete_ingest_tasks(&tenant_a, std::slice::from_ref(&logical_id))
+        .await;
+    let task_a_after_delete_result = repository.get_ingest_task(&tenant_a, &logical_id).await;
+    let task_b_after_delete_result = repository.get_ingest_task(&tenant_b, &logical_id).await;
+
+    let fixed_indexes = [
+        "rag_company_context",
+        "rag_source_documents",
+        "rag_structured_snapshots",
+        "rag_structured_rows",
+        "rag_traces",
+        "rag_harness_changes",
+        "rag_ingest_tasks",
+        "rag_ingest_results",
+        "rag_eval_runs",
+        "rag_eval_case_results",
+        "rag_eval_overviews",
+    ];
+    let cleanup_results = vec![
+        (
+            "tenant A direct fixed rows",
+            delete_tenant_rows_and_wait(&admin, &tenant_a, &fixed_indexes).await,
+        ),
+        (
+            "tenant B direct fixed rows",
+            delete_tenant_rows_and_wait(&admin, &tenant_b, &fixed_indexes).await,
+        ),
+    ];
+    assert_cleanup_results(cleanup_results);
+
+    let context_a = context_a_result
+        .expect("tenant A context read should succeed")
+        .expect("tenant A context should exist");
+    let context_b = context_b_result
+        .expect("tenant B context read should succeed")
+        .expect("tenant B context should exist");
+    assert_eq!(context_a.uri, context_uri);
+    assert_eq!(context_b.uri, context_uri);
+    assert!(context_a.body.contains(&marker_a_updated));
+    assert!(context_b.body.contains(&marker_b));
+    assert!(!context_b.body.contains(&marker_a_updated));
+
+    let source_a = source_a_result
+        .expect("tenant A source read should succeed")
+        .expect("tenant A source should exist");
+    let source_b = source_b_result
+        .expect("tenant B source read should succeed")
+        .expect("tenant B source should exist");
+    assert_eq!(source_a.id, logical_id);
+    assert_eq!(source_b.id, logical_id);
+    assert_eq!(source_a.uri, source_document_uri);
+    assert_eq!(source_b.uri, source_document_uri);
+    assert_eq!(source_a.content, marker_a_updated);
+    assert_eq!(source_b.content, marker_b);
+
+    let trace_a = trace_a_result
+        .expect("tenant A trace read should succeed")
+        .expect("tenant A trace should exist");
+    let trace_b = trace_b_result
+        .expect("tenant B trace read should succeed")
+        .expect("tenant B trace should exist");
+    assert_eq!(trace_a.id, logical_id);
+    assert_eq!(trace_b.id, logical_id);
+    assert_eq!(trace_a.query, marker_a_updated);
+    assert_eq!(trace_b.query, marker_b);
+
+    let snapshot_a = snapshot_a_result
+        .expect("tenant A snapshot read should succeed")
+        .expect("tenant A snapshot should exist");
+    let snapshot_b = snapshot_b_result
+        .expect("tenant B snapshot read should succeed")
+        .expect("tenant B snapshot should exist");
+    assert_eq!(snapshot_a.id, logical_id);
+    assert_eq!(snapshot_b.id, logical_id);
+    assert_eq!(snapshot_a.tenant_id, tenant_a);
+    assert_eq!(snapshot_b.tenant_id, tenant_b);
+
+    let rows_a = rows_a_result
+        .expect("tenant A row read should succeed")
+        .expect("tenant A rows should be supported");
+    let rows_b = rows_b_result
+        .expect("tenant B row read should succeed")
+        .expect("tenant B rows should be supported");
+    assert_eq!(rows_a.len(), 1, "{rows_a:?}");
+    assert_eq!(rows_b.len(), 1, "{rows_b:?}");
+    assert_eq!(rows_a[0]["id"], logical_id);
+    assert_eq!(rows_b[0]["id"], logical_id);
+    assert_eq!(rows_a[0]["marker"], marker_a_updated);
+    assert_eq!(rows_b[0]["marker"], marker_b);
+
+    let run_a = run_a_result
+        .expect("tenant A eval-run read should succeed")
+        .expect("tenant A eval run should exist");
+    let run_b = run_b_result
+        .expect("tenant B eval-run read should succeed")
+        .expect("tenant B eval run should exist");
+    assert_eq!(run_a.created_by, marker_a);
+    assert_eq!(run_b.created_by, marker_b);
+    let eval_results_a = eval_results_a_result
+        .expect("tenant A eval-results read should succeed")
+        .expect("tenant A eval results should be supported");
+    let eval_results_b = eval_results_b_result
+        .expect("tenant B eval-results read should succeed")
+        .expect("tenant B eval results should be supported");
+    assert_eq!(eval_results_a.len(), 1);
+    assert_eq!(eval_results_b.len(), 1);
+    assert_eq!(eval_results_a[0].answer, marker_a);
+    assert_eq!(eval_results_b[0].answer, marker_b);
+    let overview_a = overview_a_result
+        .expect("tenant A overview read should succeed")
+        .expect("tenant A overview should exist");
+    let overview_b = overview_b_result
+        .expect("tenant B overview read should succeed")
+        .expect("tenant B overview should exist");
+    assert_eq!(overview_a.overview_markdown, marker_a);
+    assert_eq!(overview_b.overview_markdown, marker_b);
+
+    let task_a = task_a_result
+        .expect("tenant A task read should succeed")
+        .expect("tenant A task should exist before deletion");
+    let task_b = task_b_result
+        .expect("tenant B task read should succeed")
+        .expect("tenant B task should exist");
+    assert_eq!(task_a.parser_backend, marker_a);
+    assert_eq!(task_b.parser_backend, marker_b);
+    let ingest_result_a = ingest_result_a_result
+        .expect("tenant A ingest-result read should succeed")
+        .expect("tenant A ingest result should exist");
+    let ingest_result_b = ingest_result_b_result
+        .expect("tenant B ingest-result read should succeed")
+        .expect("tenant B ingest result should exist");
+    assert_eq!(ingest_result_a.task.parser_backend, marker_a);
+    assert_eq!(ingest_result_b.task.parser_backend, marker_b);
+
+    let harness_a = harness_a_result
+        .expect("tenant A harness read should succeed")
+        .expect("tenant A harness change should exist");
+    let harness_b = harness_b_result
+        .expect("tenant B harness read should succeed")
+        .expect("tenant B harness change should exist");
+    assert_eq!(harness_a.root_cause, marker_a);
+    assert_eq!(harness_b.root_cause, marker_b);
+
+    for (result, tenant_id) in [(debug_a_result, &tenant_a), (debug_b_result, &tenant_b)] {
+        let body = result
+            .expect("tenant debug search should succeed")
+            .expect("tenant debug search should be supported");
+        assert!(
+            body["hits"].as_array().is_some_and(|hits| {
+                !hits.is_empty()
+                    && hits
+                        .iter()
+                        .all(|hit| hit["tenant_id"].as_str() == Some(tenant_id.as_str()))
+            }),
+            "direct debug search was not tenant scoped: {body}"
+        );
+    }
+
+    let raw_traces = raw_trace_inventory.expect("raw trace inventory should succeed");
+    assert_eq!(raw_traces.hits.len(), 2, "{raw_traces:?}");
+    assert_ne!(raw_traces.hits[0]["id"], raw_traces.hits[1]["id"]);
+    assert!(raw_traces.hits.iter().all(|trace| {
+        trace["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("ts1_"))
+            && trace["logical_id"] == logical_id
+    }));
+
+    delete_ingest_a_result.expect("tenant A ingest cleanup should succeed");
+    assert!(task_a_after_delete_result
+        .expect("tenant A post-delete task read should succeed")
+        .is_none());
+    assert!(task_b_after_delete_result
+        .expect("tenant B post-delete task read should succeed")
+        .is_some());
+}
+
+#[tokio::test]
+async fn tenant_scope_v1_live_migration_preserves_legacy_rows_across_tenants() {
+    let _guard = live_meili_test_guard().await;
+    if !isolated_migration_test_enabled() {
+        eprintln!(
+            "skipping destructive migration integration test; set \
+             RAG_TEST_MEILI_MIGRATION_ISOLATED=true only for an isolated empty Meilisearch"
+        );
+        return;
+    }
+
+    let fixture_id = uuid::Uuid::now_v7();
+    let tenant_a = format!("test-tenant-migration-a-{fixture_id}");
+    let tenant_b = format!("test-tenant-migration-b-{fixture_id}");
+    let Some(config) = meili_config_with_tenant(tenant_a.clone()).await else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    let admin = MeiliAdmin::from_config(&config);
+
+    // Inspect before bootstrap so an accidentally shared endpoint is rejected
+    // before this test changes settings or writes a document. The explicit
+    // opt-in plus this empty-inventory precondition make the direct production
+    // migration adapter safe to exercise end to end.
+    require_empty_fixed_indexes(&admin)
+        .await
+        .expect("migration integration endpoint must be isolated and empty");
+    admin
+        .bootstrap(false)
+        .await
+        .expect("isolated migration integration bootstrap should succeed");
+    require_empty_fixed_indexes(&admin)
+        .await
+        .expect("bootstrap must not create documents");
+
+    let legacy_a_id = format!("legacy-company-context-a-{fixture_id}");
+    let legacy_b_id = format!("legacy-company-context-b-{fixture_id}");
+    let shared_uri = format!("ctx://company/tenant-scope-v1-live/{fixture_id}");
+    let legacy_a = json!({
+        "id": legacy_a_id,
+        "uri": shared_uri,
+        "title": "Legacy tenant A copy",
+        "body": format!("legacy-a-{fixture_id}"),
+        "privacy": "company",
+        "retrieval_enabled": true,
+        "retrieval_role": "fragment"
+    });
+    let legacy_b = json!({
+        "id": legacy_b_id,
+        "uri": shared_uri,
+        "title": "Legacy tenant B copy",
+        "body": format!("legacy-b-{fixture_id}"),
+        "privacy": "company",
+        "retrieval_enabled": true,
+        "retrieval_role": "fragment"
+    });
+    let migrated_a = tenant_document(&tenant_a, "rag_company_context", &shared_uri, &legacy_a)
+        .expect("tenant A migrated fixture should serialize");
+    let migrated_b = tenant_document(&tenant_b, "rag_company_context", &shared_uri, &legacy_b)
+        .expect("tenant B migrated fixture should serialize");
+    let migrated_a_id = migrated_a["id"]
+        .as_str()
+        .expect("tenant A fixture should have a physical ID")
+        .to_string();
+    let migrated_b_id = migrated_b["id"]
+        .as_str()
+        .expect("tenant B fixture should have a physical ID")
+        .to_string();
+    let fixture_ids = vec![
+        legacy_a_id.clone(),
+        legacy_b_id.clone(),
+        migrated_a_id.clone(),
+        migrated_b_id.clone(),
+    ];
+    let artifact_dir =
+        std::env::temp_dir().join(format!("nowledge-tenant-scope-v1-live-{fixture_id}"));
+    fs::create_dir_all(&artifact_dir).expect("migration test artifact directory should be created");
+    let checkpoint_path = artifact_dir.join("checkpoint.json");
+
+    let outcome: AnyResult<_> = async {
+        let seed_task = admin
+            .add_documents(
+                "rag_company_context",
+                &[legacy_a.clone(), legacy_b.clone(), migrated_a.clone()],
+            )
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        wait_for_optional_task(&admin, seed_task)
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        let mapping = LegacyTenantMapping {
+            migration: MIGRATION_NAME.to_string(),
+            documents: vec![
+                LegacyTenantAssignment {
+                    index_uid: "rag_company_context".to_string(),
+                    legacy_id: legacy_a_id.clone(),
+                    tenant_id: tenant_a.clone(),
+                },
+                LegacyTenantAssignment {
+                    index_uid: "rag_company_context".to_string(),
+                    legacy_id: legacy_b_id.clone(),
+                    tenant_id: tenant_b.clone(),
+                },
+            ],
+        };
+        let plan = create_plan(&admin, &mapping, 2).await?;
+        ensure!(plan.quarantined.is_empty(), "{:?}", plan.quarantined);
+        ensure!(
+            plan.unused_mappings.is_empty(),
+            "{:?}",
+            plan.unused_mappings
+        );
+        ensure!(
+            plan.operations.len() == 1,
+            "pre-migrated tenant A should leave only tenant B to write: {:?}",
+            plan.operations
+        );
+        let operation = &plan.operations[0];
+        ensure!(operation.tenant_id == tenant_b);
+        ensure!(operation.legacy_id == legacy_b_id);
+        ensure!(operation.logical_id == shared_uri);
+        ensure!(operation.target_id == migrated_b_id);
+        ensure!(operation.document == migrated_b);
+        let company_inventory = plan
+            .indexes
+            .get("rag_company_context")
+            .ok_or_else(|| anyhow!("company-context inventory is missing"))?;
+        ensure!(
+            company_inventory
+                .tenants
+                .get(&tenant_a)
+                .is_some_and(|tenant| {
+                    tenant.expected_count == 1 && tenant.already_migrated_count == 1
+                }),
+            "tenant A pre-migrated copy was not inventoried"
+        );
+        ensure!(
+            company_inventory
+                .tenants
+                .get(&tenant_b)
+                .is_some_and(|tenant| { tenant.expected_count == 1 && tenant.planned_count == 1 }),
+            "tenant B legacy copy was not planned"
+        );
+
+        let rollback = create_rollback_plan(&plan)?;
+        let acknowledgement = rollback.acknowledgement.clone();
+        let before_dry_run = read_all_fixed_index_documents(&admin).await?;
+        let mut checkpoints = FileCheckpointStore::new(checkpoint_path.clone());
+        let dry_run = apply_plan(
+            &admin,
+            &plan,
+            &rollback,
+            &acknowledgement,
+            &mut checkpoints,
+            true,
+        )
+        .await?;
+        let after_dry_run = read_all_fixed_index_documents(&admin).await?;
+        ensure!(dry_run.dry_run);
+        ensure!(dry_run.mutation_free);
+        ensure!(dry_run.remote_batches_written == 0);
+        ensure!(dry_run.checkpoint_writes == 0);
+        ensure!(!checkpoint_path.exists());
+        ensure!(
+            before_dry_run == after_dry_run,
+            "dry-run changed the isolated Meilisearch inventory"
+        );
+
+        let applied = apply_plan(
+            &admin,
+            &plan,
+            &rollback,
+            &acknowledgement,
+            &mut checkpoints,
+            false,
+        )
+        .await?;
+        ensure!(!applied.dry_run);
+        ensure!(!applied.mutation_free);
+        ensure!(applied.completed_operations == 1);
+        ensure!(applied.remote_batches_written == 1);
+        ensure!(applied.checkpoint_writes == 1);
+        ensure!(applied.ready_to_verify);
+
+        let verification = verify_plan(&admin, &plan).await?;
+        ensure!(verification.writes_verified, "{:?}", verification.failures);
+        ensure!(
+            verification.legacy_rows_preserved,
+            "{:?}",
+            verification.failures
+        );
+        ensure!(verification.unresolved_quarantine == 0);
+        ensure!(verification.ready_to_cutover, "{:?}", verification.failures);
+
+        let inventory = read_all_fixed_index_documents(&admin).await?;
+        let company_documents = inventory
+            .get("rag_company_context")
+            .ok_or_else(|| anyhow!("company-context inventory is missing after apply"))?;
+        ensure!(company_documents.len() == 4, "{company_documents:?}");
+        let by_id = company_documents
+            .iter()
+            .filter_map(|document| document["id"].as_str().map(|id| (id.to_string(), document)))
+            .collect::<BTreeMap<_, _>>();
+        ensure!(by_id.get(&legacy_a_id).copied() == Some(&legacy_a));
+        ensure!(by_id.get(&legacy_b_id).copied() == Some(&legacy_b));
+        ensure!(by_id.get(&migrated_a_id).copied() == Some(&migrated_a));
+        ensure!(by_id.get(&migrated_b_id).copied() == Some(&migrated_b));
+        ensure!(migrated_a_id != migrated_b_id);
+        for migrated in [&migrated_a, &migrated_b] {
+            ensure!(migrated["logical_id"] == shared_uri);
+            ensure!(migrated["uri"] == shared_uri);
+        }
+
+        Ok(verification)
+    }
+    .await;
+
+    let cleanup_result: AnyResult<()> = async {
+        let task_uid = admin
+            .delete_documents_by_ids("rag_company_context", &fixture_ids)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        wait_for_optional_task(&admin, task_uid)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        require_empty_fixed_indexes(&admin).await
+    }
+    .await;
+    let artifact_cleanup = fs::remove_dir_all(&artifact_dir);
+    cleanup_result.expect("isolated migration fixtures should be removed by exact document IDs");
+    artifact_cleanup.expect("migration test artifacts should be removed");
+
+    let verification = outcome.expect("live tenant-scope migration should succeed");
+    assert!(verification.ready_to_cutover);
+}
+
+#[tokio::test]
+async fn meili_source_document_compatibility_mirror_supersedes_legacy_copy() {
+    let _guard = live_meili_test_guard().await;
+    let fixture_id = uuid::Uuid::now_v7();
+    let tenant_id = format!("test-tenant-compat-mirror-{fixture_id}");
+    let Some(config) = meili_config_with_tenant(tenant_id.clone()).await else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    let admin = bootstrapped_meili_admin(&config).await;
+    let repository = MeiliRepository::new(admin.clone(), false);
+    let logical_id = format!("compat-source-document-{fixture_id}");
+    let source_id = format!("compat-source-{fixture_id}");
+    let uri = format!("ctx://company/compat-mirror/{fixture_id}");
+    let legacy_marker = format!("legacy-active-{fixture_id}");
+    let current_marker = format!("current-superseded-{fixture_id}");
+    let now = chrono::Utc::now();
+
+    let outcome: Result<(Vec<Value>, Option<SourceDocument>), String> = async {
+        let legacy_task = admin
+            .add_documents(
+                "rag_source_documents",
+                &[json!({
+                    "id": logical_id,
+                    "tenant_id": tenant_id,
+                    "owner_user_id": null,
+                    "source_kind": "compatibility_test",
+                    "source_id": source_id,
+                    "revision_id": "legacy-revision",
+                    "uri": uri,
+                    "title": "Legacy active copy",
+                    "content": legacy_marker,
+                    "checksum": "legacy-checksum",
+                    "status": "active",
+                    "retrieval_enabled": true,
+                    "created_at": now,
+                    "updated_at": now
+                })],
+            )
+            .await
+            .map_err(|error| format!("legacy preseed failed: {error}"))?;
+        wait_for_optional_task(&admin, legacy_task)
+            .await
+            .map_err(|error| format!("legacy preseed task failed: {error}"))?;
+
+        let upsert_task = repository
+            .upsert_source_documents(&[SourceDocument {
+                id: logical_id.clone(),
+                tenant_id: tenant_id.clone(),
+                owner_user_id: None,
+                source_kind: "compatibility_test".to_string(),
+                source_id: source_id.clone(),
+                revision_id: "current-revision".to_string(),
+                uri: uri.clone(),
+                title: "Current superseded copy".to_string(),
+                content: current_marker.clone(),
+                checksum: "current-checksum".to_string(),
+                status: "superseded".to_string(),
+                retrieval_enabled: false,
+                created_at: now,
+                updated_at: now,
+            }])
+            .await
+            .map_err(|error| format!("tenant-scoped upsert failed: {error}"))?;
+        wait_for_optional_task(&admin, upsert_task)
+            .await
+            .map_err(|error| format!("tenant-scoped upsert task failed: {error}"))?;
+
+        let inventory = admin
+            .search::<Value>(
+                "rag_source_documents",
+                json!({
+                    "q": "",
+                    "filter": tenant_logical_filter(&tenant_id, &logical_id),
+                    "limit": 10
+                }),
+            )
+            .await
+            .map_err(|error| format!("post-upsert inventory failed: {error}"))?;
+        let active = repository
+            .read_source_document(&tenant_id, None, &uri)
+            .await
+            .map_err(|error| format!("active-filtered read failed: {error}"))?;
+        Ok((inventory.hits, active))
+    }
+    .await;
+
+    let cleanup = delete_tenant_rows_and_wait(&admin, &tenant_id, &["rag_source_documents"]).await;
+    assert_cleanup_results(vec![("compatibility mirror rows", cleanup)]);
+
+    let (hits, active) = outcome.expect("compatibility mirror live regression should complete");
+    assert_eq!(hits.len(), 2, "expected legacy and ts1 copies: {hits:?}");
+    let legacy = hits
+        .iter()
+        .find(|document| document["id"] == logical_id)
+        .expect("same-tenant legacy copy should remain present");
+    let current = hits
+        .iter()
+        .find(|document| {
+            document["id"] != logical_id
+                && document["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("ts1_"))
+        })
+        .expect("tenant-safe current copy should remain present");
+    for document in [legacy, current] {
+        assert_eq!(document["status"], "superseded", "{document}");
+        assert_eq!(document["content"], current_marker, "{document}");
+    }
+    assert!(
+        active.is_none(),
+        "active-filtered tenant read resurrected a stale legacy copy: {active:?}"
+    );
+}
+
+#[tokio::test]
+async fn meili_company_source_delete_preserves_personal_auxiliary_rows() {
+    let _guard = live_meili_test_guard().await;
+    let fixture_id = uuid::Uuid::now_v7();
+    let tenant_id = format!("test-tenant-company-delete-{fixture_id}");
+    let Some(config) = meili_config_with_tenant(tenant_id.clone()).await else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    let admin = bootstrapped_meili_admin(&config).await;
+    let repository = MeiliRepository::new(admin.clone(), true);
+    let source_id = format!("shared-company-personal-source-{fixture_id}");
+    let owner_user_id = format!("personal-owner-{fixture_id}");
+    let auxiliary_indexes = [
+        "rag_source_documents",
+        "rag_parse_artifacts",
+        "rag_ingest_tasks",
+        "rag_ingest_results",
+    ];
+    let touched_indexes = [
+        "rag_sources",
+        "rag_source_revisions",
+        "rag_company_context",
+        "rag_source_documents",
+        "rag_parse_artifacts",
+        "rag_ingest_tasks",
+        "rag_ingest_results",
+    ];
+
+    let outcome: Result<Vec<AuxiliaryInventory>, String> = async {
+        for index_uid in auxiliary_indexes {
+            let shared_parse_id = format!("shared-parse-artifact-{fixture_id}");
+            let company_logical_id = if index_uid == "rag_parse_artifacts" {
+                shared_parse_id.clone()
+            } else {
+                format!("{index_uid}-company-{fixture_id}")
+            };
+            let personal_logical_id = if index_uid == "rag_parse_artifacts" {
+                shared_parse_id
+            } else {
+                format!("{index_uid}-personal-{fixture_id}")
+            };
+            let documents = [
+                auxiliary_document(index_uid, &tenant_id, &company_logical_id, None, &source_id),
+                auxiliary_document(
+                    index_uid,
+                    &tenant_id,
+                    &personal_logical_id,
+                    Some(&owner_user_id),
+                    &source_id,
+                ),
+            ];
+            let task = admin
+                .add_documents(index_uid, &documents)
+                .await
+                .map_err(|error| format!("{index_uid} fixture write failed: {error}"))?;
+            wait_for_optional_task(&admin, task)
+                .await
+                .map_err(|error| format!("{index_uid} fixture task failed: {error}"))?;
+        }
+
+        let mut before = Vec::new();
+        for index_uid in auxiliary_indexes {
+            let inventory = admin
+                .search::<Value>(
+                    index_uid,
+                    json!({
+                        "q": "",
+                        "filter": tenant_resource_filter(&tenant_id, "source_id", &source_id),
+                        "limit": 10
+                    }),
+                )
+                .await
+                .map_err(|error| format!("{index_uid} pre-delete inventory failed: {error}"))?;
+            before.push((index_uid, inventory.hits));
+        }
+
+        let report = repository
+            .delete_company_source(&tenant_id, &source_id)
+            .await
+            .map_err(|error| format!("company source delete failed: {error}"))?;
+        let mut deletion_tasks = report.auxiliary_tasks.clone();
+        deletion_tasks.extend(
+            [
+                report.fragments_task.clone(),
+                report.revisions_task.clone(),
+                report.source_task.clone(),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        admin
+            .wait_for_tasks(&deletion_tasks)
+            .await
+            .map_err(|error| format!("company source delete task failed: {error}"))?;
+
+        let mut inventories = Vec::new();
+        for (index_uid, before_hits) in before {
+            let after = admin
+                .search::<Value>(
+                    index_uid,
+                    json!({
+                        "q": "",
+                        "filter": tenant_resource_filter(&tenant_id, "source_id", &source_id),
+                        "limit": 10
+                    }),
+                )
+                .await
+                .map_err(|error| format!("{index_uid} post-delete inventory failed: {error}"))?;
+            inventories.push((index_uid, before_hits, after.hits));
+        }
+        Ok(inventories)
+    }
+    .await;
+
+    let cleanup = delete_tenant_rows_and_wait(&admin, &tenant_id, &touched_indexes).await;
+    assert_cleanup_results(vec![("company-delete auxiliary rows", cleanup)]);
+
+    let inventories = outcome.expect("company-source auxiliary delete regression should complete");
+    assert_eq!(inventories.len(), auxiliary_indexes.len());
+    for (index_uid, before, after) in inventories {
+        assert_eq!(
+            before.len(),
+            2,
+            "{index_uid} fixture must contain company and personal rows: {before:?}"
+        );
+        assert!(before.iter().any(|row| row["owner_user_id"].is_null()));
+        assert!(before
+            .iter()
+            .any(|row| row["owner_user_id"] == owner_user_id));
+        assert_eq!(
+            after.len(),
+            1,
+            "{index_uid} should retain only its personal row: {after:?}"
+        );
+        assert_eq!(after[0]["owner_user_id"], owner_user_id);
+        assert_eq!(after[0]["source_id"], source_id);
+    }
+}
+
+#[tokio::test]
+async fn meili_all_fixed_indexes_enforce_tenant_safe_logical_identity_lifecycle() {
+    let _guard = live_meili_test_guard().await;
+    let Some((config_a, config_b, admin, _state_a, _app_a, _state_b, _app_b)) =
+        two_tenant_meili_fixture().await
+    else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    let tenant_a = config_a.tenant_id.clone();
+    let tenant_b = config_b.tenant_id.clone();
+    let repository = MeiliRepository::new(admin.clone(), true);
+    let fixture_id = uuid::Uuid::now_v7();
+    let shared_id = format!("tenant-scope-all-fixed-{fixture_id}");
+    let shared_context_uri = format!("ctx://company/tenant-scope-all-fixed/{fixture_id}");
+    let marker_a = format!("all-fixed-a-{}", uuid::Uuid::now_v7());
+    let marker_a_updated = format!("all-fixed-a-updated-{}", uuid::Uuid::now_v7());
+    let marker_b = format!("all-fixed-b-{}", uuid::Uuid::now_v7());
+    let mut failures = Vec::new();
+
+    for index_uid in FIXED_INDEXES {
+        let logical_id = if *index_uid == "rag_company_context" {
+            shared_context_uri.as_str()
+        } else {
+            shared_id.as_str()
+        };
+        let persistence_kind = if *index_uid == "rag_harness_components" {
+            "rag_harness_components:component"
+        } else {
+            index_uid
+        };
+        let document = |tenant_id: &str, marker: &str| {
+            let value = json!({
+                "id": logical_id,
+                "tenant_id": tenant_id,
+                "uri": logical_id,
+                "task_id": logical_id,
+                "run_id": logical_id,
+                "source_id": logical_id,
+                "snapshot_id": logical_id,
+                "doc_kind": "component",
+                "status": "active",
+                "privacy": "company",
+                "retrieval_enabled": true,
+                "retrieval_role": "fragment",
+                "marker": marker,
+                "title": marker,
+                "body": marker
+            });
+            if *index_uid == "rag_structured_rows" {
+                tenant_structured_row_document(tenant_id, &value)
+            } else if *index_uid == "rag_parse_artifacts" {
+                let storage_identity = owner_scoped_storage_identity(None, logical_id)
+                    .expect("company parse-artifact scope should be valid");
+                tenant_document_with_storage_identity(
+                    tenant_id,
+                    persistence_kind,
+                    logical_id,
+                    &storage_identity,
+                    &value,
+                )
+            } else {
+                tenant_document(tenant_id, persistence_kind, logical_id, &value)
+            }
+            .expect("tenant-scoped generic fixture should serialize")
+        };
+
+        let initial_write = match admin
+            .add_documents(
+                index_uid,
+                &[
+                    document(&tenant_a, &marker_a),
+                    document(&tenant_b, &marker_b),
+                ],
+            )
+            .await
+        {
+            Ok(task_uid) => wait_for_optional_task(&admin, task_uid).await,
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = initial_write {
+            failures.push(format!("{index_uid}: initial write failed: {error}"));
+            continue;
+        }
+
+        match admin
+            .search::<Value>(
+                index_uid,
+                json!({
+                    "q": "",
+                    "filter": two_tenant_logical_filter(&tenant_a, &tenant_b, logical_id),
+                    "limit": 10
+                }),
+            )
+            .await
+        {
+            Ok(response) => {
+                if response.hits.len() != 2 {
+                    failures.push(format!(
+                        "{index_uid}: expected two tenant rows, found {}",
+                        response.hits.len()
+                    ));
+                } else {
+                    let first_id = response.hits[0]["id"].as_str().unwrap_or_default();
+                    let second_id = response.hits[1]["id"].as_str().unwrap_or_default();
+                    if first_id == second_id
+                        || !first_id.starts_with("ts1_")
+                        || !second_id.starts_with("ts1_")
+                    {
+                        failures.push(format!(
+                            "{index_uid}: internal IDs were not distinct tenant-safe ts1 IDs"
+                        ));
+                    }
+                    if response
+                        .hits
+                        .iter()
+                        .any(|hit| hit["logical_id"].as_str() != Some(logical_id))
+                    {
+                        failures.push(format!(
+                            "{index_uid}: raw rows did not preserve the public logical ID"
+                        ));
+                    }
+                }
+            }
+            Err(error) => failures.push(format!("{index_uid}: raw inventory failed: {error}")),
+        }
+
+        for tenant_id in [&tenant_a, &tenant_b] {
+            match repository.debug_search(tenant_id, index_uid, "").await {
+                Ok(Some(body)) => {
+                    let hits = body["hits"].as_array();
+                    if !hits.is_some_and(|hits| {
+                        !hits.is_empty()
+                            && hits.iter().all(|hit| {
+                                hit["tenant_id"].as_str() == Some(tenant_id.as_str())
+                                    && hit["id"].as_str() == Some(logical_id)
+                            })
+                    }) {
+                        failures.push(format!(
+                            "{index_uid}: tenant debug did not restore/scoped public IDs for {tenant_id}: {body}"
+                        ));
+                    }
+                }
+                Ok(None) => failures.push(format!(
+                    "{index_uid}: tenant debug unexpectedly unsupported for {tenant_id}"
+                )),
+                Err(error) => failures.push(format!(
+                    "{index_uid}: tenant debug failed for {tenant_id}: {error}"
+                )),
+            }
+        }
+
+        let update_a = match admin
+            .add_documents(index_uid, &[document(&tenant_a, &marker_a_updated)])
+            .await
+        {
+            Ok(task_uid) => wait_for_optional_task(&admin, task_uid).await,
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = update_a {
+            failures.push(format!("{index_uid}: tenant A update failed: {error}"));
+            continue;
+        }
+
+        for (tenant_id, expected_marker) in [
+            (&tenant_a, marker_a_updated.as_str()),
+            (&tenant_b, marker_b.as_str()),
+        ] {
+            match admin
+                .search::<Value>(
+                    index_uid,
+                    json!({
+                        "q": "",
+                        "filter": tenant_logical_filter(tenant_id, logical_id),
+                        "limit": 10
+                    }),
+                )
+                .await
+            {
+                Ok(response)
+                    if response.hits.len() == 1
+                        && response.hits[0]["marker"].as_str() == Some(expected_marker) => {}
+                Ok(response) => failures.push(format!(
+                    "{index_uid}: update isolation failed for {tenant_id}: {:?}",
+                    response.hits
+                )),
+                Err(error) => failures.push(format!(
+                    "{index_uid}: post-update inventory failed for {tenant_id}: {error}"
+                )),
+            }
+        }
+
+        if let Err(error) = delete_by_filter_and_wait(
+            &admin,
+            index_uid,
+            &tenant_logical_filter(&tenant_a, logical_id),
+        )
+        .await
+        {
+            failures.push(format!("{index_uid}: tenant A delete failed: {error}"));
+            continue;
+        }
+
+        for (tenant_id, expected_count) in [(&tenant_a, 0usize), (&tenant_b, 1usize)] {
+            match admin
+                .search::<Value>(
+                    index_uid,
+                    json!({
+                        "q": "",
+                        "filter": tenant_logical_filter(tenant_id, logical_id),
+                        "limit": 10
+                    }),
+                )
+                .await
+            {
+                Ok(response) if response.hits.len() == expected_count => {}
+                Ok(response) => failures.push(format!(
+                    "{index_uid}: tenant A delete changed {tenant_id} count to {}, expected {expected_count}",
+                    response.hits.len()
+                )),
+                Err(error) => failures.push(format!(
+                    "{index_uid}: post-delete inventory failed for {tenant_id}: {error}"
+                )),
+            }
+        }
+    }
+
+    let cleanup_results = vec![
+        (
+            "tenant A all-fixed rows",
+            delete_tenant_rows_and_wait(&admin, &tenant_a, FIXED_INDEXES).await,
+        ),
+        (
+            "tenant B all-fixed rows",
+            delete_tenant_rows_and_wait(&admin, &tenant_b, FIXED_INDEXES).await,
+        ),
+    ];
+    assert_cleanup_results(cleanup_results);
+    assert!(
+        failures.is_empty(),
+        "fixed-index tenant lifecycle failures:\n{}",
+        failures.join("\n")
     );
 }

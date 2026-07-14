@@ -429,6 +429,10 @@ impl Store {
         tenant_id: &str,
         req: CreateHarnessChangeManifestRequest,
     ) -> Result<HarnessChangeManifest, ApiError> {
+        let id = match req.id {
+            Some(id) => require_string(Some(id), "id")?,
+            None => new_id("hchange"),
+        };
         let component_id = require_string(req.component_id, "component_id")?;
         let change_type = require_string(req.change_type, "type")?;
         if !matches!(change_type.as_str(), "new" | "improvement" | "rollback") {
@@ -442,7 +446,7 @@ impl Store {
         let why_this_component = require_string(req.why_this_component, "why_this_component")?;
         let created_by = req.created_by.unwrap_or_else(|| "admin".to_string());
         let change = HarnessChangeManifest {
-            id: req.id.unwrap_or_else(|| new_id("hchange")),
+            id,
             tenant_id: tenant_id.to_string(),
             iteration: req.iteration.unwrap_or(1),
             change_type,
@@ -900,9 +904,13 @@ impl Store {
         tenant_id: &str,
         req: CreateRagEvalCaseRequest,
     ) -> Result<RagEvalCase, ApiError> {
+        let id = match req.id {
+            Some(id) => require_string(Some(id), "id")?,
+            None => new_id("evalcase"),
+        };
         let question = require_string(req.question, "question")?;
         let case = RagEvalCase {
-            id: req.id.unwrap_or_else(|| new_id("evalcase")),
+            id,
             tenant_id: tenant_id.to_string(),
             owner_user_id: req.owner_user_id,
             question,
@@ -1138,7 +1146,7 @@ impl Store {
         let data = self.read()?;
         let owner_matches =
             |owner: &str| include_global || owner_user_id.is_some_and(|target| target == owner);
-        let tenant_matches = |value: &str| value == tenant_id || value == "default";
+        let tenant_matches = |value: &str| value == tenant_id;
 
         let event_count = data
             .event_by_id
@@ -1185,6 +1193,7 @@ impl Store {
         let snapshot_ids = data
             .snapshots
             .values()
+            .filter(|snapshot| snapshot.tenant_id == tenant_id)
             .filter(|snapshot| owner_matches(&snapshot.owner_user_id))
             .map(|snapshot| snapshot.id.clone())
             .collect::<HashSet<_>>();
@@ -1192,17 +1201,18 @@ impl Store {
         let row_count = data
             .rows_by_snapshot
             .iter()
-            .filter(|(snapshot_id, _)| include_global || snapshot_ids.contains(*snapshot_id))
+            .filter(|(snapshot_id, _)| snapshot_ids.contains(*snapshot_id))
             .map(|(_, rows)| rows.len())
             .sum::<usize>();
         let summary_count = data
             .structured_summaries
             .values()
             .filter(|summary| {
-                summary
-                    .get("owner_user_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(owner_matches)
+                summary.get("tenant_id").and_then(Value::as_str) == Some(tenant_id)
+                    && summary
+                        .get("owner_user_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(owner_matches)
             })
             .count();
         let structured_state_count = data
@@ -1241,7 +1251,10 @@ impl Store {
             })
             .count();
         let dataset_count = if include_global {
-            data.datasets.len()
+            data.datasets
+                .values()
+                .filter(|dataset| dataset.tenant_id == tenant_id)
+                .count()
         } else {
             0
         };
@@ -1274,6 +1287,7 @@ impl Store {
         let sessions = data
             .sessions
             .values()
+            .filter(|session| session.tenant_id == tenant_id)
             .filter(|session| owner_matches(&session.owner_user_id))
             .collect::<Vec<_>>();
         let message_count = sessions
@@ -1667,6 +1681,7 @@ impl Store {
     /// pruned task ids.
     pub async fn cleanup_ingest_tasks_async(
         &self,
+        tenant_id: &str,
         retention_seconds: u64,
     ) -> Result<Vec<String>, ApiError> {
         let cutoff = chrono::Utc::now()
@@ -1675,6 +1690,7 @@ impl Store {
             let data = self.read()?;
             data.ingest_tasks
                 .values()
+                .filter(|task| task.tenant_id == tenant_id)
                 .filter(|task| matches!(task.state.as_str(), "completed" | "failed"))
                 .filter(|task| task.completed_at.unwrap_or(task.updated_at) < cutoff)
                 .map(|task| task.task_id.clone())
@@ -1690,7 +1706,9 @@ impl Store {
                 data.ingest_results.remove(task_id);
             }
         }
-        self.repository.delete_ingest_tasks(&expired).await?;
+        self.repository
+            .delete_ingest_tasks(tenant_id, &expired)
+            .await?;
         Ok(expired)
     }
 
@@ -2108,7 +2126,10 @@ impl Store {
     ) -> Result<BulkStructuredRowsResponse, ApiError> {
         let response = self.bulk_rows(tenant_id, snapshot_id, req)?;
         let rows = self.snapshot_rows(snapshot_id)?;
-        let _ = self.repository.upsert_structured_rows(&rows).await?;
+        let _ = self
+            .repository
+            .upsert_structured_rows(tenant_id, &rows)
+            .await?;
         if let Some(snapshot) = self.snapshot(snapshot_id)? {
             let _ = self
                 .repository
@@ -2129,7 +2150,10 @@ impl Store {
     ) -> Result<ApplySnapshotResponse, ApiError> {
         let response = self.apply_snapshot(tenant_id, dataset_key, req)?;
         for summary in self.structured_summaries(&response.summary_ids)? {
-            let _ = self.repository.upsert_structured_summary(&summary).await?;
+            let _ = self
+                .repository
+                .upsert_structured_summary(tenant_id, &summary)
+                .await?;
         }
         let snapshot = self
             .snapshot(&response.snapshot_id)?
@@ -2349,13 +2373,18 @@ impl Store {
 
     pub async fn debug_meili_search_async(
         &self,
+        tenant_id: &str,
         index_uid: &str,
         query: &str,
     ) -> Result<Value, ApiError> {
-        if let Some(raw) = self.repository.debug_search(index_uid, query).await? {
+        if let Some(raw) = self
+            .repository
+            .debug_search(tenant_id, index_uid, query)
+            .await?
+        {
             return Ok(raw);
         }
-        self.debug_meili_search(index_uid, query)
+        self.debug_meili_search(tenant_id, index_uid, query)
     }
 
     pub async fn get_event_async(
@@ -2378,47 +2407,63 @@ impl Store {
 
     pub async fn get_snapshot_async(
         &self,
+        tenant_id: &str,
         snapshot_id: &str,
     ) -> Result<StructuredSnapshot, ApiError> {
-        if let Ok(snapshot) = self.get_snapshot(snapshot_id) {
+        if let Ok(snapshot) = self.get_snapshot(tenant_id, snapshot_id) {
             return Ok(snapshot);
         }
-        if let Some(snapshot) = self.repository.get_snapshot(snapshot_id).await? {
+        if let Some(snapshot) = self.repository.get_snapshot(tenant_id, snapshot_id).await? {
             return Ok(snapshot);
         }
         Err(ApiError::not_found("snapshot not found"))
     }
 
-    pub async fn snapshot_owner_async(&self, snapshot_id: &str) -> Result<String, ApiError> {
-        if let Ok(owner) = self.snapshot_owner(snapshot_id) {
+    pub async fn snapshot_owner_async(
+        &self,
+        tenant_id: &str,
+        snapshot_id: &str,
+    ) -> Result<String, ApiError> {
+        if let Ok(owner) = self.snapshot_owner(tenant_id, snapshot_id) {
             return Ok(owner);
         }
         self.repository
-            .get_snapshot(snapshot_id)
+            .get_snapshot(tenant_id, snapshot_id)
             .await?
             .map(|snapshot| snapshot.owner_user_id)
             .ok_or_else(|| ApiError::not_found("snapshot not found"))
     }
 
-    pub async fn list_rows_async(&self, snapshot_id: &str) -> Result<Value, ApiError> {
+    pub async fn list_rows_async(
+        &self,
+        tenant_id: &str,
+        snapshot_id: &str,
+    ) -> Result<Value, ApiError> {
         let memory_rows = {
             let data = self.read()?;
-            data.rows_by_snapshot.get(snapshot_id).cloned()
+            data.snapshots
+                .get(snapshot_id)
+                .filter(|snapshot| snapshot.tenant_id == tenant_id)
+                .and_then(|_| data.rows_by_snapshot.get(snapshot_id).cloned())
         };
         if let Some(rows) = memory_rows {
             return Ok(json!({ "snapshot_id": snapshot_id, "rows": rows }));
         }
-        if let Some(rows) = self.repository.list_rows(snapshot_id).await? {
+        if let Some(rows) = self.repository.list_rows(tenant_id, snapshot_id).await? {
             return Ok(json!({ "snapshot_id": snapshot_id, "rows": rows }));
         }
         Ok(json!({ "snapshot_id": snapshot_id, "rows": [] }))
     }
 
-    pub async fn get_trace_async(&self, trace_id: &str) -> Result<TraceRecord, ApiError> {
-        if let Ok(trace) = self.get_trace(trace_id) {
+    pub async fn get_trace_async(
+        &self,
+        tenant_id: &str,
+        trace_id: &str,
+    ) -> Result<TraceRecord, ApiError> {
+        if let Ok(trace) = self.get_trace(tenant_id, trace_id) {
             return Ok(trace);
         }
-        if let Some(trace) = self.repository.get_trace(trace_id).await? {
+        if let Some(trace) = self.repository.get_trace(tenant_id, trace_id).await? {
             return Ok(trace);
         }
         Err(ApiError::not_found("trace not found"))
@@ -3185,6 +3230,7 @@ impl Store {
         );
         let insight = InsightRecord {
             id: id.clone(),
+            tenant_id: tenant_id.to_string(),
             insight_type,
             title: title.clone(),
             statement: statement.clone(),
@@ -3586,6 +3632,7 @@ impl Store {
         source_id: &str,
         req: CreateRevisionRequest,
     ) -> Result<CreateRevisionResponse, ApiError> {
+        require_string(Some(source_id.to_string()), "source_id")?;
         if let Some(decision_id) = &req.preflight_decision_id {
             let data = self.read()?;
             if let Some(decision) = data.preflight_decisions.get(decision_id) {
@@ -3610,6 +3657,7 @@ impl Store {
         });
         let revision = SourceRevision {
             id: new_id("rev"),
+            tenant_id: tenant_id.to_string(),
             source_id: source_id.to_string(),
             title: title.clone(),
             source_uri: source_uri.clone(),
@@ -3624,6 +3672,7 @@ impl Store {
             .entry(source_id.to_string())
             .or_insert_with(|| CompanySource {
                 id: source_id.to_string(),
+                tenant_id: tenant_id.to_string(),
                 title: title.clone(),
                 canonical_key: sanitize_slug(&title),
                 source_uri: source_uri.clone(),
@@ -3832,6 +3881,7 @@ impl Store {
 
     pub fn upsert_dataset(
         &self,
+        tenant_id: &str,
         dataset_key: &str,
         req: DatasetSchemaUpsertRequest,
     ) -> Result<DatasetSchemaResponse, ApiError> {
@@ -3843,6 +3893,7 @@ impl Store {
             .unwrap_or(0);
         let dataset = DatasetRecord {
             id: format!("dataset_{}", sanitize_slug(dataset_key)),
+            tenant_id: tenant_id.to_string(),
             dataset_key: dataset_key.to_string(),
             title: req.title.unwrap_or_else(|| dataset_key.replace('-', " ")),
             schema_version: existing_version + 1,
@@ -3888,6 +3939,7 @@ impl Store {
 
         let snapshot = StructuredSnapshot {
             id: id.clone(),
+            tenant_id: tenant_id.to_string(),
             dataset_key: dataset_key.clone(),
             owner_user_id: owner_user_id.clone(),
             period_key,
@@ -3917,10 +3969,15 @@ impl Store {
         })
     }
 
-    pub fn get_snapshot(&self, snapshot_id: &str) -> Result<StructuredSnapshot, ApiError> {
+    pub fn get_snapshot(
+        &self,
+        tenant_id: &str,
+        snapshot_id: &str,
+    ) -> Result<StructuredSnapshot, ApiError> {
         let data = self.read()?;
         data.snapshots
             .get(snapshot_id)
+            .filter(|snapshot| snapshot.tenant_id == tenant_id)
             .cloned()
             .ok_or_else(|| ApiError::not_found("snapshot not found"))
     }
@@ -3931,10 +3988,16 @@ impl Store {
         snapshot_id: &str,
         req: BulkStructuredRowsRequest,
     ) -> Result<BulkStructuredRowsResponse, ApiError> {
+        for row in &req.rows {
+            if let Some(id) = row.get("id").and_then(Value::as_str) {
+                require_string(Some(id.to_string()), "id")?;
+            }
+        }
         let mut data = self.write()?;
         let owner_user_id = data
             .snapshots
             .get(snapshot_id)
+            .filter(|snapshot| snapshot.tenant_id == tenant_id)
             .map(|snapshot| snapshot.owner_user_id.clone())
             .ok_or_else(|| ApiError::not_found("snapshot not found"))?;
 
@@ -3963,14 +4026,19 @@ impl Store {
                 duplicates += 1;
             } else {
                 if let Some(obj) = row.as_object_mut() {
-                    obj.entry("id".to_string())
-                        .or_insert_with(|| Value::String(row_id.clone()));
-                    obj.entry("snapshot_id".to_string())
-                        .or_insert_with(|| Value::String(snapshot_id.to_string()));
-                    obj.entry("tenant_id".to_string())
-                        .or_insert_with(|| Value::String(tenant_id.to_string()));
-                    obj.entry("owner_user_id".to_string())
-                        .or_insert_with(|| Value::String(owner_user_id.clone()));
+                    obj.insert("id".to_string(), Value::String(row_id.clone()));
+                    obj.insert(
+                        "snapshot_id".to_string(),
+                        Value::String(snapshot_id.to_string()),
+                    );
+                    obj.insert(
+                        "tenant_id".to_string(),
+                        Value::String(tenant_id.to_string()),
+                    );
+                    obj.insert(
+                        "owner_user_id".to_string(),
+                        Value::String(owner_user_id.clone()),
+                    );
                 }
                 data.row_idempotency.insert(key);
                 rows_to_add.push(row);
@@ -4032,6 +4100,7 @@ impl Store {
             let snapshot = data
                 .snapshots
                 .get(&snapshot_id)
+                .filter(|snapshot| snapshot.tenant_id == tenant_id)
                 .cloned()
                 .ok_or_else(|| ApiError::not_found("snapshot not found"))?;
             let rows = data
@@ -4044,6 +4113,7 @@ impl Store {
                 .values()
                 .filter(|candidate| {
                     candidate.id != snapshot.id
+                        && candidate.tenant_id == tenant_id
                         && candidate.dataset_key == snapshot.dataset_key
                         && candidate.owner_user_id == snapshot.owner_user_id
                         && candidate.period_start < snapshot.period_start
@@ -4089,6 +4159,7 @@ impl Store {
         });
         let summary = json!({
             "id": summary_id,
+            "tenant_id": tenant_id,
             "snapshot_id": snapshot_id,
             "dataset_key": dataset_key,
             "owner_user_id": snapshot.owner_user_id,
@@ -4194,10 +4265,11 @@ impl Store {
                 .structured_summaries
                 .values()
                 .filter(|summary| {
-                    summary
-                        .get("owner_user_id")
-                        .and_then(Value::as_str)
-                        .is_some_and(private_allowed)
+                    summary.get("tenant_id").and_then(Value::as_str) == Some(tenant_id)
+                        && summary
+                            .get("owner_user_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(private_allowed)
                 })
                 .cloned()
                 .collect(),
@@ -4525,10 +4597,15 @@ impl Store {
         Ok(self.answer_from_context(outcome))
     }
 
-    pub fn create_session(&self, req: SessionCreateRequest) -> Result<SessionResponse, ApiError> {
+    pub fn create_session(
+        &self,
+        tenant_id: &str,
+        req: SessionCreateRequest,
+    ) -> Result<SessionResponse, ApiError> {
         let owner_user_id = require_string(req.owner_user_id, "owner_user_id")?;
         let session = SessionRecord {
             id: new_id("session"),
+            tenant_id: tenant_id.to_string(),
             owner_user_id,
             title: req.title.unwrap_or_else(|| "Untitled session".to_string()),
             status: "active".to_string(),
@@ -4678,31 +4755,49 @@ impl Store {
         })
     }
 
-    pub fn get_trace(&self, trace_id: &str) -> Result<TraceRecord, ApiError> {
+    pub fn get_trace(&self, tenant_id: &str, trace_id: &str) -> Result<TraceRecord, ApiError> {
         let data = self.read()?;
         data.traces
             .get(trace_id)
+            .filter(|trace| trace.tenant_id == tenant_id)
             .cloned()
             .ok_or_else(|| ApiError::not_found("trace not found"))
     }
 
-    pub fn trace_owner_id(&self, trace_id: &str) -> Result<Option<String>, ApiError> {
+    pub fn trace_owner_id(
+        &self,
+        tenant_id: &str,
+        trace_id: &str,
+    ) -> Result<Option<String>, ApiError> {
         let data = self.read()?;
         data.traces
             .get(trace_id)
+            .filter(|trace| trace.tenant_id == tenant_id)
             .map(|trace| trace.owner_user_id.clone())
             .ok_or_else(|| ApiError::not_found("trace not found"))
     }
 
-    pub fn debug_meili_search(&self, index_uid: &str, query: &str) -> Result<Value, ApiError> {
+    pub fn debug_meili_search(
+        &self,
+        tenant_id: &str,
+        index_uid: &str,
+        query: &str,
+    ) -> Result<Value, ApiError> {
         let data = self.read()?;
-        let nodes = if index_uid == "rag_company_context" {
-            data.company_context.clone()
+        let nodes: Vec<ContextNode> = if index_uid == "rag_company_context" {
+            data.company_context
+                .iter()
+                .filter(|node| node.tenant_id == tenant_id)
+                .cloned()
+                .collect()
         } else {
             data.personal_context
                 .get(index_uid)
                 .cloned()
                 .unwrap_or_default()
+                .into_iter()
+                .filter(|node| node.tenant_id == tenant_id)
+                .collect()
         };
         let vector_scores = self.vector_score_map(query, &nodes);
         let doc_scores = self.vector_doc_score_map(query, doc_candidates_locked(&data, &nodes));
@@ -4729,10 +4824,11 @@ impl Store {
             .ok_or_else(|| ApiError::not_found("insight not found"))
     }
 
-    pub fn snapshot_owner(&self, snapshot_id: &str) -> Result<String, ApiError> {
+    pub fn snapshot_owner(&self, tenant_id: &str, snapshot_id: &str) -> Result<String, ApiError> {
         let data = self.read()?;
         data.snapshots
             .get(snapshot_id)
+            .filter(|snapshot| snapshot.tenant_id == tenant_id)
             .map(|snapshot| snapshot.owner_user_id.clone())
             .ok_or_else(|| ApiError::not_found("snapshot not found"))
     }
@@ -4919,6 +5015,7 @@ impl Store {
         let tokens_per_answer = answer_text.split_whitespace().count() as f64;
         Ok(RagEvalCaseResult {
             id: new_id("evalresult"),
+            tenant_id: tenant_id.to_string(),
             run_id: run_id.to_string(),
             case_id: case.id.clone(),
             owner_user_id: case.owner_user_id.clone(),
@@ -6007,7 +6104,7 @@ impl Store {
         let mut nodes: Vec<_> = data
             .company_context
             .iter()
-            .filter(|node| node.tenant_id == tenant_id || node.tenant_id == "default")
+            .filter(|node| node.tenant_id == tenant_id)
             .cloned()
             .collect();
         if let Some(owner) = owner_user_id {
@@ -6033,7 +6130,7 @@ impl Store {
             return Ok(self
                 .all_context_nodes_locked(data)
                 .into_iter()
-                .filter(|node| node.tenant_id == tenant_id || node.tenant_id == "default")
+                .filter(|node| node.tenant_id == tenant_id)
                 .collect());
         }
         self.context_scope_locked(data, tenant_id, owner_user_id)
@@ -6050,7 +6147,7 @@ impl Store {
         data.source_documents
             .get(uri)
             .filter(|document| document.status == "active")
-            .filter(|document| document.tenant_id == tenant_id || document.tenant_id == "default")
+            .filter(|document| document.tenant_id == tenant_id)
             .filter(|document| {
                 if include_all_private {
                     true
@@ -6499,6 +6596,7 @@ fn build_eval_overview(run: &RagEvalRun, results: &[RagEvalCaseResult]) -> RagEv
         suggested_target_component
     ));
     RagEvalOverview {
+        tenant_id: run.tenant_id.clone(),
         run_id: run.id.clone(),
         status: run.status.clone(),
         metrics: run.metrics.clone(),
@@ -7477,7 +7575,7 @@ fn source_document_for_hit_locked(
     data.source_documents
         .get(&source_document_uri)
         .filter(|document| document.status == "active")
-        .filter(|document| document.tenant_id == tenant_id || document.tenant_id == "default")
+        .filter(|document| document.tenant_id == tenant_id)
         .filter(|document| owner_can_see_optional(document.owner_user_id.as_deref(), owner_user_id))
         .cloned()
 }
@@ -7565,7 +7663,7 @@ fn neighbor_fragments_for_hit_locked(
         .chain(data.company_context.iter().cloned())
         .chain(data.personal_context.values().flatten().cloned())
         .filter(|node| node.uri != hit.uri)
-        .filter(|node| node.tenant_id == tenant_id || node.tenant_id == "default")
+        .filter(|node| node.tenant_id == tenant_id)
         .filter(retrieval_candidate)
         .filter(|node| node.source_document_uri.as_deref() == Some(source_document_uri))
         .filter(|node| {
@@ -7982,6 +8080,330 @@ mod tests {
     }
 
     #[test]
+    fn default_tenant_rows_are_never_visible_to_another_tenant() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant_id = "tenant-b";
+        let source_document_uri = "ctx://default/source-document";
+        let mut default_neighbor = store.context_node(
+            "ctx://default/fragments/0001",
+            "Default neighbor",
+            2,
+            "default-only",
+            "company",
+            "rag_company_context",
+            "default",
+            None,
+            Some("source-default".to_string()),
+            Some("revision-default".to_string()),
+        );
+        default_neighbor.source_document_uri = Some(source_document_uri.to_string());
+        default_neighbor.fragment_index = Some(1);
+        let mut tenant_hit = store.context_node(
+            "ctx://tenant-b/fragments/0001",
+            "Tenant hit",
+            2,
+            "tenant-b-hit",
+            "company",
+            "rag_company_context",
+            tenant_id,
+            None,
+            Some("source-b".to_string()),
+            Some("revision-b".to_string()),
+        );
+        tenant_hit.source_document_uri = Some(source_document_uri.to_string());
+        tenant_hit.fragment_index = Some(1);
+        let mut tenant_neighbor = store.context_node(
+            "ctx://tenant-b/fragments/0002",
+            "Tenant neighbor",
+            2,
+            "tenant-b-neighbor",
+            "company",
+            "rag_company_context",
+            tenant_id,
+            None,
+            Some("source-b".to_string()),
+            Some("revision-b".to_string()),
+        );
+        tenant_neighbor.source_document_uri = Some(source_document_uri.to_string());
+        tenant_neighbor.fragment_index = Some(2);
+
+        let stamp = now();
+        {
+            let mut data = store.write().unwrap();
+            data.company_context.extend([
+                default_neighbor.clone(),
+                tenant_hit.clone(),
+                tenant_neighbor.clone(),
+            ]);
+            data.source_documents.insert(
+                source_document_uri.to_string(),
+                SourceDocument {
+                    id: "default-source-document".to_string(),
+                    tenant_id: "default".to_string(),
+                    owner_user_id: None,
+                    source_kind: "test".to_string(),
+                    source_id: "source-default".to_string(),
+                    revision_id: "revision-default".to_string(),
+                    uri: source_document_uri.to_string(),
+                    title: "Default source".to_string(),
+                    content: "default-only".to_string(),
+                    checksum: "default-checksum".to_string(),
+                    status: "active".to_string(),
+                    retrieval_enabled: false,
+                    created_at: stamp,
+                    updated_at: stamp,
+                },
+            );
+            for scope in ["default", tenant_id] {
+                let dataset_key = format!("dataset-{scope}");
+                data.datasets.insert(
+                    dataset_key.clone(),
+                    DatasetRecord {
+                        id: format!("dataset-id-{scope}"),
+                        tenant_id: scope.to_string(),
+                        dataset_key,
+                        title: format!("Dataset {scope}"),
+                        schema_version: 1,
+                        status: "active".to_string(),
+                        columns: Vec::new(),
+                    },
+                );
+                let snapshot_id = format!("snapshot-{scope}");
+                data.snapshots.insert(
+                    snapshot_id.clone(),
+                    StructuredSnapshot {
+                        id: snapshot_id.clone(),
+                        tenant_id: scope.to_string(),
+                        dataset_key: format!("dataset-{scope}"),
+                        owner_user_id: "owner-a".to_string(),
+                        period_key: "period-a".to_string(),
+                        period_start: stamp,
+                        period_end: stamp,
+                        row_count: 1,
+                        status: "open".to_string(),
+                    },
+                );
+                data.rows_by_snapshot
+                    .insert(snapshot_id, vec![json!({"value": scope})]);
+                data.structured_summaries.insert(
+                    format!("summary-{scope}"),
+                    json!({
+                        "id": format!("summary-{scope}"),
+                        "tenant_id": scope,
+                        "owner_user_id": "owner-a"
+                    }),
+                );
+                data.sessions.insert(
+                    format!("session-{scope}"),
+                    SessionRecord {
+                        id: format!("session-{scope}"),
+                        tenant_id: scope.to_string(),
+                        owner_user_id: "owner-a".to_string(),
+                        title: format!("Session {scope}"),
+                        status: "active".to_string(),
+                        messages: vec![json!({"scope": scope})],
+                        created_at: stamp,
+                    },
+                );
+            }
+        }
+
+        let usage = store.usage_snapshot(tenant_id, None, true).unwrap();
+        assert_eq!(
+            usage["providers"]["contextfs"]["company_context_node_count"],
+            2
+        );
+        assert_eq!(usage["providers"]["structured_data"]["dataset_count"], 1);
+        assert_eq!(usage["providers"]["structured_data"]["snapshot_count"], 1);
+        assert_eq!(usage["providers"]["structured_data"]["row_count"], 1);
+        assert_eq!(usage["providers"]["structured_data"]["summary_count"], 1);
+        assert_eq!(usage["providers"]["sessions"]["session_count"], 1);
+        assert_eq!(usage["providers"]["sessions"]["message_count"], 1);
+
+        let data = store.read().unwrap();
+        let scoped = store
+            .context_scope_for_acl_locked(&data, tenant_id, None, true)
+            .unwrap();
+        assert_eq!(scoped.len(), 2);
+        assert!(scoped.iter().all(|node| node.tenant_id == tenant_id));
+        assert!(store
+            .source_document_for_acl_locked(&data, tenant_id, source_document_uri, None, true)
+            .is_none());
+
+        let hit = context_hit_from_node(&tenant_hit, 1.0, &[]);
+        assert!(source_document_for_hit_locked(&data, tenant_id, None, &hit).is_none());
+        let neighbors = neighbor_fragments_for_hit_locked(
+            &data,
+            tenant_id,
+            None,
+            std::slice::from_ref(&tenant_hit),
+            &hit,
+        );
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].uri, tenant_neighbor.uri);
+    }
+
+    #[tokio::test]
+    async fn blank_harness_change_id_is_rejected_without_mutation() {
+        let config = Config::test();
+        let store = Store::new(&config);
+
+        let error = store
+            .create_harness_change_async(
+                &config.tenant_id,
+                CreateHarnessChangeManifestRequest {
+                    id: Some(" \t".to_string()),
+                    change_type: Some("new".to_string()),
+                    component_id: Some("retrieval.context_search".to_string()),
+                    failure_pattern: Some("failure".to_string()),
+                    root_cause: Some("cause".to_string()),
+                    targeted_fix: Some("fix".to_string()),
+                    why_this_component: Some("reason".to_string()),
+                    ..CreateHarnessChangeManifestRequest::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "id is required");
+        assert!(store.read().unwrap().harness_changes.is_empty());
+    }
+
+    #[test]
+    fn blank_eval_case_id_is_rejected_without_mutation() {
+        let config = Config::test();
+        let store = Store::new(&config);
+
+        let error = store
+            .create_eval_case(
+                &config.tenant_id,
+                CreateRagEvalCaseRequest {
+                    id: Some("\n".to_string()),
+                    question: Some("What changed?".to_string()),
+                    ..CreateRagEvalCaseRequest::default()
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "id is required");
+        assert!(store.read().unwrap().eval_cases.is_empty());
+    }
+
+    #[test]
+    fn blank_company_source_id_is_rejected_without_mutation() {
+        let config = Config::test();
+        let store = Store::new(&config);
+
+        let error = store
+            .create_revision(&config.tenant_id, "   ", CreateRevisionRequest::default())
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "source_id is required");
+        let data = store.read().unwrap();
+        assert!(data.sources.is_empty());
+        assert!(data.source_revisions.is_empty());
+        assert!(data.event_by_id.is_empty());
+    }
+
+    #[test]
+    fn blank_structured_row_id_rejects_batch_without_partial_mutation() {
+        let config = Config::test();
+        let tenant_id = config.tenant_id.clone();
+        let store = Store::new(&config);
+        let snapshot_id = "snapshot-blank-row-id";
+        let stamp = now();
+        store.write().unwrap().snapshots.insert(
+            snapshot_id.to_string(),
+            StructuredSnapshot {
+                id: snapshot_id.to_string(),
+                tenant_id: tenant_id.clone(),
+                dataset_key: "dataset-a".to_string(),
+                owner_user_id: "owner-a".to_string(),
+                period_key: "period-a".to_string(),
+                period_start: stamp,
+                period_end: stamp,
+                row_count: 0,
+                status: "open".to_string(),
+            },
+        );
+
+        let error = store
+            .bulk_rows(
+                &tenant_id,
+                snapshot_id,
+                BulkStructuredRowsRequest {
+                    rows: vec![json!({ "id": "row-valid" }), json!({ "id": " \t" })],
+                    ..BulkStructuredRowsRequest::default()
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "id is required");
+        let data = store.read().unwrap();
+        assert!(!data.rows_by_snapshot.contains_key(snapshot_id));
+        assert!(data.row_idempotency.is_empty());
+        assert_eq!(data.snapshots[snapshot_id].row_count, 0);
+        assert!(data.event_by_id.is_empty());
+    }
+
+    #[test]
+    fn structured_rows_overwrite_scope_fields_and_allow_ids_per_snapshot() {
+        let config = Config::test();
+        let tenant_id = config.tenant_id.clone();
+        let store = Store::new(&config);
+        let stamp = now();
+        {
+            let mut data = store.write().unwrap();
+            for snapshot_id in ["snapshot-a", "snapshot-b"] {
+                data.snapshots.insert(
+                    snapshot_id.to_string(),
+                    StructuredSnapshot {
+                        id: snapshot_id.to_string(),
+                        tenant_id: tenant_id.clone(),
+                        dataset_key: "dataset-a".to_string(),
+                        owner_user_id: "owner-a".to_string(),
+                        period_key: snapshot_id.to_string(),
+                        period_start: stamp,
+                        period_end: stamp,
+                        row_count: 0,
+                        status: "open".to_string(),
+                    },
+                );
+            }
+        }
+
+        for snapshot_id in ["snapshot-a", "snapshot-b"] {
+            let response = store
+                .bulk_rows(
+                    &tenant_id,
+                    snapshot_id,
+                    BulkStructuredRowsRequest {
+                        rows: vec![json!({
+                            "id": "row-1",
+                            "snapshot_id": "attacker-snapshot",
+                            "tenant_id": "attacker-tenant",
+                            "owner_user_id": "attacker-owner",
+                            "value": snapshot_id,
+                        })],
+                        ..BulkStructuredRowsRequest::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(response.inserted, 1);
+        }
+
+        let data = store.read().unwrap();
+        for snapshot_id in ["snapshot-a", "snapshot-b"] {
+            let row = &data.rows_by_snapshot[snapshot_id][0];
+            assert_eq!(row["id"], "row-1");
+            assert_eq!(row["snapshot_id"], snapshot_id);
+            assert_eq!(row["tenant_id"], tenant_id);
+            assert_eq!(row["owner_user_id"], "owner-a");
+        }
+    }
+
+    #[test]
     fn ingest_polling_sanitizes_legacy_persisted_failure_causes() {
         let config = Config::test();
         let store = Store::new(&config);
@@ -8346,7 +8768,10 @@ mod tests {
             );
         }
 
-        let mut pruned = store.cleanup_ingest_tasks_async(3_600).await.unwrap();
+        let mut pruned = store
+            .cleanup_ingest_tasks_async(tenant_id, 3_600)
+            .await
+            .unwrap();
         pruned.sort();
         assert_eq!(
             pruned,
@@ -8652,6 +9077,7 @@ mod tests {
                     id.to_string(),
                     RagEvalCaseResult {
                         id: id.to_string(),
+                        tenant_id: config.tenant_id.clone(),
                         run_id: run_id.to_string(),
                         case_id: case_id.to_string(),
                         owner_user_id: None,

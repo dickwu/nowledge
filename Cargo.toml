@@ -4,6 +4,11 @@ version = "0.11.0"
 edition = "2021"
 description = "ContextFS-style State/History RAG service with per-user Meilisearch event indexes"
 license = "MIT"
+default-run = "nowledge"
+
+[[bin]]
+name = "tenant_scope_v1"
+path = "src/tenant_scope_v1_main.rs"
 
 [dependencies]
 anyhow = "1"

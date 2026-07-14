@@ -398,6 +398,51 @@ async fn user_history_events_are_index_isolated() {
 }
 
 #[tokio::test]
+async fn admin_http_rejects_all_bootstrap_mutation_and_meili_path_escape() {
+    let app = app();
+    let (bootstrap_status, bootstrap_body) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/bootstrap",
+        json!({ "reset": false }),
+    )
+    .await;
+    assert_eq!(
+        bootstrap_status,
+        StatusCode::BAD_REQUEST,
+        "{bootstrap_body}"
+    );
+    assert!(bootstrap_body["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("unavailable over HTTP")));
+
+    let (reset_status, reset_body) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/admin/bootstrap",
+        json!({ "reset": true }),
+    )
+    .await;
+    assert_eq!(reset_status, StatusCode::BAD_REQUEST, "{reset_body}");
+    assert!(reset_body["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("unavailable over HTTP")));
+
+    let (debug_status, debug_body) = call(
+        app,
+        Method::POST,
+        "/v1/debug/meili/search",
+        json!({ "index_uid": "rag_sources/../../tasks", "query": "" }),
+    )
+    .await;
+    assert_eq!(debug_status, StatusCode::BAD_REQUEST, "{debug_body}");
+    assert_eq!(
+        debug_body["error"]["message"],
+        "index_uid contains invalid characters"
+    );
+}
+
+#[tokio::test]
 async fn livez_is_minimal_process_liveness() {
     let app = llm_health_app("mock");
     let (status, body) = call(app, Method::GET, "/livez", Value::Null).await;
