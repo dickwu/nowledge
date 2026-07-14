@@ -29,7 +29,7 @@ Schema: `LinkUpsertRequest`
 | evidence_text | string | optional | Evidence recorded for the link. |
 | confidence | number | optional, default 0.7 | Confidence score. |
 | created_by | string | optional, default api | Producer label. |
-| tags | string[] | optional, default [] | Tags for search and filtering. |
+| tags | string[] | optional, default [] | Tags for search and filtering; at most `RAG_MAX_TAGS_PER_ITEM`, each at most `RAG_MAX_TAG_BYTES` UTF-8 bytes. |
 | idempotency_key | string | optional | Client deduplication key. |
 
 ## Response
@@ -43,6 +43,9 @@ Schema: `LinkResponse`
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
+- Excess tags return 400 `validation_error` with `details.field=tags`; an
+  oversized tag uses `details.field=tags[i]`. Validation happens before store
+  mutation.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 

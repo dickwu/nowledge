@@ -25,7 +25,7 @@ Schema: `StateSearchRequest`
 | state_types | string[] | optional, default [] | Restrict search to selected state types. |
 | owner_user_id | string | optional, auth default may apply | Owner scope. |
 | status | string | optional, default active | State item status filter. |
-| limit | integer | optional, default 10 | Maximum hits returned. |
+| limit | integer | optional, default 10 | Maximum hits returned; must not exceed `RAG_MAX_SEARCH_LIMIT`. |
 
 ## Response
 Schema: `StateSearchResponse`
@@ -36,6 +36,8 @@ Schema: `StateSearchResponse`
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
+- `limit` above `RAG_MAX_SEARCH_LIMIT` returns 400 `validation_error` with
+  `details.field=limit` before search.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 

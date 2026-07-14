@@ -22,6 +22,15 @@ scrubbed.
 
 - Kept for tests and caller flows that need immediate completion.
 - Uses the same parser, fragmenter, source-document, ACL, and retrieval safety rules as asynchronous ingest.
+- The JSON body is bounded by `RAG_MAX_JSON_BYTES`; the route is bounded by
+  `RAG_SYNC_INGEST_TIMEOUT_MS`. Timeout returns 504 and terminalizes the task as
+  `ingest_interrupted`.
+- A separate sync-ingest lane permits at most
+  `RAG_INGEST_MAX_CONCURRENT_TASKS` concurrent sync requests. Saturation
+  returns 503 plus `Retry-After` before buffering the JSON body.
+- Oversized JSON returns 413. Principal/global pressure returns 429/503 and
+  includes `Retry-After`; every response includes `X-Request-Id`. See the
+  [shared HTTP boundary contract](../README.md#http-boundary-contract).
 
 ```mermaid
 flowchart TD

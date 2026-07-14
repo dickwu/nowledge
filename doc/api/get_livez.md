@@ -29,6 +29,10 @@ Schema: `LivezResponse`
 ## Errors and Access Rules
 - Public; no bearer token is required.
 - This endpoint performs no store, Meilisearch, parser, or LLM checks.
+- It bypasses request-body buffering, rate limiting, global in-flight capacity,
+  and route timeout enforcement so saturation does not hide a live process.
+- Successful responses still include the server-generated `X-Request-Id` and
+  configured CORS policy.
 - A serving process returns 200. Connection-level failures occur before an HTTP response exists.
 
 ## Internal Logic Call Graph

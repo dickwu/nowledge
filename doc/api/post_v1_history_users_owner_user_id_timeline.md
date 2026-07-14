@@ -27,7 +27,7 @@ Schema: `TimelineQueryRequest`
 | to | RFC3339 datetime | optional | Upper timeline bound. |
 | include_state_changes | boolean | optional, default false | Include state change events when supported by the store. |
 | include_doc_revisions | boolean | optional, default false | Include company document revision events when supported by the store. |
-| limit | integer | optional, default 10 | Maximum events returned. |
+| limit | integer | optional, default 10 | Maximum events returned; must not exceed `RAG_MAX_SEARCH_LIMIT`. |
 
 ## Response
 Schema: `TimelineResponse`
@@ -38,6 +38,8 @@ Schema: `TimelineResponse`
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
+- `limit` above `RAG_MAX_SEARCH_LIMIT` returns 400 `validation_error` with
+  `details.field=limit` before timeline assembly.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 

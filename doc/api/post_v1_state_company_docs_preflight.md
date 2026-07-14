@@ -24,7 +24,7 @@ Schema: `CompanyDocPreflightRequest`
 | content_type | string | optional | MIME type or logical content type. |
 | text_preview | string | optional | Preview text used for similarity checks. |
 | checksum | string | optional | Content checksum used to detect duplicates. |
-| tags | string[] | optional, default [] | Document tags. |
+| tags | string[] | optional, default [] | Document tags; at most `RAG_MAX_TAGS_PER_ITEM`, each at most `RAG_MAX_TAG_BYTES` UTF-8 bytes. |
 | scope | string | optional | Document visibility or business scope. |
 | similarity_threshold | number | optional, default 0.82 | Threshold used to flag similar existing sources. |
 
@@ -43,6 +43,9 @@ Schema: `CompanyDocPreflightResponse`
 - Missing or invalid bearer authentication returns 401.
 - Authenticated principals without `company_writer` or admin permission return 403 unless the temporary `RAG_ALLOW_LEGACY_SHARED_WRITER=true` compatibility switch is active.
 - Malformed JSON or invalid request fields returns 400 after authorization.
+- Excess tags return 400 `validation_error` with `details.field=tags`; an
+  oversized tag uses `details.field=tags[i]`. Validation happens before store
+  mutation.
 - Authorization denials and store success/failure emit structured audit events with keyed identifiers correlated by the response `X-Request-Id`.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 

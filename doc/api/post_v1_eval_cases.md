@@ -25,7 +25,7 @@ Schema: `CreateRagEvalCaseRequest`
 | expected_context_uris | string[] | optional, default `[]` | ContextFS URIs expected in retrieval. |
 | expected_source_document_uris | string[] | optional, default `[]` | Source document URIs expected in retrieval. |
 | expected_answer_contains | string[] | optional, default `[]` | Substrings expected in the generated answer. |
-| tags | string[] | optional, default `[]` | Free-form labels. |
+| tags | string[] | optional, default `[]` | Free-form labels; at most `RAG_MAX_TAGS_PER_ITEM`, each at most `RAG_MAX_TAG_BYTES` UTF-8 bytes. |
 | metadata | object | optional, default `null` | Arbitrary caller metadata stored verbatim. |
 
 ## Response
@@ -46,6 +46,8 @@ Schema: `RagEvalCase`
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
+- Excess tags return 400 `validation_error` with `details.field=tags`; an
+  oversized tag uses `details.field=tags[i]` before persistence.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 - Requires admin authentication; non-admin principals are rejected by AdminGuard.

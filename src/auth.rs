@@ -9,6 +9,7 @@ use crate::{
     config::{AuthUserConfig, AuthUserScope, BearerTokenScope},
     error::ApiError,
     routes::{audit_shared_write_denial, AppState},
+    util::hmac_hex,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +123,12 @@ impl Principal {
             (PrincipalScope::TenantService | PrincipalScope::Admin, _) => Ok(()),
         }
     }
+
+    fn rate_limit_key(&self, index_hash_secret: &[u8]) -> String {
+        let owner = self.owner_user_id().unwrap_or_default();
+        let identity = format!("{}\0{}\0{owner}", self.tenant_id, self.scope_label());
+        hmac_hex(index_hash_secret, "rate-limit-principal", &identity, 32)
+    }
 }
 
 impl FromRequestParts<AppState> for UserGuard {
@@ -131,9 +138,9 @@ impl FromRequestParts<AppState> for UserGuard {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        Ok(Self {
-            principal: authenticate(parts, state)?,
-        })
+        let principal = authenticate(parts, state)?;
+        enforce_principal_rate_limit(&principal, state)?;
+        Ok(Self { principal })
     }
 }
 
@@ -158,6 +165,7 @@ impl FromRequestParts<AppState> for CompanyWriterGuard {
                 return Err(error);
             }
         };
+        enforce_principal_rate_limit(&principal, state)?;
         if let Err(error) = principal.require_company_write() {
             if !state.config.allow_legacy_shared_writer {
                 audit_shared_write_denial(
@@ -196,6 +204,7 @@ impl FromRequestParts<AppState> for AdminGuard {
                 return Err(error);
             }
         };
+        enforce_principal_rate_limit(&principal, state)?;
         if let Err(error) = principal.require_admin() {
             audit_shared_write_denial(
                 Some(&principal),
@@ -209,6 +218,11 @@ impl FromRequestParts<AppState> for AdminGuard {
         }
         Ok(Self { principal })
     }
+}
+
+fn enforce_principal_rate_limit(principal: &Principal, state: &AppState) -> Result<(), ApiError> {
+    let key = principal.rate_limit_key(&state.config.index_hash_secret);
+    state.http_boundary.check_rate_limit(&key)
 }
 
 impl UserGuard {
@@ -413,5 +427,35 @@ mod tests {
         assert!(!token_matches("correct-token", "short"));
         assert!(!token_matches("correct-token", "correct-token-longer"));
         assert!(token_matches("", ""));
+    }
+
+    #[test]
+    fn logical_rate_keys_ignore_credentials_and_roles_but_separate_scope() {
+        let secret = b"rate-key-test-secret";
+        let first = principal(
+            PrincipalScope::Owner {
+                owner_user_id: "u1".to_string(),
+            },
+            &["user"],
+        );
+        let rotated = principal(
+            PrincipalScope::Owner {
+                owner_user_id: "u1".to_string(),
+            },
+            &["user", "company_writer"],
+        );
+        let other = principal(
+            PrincipalScope::Owner {
+                owner_user_id: "u2".to_string(),
+            },
+            &["user"],
+        );
+
+        assert_eq!(first.rate_limit_key(secret), rotated.rate_limit_key(secret));
+        assert_ne!(first.rate_limit_key(secret), other.rate_limit_key(secret));
+        assert_ne!(
+            first.rate_limit_key(secret),
+            principal(PrincipalScope::TenantService, &["user"]).rate_limit_key(secret)
+        );
     }
 }

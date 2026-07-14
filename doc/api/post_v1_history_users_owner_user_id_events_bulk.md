@@ -21,7 +21,7 @@ Schema: `BulkHistoryEventsRequest`
 
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| events | AppendHistoryEventRequest[] | optional, default [] | Events to insert in one owner/index routing operation. |
+| events | AppendHistoryEventRequest[] | optional, default [] | Events to insert in one owner/index routing operation; at most `RAG_MAX_BULK_EVENTS`. Every event's tags use the configured tag count/byte bounds. |
 | idempotency_key | string | optional | Batch-level idempotency key. |
 
 ## Response
@@ -38,6 +38,9 @@ Schema: `BulkHistoryEventsResponse`
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
+- More than `RAG_MAX_BULK_EVENTS` returns 400 `validation_error` with
+  `details.field=events`. Nested tag failures identify
+  `events[i].tags` or `events[i].tags[j]`. Validation happens before mutation.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 

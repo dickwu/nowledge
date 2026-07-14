@@ -29,7 +29,7 @@ Schema: `AppendHistoryEventRequest`
 | source_ref | SourceRef object | optional | Source reference with kind, id, optional uri, and optional meta. |
 | text | string | optional | Searchable human-readable event text. |
 | payload | object | optional, default {} | Structured event payload stored with the event. |
-| tags | string[] | optional, default [] | Search and grouping tags. |
+| tags | string[] | optional, default [] | Search and grouping tags; at most `RAG_MAX_TAGS_PER_ITEM`, each at most `RAG_MAX_TAG_BYTES` UTF-8 bytes. |
 | privacy | string | optional, default private | Privacy label for the event. |
 | promote_policy | string | optional, default none | Policy hint for promoting the event into state or context. |
 | idempotency_key | string | optional | Client key used to deduplicate writes for the owner. |
@@ -48,6 +48,9 @@ Schema: `HistoryEventResponse`
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
+- Excess tags return 400 `validation_error` with `details.field=tags`; an
+  oversized tag uses `details.field=tags[i]`. Validation happens before store
+  mutation.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 

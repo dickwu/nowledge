@@ -23,8 +23,8 @@ Schema: `AnalysisInsightRequest`
 | history_event_id | string | optional | When supplied, analysis is constrained to the selected event and other events from the same owner event index. |
 | query | string | required by handler | Analysis question or topic. |
 | seed_uris | string[] | optional, default [] | Extra seed context URIs used when not running in history_event_id mode. |
-| context_limit | integer | optional, default 8 | Maximum context hits used in prompt construction. |
-| link_limit | integer | optional, default 10 | Maximum existing links considered. |
+| context_limit | integer | optional, default 8 | Maximum context hits used in prompt construction; must not exceed `RAG_MAX_SEARCH_LIMIT`. |
+| link_limit | integer | optional, default 10 | Maximum existing links considered; must not exceed `RAG_MAX_SEARCH_LIMIT`. |
 | create_links | boolean | optional, default true | Persist proposed link candidates. |
 | upsert_insights | boolean | optional, default true | Persist proposed insight candidates. |
 | debug | boolean | optional, default false | Include prompt and debug-stage data where available; admin-only. |
@@ -49,6 +49,8 @@ Schema: `AnalysisInsightResponse`
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
+- `context_limit` or `link_limit` above `RAG_MAX_SEARCH_LIMIT` returns 400
+  `validation_error` naming that field before retrieval or persistence.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Authenticated non-admin principals receive 403 when `debug=true` because the response can contain a grounded prompt.
 - Configured secrets are redacted from the complete response. Provider previews

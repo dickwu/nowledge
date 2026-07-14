@@ -1,4 +1,8 @@
-use axum::{http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    http::{header::RETRY_AFTER, HeaderValue, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -44,6 +48,8 @@ pub struct ErrorInfo {
 pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
+    #[error("{message}")]
+    Validation { field: String, message: String },
     #[error("{0}")]
     Unauthorized(String),
     #[error("{0}")]
@@ -52,6 +58,14 @@ pub enum ApiError {
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("request payload is too large")]
+    PayloadTooLarge,
+    #[error("too many requests")]
+    TooManyRequests(u64),
+    #[error("service unavailable")]
+    ServiceUnavailable(u64),
+    #[error("request timed out")]
+    Timeout,
     #[error("{0}")]
     Upstream(String),
     #[error("{0}")]
@@ -61,6 +75,13 @@ pub enum ApiError {
 impl ApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::BadRequest(message.into())
+    }
+
+    pub fn validation(field: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Validation {
+            field: field.into(),
+            message: message.into(),
+        }
     }
 
     pub fn forbidden(message: impl Into<String>) -> Self {
@@ -75,13 +96,34 @@ impl ApiError {
         Self::Conflict(message.into())
     }
 
+    pub fn payload_too_large() -> Self {
+        Self::PayloadTooLarge
+    }
+
+    pub fn too_many_requests(retry_after_seconds: u64) -> Self {
+        Self::TooManyRequests(retry_after_seconds)
+    }
+
+    pub fn service_unavailable(retry_after_seconds: u64) -> Self {
+        Self::ServiceUnavailable(retry_after_seconds)
+    }
+
+    pub fn timeout() -> Self {
+        Self::Timeout
+    }
+
     fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
+            Self::Validation { .. } => (StatusCode::BAD_REQUEST, "validation_error"),
             Self::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+            Self::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, "too_many_requests"),
+            Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
+            Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
             Self::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
@@ -90,10 +132,15 @@ impl ApiError {
     fn public_message(&self) -> &str {
         match self {
             Self::BadRequest(message)
+            | Self::Validation { message, .. }
             | Self::Unauthorized(message)
             | Self::Forbidden(message)
             | Self::NotFound(message)
             | Self::Conflict(message) => message,
+            Self::PayloadTooLarge => "request payload is too large",
+            Self::TooManyRequests(_) => "too many requests",
+            Self::ServiceUnavailable(_) => "service unavailable",
+            Self::Timeout => "request timed out",
             Self::Upstream(_) => "upstream service unavailable",
             Self::Internal(_) => "internal server error",
         }
@@ -102,6 +149,13 @@ impl ApiError {
     fn private_cause(&self) -> Option<&str> {
         match self {
             Self::Upstream(cause) | Self::Internal(cause) => Some(cause),
+            _ => None,
+        }
+    }
+
+    fn retry_after_seconds(&self) -> Option<u64> {
+        match self {
+            Self::TooManyRequests(seconds) | Self::ServiceUnavailable(seconds) => Some(*seconds),
             _ => None,
         }
     }
@@ -134,13 +188,23 @@ impl IntoResponse for ApiError {
             }
             request_id
         });
-        let details = match request_id {
-            Some(request_id) => json!({
+        let details = match (&self, request_id) {
+            (Self::Validation { field, .. }, Some(request_id)) => json!({
+                "status": status.as_u16(),
+                "field": field,
+                "request_id": request_id
+            }),
+            (Self::Validation { field, .. }, None) => json!({
+                "status": status.as_u16(),
+                "field": field
+            }),
+            (_, Some(request_id)) => json!({
                 "status": status.as_u16(),
                 "request_id": request_id
             }),
-            None => json!({ "status": status.as_u16() }),
+            (_, None) => json!({ "status": status.as_u16() }),
         };
+        let retry_after_seconds = self.retry_after_seconds();
         let body = ErrorBody {
             error: ErrorInfo {
                 code: code.to_string(),
@@ -148,7 +212,13 @@ impl IntoResponse for ApiError {
                 details: Some(details),
             },
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(seconds) = retry_after_seconds {
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -201,7 +271,10 @@ impl From<anyhow::Error> for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_cause_diagnostic, safe_value_fingerprint};
+    use axum::{body::to_bytes, http::header::RETRY_AFTER, response::IntoResponse};
+    use serde_json::Value;
+
+    use super::{safe_cause_diagnostic, safe_value_fingerprint, ApiError};
 
     #[test]
     fn safe_diagnostic_emits_only_category_and_keyed_fingerprint() {
@@ -223,5 +296,44 @@ mod tests {
 
         assert_eq!(first, repeated);
         assert_ne!(first, other_namespace);
+    }
+
+    #[tokio::test]
+    async fn validation_errors_include_the_field_in_the_stable_envelope() {
+        let response =
+            ApiError::validation("rows", "rows exceeds the configured maximum").into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "validation_error");
+        assert_eq!(body["error"]["details"]["status"], 400);
+        assert_eq!(body["error"]["details"]["field"], "rows");
+    }
+
+    #[test]
+    fn pressure_errors_set_retry_after_without_changing_the_envelope_status() {
+        for error in [
+            ApiError::too_many_requests(17),
+            ApiError::service_unavailable(3),
+        ] {
+            let response = error.into_response();
+            assert!(matches!(response.status().as_u16(), 429 | 503));
+            assert!(matches!(
+                response
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("17" | "3")
+            ));
+        }
+    }
+
+    #[test]
+    fn timeout_uses_gateway_timeout() {
+        assert_eq!(
+            ApiError::timeout().into_response().status(),
+            axum::http::StatusCode::GATEWAY_TIMEOUT
+        );
     }
 }

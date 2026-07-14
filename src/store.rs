@@ -12,7 +12,7 @@ use crate::{
     error::ApiError,
     fragmenter::{BlockAwareFragmenter, FragmentChunk},
     models::*,
-    parser::{parser_from_config, ParserInput, ParserOutput},
+    parser::{parser_from_config, ParserInput, ParserOutput, StagedUpload},
     repository::{repository_from_config, KnowledgeRepository, RepositoryContextSearchQuery},
     resolver::{EventIndexResolver, EVENT_INDEX_SCHEMA_VERSION, EVENT_SETTINGS_HASH},
     util::{
@@ -26,6 +26,7 @@ use crate::{
 const INGEST_ERROR_PARSER_FAILED: &str = "parser_failed";
 const INGEST_ERROR_INDEXING_FAILED: &str = "indexing_failed";
 const INGEST_ERROR_FAILED: &str = "ingest_failed";
+const INGEST_ERROR_INTERRUPTED: &str = "ingest_interrupted";
 
 #[derive(Clone)]
 pub struct Store {
@@ -304,13 +305,32 @@ impl Store {
         counts.insert("eval_case_results".to_string(), json!(eval_result_count));
         counts.insert("eval_overviews".to_string(), json!(eval_overview_count));
 
+        let mut restored_nonterminal_tasks = Vec::new();
         if let Some(tasks) = self.repository.list_ingest_tasks(tenant_id).await? {
             let mut data = self.write()?;
             let count = tasks.len();
             for task in tasks {
+                if data.ingest_tasks.contains_key(&task.task_id) {
+                    continue;
+                }
+                if is_nonterminal_ingest_state(&task.state) {
+                    restored_nonterminal_tasks.push(task.task_id.clone());
+                }
                 data.ingest_tasks.insert(task.task_id.clone(), task);
             }
             counts.insert("ingest_tasks".to_string(), json!(count));
+        }
+        let mut interrupted = 0usize;
+        for task_id in restored_nonterminal_tasks {
+            if self.mark_ingest_task_interrupted_async(&task_id).await? {
+                interrupted += 1;
+            }
+        }
+        if interrupted > 0 {
+            tracing::info!(
+                interrupted_tasks = interrupted,
+                "terminalized non-replayable ingest tasks during hydration"
+            );
         }
         if let Some(results) = self.repository.list_ingest_results(tenant_id).await? {
             let mut data = self.write()?;
@@ -1632,9 +1652,9 @@ impl Store {
         config: &Config,
     ) -> Result<IngestTask, ApiError> {
         let task = self
-            .create_ingest_task_record_async(tenant_id, &req, config, 0)
+            .create_ingest_task_record_async(tenant_id, &req, config, false, 0)
             .await?;
-        self.run_ingest_task_async(tenant_id, &task.task_id, req, config)
+        self.run_ingest_task_async(tenant_id, &task.task_id, req, None, config)
             .await
             .map(|result| result.task)
     }
@@ -1674,16 +1694,23 @@ impl Store {
         Ok(expired)
     }
 
-    pub async fn ingest_file_sync_async(
+    pub async fn ingest_file_sync_async<F>(
         &self,
         tenant_id: &str,
         req: IngestTaskRequest,
+        staged_upload: Option<StagedUpload>,
         config: &Config,
-    ) -> Result<IngestTaskResult, ApiError> {
+        on_task_created: F,
+    ) -> Result<IngestTaskResult, ApiError>
+    where
+        F: FnOnce(&str),
+    {
+        let has_staged_upload = staged_upload.is_some();
         let task = self
-            .create_ingest_task_record_async(tenant_id, &req, config, 0)
+            .create_ingest_task_record_async(tenant_id, &req, config, has_staged_upload, 0)
             .await?;
-        self.run_ingest_task_async(tenant_id, &task.task_id, req, config)
+        on_task_created(&task.task_id);
+        self.run_ingest_task_async(tenant_id, &task.task_id, req, staged_upload, config)
             .await
     }
 
@@ -1692,6 +1719,7 @@ impl Store {
         tenant_id: &str,
         req: &IngestTaskRequest,
         config: &Config,
+        has_staged_upload: bool,
         queued_ahead: usize,
     ) -> Result<IngestTask, ApiError> {
         let mut parser_config = config.clone();
@@ -1713,6 +1741,7 @@ impl Store {
             .is_some_and(|content| !content.trim().is_empty());
         if !has_content
             && req.bytes.as_ref().is_none_or(Vec::is_empty)
+            && !has_staged_upload
             && req.content_list.is_none()
             && req.content_list_v2.is_none()
         {
@@ -1777,11 +1806,11 @@ impl Store {
             result_url: Some(format!("/v1/ingest/tasks/{task_id}/result")),
             queued_ahead: Some(queued_ahead),
         };
+        let _ = self.repository.upsert_ingest_task(&task).await?;
         {
             let mut data = self.write()?;
             data.ingest_tasks.insert(task.task_id.clone(), task.clone());
         }
-        let _ = self.repository.upsert_ingest_task(&task).await?;
         Ok(task)
     }
 
@@ -1789,7 +1818,8 @@ impl Store {
         &self,
         tenant_id: &str,
         task_id: &str,
-        req: IngestTaskRequest,
+        mut req: IngestTaskRequest,
+        staged_upload: Option<StagedUpload>,
         config: &Config,
     ) -> Result<IngestTaskResult, ApiError> {
         let mut parser_config = config.clone();
@@ -1800,23 +1830,42 @@ impl Store {
             parser_config.mineru_backend = backend.to_string();
         }
         let task = self.ingest_task_for_run(task_id)?;
-        let original_content = req
-            .content
-            .clone()
-            .or_else(|| {
-                req.bytes
-                    .as_ref()
-                    .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
-            })
-            .unwrap_or_default();
+        let uses_builtin_parser = parser_config.parser_provider == "builtin";
+        let staged_builtin_upload = uses_builtin_parser && staged_upload.is_some();
+        let staged_original = (!uses_builtin_parser)
+            .then(|| staged_upload.clone())
+            .flatten();
+        let original_content = if uses_builtin_parser {
+            String::new()
+        } else {
+            req.content
+                .clone()
+                .or_else(|| {
+                    req.bytes
+                        .as_ref()
+                        .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
+                })
+                .unwrap_or_default()
+        };
+        let parser_content = if uses_builtin_parser {
+            req.content.take()
+        } else {
+            req.content.clone()
+        };
+        let parser_bytes = if uses_builtin_parser {
+            req.bytes.take()
+        } else {
+            req.bytes.clone()
+        };
 
         self.transition_ingest_task_async(task_id, "parsing", None)
             .await?;
         let parser = parser_from_config(&parser_config);
-        let parsed = match parser
+        let mut parsed = match parser
             .parse(ParserInput {
-                content: req.content.clone(),
-                bytes: req.bytes.clone(),
+                content: parser_content,
+                bytes: parser_bytes,
+                staged_upload,
                 content_type: req.content_type.clone(),
                 file_name: req.file_name.clone(),
                 content_list: req.content_list.clone(),
@@ -1839,13 +1888,26 @@ impl Store {
             }
         };
 
+        let staged_original_content = if original_content.is_empty() {
+            match staged_original {
+                Some(upload) => upload.read_utf8().await?,
+                None => None,
+            }
+        } else {
+            None
+        };
+
         self.transition_ingest_task_async(task_id, "parsed", None)
             .await?;
-        let document_content = parsed_content(&original_content, &parsed);
-        let checksum = req
-            .checksum
-            .clone()
-            .unwrap_or_else(|| sha256_hex(document_content.as_bytes()));
+        // The built-in parser already performs the single bounded staged-file read.
+        // Reuse its markdown rather than materializing the upload a second time.
+        let original_content_for_artifacts = if !original_content.is_empty() {
+            original_content.as_str()
+        } else if staged_builtin_upload {
+            parsed.markdown.as_deref().unwrap_or_default()
+        } else {
+            staged_original_content.as_deref().unwrap_or_default()
+        };
         let artifacts = build_parse_artifacts(
             tenant_id,
             req.owner_user_id.clone(),
@@ -1853,7 +1915,7 @@ impl Store {
             &task.source_id,
             &task.revision_id,
             &parsed,
-            &original_content,
+            original_content_for_artifacts,
         )?;
         let artifact_refs = artifacts
             .iter()
@@ -1864,6 +1926,28 @@ impl Store {
                 checksum: Some(artifact.checksum.clone()),
             })
             .collect::<Vec<_>>();
+        let document_content = parsed
+            .markdown
+            .take()
+            .filter(|content| !content.trim().is_empty())
+            .unwrap_or_else(|| {
+                if !original_content.trim().is_empty() {
+                    original_content
+                } else if let Some(content) = staged_original_content {
+                    content
+                } else {
+                    parsed
+                        .blocks
+                        .iter()
+                        .filter_map(parsed_block_text)
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                }
+            });
+        let checksum = req
+            .checksum
+            .clone()
+            .unwrap_or_else(|| sha256_hex(document_content.as_bytes()));
 
         self.transition_ingest_task_async(task_id, "fragmenting", None)
             .await?;
@@ -1917,9 +2001,8 @@ impl Store {
             return Err(err);
         }
 
-        let task = self
-            .transition_ingest_task_async(task_id, "completed", None)
-            .await?;
+        let mut task = self.ingest_task_for_run(task_id)?;
+        apply_ingest_task_transition(&mut task, "completed", None);
         let result = IngestTaskResult {
             task: task.clone(),
             source_document_uri: ingest.source_document_uri,
@@ -1930,12 +2013,23 @@ impl Store {
             context_uris: ingest.fragment_uris.clone(),
             fragment_uris: ingest.fragment_uris,
         };
+        let _ = self.repository.upsert_ingest_result(&result).await?;
+        let _ = self.repository.upsert_ingest_task(&task).await?;
         {
             let mut data = self.write()?;
+            let current = data
+                .ingest_tasks
+                .get(task_id)
+                .ok_or_else(|| ApiError::not_found("ingest task not found"))?;
+            if !is_nonterminal_ingest_state(&current.state) {
+                return Err(ApiError::conflict(
+                    "ingest task was terminalized before completion",
+                ));
+            }
+            data.ingest_tasks.insert(task.task_id.clone(), task.clone());
             data.ingest_results
                 .insert(task.task_id.clone(), result.clone());
         }
-        let _ = self.repository.upsert_ingest_result(&result).await?;
         Ok(result)
     }
 
@@ -1961,9 +2055,13 @@ impl Store {
         include_all_private: bool,
     ) -> Result<IngestTaskResult, ApiError> {
         let data = self.read()?;
-        data.ingest_results
+        let visible_completed_task = data
+            .ingest_tasks
             .get(task_id)
-            .filter(|result| ingest_task_visible(&result.task, owner_user_id, include_all_private))
+            .filter(|task| ingest_task_visible(task, owner_user_id, include_all_private))
+            .filter(|task| task.state == "completed");
+        visible_completed_task
+            .and_then(|_| data.ingest_results.get(task_id))
             .cloned()
             .map(|mut result| {
                 result.task = sanitize_ingest_task(result.task);
@@ -5042,13 +5140,111 @@ impl Store {
             .ingest_tasks
             .get_mut(task_id)
             .ok_or_else(|| ApiError::not_found("ingest task not found"))?;
-        task.state = state.to_string();
-        task.error = sanitize_ingest_error(state, error.as_deref()).map(ToString::to_string);
-        task.updated_at = now();
-        if matches!(state, "completed" | "failed") {
-            task.completed_at = Some(task.updated_at);
-        }
+        apply_ingest_task_transition(task, state, error.as_deref());
         Ok(task.clone())
+    }
+
+    fn fail_nonterminal_ingest_task(
+        &self,
+        task_id: &str,
+        error: &'static str,
+    ) -> Result<Option<IngestTask>, ApiError> {
+        let mut data = self.write()?;
+        let task = data
+            .ingest_tasks
+            .get_mut(task_id)
+            .ok_or_else(|| ApiError::not_found("ingest task not found"))?;
+        if !is_nonterminal_ingest_state(&task.state) {
+            return Ok(None);
+        }
+        task.state = "failed".to_string();
+        task.error = Some(error.to_string());
+        task.updated_at = now();
+        task.completed_at = Some(task.updated_at);
+        Ok(Some(task.clone()))
+    }
+
+    async fn fail_nonterminal_ingest_task_async(
+        &self,
+        task_id: &str,
+        error: &'static str,
+    ) -> Result<bool, ApiError> {
+        let Some(task) = self.fail_nonterminal_ingest_task(task_id, error)? else {
+            return Ok(false);
+        };
+        let _ = self.repository.upsert_ingest_task(&task).await?;
+        Ok(true)
+    }
+
+    pub(crate) fn mark_ingest_task_interrupted_local(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<IngestTask>, ApiError> {
+        self.fail_nonterminal_ingest_task(task_id, INGEST_ERROR_INTERRUPTED)
+    }
+
+    pub(crate) fn mark_ingest_task_failed_local(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<IngestTask>, ApiError> {
+        self.fail_nonterminal_ingest_task(task_id, INGEST_ERROR_FAILED)
+    }
+
+    pub(crate) async fn persist_ingest_task_record(
+        &self,
+        task: &IngestTask,
+    ) -> Result<(), ApiError> {
+        let _ = self.repository.upsert_ingest_task(task).await?;
+        Ok(())
+    }
+
+    pub async fn mark_ingest_task_interrupted_async(
+        &self,
+        task_id: &str,
+    ) -> Result<bool, ApiError> {
+        self.fail_nonterminal_ingest_task_async(task_id, INGEST_ERROR_INTERRUPTED)
+            .await
+    }
+
+    pub async fn mark_ingest_task_failed_async(&self, task_id: &str) -> Result<bool, ApiError> {
+        self.fail_nonterminal_ingest_task_async(task_id, INGEST_ERROR_FAILED)
+            .await
+    }
+
+    pub async fn interrupt_nonterminal_ingest_tasks_async(
+        &self,
+        tenant_id: &str,
+    ) -> Result<usize, ApiError> {
+        let tasks = self.interrupt_nonterminal_ingest_tasks_local(tenant_id)?;
+        for task in &tasks {
+            self.persist_ingest_task_record(task).await?;
+        }
+        Ok(tasks.len())
+    }
+
+    pub(crate) fn interrupt_nonterminal_ingest_tasks_local(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<IngestTask>, ApiError> {
+        let mut data = self.write()?;
+        let mut interrupted = Vec::new();
+        for task in data.ingest_tasks.values_mut() {
+            if task.tenant_id == tenant_id && is_nonterminal_ingest_state(&task.state) {
+                apply_ingest_task_transition(task, "failed", Some(INGEST_ERROR_INTERRUPTED));
+                interrupted.push(task.clone());
+            }
+        }
+        Ok(interrupted)
+    }
+
+    pub(crate) async fn persist_ingest_task_records(
+        &self,
+        tasks: &[IngestTask],
+    ) -> Result<(), ApiError> {
+        for task in tasks {
+            self.persist_ingest_task_record(task).await?;
+        }
+        Ok(())
     }
 
     async fn transition_ingest_task_async(
@@ -6741,25 +6937,6 @@ fn source_document_context_node(document: SourceDocument) -> ContextNode {
     }
 }
 
-fn parsed_content(original: &str, parsed: &ParserOutput) -> String {
-    parsed
-        .markdown
-        .clone()
-        .filter(|content| !content.trim().is_empty())
-        .unwrap_or_else(|| {
-            if original.trim().is_empty() {
-                parsed
-                    .blocks
-                    .iter()
-                    .filter_map(parsed_block_text)
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
-            } else {
-                original.to_string()
-            }
-        })
-}
-
 fn parsed_block_text(block: &ParsedBlock) -> Option<String> {
     block
         .text
@@ -6941,8 +7118,27 @@ fn sanitize_ingest_error(state: &str, error: Option<&str>) -> Option<&'static st
     match error {
         Some(INGEST_ERROR_PARSER_FAILED) => Some(INGEST_ERROR_PARSER_FAILED),
         Some(INGEST_ERROR_INDEXING_FAILED) => Some(INGEST_ERROR_INDEXING_FAILED),
+        Some(INGEST_ERROR_INTERRUPTED) => Some(INGEST_ERROR_INTERRUPTED),
         Some(_) | None => Some(INGEST_ERROR_FAILED),
     }
+}
+
+fn apply_ingest_task_transition(task: &mut IngestTask, state: &str, error: Option<&str>) {
+    task.state = state.to_string();
+    task.error = sanitize_ingest_error(state, error).map(ToString::to_string);
+    task.updated_at = now();
+    if matches!(state, "completed" | "failed") {
+        task.completed_at = Some(task.updated_at);
+    } else {
+        task.completed_at = None;
+    }
+}
+
+fn is_nonterminal_ingest_state(state: &str) -> bool {
+    matches!(
+        state,
+        "queued" | "parsing" | "parsed" | "fragmenting" | "indexing"
+    )
 }
 
 fn sanitize_ingest_task(mut task: IngestTask) -> IngestTask {
