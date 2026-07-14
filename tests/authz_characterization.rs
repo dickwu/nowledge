@@ -187,6 +187,52 @@ async fn owner_scope_forbids_cross_owner_event_index_reads() {
 }
 
 #[tokio::test]
+async fn owner_mismatch_precedes_history_boundary_validation() {
+    let app = characterized_app();
+    let oversized_tag = "x".repeat(129);
+    let cases = [
+        (
+            "/v1/history/users/u2/events",
+            json!({ "tags": [oversized_tag.clone()] }),
+        ),
+        (
+            "/v1/history/users/u2/events:bulk",
+            json!({ "events": [{ "tags": [oversized_tag.clone()] }] }),
+        ),
+        ("/v1/history/users/u2/search", json!({ "limit": 101 })),
+        ("/v1/history/users/u2/timeline", json!({ "limit": 101 })),
+        (
+            "/v1/history/events",
+            json!({ "owner_user_id": "u2", "tags": [oversized_tag.clone()] }),
+        ),
+        (
+            "/v1/history/events:bulk",
+            json!({
+                "events": [{
+                    "owner_user_id": "u2",
+                    "tags": [oversized_tag]
+                }]
+            }),
+        ),
+        (
+            "/v1/history/search",
+            json!({ "owner_user_id": "u2", "limit": 101 }),
+        ),
+        (
+            "/v1/history/timeline",
+            json!({ "owner_user_id": "u2", "limit": 101 }),
+        ),
+    ];
+
+    for (uri, body) in cases {
+        let (status, response) =
+            call(app.clone(), Method::POST, uri, body, Some(OWNER_U1_TOKEN)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {response}");
+        assert_error(&response, StatusCode::FORBIDDEN, "forbidden");
+    }
+}
+
+#[tokio::test]
 async fn tenant_service_scope_can_access_multiple_explicit_owners() {
     let app = characterized_app();
     for owner_user_id in ["u1", "u2"] {

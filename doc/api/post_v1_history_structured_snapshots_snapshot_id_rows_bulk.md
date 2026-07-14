@@ -21,7 +21,7 @@ Schema: `BulkStructuredRowsRequest`
 
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| rows | object[] | optional, default [] | Rows to attach to the snapshot. |
+| rows | object[] | optional, default [] | Rows to attach to the snapshot; at most `RAG_MAX_BULK_ROWS`. |
 | mode | string | optional, default insert | Write mode for row ingestion. |
 | idempotency_key | string | optional | Client deduplication key. |
 
@@ -39,6 +39,8 @@ Schema: `BulkStructuredRowsResponse`
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
+- More than `RAG_MAX_BULK_ROWS` returns 400 `validation_error` with
+  `details.field=rows` before snapshot lookup or store mutation.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 

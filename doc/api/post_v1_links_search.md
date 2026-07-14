@@ -25,7 +25,7 @@ Schema: `LinkSearchRequest`
 | direction | string | optional, default both | Link direction: both, outbound, or backlinks. |
 | relations | string[] | optional, default [] | Relationship type filter. |
 | status | string | optional, default active | Link status filter. |
-| limit | integer | optional, default 10 | Maximum links returned. |
+| limit | integer | optional, default 10 | Maximum links returned; must not exceed `RAG_MAX_SEARCH_LIMIT`. |
 
 ## Response
 Schema: `LinkSearchResponse`
@@ -38,6 +38,8 @@ Schema: `LinkSearchResponse`
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
+- `limit` above `RAG_MAX_SEARCH_LIMIT` returns 400 `validation_error` with
+  `details.field=limit` before search.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 

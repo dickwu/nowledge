@@ -26,6 +26,43 @@ Use `include: ["traceback"]`, `POST /v1/context/traceback`, or explicit `GET /v1
 
 `ContextNode.node_kind` is one of `source_doc`, `fragment`, `abstract`, or `overview`. `ContextNode.retrieval_role` is one of `none`, `fragment`, or `overview`. Source documents are stored in `rag_source_documents` with `retrieval_enabled=false` by default.
 
+## HTTP Boundary Contract
+
+Every response carries a server-generated `X-Request-Id`; configured browser
+origins can read it and `Retry-After`. Non-multipart request bodies are capped
+by `RAG_MAX_JSON_BYTES`, ordinary route execution by
+`RAG_REQUEST_TIMEOUT_MS`, concurrent work by `RAG_MAX_IN_FLIGHT_REQUESTS`, and
+authenticated callers by `RAG_RATE_LIMIT_REQUESTS_PER_MINUTE` per logical
+tenant/principal. Token rotation does not reset that principal budget.
+`/readyz` uses a separate public-probe budget. `/livez` bypasses body,
+capacity, rate, and timeout enforcement so saturation does not hide process
+liveness.
+
+`RAG_CORS_ALLOWED_ORIGINS` accepts comma-separated exact HTTP(S) origins.
+Development/test default to `*`; production defaults to no browser origin and
+requires `RAG_ALLOW_WILDCARD_CORS=true` for an explicit sole wildcard.
+
+Boundary errors retain the shared JSON shape
+`{"error":{"code","message","details"}}`:
+
+| Condition | Status and `error.code` | Additional contract |
+| --- | --- | --- |
+| JSON body, multipart metadata/framing, or upload too large | 413 `payload_too_large` | `details.status=413` |
+| Principal rate or ingest queue pressure | 429 `too_many_requests` | `Retry-After` is present |
+| Global capacity, disabled ingest worker, or closing service | 503 `service_unavailable` | `Retry-After` is present |
+| Route deadline | 504 `timeout` | `details.status=504`; a created sync-ingest task becomes `ingest_interrupted` |
+| Bulk, search, tag, MIME, or multipart-shape validation | 400 `validation_error` | `details.field` identifies the rejected field |
+
+These boundary 503 responses are distinct from `/readyz` and `/healthz`
+dependency-health 503 responses, which keep their documented health payloads.
+The default upload MIME allowlist includes `application/octet-stream`; see
+[ADR 0003](adr/0003-http-ingest-runtime-boundaries.md) and the upload endpoint
+documents for the complete policy.
+
+Synchronous ingest has an additional, separate immediate load-shed lane capped
+by `RAG_INGEST_MAX_CONCURRENT_TASKS`. When full, both sync ingest routes return
+503 plus `Retry-After` before buffering their JSON or multipart request bodies.
+
 ## Endpoint Index
 
 | Method | Path | Handler | Document |

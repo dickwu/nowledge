@@ -26,7 +26,7 @@ Schema: `HistorySearchRequest`
 | owner_user_id | string | optional or path-derived | Owner scope for alias endpoints; path-scoped routes override it. |
 | from | RFC3339 datetime | optional | Lower occurred_at bound. |
 | to | RFC3339 datetime | optional | Upper occurred_at bound. |
-| limit | integer | optional, default 10 | Maximum number of events returned. |
+| limit | integer | optional, default 10 | Maximum number of events returned; must not exceed `RAG_MAX_SEARCH_LIMIT`. |
 
 ## Response
 Schema: `HistorySearchResponse`
@@ -38,6 +38,8 @@ Schema: `HistorySearchResponse`
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
+- `limit` above `RAG_MAX_SEARCH_LIMIT` returns 400 `validation_error` with
+  `details.field=limit`. The alias and path-scoped route use the same bound.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 

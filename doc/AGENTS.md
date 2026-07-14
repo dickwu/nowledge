@@ -15,6 +15,7 @@ APIs and must stay in sync with the router.
 |------|-------------|
 | `README.md` | Endpoint index. Lists every documented route as a `\| Method \| Path \| Handler \| Document \|` row, plus narrative context for retrieval semantics (return profiles, include values, structured filters, traceback rules, citation provenance, and the `ContextNode.node_kind` / `retrieval_role` enumerations). |
 | `api_manifest.json` | Machine-readable list of `{ method, path, handler, group, file }` entries. Groups in use: `Health`, `Admin`, `Harness`, `Analysis`, `Context`, `Debug`, `Eval`, `Context FS`, `Company Docs`, `History Alias`, `Insights`, `Structured History`, `History User Indexes`, `History Events`, `Links`, `LLM`, `Ingest`, `RAG`, `Sessions`, `State`, `Structured State`, `Usage`. Useful for tooling that validates handler/path coverage. |
+| `adr/0003-http-ingest-runtime-boundaries.md` | Decision record for typed HTTP limits, production CORS, stable pressure/timeout errors, streamed multipart staging, queue admission, recovery, and coordinated shutdown. |
 
 ## Subdirectories
 | Directory | Purpose |

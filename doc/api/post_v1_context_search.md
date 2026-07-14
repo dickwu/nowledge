@@ -26,7 +26,7 @@ Schema: `ContextSearchRequest`
 | include | string[] | optional, default [] | Optional payload expansions. Supported values: `traceback`, `links`, `neighbor_fragments`, `source_summary`, `artifact_refs`, `score_breakdown`, `raw_stage_debug`. |
 | return_profile | string | optional, default standard | Response profile: `compact`, `standard`, or `full`. |
 | owner_user_id | string | optional, auth default may apply | Owner scope. |
-| limit | integer | optional, default 10 | Maximum context hits returned. |
+| limit | integer | optional, default 10 | Maximum context hits returned; must not exceed `RAG_MAX_SEARCH_LIMIT`. |
 | debug | boolean | optional, default false | Include stage details in the trace response. |
 
 ### Structured Filter Fields
@@ -122,6 +122,8 @@ an eight-character heuristic floor to avoid rewriting ordinary short words.
 
 ## Errors and Access Rules
 - Malformed JSON, unsupported `include`, unsupported `return_profile`, or invalid filter value types return 400.
+- `limit` above `RAG_MAX_SEARCH_LIMIT` returns 400 `validation_error` with
+  `details.field=limit` before retrieval.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Source documents with `retrieval_enabled=false` are not returned by default search.
 - Default retrieval always enforces active fragments only: `status=active`, `retrieval_enabled=true`, and `retrieval_role=fragment`.

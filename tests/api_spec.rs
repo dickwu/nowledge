@@ -877,7 +877,7 @@ async fn async_ingest_task_returns_queued_and_worker_completes() {
 }
 
 #[tokio::test]
-async fn async_ingest_not_ready_failure_acl_and_usage_are_reported() {
+async fn disabled_async_ingest_is_rejected_without_creating_usage() {
     let mut config = Config::test();
     config.ingest_worker_enabled = false;
     let app = authed_app_with_config(config);
@@ -893,33 +893,8 @@ async fn async_ingest_not_ready_failure_acl_and_usage_are_reported() {
         Some("u1-token"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{task}");
-    assert_eq!(task["state"], "queued");
-    let task_id = task["task_id"].as_str().unwrap();
-
-    let (status, result) = call_with_token(
-        app.clone(),
-        Method::GET,
-        &format!("/v1/ingest/tasks/{task_id}/result"),
-        Value::Null,
-        Some("u1-token"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{result}");
-    assert!(result["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("not ready"));
-
-    let (status, u2_task) = call_with_token(
-        app.clone(),
-        Method::GET,
-        &format!("/v1/ingest/tasks/{task_id}"),
-        Value::Null,
-        Some("u2-token"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{u2_task}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{task}");
+    assert_eq!(task["error"]["code"], "service_unavailable");
 
     let (status, usage) = call_with_token(
         app,
@@ -930,7 +905,8 @@ async fn async_ingest_not_ready_failure_acl_and_usage_are_reported() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{usage}");
-    assert_eq!(usage["providers"]["ingest"]["queued"], 1);
+    assert_eq!(usage["providers"]["ingest"]["task_count"], 0);
+    assert_eq!(usage["providers"]["ingest"]["queued"], 0);
 }
 
 #[tokio::test]

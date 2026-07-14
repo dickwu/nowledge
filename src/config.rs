@@ -15,6 +15,23 @@ const MIN_REDACTION_SECRET_CHARS: usize = 4;
 const CODEX_SECRET_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const MIN_PRODUCTION_INDEX_HASH_SECRET_BYTES: usize = 32;
 const MIN_PRODUCTION_INDEX_HASH_SECRET_DISTINCT_BYTES: usize = 12;
+const DEFAULT_MAX_JSON_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
+const DEFAULT_MAX_MULTIPART_FIELDS: usize = 32;
+const MULTIPART_FRAMING_ALLOWANCE_PER_FIELD_BYTES: usize = 16 * 1024;
+const DEFAULT_MAX_BULK_EVENTS: usize = 500;
+const DEFAULT_MAX_BULK_ROWS: usize = 5_000;
+const DEFAULT_MAX_SEARCH_LIMIT: usize = 100;
+const DEFAULT_MAX_TAGS_PER_ITEM: usize = 64;
+const DEFAULT_MAX_TAG_BYTES: usize = 128;
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_SYNC_INGEST_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 256;
+const DEFAULT_RATE_LIMIT_REQUESTS_PER_MINUTE: u64 = 600;
+const DEFAULT_INGEST_MAX_CONCURRENT_TASKS: usize = 2;
+const DEFAULT_INGEST_QUEUE_MULTIPLIER: usize = 8;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
+const MAX_BOUNDARY_DEADLINE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone)]
 pub struct Config {
@@ -43,6 +60,23 @@ pub struct Config {
     pub mineru_return_content_list: bool,
     pub mineru_return_middle_json: bool,
     pub mineru_return_images: bool,
+    pub max_json_bytes: usize,
+    pub max_upload_bytes: usize,
+    pub max_multipart_fields: usize,
+    pub max_bulk_events: usize,
+    pub max_bulk_rows: usize,
+    pub max_search_limit: usize,
+    pub max_tags_per_item: usize,
+    pub max_tag_bytes: usize,
+    pub upload_allowed_mime_types: Vec<String>,
+    pub request_timeout_ms: u64,
+    pub sync_ingest_timeout_ms: u64,
+    pub max_in_flight_requests: usize,
+    pub rate_limit_requests_per_minute: u64,
+    pub ingest_queue_capacity: usize,
+    pub shutdown_timeout_ms: u64,
+    pub cors_allowed_origins: Vec<String>,
+    pub allow_wildcard_cors: bool,
     pub ingest_max_concurrent_tasks: usize,
     pub ingest_task_retention_seconds: u64,
     pub ingest_cleanup_interval_seconds: u64,
@@ -69,6 +103,7 @@ pub struct Config {
     pub vector_match_doc_weight: f32,
     pub vector_match_min_score: f32,
     auth_config_error: Option<String>,
+    boundary_config_error: Option<String>,
     previous_redaction_secrets: Vec<String>,
     codex_secret_inventory: Arc<Mutex<CodexSecretInventory>>,
     codex_secret_refresh: Arc<Mutex<CodexSecretRefreshState>>,
@@ -139,6 +174,37 @@ impl Config {
             },
             Err(_) => None,
         };
+        let mut boundary_errors = Vec::new();
+        let ingest_max_concurrent_tasks = parse_env_number(
+            "RAG_INGEST_MAX_CONCURRENT_TASKS",
+            DEFAULT_INGEST_MAX_CONCURRENT_TASKS,
+            &mut boundary_errors,
+        );
+        let default_ingest_queue_capacity = ingest_max_concurrent_tasks
+            .checked_mul(DEFAULT_INGEST_QUEUE_MULTIPLIER)
+            .unwrap_or_else(|| {
+                boundary_errors.push(
+                    "RAG_INGEST_MAX_CONCURRENT_TASKS is too large to derive RAG_INGEST_QUEUE_CAPACITY"
+                        .to_string(),
+                );
+                DEFAULT_INGEST_MAX_CONCURRENT_TASKS * DEFAULT_INGEST_QUEUE_MULTIPLIER
+            });
+        let max_json_bytes = parse_env_number(
+            "RAG_MAX_JSON_BYTES",
+            DEFAULT_MAX_JSON_BYTES,
+            &mut boundary_errors,
+        );
+        let max_upload_bytes = parse_env_number(
+            "RAG_MAX_UPLOAD_BYTES",
+            DEFAULT_MAX_UPLOAD_BYTES,
+            &mut boundary_errors,
+        );
+        let cors_allowed_origins = std::env::var("RAG_CORS_ALLOWED_ORIGINS")
+            .map(|value| parse_cors_allowed_origins(&value))
+            .unwrap_or_else(|_| default_cors_allowed_origins(&run_mode));
+        let upload_allowed_mime_types = std::env::var("RAG_UPLOAD_ALLOWED_MIME_TYPES")
+            .map(|value| parse_csv_values(&value))
+            .unwrap_or_else(|_| default_upload_allowed_mime_types());
 
         let config = Self {
             host: std::env::var("RAG_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
@@ -195,10 +261,74 @@ impl Config {
             mineru_return_images: std::env::var("RAG_MINERU_RETURN_IMAGES")
                 .map(|v| truthy(&v))
                 .unwrap_or(true),
-            ingest_max_concurrent_tasks: std::env::var("RAG_INGEST_MAX_CONCURRENT_TASKS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2),
+            max_json_bytes,
+            max_upload_bytes,
+            max_multipart_fields: parse_env_number(
+                "RAG_MAX_MULTIPART_FIELDS",
+                DEFAULT_MAX_MULTIPART_FIELDS,
+                &mut boundary_errors,
+            ),
+            max_bulk_events: parse_env_number(
+                "RAG_MAX_BULK_EVENTS",
+                DEFAULT_MAX_BULK_EVENTS,
+                &mut boundary_errors,
+            ),
+            max_bulk_rows: parse_env_number(
+                "RAG_MAX_BULK_ROWS",
+                DEFAULT_MAX_BULK_ROWS,
+                &mut boundary_errors,
+            ),
+            max_search_limit: parse_env_number(
+                "RAG_MAX_SEARCH_LIMIT",
+                DEFAULT_MAX_SEARCH_LIMIT,
+                &mut boundary_errors,
+            ),
+            max_tags_per_item: parse_env_number(
+                "RAG_MAX_TAGS_PER_ITEM",
+                DEFAULT_MAX_TAGS_PER_ITEM,
+                &mut boundary_errors,
+            ),
+            max_tag_bytes: parse_env_number(
+                "RAG_MAX_TAG_BYTES",
+                DEFAULT_MAX_TAG_BYTES,
+                &mut boundary_errors,
+            ),
+            upload_allowed_mime_types,
+            request_timeout_ms: parse_env_number(
+                "RAG_REQUEST_TIMEOUT_MS",
+                DEFAULT_REQUEST_TIMEOUT_MS,
+                &mut boundary_errors,
+            ),
+            sync_ingest_timeout_ms: parse_env_number(
+                "RAG_SYNC_INGEST_TIMEOUT_MS",
+                DEFAULT_SYNC_INGEST_TIMEOUT_MS,
+                &mut boundary_errors,
+            ),
+            max_in_flight_requests: parse_env_number(
+                "RAG_MAX_IN_FLIGHT_REQUESTS",
+                DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+                &mut boundary_errors,
+            ),
+            rate_limit_requests_per_minute: parse_env_number(
+                "RAG_RATE_LIMIT_REQUESTS_PER_MINUTE",
+                DEFAULT_RATE_LIMIT_REQUESTS_PER_MINUTE,
+                &mut boundary_errors,
+            ),
+            ingest_queue_capacity: parse_env_number(
+                "RAG_INGEST_QUEUE_CAPACITY",
+                default_ingest_queue_capacity,
+                &mut boundary_errors,
+            ),
+            shutdown_timeout_ms: parse_env_number(
+                "RAG_SHUTDOWN_TIMEOUT_MS",
+                DEFAULT_SHUTDOWN_TIMEOUT_MS,
+                &mut boundary_errors,
+            ),
+            cors_allowed_origins,
+            allow_wildcard_cors: std::env::var("RAG_ALLOW_WILDCARD_CORS")
+                .map(|v| truthy(&v))
+                .unwrap_or(false),
+            ingest_max_concurrent_tasks,
             ingest_task_retention_seconds: std::env::var("RAG_INGEST_TASK_RETENTION_SECONDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -278,6 +408,8 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.25),
             auth_config_error: (!auth_errors.is_empty()).then(|| auth_errors.join("; ")),
+            boundary_config_error: (!boundary_errors.is_empty())
+                .then(|| boundary_errors.join("; ")),
             previous_redaction_secrets: std::env::var("RAG_REDACTION_PREVIOUS_SECRETS")
                 .map(|value| parse_previous_redaction_secrets(&value))
                 .unwrap_or_default(),
@@ -467,6 +599,7 @@ impl Config {
             anyhow::bail!("RAG_PARSER_PROVIDER must be builtin or mineru");
         }
 
+        self.validate_http_boundaries()?;
         self.validate_index_hash_secret()?;
 
         self.validate_auth_configuration()?;
@@ -481,6 +614,109 @@ impl Config {
             );
         }
 
+        Ok(())
+    }
+
+    pub fn max_multipart_body_bytes(&self) -> Option<usize> {
+        let framing_allowance = self
+            .max_multipart_fields
+            .checked_mul(MULTIPART_FRAMING_ALLOWANCE_PER_FIELD_BYTES)?;
+        self.max_upload_bytes
+            .checked_add(self.max_json_bytes)?
+            .checked_add(framing_allowance)
+    }
+
+    fn validate_http_boundaries(&self) -> anyhow::Result<()> {
+        if let Some(error) = &self.boundary_config_error {
+            anyhow::bail!("invalid boundary configuration: {error}");
+        }
+
+        for (name, value) in [
+            ("RAG_MAX_JSON_BYTES", self.max_json_bytes as u128),
+            ("RAG_MAX_UPLOAD_BYTES", self.max_upload_bytes as u128),
+            (
+                "RAG_MAX_MULTIPART_FIELDS",
+                self.max_multipart_fields as u128,
+            ),
+            ("RAG_MAX_BULK_EVENTS", self.max_bulk_events as u128),
+            ("RAG_MAX_BULK_ROWS", self.max_bulk_rows as u128),
+            ("RAG_MAX_SEARCH_LIMIT", self.max_search_limit as u128),
+            ("RAG_MAX_TAGS_PER_ITEM", self.max_tags_per_item as u128),
+            ("RAG_MAX_TAG_BYTES", self.max_tag_bytes as u128),
+            ("RAG_REQUEST_TIMEOUT_MS", self.request_timeout_ms as u128),
+            (
+                "RAG_SYNC_INGEST_TIMEOUT_MS",
+                self.sync_ingest_timeout_ms as u128,
+            ),
+            (
+                "RAG_MAX_IN_FLIGHT_REQUESTS",
+                self.max_in_flight_requests as u128,
+            ),
+            (
+                "RAG_RATE_LIMIT_REQUESTS_PER_MINUTE",
+                self.rate_limit_requests_per_minute as u128,
+            ),
+            (
+                "RAG_INGEST_MAX_CONCURRENT_TASKS",
+                self.ingest_max_concurrent_tasks as u128,
+            ),
+            (
+                "RAG_INGEST_QUEUE_CAPACITY",
+                self.ingest_queue_capacity as u128,
+            ),
+            ("RAG_SHUTDOWN_TIMEOUT_MS", self.shutdown_timeout_ms as u128),
+        ] {
+            if value == 0 {
+                anyhow::bail!("{name} must be greater than zero");
+            }
+        }
+
+        let now = Instant::now();
+        for (name, value) in [
+            ("RAG_REQUEST_TIMEOUT_MS", self.request_timeout_ms),
+            ("RAG_SYNC_INGEST_TIMEOUT_MS", self.sync_ingest_timeout_ms),
+            ("RAG_SHUTDOWN_TIMEOUT_MS", self.shutdown_timeout_ms),
+        ] {
+            if value > MAX_BOUNDARY_DEADLINE_MS {
+                anyhow::bail!("{name} must not exceed {MAX_BOUNDARY_DEADLINE_MS} milliseconds");
+            }
+            if now.checked_add(Duration::from_millis(value)).is_none() {
+                anyhow::bail!("{name} is too large for platform deadline arithmetic");
+            }
+        }
+        if self.sync_ingest_timeout_ms < self.request_timeout_ms {
+            anyhow::bail!(
+                "RAG_SYNC_INGEST_TIMEOUT_MS must be greater than or equal to RAG_REQUEST_TIMEOUT_MS"
+            );
+        }
+        if self.max_multipart_body_bytes().is_none() {
+            anyhow::bail!(
+                "multipart upload, metadata, and framing limits exceed the platform size limit"
+            );
+        }
+        for (name, value) in [
+            ("RAG_MAX_IN_FLIGHT_REQUESTS", self.max_in_flight_requests),
+            ("RAG_INGEST_QUEUE_CAPACITY", self.ingest_queue_capacity),
+            (
+                "RAG_INGEST_MAX_CONCURRENT_TASKS",
+                self.ingest_max_concurrent_tasks,
+            ),
+        ] {
+            if value > tokio::sync::Semaphore::MAX_PERMITS {
+                anyhow::bail!(
+                    "{name} must not exceed {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                );
+            }
+        }
+
+        validate_upload_allowed_mime_types(&self.upload_allowed_mime_types)?;
+
+        validate_cors_allowed_origins(
+            &self.run_mode,
+            &self.cors_allowed_origins,
+            self.allow_wildcard_cors,
+        )?;
         Ok(())
     }
 
@@ -731,7 +967,28 @@ impl Config {
             mineru_return_content_list: true,
             mineru_return_middle_json: true,
             mineru_return_images: true,
-            ingest_max_concurrent_tasks: 2,
+            max_json_bytes: DEFAULT_MAX_JSON_BYTES,
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            max_multipart_fields: DEFAULT_MAX_MULTIPART_FIELDS,
+            max_bulk_events: DEFAULT_MAX_BULK_EVENTS,
+            max_bulk_rows: DEFAULT_MAX_BULK_ROWS,
+            max_search_limit: DEFAULT_MAX_SEARCH_LIMIT,
+            max_tags_per_item: DEFAULT_MAX_TAGS_PER_ITEM,
+            max_tag_bytes: DEFAULT_MAX_TAG_BYTES,
+            upload_allowed_mime_types: default_upload_allowed_mime_types(),
+            request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+            sync_ingest_timeout_ms: DEFAULT_SYNC_INGEST_TIMEOUT_MS,
+            max_in_flight_requests: DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+            rate_limit_requests_per_minute: DEFAULT_RATE_LIMIT_REQUESTS_PER_MINUTE,
+            ingest_queue_capacity: DEFAULT_INGEST_MAX_CONCURRENT_TASKS
+                * DEFAULT_INGEST_QUEUE_MULTIPLIER,
+            shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
+            // Test fixtures do not need browser access. Keeping this empty also
+            // lets tests promote the fixture to production without inheriting
+            // a development-only wildcard origin.
+            cors_allowed_origins: Vec::new(),
+            allow_wildcard_cors: false,
+            ingest_max_concurrent_tasks: DEFAULT_INGEST_MAX_CONCURRENT_TASKS,
             ingest_task_retention_seconds: 86_400,
             ingest_cleanup_interval_seconds: 300,
             ingest_worker_enabled: true,
@@ -757,12 +1014,179 @@ impl Config {
             vector_match_doc_weight: 2.0,
             vector_match_min_score: 0.25,
             auth_config_error: None,
+            boundary_config_error: None,
             previous_redaction_secrets: Vec::new(),
             codex_secret_inventory: Arc::new(Mutex::new(CodexSecretInventory::default())),
             codex_secret_refresh: Arc::new(Mutex::new(CodexSecretRefreshState::default())),
             codex_secret_refresh_task_started: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+fn validate_upload_allowed_mime_types(mime_types: &[String]) -> anyhow::Result<()> {
+    if mime_types.is_empty() {
+        anyhow::bail!("RAG_UPLOAD_ALLOWED_MIME_TYPES must contain at least one MIME type");
+    }
+    let mut unique = HashSet::new();
+    for mime_type in mime_types {
+        if mime_type.is_empty()
+            || mime_type != mime_type.trim()
+            || mime_type != &mime_type.to_ascii_lowercase()
+            || mime_type.contains('*')
+        {
+            anyhow::bail!(
+                "RAG_UPLOAD_ALLOWED_MIME_TYPES entries must be exact lowercase MIME types"
+            );
+        }
+        reqwest::multipart::Part::bytes(Vec::new())
+            .mime_str(mime_type)
+            .map_err(|_| {
+                anyhow::anyhow!("RAG_UPLOAD_ALLOWED_MIME_TYPES contains an invalid MIME type")
+            })?;
+        if !unique.insert(mime_type.as_str()) {
+            anyhow::bail!("RAG_UPLOAD_ALLOWED_MIME_TYPES must not contain duplicate MIME types");
+        }
+    }
+    Ok(())
+}
+
+fn parse_env_number<T>(name: &str, default: T, errors: &mut Vec<String>) -> T
+where
+    T: Copy + std::str::FromStr,
+{
+    match std::env::var(name) {
+        Ok(value) => parse_number_value(name, &value, default, errors),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            errors.push(format!("{name} must contain valid Unicode digits"));
+            default
+        }
+    }
+}
+
+fn parse_number_value<T>(name: &str, value: &str, default: T, errors: &mut Vec<String>) -> T
+where
+    T: Copy + std::str::FromStr,
+{
+    match value.parse() {
+        Ok(value) => value,
+        Err(_) => {
+            errors.push(format!("{name} must be a valid non-negative integer"));
+            default
+        }
+    }
+}
+
+fn parse_cors_allowed_origins(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        value
+            .split(',')
+            .map(|origin| origin.trim().to_string())
+            .collect()
+    }
+}
+
+fn parse_csv_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn default_upload_allowed_mime_types() -> Vec<String> {
+    [
+        "text/plain",
+        "text/markdown",
+        "application/octet-stream",
+        "application/pdf",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "image/tiff",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+fn default_cors_allowed_origins(run_mode: &str) -> Vec<String> {
+    if matches!(run_mode, "development" | "test") {
+        vec!["*".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+pub(crate) fn validate_cors_allowed_origins(
+    run_mode: &str,
+    origins: &[String],
+    allow_wildcard_cors: bool,
+) -> anyhow::Result<()> {
+    if origins.iter().any(|origin| origin == "*") {
+        if origins.len() != 1 {
+            anyhow::bail!("RAG_CORS_ALLOWED_ORIGINS wildcard must be the sole origin");
+        }
+        if run_mode == "production" && !allow_wildcard_cors {
+            anyhow::bail!("production wildcard CORS requires RAG_ALLOW_WILDCARD_CORS=true");
+        }
+        return Ok(());
+    }
+
+    let mut unique_origins = HashSet::new();
+    for origin in origins {
+        validate_cors_origin(origin)?;
+        if !unique_origins.insert(origin.as_str()) {
+            anyhow::bail!("RAG_CORS_ALLOWED_ORIGINS must not contain duplicate origins");
+        }
+    }
+    Ok(())
+}
+
+fn validate_cors_origin(origin: &str) -> anyhow::Result<()> {
+    if origin.is_empty() || origin != origin.trim() {
+        anyhow::bail!("RAG_CORS_ALLOWED_ORIGINS contains an empty or padded origin");
+    }
+
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        anyhow::bail!("RAG_CORS_ALLOWED_ORIGINS entries must be exact http/https origins");
+    };
+    if !matches!(scheme, "http" | "https")
+        || authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+    {
+        anyhow::bail!("RAG_CORS_ALLOWED_ORIGINS entries must be exact http/https origins");
+    }
+
+    let uri = origin
+        .parse::<axum::http::Uri>()
+        .map_err(|_| anyhow::anyhow!("RAG_CORS_ALLOWED_ORIGINS contains an invalid origin"))?;
+    if uri.scheme_str() != Some(scheme) {
+        anyhow::bail!("RAG_CORS_ALLOWED_ORIGINS entries must be exact http/https origins");
+    }
+    let Some(authority) = uri.authority() else {
+        anyhow::bail!("RAG_CORS_ALLOWED_ORIGINS entries must be exact http/https origins");
+    };
+    let authority_text = authority.as_str();
+    let has_port_separator = if authority_text.starts_with('[') {
+        authority_text
+            .find(']')
+            .is_some_and(|index| authority_text[index + 1..].starts_with(':'))
+    } else {
+        authority_text.contains(':')
+    };
+    if authority.host().is_empty() || (has_port_separator && authority.port().is_none()) {
+        anyhow::bail!("RAG_CORS_ALLOWED_ORIGINS contains an invalid origin");
+    }
+    axum::http::HeaderValue::from_str(origin)
+        .map_err(|_| anyhow::anyhow!("RAG_CORS_ALLOWED_ORIGINS contains an invalid origin"))?;
+    Ok(())
 }
 
 fn default_allow_unsafe_unauthenticated(run_mode: &str) -> bool {
@@ -1325,5 +1749,197 @@ mod tests {
         config.run_mode = "prod".to_string();
         let error = config.validate_startup().unwrap_err().to_string();
         assert!(error.contains("RAG_RUN_MODE must be development, test, or production"));
+    }
+
+    #[test]
+    fn boundary_defaults_are_positive_and_internally_consistent() {
+        let config = Config::test();
+
+        assert_eq!(config.max_json_bytes, 2 * 1024 * 1024);
+        assert_eq!(config.max_upload_bytes, 50 * 1024 * 1024);
+        assert_eq!(config.ingest_queue_capacity, 16);
+        assert_eq!(
+            config.max_multipart_body_bytes(),
+            Some(52 * 1024 * 1024 + 32 * 16 * 1024)
+        );
+        assert!(config.validate_http_boundaries().is_ok());
+    }
+
+    #[test]
+    fn boundary_validation_rejects_zero_ordering_and_size_overflow() {
+        let mut zero = Config::test();
+        zero.max_bulk_events = 0;
+        assert!(zero
+            .validate_http_boundaries()
+            .unwrap_err()
+            .to_string()
+            .contains("RAG_MAX_BULK_EVENTS"));
+
+        let mut timeout = Config::test();
+        timeout.sync_ingest_timeout_ms = timeout.request_timeout_ms - 1;
+        assert!(timeout
+            .validate_http_boundaries()
+            .unwrap_err()
+            .to_string()
+            .contains("RAG_SYNC_INGEST_TIMEOUT_MS"));
+
+        let mut overflow = Config::test();
+        overflow.max_upload_bytes = usize::MAX;
+        assert!(overflow.validate_http_boundaries().is_err());
+        assert_eq!(overflow.max_multipart_body_bytes(), None);
+    }
+
+    #[test]
+    fn boundary_validation_rejects_capacity_values_above_tokio_limits() {
+        let above_max = tokio::sync::Semaphore::MAX_PERMITS
+            .checked_add(1)
+            .expect("Tokio semaphore limit must leave room for an invalid test value");
+
+        for (name, configure) in [
+            (
+                "RAG_MAX_IN_FLIGHT_REQUESTS",
+                (|config: &mut Config, value| config.max_in_flight_requests = value)
+                    as fn(&mut Config, usize),
+            ),
+            (
+                "RAG_INGEST_QUEUE_CAPACITY",
+                (|config: &mut Config, value| config.ingest_queue_capacity = value)
+                    as fn(&mut Config, usize),
+            ),
+            (
+                "RAG_INGEST_MAX_CONCURRENT_TASKS",
+                (|config: &mut Config, value| config.ingest_max_concurrent_tasks = value)
+                    as fn(&mut Config, usize),
+            ),
+        ] {
+            let mut config = Config::test();
+            configure(&mut config, above_max);
+            let error = config.validate_http_boundaries().unwrap_err().to_string();
+            assert!(error.contains(name), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn boundary_validation_rejects_unrepresentable_deadlines() {
+        for (name, configure) in [
+            (
+                "RAG_REQUEST_TIMEOUT_MS",
+                (|config: &mut Config| config.request_timeout_ms = u64::MAX) as fn(&mut Config),
+            ),
+            (
+                "RAG_SYNC_INGEST_TIMEOUT_MS",
+                (|config: &mut Config| config.sync_ingest_timeout_ms = u64::MAX) as fn(&mut Config),
+            ),
+            (
+                "RAG_SHUTDOWN_TIMEOUT_MS",
+                (|config: &mut Config| config.shutdown_timeout_ms = u64::MAX) as fn(&mut Config),
+            ),
+        ] {
+            let mut config = Config::test();
+            configure(&mut config);
+            let error = config.validate_http_boundaries().unwrap_err().to_string();
+            assert!(error.contains(name), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn upload_mime_policy_is_exact_normalized_and_nonempty() {
+        let config = Config::test();
+        assert!(config
+            .upload_allowed_mime_types
+            .iter()
+            .any(|value| value == "application/octet-stream"));
+        assert!(config.validate_http_boundaries().is_ok());
+
+        for invalid in [
+            Vec::<String>::new(),
+            vec!["text/*".to_string()],
+            vec!["Text/Plain".to_string()],
+            vec!["not-a-mime".to_string()],
+            vec!["text/plain".to_string(), "text/plain".to_string()],
+        ] {
+            let mut config = Config::test();
+            config.upload_allowed_mime_types = invalid;
+            assert!(config.validate_http_boundaries().is_err());
+        }
+
+        assert_eq!(
+            parse_csv_values(" Text/Plain, APPLICATION/PDF "),
+            ["text/plain", "application/pdf"]
+        );
+    }
+
+    #[test]
+    fn malformed_boundary_numbers_are_retained_as_startup_errors() {
+        let mut errors = Vec::new();
+        let parsed = parse_number_value("RAG_MAX_JSON_BYTES", "not-a-number", 42usize, &mut errors);
+
+        assert_eq!(parsed, 42);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("RAG_MAX_JSON_BYTES"));
+        assert!(!errors[0].contains("not-a-number"));
+
+        let mut config = Config::test();
+        config.boundary_config_error = Some(errors.join("; "));
+        assert!(config.validate_http_boundaries().is_err());
+    }
+
+    #[test]
+    fn cors_origins_are_exact_unique_and_wildcard_is_bounded() {
+        assert!(validate_cors_allowed_origins(
+            "production",
+            &[
+                "https://app.example.com".to_string(),
+                "http://localhost:3000".to_string(),
+            ],
+            false,
+        )
+        .is_ok());
+        for invalid in [
+            "ftp://app.example.com",
+            "https://app.example.com/",
+            "https://app.example.com/path",
+            "https://user@app.example.com",
+            "http://:80",
+            "http://app.example.com:99999",
+            "",
+        ] {
+            assert!(
+                validate_cors_allowed_origins("production", &[invalid.to_string()], false,)
+                    .is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+
+        assert!(validate_cors_allowed_origins(
+            "development",
+            &["*".to_string(), "https://app.example.com".to_string()],
+            true,
+        )
+        .is_err());
+        assert!(validate_cors_allowed_origins("production", &["*".to_string()], false,).is_err());
+        assert!(validate_cors_allowed_origins("production", &["*".to_string()], true,).is_ok());
+        assert!(validate_cors_allowed_origins(
+            "production",
+            &[
+                "https://app.example.com".to_string(),
+                "https://app.example.com".to_string(),
+            ],
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cors_defaults_are_open_only_in_development_and_test() {
+        assert_eq!(default_cors_allowed_origins("development"), vec!["*"]);
+        assert_eq!(default_cors_allowed_origins("test"), vec!["*"]);
+        assert!(default_cors_allowed_origins("production").is_empty());
+        assert!(default_cors_allowed_origins("unknown").is_empty());
+        assert!(parse_cors_allowed_origins("").is_empty());
+        assert_eq!(
+            parse_cors_allowed_origins("https://a.example, https://b.example"),
+            vec!["https://a.example", "https://b.example"]
+        );
     }
 }

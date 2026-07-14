@@ -1,4 +1,9 @@
-use std::time::Instant;
+use std::{
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
@@ -8,16 +13,66 @@ use tokio::time::{timeout, Duration};
 
 use crate::{config::Config, error::ApiError, models::*};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ParserInput {
     pub content: Option<String>,
     pub bytes: Option<Vec<u8>>,
+    pub staged_upload: Option<StagedUpload>,
     pub content_type: Option<String>,
     pub file_name: Option<String>,
     pub content_list: Option<Value>,
     pub content_list_v2: Option<Value>,
     pub middle_json: Option<Value>,
     pub model_json: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StagedUpload {
+    inner: Arc<StagedUploadInner>,
+    pub byte_len: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug)]
+struct StagedUploadInner {
+    path: PathBuf,
+}
+
+impl StagedUpload {
+    pub(crate) fn new(path: PathBuf, byte_len: u64, sha256: String) -> Self {
+        Self {
+            inner: Arc::new(StagedUploadInner { path }),
+            byte_len,
+            sha256,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.inner.path
+    }
+
+    pub(crate) async fn read_utf8(&self) -> Result<Option<String>, ApiError> {
+        match tokio::fs::read_to_string(self.path()).await {
+            Ok(value) => Ok(Some(value)),
+            Err(err) if err.kind() == ErrorKind::InvalidData => Ok(None),
+            Err(err) => Err(ApiError::Internal(format!(
+                "failed to read staged upload: {err}"
+            ))),
+        }
+    }
+}
+
+impl Drop for StagedUploadInner {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            if err.kind() != ErrorKind::NotFound {
+                tracing::warn!(
+                    error_kind = "staged_upload_cleanup",
+                    "failed to remove staged upload"
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,12 +102,15 @@ impl DocumentParser for BuiltinTextParser {
     async fn parse(&self, input: ParserInput) -> Result<ParserOutput, ApiError> {
         let blocks =
             parse_supplied_blocks(input.content_list.as_ref(), input.content_list_v2.as_ref());
-        let markdown = match (input.content, input.bytes) {
-            (Some(content), _) => Some(content),
-            (None, Some(bytes)) => Some(String::from_utf8(bytes).map_err(|_| {
+        let markdown = match (input.content, input.bytes, input.staged_upload) {
+            (Some(content), _, _) => Some(content),
+            (None, Some(bytes), _) => Some(String::from_utf8(bytes).map_err(|_| {
                 ApiError::bad_request("builtin parser only supports UTF-8 text uploads")
             })?),
-            (None, None) => None,
+            (None, None, Some(upload)) => Some(upload.read_utf8().await?.ok_or_else(|| {
+                ApiError::bad_request("builtin parser only supports UTF-8 text uploads")
+            })?),
+            (None, None, None) => None,
         };
         Ok(ParserOutput {
             provider: "builtin".to_string(),
@@ -114,15 +172,24 @@ impl DocumentParser for MineruParserClient {
             });
         }
 
+        let staged_upload = input.staged_upload;
         let file_name = input
             .file_name
             .unwrap_or_else(|| "document.txt".to_string());
-        let bytes = input
-            .bytes
-            .or_else(|| input.content.map(String::into_bytes));
-        let bytes = bytes
-            .ok_or_else(|| ApiError::bad_request("content or uploaded file bytes are required"))?;
-        let mut part = Part::bytes(bytes).file_name(file_name);
+        let mut part = if let Some(upload) = staged_upload.as_ref() {
+            let file = tokio::fs::File::open(upload.path()).await.map_err(|err| {
+                ApiError::Internal(format!("failed to open staged upload: {err}"))
+            })?;
+            Part::stream_with_length(file, upload.byte_len).file_name(file_name)
+        } else {
+            let bytes = input
+                .bytes
+                .or_else(|| input.content.map(String::into_bytes))
+                .ok_or_else(|| {
+                    ApiError::bad_request("content or uploaded file bytes are required")
+                })?;
+            Part::bytes(bytes).file_name(file_name)
+        };
         if let Some(content_type) = input.content_type.as_deref() {
             part = part
                 .mime_str(content_type)

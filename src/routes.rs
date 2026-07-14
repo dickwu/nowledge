@@ -1,14 +1,19 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
+    time::Duration,
 };
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{MatchedPath, Multipart, Path, Query, Request, State},
+    extract::{
+        multipart::{Field, MultipartError},
+        DefaultBodyLimit, Extension, MatchedPath, Multipart, Path, Query, Request, State,
+    },
     http::{header::CONTENT_LENGTH, header::CONTENT_TYPE, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -17,20 +22,32 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
+use sha2::{Digest, Sha256};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{mpsc, oneshot, watch},
+    task::JoinSet,
+};
+use tower_http::{
+    compression::CompressionLayer,
+    trace::{DefaultOnResponse, TraceLayer},
+    LatencyUnit,
+};
 
 use crate::{
     auth::{AdminGuard, CompanyWriterGuard, Principal, UserGuard},
     config::Config,
     error::{safe_cause_diagnostic, safe_value_fingerprint, ApiError},
+    http_boundary::{self, HttpBoundaryState, RequestDeadline},
     llm::{
         llm_client_from_config, llm_client_from_config_with_credentials, LlmHealthProbe,
         LlmHealthProbeResult, LlmRequest,
     },
     meili::MeiliAdmin,
     models::*,
-    parser::parser_health_status,
+    parser::{parser_health_status, StagedUpload},
     request_context::{self, RequestContextState, RequestId},
+    runtime::RuntimeSupervisor,
     store::Store,
     util::{
         hmac_hex, redact_egress_text, redact_locator, redact_secrets, redact_string,
@@ -40,83 +57,448 @@ use crate::{
 
 #[derive(Clone)]
 pub struct IngestTaskManager {
-    queue: Option<tokio::sync::mpsc::Sender<QueuedIngestJob>>,
+    queue: Arc<Mutex<Option<mpsc::Sender<QueuedIngestJob>>>>,
     queued_depth: Arc<AtomicUsize>,
+    accepting: Arc<AtomicBool>,
+    enabled: bool,
+    runtime: RuntimeSupervisor,
 }
 
 struct QueuedIngestJob {
     tenant_id: String,
     task_id: String,
     req: IngestTaskRequest,
+    staged_upload: Option<StagedUpload>,
     config: Config,
+    queue_depth: Option<QueueDepthLease>,
+}
+
+type IngestRunCompletion = (tokio::task::Id, String, Result<IngestTaskResult, ApiError>);
+type IngestJoinCompletion = Result<IngestRunCompletion, tokio::task::JoinError>;
+
+struct QueueDepthLease {
+    queued_depth: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Default)]
+struct SyncIngestTracker {
+    task_id: Arc<Mutex<Option<String>>>,
+}
+
+impl SyncIngestTracker {
+    fn set_task_id(&self, task_id: &str) {
+        *self
+            .task_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task_id.to_string());
+    }
+
+    fn task_id(&self) -> Option<String> {
+        self.task_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+#[derive(Clone)]
+struct SyncIngestTimeoutState {
+    timeout: Duration,
+    store: Store,
+    runtime: RuntimeSupervisor,
+}
+
+impl QueueDepthLease {
+    fn acquire(queued_depth: Arc<AtomicUsize>) -> (Self, usize) {
+        let queued_ahead = queued_depth.fetch_add(1, Ordering::SeqCst);
+        (Self { queued_depth }, queued_ahead)
+    }
+}
+
+impl Drop for QueueDepthLease {
+    fn drop(&mut self) {
+        self.queued_depth.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl IngestTaskManager {
-    fn new(store: Store, config: Arc<Config>) -> Self {
+    fn new(store: Store, config: Arc<Config>, runtime: RuntimeSupervisor) -> Self {
         let queued_depth = Arc::new(AtomicUsize::new(0));
+        let accepting = Arc::new(AtomicBool::new(config.ingest_worker_enabled));
         if !config.ingest_worker_enabled {
             return Self {
-                queue: None,
+                queue: Arc::new(Mutex::new(None)),
                 queued_depth,
+                accepting,
+                enabled: false,
+                runtime,
             };
         }
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<QueuedIngestJob>(
-            config.ingest_max_concurrent_tasks.max(1) * 8,
-        );
-        let depth = queued_depth.clone();
+        let (tx, rx) = mpsc::channel::<QueuedIngestJob>(config.ingest_queue_capacity.max(1));
         let max_concurrent = config.ingest_max_concurrent_tasks.max(1);
-        tokio::spawn(async move {
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-            while let Some(job) = rx.recv().await {
-                depth.fetch_sub(1, Ordering::SeqCst);
-                let Ok(permit) = semaphore.clone().acquire_owned().await else {
-                    break;
-                };
-                let store = store.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(err) = store
-                        .run_ingest_task_async(&job.tenant_id, &job.task_id, job.req, &job.config)
-                        .await
-                    {
-                        let diagnostic = safe_cause_diagnostic(&err);
-                        let task_fingerprint =
-                            safe_value_fingerprint("ingest_task_id", &job.task_id);
-                        tracing::warn!(
-                            %task_fingerprint,
-                            cause_category = diagnostic.category,
-                            cause_fingerprint = %diagnostic.fingerprint,
-                            "ingest task failed"
-                        );
-                    }
-                });
-            }
-        });
+        let shutdown = runtime.subscribe();
+        let shutdown_grace = Duration::from_millis(config.shutdown_timeout_ms);
+        let spawned = runtime.spawn(run_ingest_dispatcher(
+            store,
+            rx,
+            max_concurrent,
+            shutdown,
+            shutdown_grace,
+        ));
+        debug_assert!(spawned, "fresh ingest runtime must accept its dispatcher");
 
         Self {
-            queue: Some(tx),
+            queue: Arc::new(Mutex::new(Some(tx))),
             queued_depth,
+            accepting,
+            enabled: true,
+            runtime,
         }
     }
 
-    fn queued_ahead(&self) -> usize {
-        self.queued_depth.load(Ordering::SeqCst)
-    }
-
-    async fn enqueue(&self, job: QueuedIngestJob) -> Result<(), ApiError> {
-        let Some(queue) = &self.queue else {
-            return Ok(());
-        };
-        self.queued_depth.fetch_add(1, Ordering::SeqCst);
-        if queue.send(job).await.is_err() {
-            self.queued_depth.fetch_sub(1, Ordering::SeqCst);
-            return Err(ApiError::Internal(
-                "ingest worker queue is unavailable".to_string(),
-            ));
+    fn ensure_available(&self) -> Result<(), ApiError> {
+        if !self.enabled {
+            return Err(ApiError::service_unavailable(1));
+        }
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(ApiError::service_unavailable(1));
         }
         Ok(())
     }
+
+    async fn submit(
+        &self,
+        store: Store,
+        tenant_id: String,
+        req: IngestTaskRequest,
+        staged_upload: Option<StagedUpload>,
+        config: Config,
+        deadline: RequestDeadline,
+    ) -> Result<IngestTask, ApiError> {
+        self.ensure_available()?;
+        let queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| ApiError::service_unavailable(1))?;
+        let permit = match queue.try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Err(ApiError::too_many_requests(1));
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(ApiError::service_unavailable(1));
+            }
+        };
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(ApiError::service_unavailable(1));
+        }
+
+        let (queue_depth, queued_ahead) = QueueDepthLease::acquire(self.queued_depth.clone());
+        let has_staged_upload = staged_upload.is_some();
+        let (reply, response) = oneshot::channel();
+        let admission = async move {
+            let result = match tokio::time::timeout_at(deadline.instant(), async {
+                let task = store
+                    .create_ingest_task_record_async(
+                        &tenant_id,
+                        &req,
+                        &config,
+                        has_staged_upload,
+                        queued_ahead,
+                    )
+                    .await?;
+                permit.send(QueuedIngestJob {
+                    tenant_id,
+                    task_id: task.task_id.clone(),
+                    req,
+                    staged_upload,
+                    config,
+                    queue_depth: Some(queue_depth),
+                });
+                Ok(task)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(ApiError::timeout()),
+            };
+            let _ = reply.send(result);
+        };
+        if !self.runtime.spawn(admission) {
+            return Err(ApiError::service_unavailable(1));
+        }
+        response
+            .await
+            .unwrap_or_else(|_| Err(ApiError::service_unavailable(1)))
+    }
+
+    fn begin_shutdown(&self) {
+        self.accepting.store(false, Ordering::Release);
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    }
+}
+
+async fn run_ingest_dispatcher(
+    store: Store,
+    mut queue: mpsc::Receiver<QueuedIngestJob>,
+    max_concurrent: usize,
+    mut shutdown: watch::Receiver<bool>,
+    shutdown_grace: Duration,
+) {
+    let mut running = JoinSet::new();
+    let mut active_task_ids = HashMap::new();
+
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            joined = running.join_next(), if !running.is_empty() => {
+                handle_ingest_completion(&store, joined, &mut active_task_ids).await;
+            }
+            job = queue.recv(), if running.len() < max_concurrent => {
+                let Some(mut job) = job else {
+                    break;
+                };
+                job.queue_depth.take();
+                let tracked_task_id = job.task_id.clone();
+                let task_id = tracked_task_id.clone();
+                let task_store = store.clone();
+                let handle = running.spawn(async move {
+                    let join_id = tokio::task::id();
+                    let result = task_store
+                        .run_ingest_task_async(
+                            &job.tenant_id,
+                            &job.task_id,
+                            job.req,
+                            job.staged_upload,
+                            &job.config,
+                        )
+                        .await;
+                    (join_id, task_id, result)
+                });
+                active_task_ids.insert(handle.id(), tracked_task_id);
+            }
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + shutdown_grace;
+    let mut interrupted_tasks = Vec::new();
+    queue.close();
+    while let Some(mut job) = queue.recv().await {
+        job.queue_depth.take();
+        match store.mark_ingest_task_interrupted_local(&job.task_id) {
+            Ok(Some(task)) => interrupted_tasks.push(task),
+            Ok(None) => {}
+            Err(err) => {
+                log_ingest_failure(&job.task_id, &err, "failed to interrupt queued ingest task")
+            }
+        }
+    }
+
+    while !running.is_empty() {
+        match tokio::time::timeout_at(deadline, running.join_next()).await {
+            Ok(joined) => {
+                if tokio::time::timeout_at(
+                    deadline,
+                    handle_ingest_completion(&store, joined, &mut active_task_ids),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    if !running.is_empty() {
+        running.abort_all();
+        while let Ok(Some(joined)) = tokio::time::timeout_at(deadline, running.join_next()).await {
+            if tokio::time::timeout_at(
+                deadline,
+                handle_ingest_completion(&store, Some(joined), &mut active_task_ids),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+        }
+    }
+    for task_id in active_task_ids.into_values() {
+        match store.mark_ingest_task_interrupted_local(&task_id) {
+            Ok(Some(task)) => interrupted_tasks.push(task),
+            Ok(None) => {}
+            Err(err) => {
+                log_ingest_failure(&task_id, &err, "failed to interrupt active ingest task")
+            }
+        }
+    }
+    if !interrupted_tasks.is_empty() {
+        match tokio::time::timeout_at(
+            deadline,
+            store.persist_ingest_task_records(&interrupted_tasks),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => log_ingest_failure(
+                &interrupted_tasks[0].task_id,
+                &err,
+                "failed to persist interrupted ingest tasks",
+            ),
+            Err(_) => tracing::warn!(
+                interrupted_tasks = interrupted_tasks.len(),
+                "ingest dispatcher deadline elapsed before task states were persisted"
+            ),
+        }
+    }
+}
+
+async fn handle_ingest_completion(
+    store: &Store,
+    joined: Option<IngestJoinCompletion>,
+    active_task_ids: &mut HashMap<tokio::task::Id, String>,
+) {
+    let Some(joined) = joined else {
+        return;
+    };
+    match joined {
+        Ok((join_id, task_id, result)) => {
+            active_task_ids.remove(&join_id);
+            if let Err(err) = result {
+                log_ingest_failure(&task_id, &err, "ingest task failed");
+                if let Err(mark_err) = store.mark_ingest_task_failed_async(&task_id).await {
+                    log_ingest_failure(&task_id, &mark_err, "failed to finalize ingest task");
+                }
+            }
+        }
+        Err(join_error) => {
+            let Some(task_id) = active_task_ids.remove(&join_error.id()) else {
+                return;
+            };
+            let result = if join_error.is_cancelled() {
+                store.mark_ingest_task_interrupted_async(&task_id).await
+            } else {
+                let task_fingerprint = safe_value_fingerprint("ingest_task_id", &task_id);
+                tracing::warn!(
+                    %task_fingerprint,
+                    cause_category = "task_panic",
+                    "ingest task terminated unexpectedly"
+                );
+                store.mark_ingest_task_failed_async(&task_id).await
+            };
+            if let Err(err) = result {
+                log_ingest_failure(&task_id, &err, "failed to finalize terminated ingest task");
+            }
+        }
+    }
+}
+
+async fn enforce_sync_ingest_timeout(
+    State(state): State<SyncIngestTimeoutState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if !http_boundary::store_owns_timeout(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let deadline = tokio::time::Instant::now() + state.timeout;
+    let tracker = SyncIngestTracker::default();
+    request
+        .extensions_mut()
+        .insert(RequestDeadline::new(deadline));
+    request.extensions_mut().insert(tracker.clone());
+
+    match tokio::time::timeout_at(deadline, next.run(request)).await {
+        Ok(response) => {
+            if response.status().is_client_error() || response.status().is_server_error() {
+                if let Some(task_id) = tracker.task_id() {
+                    match state.store.mark_ingest_task_failed_local(&task_id) {
+                        Ok(Some(task)) => supervise_ingest_task_persistence(
+                            &state,
+                            task,
+                            "failed to persist failed sync ingest task",
+                        ),
+                        Ok(None) => {}
+                        Err(err) => log_ingest_failure(
+                            &task_id,
+                            &err,
+                            "failed to finalize sync ingest task",
+                        ),
+                    }
+                }
+            }
+            response
+        }
+        Err(_) => {
+            if let Some(task_id) = tracker.task_id() {
+                if let Ok(result) = state.store.get_ingest_task_result(&task_id, None, true) {
+                    return Json(result).into_response();
+                }
+                match state.store.mark_ingest_task_interrupted_local(&task_id) {
+                    Ok(Some(task)) => supervise_ingest_task_persistence(
+                        &state,
+                        task,
+                        "failed to persist timed-out ingest task",
+                    ),
+                    Ok(None) => {}
+                    Err(err) => {
+                        log_ingest_failure(
+                            &task_id,
+                            &err,
+                            "failed to interrupt timed-out ingest task",
+                        );
+                    }
+                }
+            }
+            ApiError::timeout().into_response()
+        }
+    }
+}
+
+fn supervise_ingest_task_persistence(
+    state: &SyncIngestTimeoutState,
+    task: IngestTask,
+    message: &'static str,
+) {
+    let store = state.store.clone();
+    let task_id = task.task_id.clone();
+    let rejected_task_id = task_id.clone();
+    if !state.runtime.spawn(async move {
+        if let Err(err) = store.persist_ingest_task_record(&task).await {
+            log_ingest_failure(&task_id, &err, message);
+        }
+    }) {
+        tracing::warn!(
+            task_fingerprint = %safe_value_fingerprint("ingest_task_id", &rejected_task_id),
+            "ingest runtime closed before terminal task persistence could be supervised"
+        );
+    }
+}
+
+fn log_ingest_failure(task_id: &str, err: &ApiError, message: &'static str) {
+    let diagnostic = safe_cause_diagnostic(err);
+    let task_fingerprint = safe_value_fingerprint("ingest_task_id", task_id);
+    tracing::warn!(
+        %task_fingerprint,
+        cause_category = diagnostic.category,
+        cause_fingerprint = %diagnostic.fingerprint,
+        message
+    );
 }
 
 #[derive(Clone)]
@@ -126,19 +508,25 @@ pub struct AppState {
     pub meili: MeiliAdmin,
     pub llm_health: LlmHealthProbe,
     pub ingest_manager: IngestTaskManager,
+    pub(crate) http_boundary: HttpBoundaryState,
+    runtime: RuntimeSupervisor,
 }
 
 impl AppState {
     pub fn new(config: Arc<Config>) -> Self {
         let store = Store::new(&config);
+        let runtime = RuntimeSupervisor::new();
+        let http_boundary = HttpBoundaryState::new(&config);
         config.start_codex_secret_refresh_task();
-        let ingest_manager = IngestTaskManager::new(store.clone(), config.clone());
-        spawn_ingest_task_cleanup(store.clone(), &config);
+        let ingest_manager = IngestTaskManager::new(store.clone(), config.clone(), runtime.clone());
+        spawn_ingest_task_cleanup(store.clone(), &config, &runtime);
         Self {
             store,
             meili: MeiliAdmin::from_config(&config),
             llm_health: LlmHealthProbe::new(),
             ingest_manager,
+            http_boundary,
+            runtime,
             config,
         }
     }
@@ -150,25 +538,83 @@ impl AppState {
     fn effective_config(&self) -> Config {
         (*self.config).clone()
     }
+
+    pub fn begin_shutdown(&self) {
+        self.ingest_manager.begin_shutdown();
+        self.runtime.begin_shutdown();
+    }
+
+    pub async fn shutdown(&self) {
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(self.config.shutdown_timeout_ms);
+        self.shutdown_until(deadline).await;
+    }
+
+    pub async fn shutdown_until(&self, deadline: tokio::time::Instant) {
+        self.begin_shutdown();
+        self.runtime.shutdown_until(deadline).await;
+        match self
+            .store
+            .interrupt_nonterminal_ingest_tasks_local(self.tenant_id())
+        {
+            Ok(tasks) if !tasks.is_empty() => {
+                match tokio::time::timeout_at(
+                    deadline,
+                    self.store.persist_ingest_task_records(&tasks),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => log_ingest_failure(
+                        &tasks[0].task_id,
+                        &err,
+                        "failed to persist interrupted ingest tasks during shutdown",
+                    ),
+                    Err(_) => tracing::warn!(
+                        interrupted_tasks = tasks.len(),
+                        "shutdown deadline elapsed before interrupted task states were persisted"
+                    ),
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                let diagnostic = safe_cause_diagnostic(&err);
+                tracing::warn!(
+                    cause_category = diagnostic.category,
+                    cause_fingerprint = %diagnostic.fingerprint,
+                    "failed to finalize interrupted ingest tasks during shutdown"
+                );
+            }
+        }
+    }
 }
 
 /// Periodically prune terminal ingest tasks past their retention window:
 /// `RAG_INGEST_TASK_RETENTION_SECONDS` (0 disables pruning entirely), swept
 /// every `RAG_INGEST_CLEANUP_INTERVAL_SECONDS`.
-fn spawn_ingest_task_cleanup(store: Store, config: &Arc<Config>) {
+fn spawn_ingest_task_cleanup(store: Store, config: &Arc<Config>, runtime: &RuntimeSupervisor) {
     let retention_seconds = config.ingest_task_retention_seconds;
     if retention_seconds == 0 {
         return;
     }
     let interval_seconds = config.ingest_cleanup_interval_seconds.max(1);
-    tokio::spawn(async move {
+    let mut shutdown = runtime.subscribe();
+    let _ = runtime.spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // interval() completes its first tick immediately; skip it so a
         // fresh process doesn't sweep while it is still reloading state.
         ticker.tick().await;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                _ = ticker.tick() => {}
+            }
             match store.cleanup_ingest_tasks_async(retention_seconds).await {
                 Ok(pruned) if !pruned.is_empty() => {
                     tracing::info!(count = pruned.len(), "pruned expired ingest tasks");
@@ -197,6 +643,58 @@ struct FsQuery {
     uri: Option<String>,
     depth: Option<usize>,
     owner_user_id: Option<String>,
+}
+
+fn validate_max_items(field: &str, actual: usize, maximum: usize) -> Result<(), ApiError> {
+    if actual > maximum {
+        return Err(ApiError::validation(
+            field,
+            format!("must contain at most {maximum} items"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_search_limit(field: &str, limit: usize, config: &Config) -> Result<(), ApiError> {
+    if limit > config.max_search_limit {
+        return Err(ApiError::validation(
+            field,
+            format!("must be at most {}", config.max_search_limit),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tags(field: &str, tags: &[String], config: &Config) -> Result<(), ApiError> {
+    validate_max_items(field, tags.len(), config.max_tags_per_item)?;
+    for (index, tag) in tags.iter().enumerate() {
+        if tag.len() > config.max_tag_bytes {
+            return Err(ApiError::validation(
+                format!("{field}[{index}]"),
+                format!("must be at most {} UTF-8 bytes", config.max_tag_bytes),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_history_event(
+    field: &str,
+    request: &AppendHistoryEventRequest,
+    config: &Config,
+) -> Result<(), ApiError> {
+    validate_tags(&format!("{field}.tags"), &request.tags, config)
+}
+
+fn validate_history_bulk(
+    request: &BulkHistoryEventsRequest,
+    config: &Config,
+) -> Result<(), ApiError> {
+    validate_max_items("events", request.events.len(), config.max_bulk_events)?;
+    for (index, event) in request.events.iter().enumerate() {
+        validate_history_event(&format!("events[{index}]"), event, config)?;
+    }
+    Ok(())
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -380,32 +878,66 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/debug/traces/{trace_id}", get(get_trace))
         .route("/v1/debug/meili/search", post(debug_meili_search))
         .route("/v1/debug/prompt/preview", post(prompt_preview))
+        .layer(DefaultBodyLimit::max(
+            state
+                .config
+                .max_multipart_body_bytes()
+                .expect("validated multipart body limit"),
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.http_boundary.clone(),
+            http_boundary::enforce_non_multipart_body,
+        ))
+        .layer(middleware::from_fn_with_state(
+            SyncIngestTimeoutState {
+                timeout: Duration::from_millis(state.config.sync_ingest_timeout_ms),
+                store: state.store.clone(),
+                runtime: state.runtime.clone(),
+            },
+            enforce_sync_ingest_timeout,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.http_boundary.clone(),
+            http_boundary::enforce_timeout,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.http_boundary.clone(),
+            http_boundary::load_shed,
+        ))
         .layer(middleware::from_fn_with_state(
             state.config.clone(),
             redact_json_response,
         ))
         .layer(CompressionLayer::new())
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http().make_span_with(
-            |request: &axum::http::Request<axum::body::Body>| {
-                let request_id = request
-                    .extensions()
-                    .get::<RequestId>()
-                    .map(RequestId::as_str)
-                    .unwrap_or("missing");
-                let route = request
-                    .extensions()
-                    .get::<MatchedPath>()
-                    .map(MatchedPath::as_str)
-                    .unwrap_or("unmatched");
-                tracing::info_span!(
-                    "http_request",
-                    %request_id,
-                    method = %request.method(),
-                    route
-                )
-            },
-        ))
+        .layer(
+            http_boundary::build_cors_layer(&state.config).expect("validated CORS configuration"),
+        )
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+                    let request_id = request
+                        .extensions()
+                        .get::<RequestId>()
+                        .map(RequestId::as_str)
+                        .unwrap_or("missing");
+                    let route = request
+                        .extensions()
+                        .get::<MatchedPath>()
+                        .map(MatchedPath::as_str)
+                        .unwrap_or("unmatched");
+                    tracing::info_span!(
+                        "http_request",
+                        %request_id,
+                        method = %request.method(),
+                        route
+                    )
+                })
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(tracing::Level::INFO)
+                        .latency_unit(LatencyUnit::Millis),
+                ),
+        )
         .layer(middleware::from_fn_with_state(
             RequestContextState::from_shared_config(state.config.clone()),
             request_context::assign,
@@ -951,6 +1483,7 @@ async fn append_user_event(
     Json(req): Json<AppendHistoryEventRequest>,
 ) -> Result<Json<HistoryEventResponse>, ApiError> {
     user.require_owner_access(&owner_user_id)?;
+    validate_tags("tags", &req.tags, &state.config)?;
     Ok(Json(
         state
             .store
@@ -966,6 +1499,7 @@ async fn append_user_events_bulk(
     Json(req): Json<BulkHistoryEventsRequest>,
 ) -> Result<Json<BulkHistoryEventsResponse>, ApiError> {
     user.require_owner_access(&owner_user_id)?;
+    validate_history_bulk(&req, &state.config)?;
     Ok(Json(
         state
             .store
@@ -981,6 +1515,7 @@ async fn search_user_events(
     Json(mut req): Json<HistorySearchRequest>,
 ) -> Result<Json<HistorySearchResponse>, ApiError> {
     user.require_owner_access(&owner_user_id)?;
+    validate_search_limit("limit", req.limit, &state.config)?;
     req.owner_user_id = Some(owner_user_id.clone());
     Ok(Json(
         state
@@ -1011,6 +1546,7 @@ async fn user_timeline(
     Json(req): Json<TimelineQueryRequest>,
 ) -> Result<Json<TimelineResponse>, ApiError> {
     user.require_owner_access(&owner_user_id)?;
+    validate_search_limit("limit", req.limit, &state.config)?;
     Ok(Json(state.store.timeline(
         state.tenant_id(),
         Some(&owner_user_id),
@@ -1025,6 +1561,7 @@ async fn append_event_alias(
 ) -> Result<Json<HistoryEventResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
     require_owner_for_write(&user, req.owner_user_id.as_deref())?;
+    validate_tags("tags", &req.tags, &state.config)?;
     Ok(Json(
         state
             .store
@@ -1048,6 +1585,7 @@ async fn append_events_bulk_alias(
     {
         user.require_owner_access(&owner)?;
     }
+    validate_history_bulk(&req, &state.config)?;
     Ok(Json(
         state
             .store
@@ -1062,6 +1600,7 @@ async fn search_events_alias(
     Json(mut req): Json<HistorySearchRequest>,
 ) -> Result<Json<HistorySearchResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
+    validate_search_limit("limit", req.limit, &state.config)?;
     Ok(Json(
         state
             .store
@@ -1092,6 +1631,7 @@ async fn timeline_alias(
     Json(mut req): Json<TimelineQueryRequest>,
 ) -> Result<Json<TimelineResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
+    validate_search_limit("limit", req.limit, &state.config)?;
     Ok(Json(state.store.timeline(state.tenant_id(), None, req)?))
 }
 
@@ -1149,6 +1689,7 @@ async fn search_state(
 ) -> Result<Json<StateSearchResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
     require_explicit_owner_for_unbound_private_read(&user, req.owner_user_id.as_deref())?;
+    validate_search_limit("limit", req.limit, &state.config)?;
     Ok(Json(state.store.search_state(state.tenant_id(), req)?))
 }
 
@@ -1189,6 +1730,7 @@ async fn search_insights(
 ) -> Result<Json<InsightSearchResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
     require_explicit_owner_for_unbound_private_read(&user, req.owner_user_id.as_deref())?;
+    validate_search_limit("limit", req.limit, &state.config)?;
     Ok(Json(state.store.search_insights(req)?))
 }
 
@@ -1199,6 +1741,7 @@ async fn upsert_link(
 ) -> Result<Json<LinkResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
     require_owner_for_write(&user, req.owner_user_id.as_deref())?;
+    validate_tags("tags", &req.tags, &state.config)?;
     Ok(Json(
         state
             .store
@@ -1213,6 +1756,7 @@ async fn search_links(
     Json(mut req): Json<LinkSearchRequest>,
 ) -> Result<Json<LinkSearchResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
+    validate_search_limit("limit", req.limit, &state.config)?;
     Ok(Json(state.store.search_links(
         state.tenant_id(),
         req,
@@ -1232,6 +1776,8 @@ async fn analyze_insights(
     }
     user.apply_owner_default(&mut req.owner_user_id)?;
     require_owner_for_write(&user, req.owner_user_id.as_deref())?;
+    validate_search_limit("context_limit", req.context_limit, &state.config)?;
+    validate_search_limit("link_limit", req.link_limit, &state.config)?;
     if req.history_event_id.is_some() && req.owner_user_id.is_none() {
         return Err(ApiError::bad_request(
             "owner_user_id is required for history_event_id analysis",
@@ -1248,6 +1794,7 @@ async fn preflight_doc(
     State(state): State<AppState>,
     Json(req): Json<CompanyDocPreflightRequest>,
 ) -> Result<Json<CompanyDocPreflightResponse>, ApiError> {
+    validate_tags("tags", &req.tags, &state.config)?;
     let result = state.store.preflight_company_doc(req);
     Ok(Json(audit_shared_write(
         result,
@@ -1426,6 +1973,7 @@ async fn bulk_rows(
 ) -> Result<Json<BulkStructuredRowsResponse>, ApiError> {
     let owner = state.store.snapshot_owner_async(&snapshot_id).await?;
     user.require_owner_access(&owner)?;
+    validate_max_items("rows", req.rows.len(), state.config.max_bulk_rows)?;
     Ok(Json(
         state
             .store
@@ -1545,6 +2093,7 @@ async fn context_search(
     Json(mut req): Json<ContextSearchRequest>,
 ) -> Result<Json<ContextSearchResponse>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
+    validate_search_limit("limit", req.limit, &state.config)?;
     Ok(Json(
         state
             .store
@@ -1591,28 +2140,22 @@ async fn context_traceback(
 async fn create_ingest_task(
     user: UserGuard,
     State(state): State<AppState>,
+    Extension(deadline): Extension<RequestDeadline>,
     Json(mut req): Json<IngestTaskRequest>,
 ) -> Result<Json<IngestTask>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
     require_owner_for_write(&user, req.owner_user_id.as_deref())?;
     let config = state.effective_config();
     let task = state
-        .store
-        .create_ingest_task_record_async(
-            state.tenant_id(),
-            &req,
-            &config,
-            state.ingest_manager.queued_ahead(),
-        )
-        .await?;
-    state
         .ingest_manager
-        .enqueue(QueuedIngestJob {
-            tenant_id: state.tenant_id().to_string(),
-            task_id: task.task_id.clone(),
+        .submit(
+            state.store.clone(),
+            state.tenant_id().to_string(),
             req,
+            None,
             config,
-        })
+            deadline,
+        )
         .await?;
     Ok(Json(task))
 }
@@ -1650,6 +2193,7 @@ async fn get_ingest_task_result(
 async fn ingest_file_sync(
     user: UserGuard,
     State(state): State<AppState>,
+    Extension(tracker): Extension<SyncIngestTracker>,
     Json(mut req): Json<IngestTaskRequest>,
 ) -> Result<Json<IngestTaskResult>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
@@ -1657,7 +2201,13 @@ async fn ingest_file_sync(
     Ok(Json(
         state
             .store
-            .ingest_file_sync_async(state.tenant_id(), req, &state.effective_config())
+            .ingest_file_sync_async(
+                state.tenant_id(),
+                req,
+                None,
+                &state.effective_config(),
+                |task_id| tracker.set_task_id(task_id),
+            )
             .await?,
     ))
 }
@@ -1665,29 +2215,24 @@ async fn ingest_file_sync(
 async fn create_ingest_upload(
     user: UserGuard,
     State(state): State<AppState>,
+    Extension(deadline): Extension<RequestDeadline>,
     multipart: Multipart,
 ) -> Result<Json<IngestTask>, ApiError> {
-    let mut req = ingest_request_from_multipart(multipart).await?;
-    user.apply_owner_default(&mut req.owner_user_id)?;
-    require_owner_for_write(&user, req.owner_user_id.as_deref())?;
+    state.ingest_manager.ensure_available()?;
+    let mut prepared = ingest_request_from_multipart(multipart, &state.config).await?;
+    user.apply_owner_default(&mut prepared.request.owner_user_id)?;
+    require_owner_for_write(&user, prepared.request.owner_user_id.as_deref())?;
     let config = state.effective_config();
     let task = state
-        .store
-        .create_ingest_task_record_async(
-            state.tenant_id(),
-            &req,
-            &config,
-            state.ingest_manager.queued_ahead(),
-        )
-        .await?;
-    state
         .ingest_manager
-        .enqueue(QueuedIngestJob {
-            tenant_id: state.tenant_id().to_string(),
-            task_id: task.task_id.clone(),
-            req,
+        .submit(
+            state.store.clone(),
+            state.tenant_id().to_string(),
+            prepared.request,
+            prepared.staged_upload,
             config,
-        })
+            deadline,
+        )
         .await?;
     Ok(Json(task))
 }
@@ -1695,50 +2240,272 @@ async fn create_ingest_upload(
 async fn ingest_upload_sync(
     user: UserGuard,
     State(state): State<AppState>,
+    Extension(tracker): Extension<SyncIngestTracker>,
     multipart: Multipart,
 ) -> Result<Json<IngestTaskResult>, ApiError> {
-    let mut req = ingest_request_from_multipart(multipart).await?;
-    user.apply_owner_default(&mut req.owner_user_id)?;
-    require_owner_for_write(&user, req.owner_user_id.as_deref())?;
+    let mut prepared = ingest_request_from_multipart(multipart, &state.config).await?;
+    user.apply_owner_default(&mut prepared.request.owner_user_id)?;
+    require_owner_for_write(&user, prepared.request.owner_user_id.as_deref())?;
     Ok(Json(
         state
             .store
-            .ingest_file_sync_async(state.tenant_id(), req, &state.effective_config())
+            .ingest_file_sync_async(
+                state.tenant_id(),
+                prepared.request,
+                prepared.staged_upload,
+                &state.effective_config(),
+                |task_id| tracker.set_task_id(task_id),
+            )
             .await?,
     ))
 }
 
+struct PreparedIngestRequest {
+    request: IngestTaskRequest,
+    staged_upload: Option<StagedUpload>,
+}
+
+struct TemporaryUploadPath {
+    path: Option<PathBuf>,
+}
+
+impl TemporaryUploadPath {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.path
+            .as_deref()
+            .expect("temporary upload path must exist until staged")
+    }
+
+    fn into_staged(mut self, byte_len: u64, sha256: String) -> StagedUpload {
+        let path = self
+            .path
+            .take()
+            .expect("temporary upload path must exist until staged");
+        StagedUpload::new(path, byte_len, sha256)
+    }
+}
+
+impl Drop for TemporaryUploadPath {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        if let Err(err) = std::fs::remove_file(path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    error_kind = "temporary_upload_cleanup",
+                    "failed to remove incomplete staged upload"
+                );
+            }
+        }
+    }
+}
+
 async fn ingest_request_from_multipart(
     mut multipart: Multipart,
-) -> Result<IngestTaskRequest, ApiError> {
+    config: &Config,
+) -> Result<PreparedIngestRequest, ApiError> {
     let mut req = IngestTaskRequest::default();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|err| ApiError::bad_request(format!("invalid multipart body: {err}")))?
-    {
+    let mut staged_upload = None;
+    let mut file_part_content_type = None;
+    let mut field_count = 0_usize;
+    let mut metadata_bytes = 0_usize;
+    while let Some(field) = multipart.next_field().await.map_err(map_multipart_error)? {
+        field_count = field_count.saturating_add(1);
+        if field_count > config.max_multipart_fields {
+            return Err(ApiError::payload_too_large());
+        }
         let name = field.name().map(ToString::to_string).unwrap_or_default();
         if matches!(name.as_str(), "file" | "document" | "upload") {
+            if staged_upload.is_some() {
+                return Err(ApiError::validation(
+                    "file",
+                    "only one upload file is allowed",
+                ));
+            }
             if req.file_name.is_none() {
-                req.file_name = field.file_name().map(ToString::to_string);
+                req.file_name = field.file_name().map(sanitize_upload_filename);
             }
-            if req.content_type.is_none() {
-                req.content_type = field.content_type().map(ToString::to_string);
+            let part_content_type = field
+                .content_type()
+                .ok_or_else(|| ApiError::validation("content_type", "is required for uploads"))
+                .and_then(validate_multipart_content_type)?;
+            validate_upload_content_type_policy(&part_content_type, config)?;
+            if req
+                .content_type
+                .as_deref()
+                .is_some_and(|declared| !declared.eq_ignore_ascii_case(&part_content_type))
+            {
+                return Err(ApiError::validation(
+                    "content_type",
+                    "metadata must match the upload part Content-Type",
+                ));
             }
-            let bytes = field
-                .bytes()
-                .await
-                .map_err(|err| ApiError::bad_request(format!("invalid uploaded file: {err}")))?;
-            req.bytes = Some(bytes.to_vec());
+            req.content_type = Some(part_content_type.clone());
+            file_part_content_type = Some(part_content_type);
+            staged_upload = Some(stage_multipart_upload(field, config.max_upload_bytes).await?);
             continue;
         }
 
-        let text = field.text().await.map_err(|err| {
-            ApiError::bad_request(format!("invalid multipart field {name}: {err}"))
-        })?;
+        let text =
+            read_multipart_metadata_field(field, &name, &mut metadata_bytes, config.max_json_bytes)
+                .await?;
         apply_ingest_multipart_field(&mut req, &name, text)?;
     }
-    Ok(req)
+
+    if staged_upload.is_some()
+        && (req.content.is_some()
+            || req.bytes.is_some()
+            || req.content_list.is_some()
+            || req.content_list_v2.is_some()
+            || req.middle_json.is_some()
+            || req.model_json.is_some())
+    {
+        return Err(ApiError::validation(
+            "multipart",
+            "file uploads cannot be combined with alternate content or parser output fields",
+        ));
+    }
+
+    if let (Some(part_content_type), Some(effective_content_type)) = (
+        file_part_content_type.as_deref(),
+        req.content_type.as_deref(),
+    ) {
+        if !part_content_type.eq_ignore_ascii_case(effective_content_type) {
+            return Err(ApiError::validation(
+                "content_type",
+                "metadata must match the upload part Content-Type",
+            ));
+        }
+    }
+
+    if let Some(content_type) = req.content_type.as_deref() {
+        validate_upload_content_type_policy(content_type, config)?;
+    }
+
+    if let (Some(checksum), Some(upload)) = (req.checksum.as_deref(), staged_upload.as_ref()) {
+        verify_upload_checksum(checksum, &upload.sha256)?;
+    }
+
+    Ok(PreparedIngestRequest {
+        request: req,
+        staged_upload,
+    })
+}
+
+async fn stage_multipart_upload(
+    mut field: Field<'_>,
+    max_upload_bytes: usize,
+) -> Result<StagedUpload, ApiError> {
+    let path =
+        std::env::temp_dir().join(format!("nowledge-upload-{}", uuid::Uuid::now_v7().simple()));
+    let temporary_path = TemporaryUploadPath::new(path);
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(temporary_path.path())
+        .await
+        .map_err(|err| ApiError::Internal(format!("failed to create temporary upload: {err}")))?;
+    let mut byte_len = 0_u64;
+    let max_upload_bytes = u64::try_from(max_upload_bytes).unwrap_or(u64::MAX);
+    let mut hasher = Sha256::new();
+
+    while let Some(chunk) = field.chunk().await.map_err(map_multipart_error)? {
+        let next_len = byte_len
+            .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+            .ok_or_else(ApiError::payload_too_large)?;
+        if next_len > max_upload_bytes {
+            return Err(ApiError::payload_too_large());
+        }
+        file.write_all(&chunk).await.map_err(|err| {
+            ApiError::Internal(format!("failed to write temporary upload: {err}"))
+        })?;
+        hasher.update(&chunk);
+        byte_len = next_len;
+    }
+    file.flush()
+        .await
+        .map_err(|err| ApiError::Internal(format!("failed to flush temporary upload: {err}")))?;
+    drop(file);
+
+    if byte_len == 0 {
+        return Err(ApiError::validation("file", "must not be empty"));
+    }
+    Ok(temporary_path.into_staged(byte_len, hex::encode(hasher.finalize())))
+}
+
+async fn read_multipart_metadata_field(
+    mut field: Field<'_>,
+    name: &str,
+    metadata_bytes: &mut usize,
+    max_json_bytes: usize,
+) -> Result<String, ApiError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(map_multipart_error)? {
+        let next_total = metadata_bytes
+            .checked_add(chunk.len())
+            .ok_or_else(ApiError::payload_too_large)?;
+        if next_total > max_json_bytes {
+            return Err(ApiError::payload_too_large());
+        }
+        *metadata_bytes = next_total;
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        ApiError::validation(
+            if name.is_empty() { "multipart" } else { name },
+            "must be valid UTF-8",
+        )
+    })
+}
+
+fn map_multipart_error(err: MultipartError) -> ApiError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::payload_too_large()
+    } else {
+        ApiError::bad_request("invalid multipart body")
+    }
+}
+
+fn sanitize_upload_filename(value: &str) -> String {
+    let leaf = value.rsplit(['/', '\\']).next().unwrap_or_default();
+    let mut sanitized = leaf
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    while sanitized.len() > 255 {
+        sanitized.pop();
+    }
+    if sanitized.is_empty() || matches!(sanitized.as_str(), "." | "..") {
+        "upload.bin".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn verify_upload_checksum(expected: &str, actual: &str) -> Result<(), ApiError> {
+    let expected = expected.trim();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::validation(
+            "checksum",
+            "must be exactly 64 hexadecimal SHA-256 characters",
+        ));
+    }
+    if !expected.eq_ignore_ascii_case(actual) {
+        return Err(ApiError::validation(
+            "checksum",
+            "does not match the uploaded file",
+        ));
+    }
+    Ok(())
 }
 
 fn apply_ingest_multipart_field(
@@ -1755,7 +2522,7 @@ fn apply_ingest_multipart_field(
         "source_document_uri" => req.source_document_uri = non_empty(value),
         "content" => req.content = Some(value),
         "content_type" => req.content_type = non_empty(validate_multipart_content_type(&value)?),
-        "file_name" => req.file_name = non_empty(value),
+        "file_name" => req.file_name = non_empty(sanitize_upload_filename(&value)),
         "checksum" => req.checksum = non_empty(value),
         "parser_provider" => req.parser_provider = non_empty(value),
         "parser_backend" => req.parser_backend = non_empty(value),
@@ -1799,8 +2566,23 @@ fn non_empty(value: String) -> Option<String> {
 fn validate_multipart_content_type(value: &str) -> Result<String, ApiError> {
     reqwest::multipart::Part::bytes(Vec::new())
         .mime_str(value)
-        .map_err(|err| ApiError::bad_request(format!("invalid content_type: {err}")))?;
-    Ok(value.to_string())
+        .map_err(|_| ApiError::validation("content_type", "must be a valid MIME type"))?;
+    Ok(value.trim().to_ascii_lowercase())
+}
+
+fn validate_upload_content_type_policy(value: &str, config: &Config) -> Result<(), ApiError> {
+    if config
+        .upload_allowed_mime_types
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(value))
+    {
+        Ok(())
+    } else {
+        Err(ApiError::validation(
+            "content_type",
+            "is not allowed by RAG_UPLOAD_ALLOWED_MIME_TYPES",
+        ))
+    }
 }
 
 fn parse_json_field<T: serde::de::DeserializeOwned>(
@@ -1866,6 +2648,7 @@ async fn create_eval_case(
     State(state): State<AppState>,
     Json(req): Json<CreateRagEvalCaseRequest>,
 ) -> Result<Json<RagEvalCase>, ApiError> {
+    validate_tags("tags", &req.tags, &state.config)?;
     Ok(Json(
         state
             .store
@@ -2230,7 +3013,7 @@ async fn run_analysis_insights(
                     ContextSearchRequest {
                         query: Some(query.clone()),
                         owner_user_id: owner_user_id.clone(),
-                        limit: req.context_limit.max(2),
+                        limit: req.context_limit.max(2).min(state.config.max_search_limit),
                         debug: req.debug,
                         ..ContextSearchRequest::default()
                     },
@@ -2429,7 +3212,7 @@ async fn history_analysis_scope(
             HistorySearchRequest {
                 owner_user_id: Some(owner_user_id.to_string()),
                 query: Some(query.to_string()),
-                limit: context_limit.max(2),
+                limit: context_limit.max(2).min(state.config.max_search_limit),
                 ..HistorySearchRequest::default()
             },
         )
@@ -2457,7 +3240,7 @@ async fn history_analysis_scope(
             state.tenant_id(),
             LinkSearchRequest {
                 owner_user_id: Some(owner_user_id.to_string()),
-                limit: link_limit.max(1),
+                limit: link_limit.max(1).min(state.config.max_search_limit),
                 ..LinkSearchRequest::default()
             },
             true,
@@ -2975,10 +3758,15 @@ fn audit_reason(config: &Config, reason: &str) -> (&'static str, String) {
 fn api_error_kind(error: &ApiError) -> &'static str {
     match error {
         ApiError::BadRequest(_) => "bad_request",
+        ApiError::Validation { .. } => "validation_error",
         ApiError::Unauthorized(_) => "unauthorized",
         ApiError::Forbidden(_) => "forbidden",
         ApiError::NotFound(_) => "not_found",
         ApiError::Conflict(_) => "conflict",
+        ApiError::PayloadTooLarge => "payload_too_large",
+        ApiError::TooManyRequests(_) => "too_many_requests",
+        ApiError::ServiceUnavailable(_) => "service_unavailable",
+        ApiError::Timeout => "timeout",
         ApiError::Upstream(_) => "upstream_error",
         ApiError::Internal(_) => "internal_error",
     }

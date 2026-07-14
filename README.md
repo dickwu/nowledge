@@ -66,14 +66,31 @@ RAG_MINERU_RETURN_MD=true
 RAG_MINERU_RETURN_CONTENT_LIST=true
 RAG_MINERU_RETURN_MIDDLE_JSON=true
 RAG_MINERU_RETURN_IMAGES=true
+RAG_MAX_JSON_BYTES=2097152
+RAG_MAX_UPLOAD_BYTES=52428800
+RAG_MAX_MULTIPART_FIELDS=32
+RAG_UPLOAD_ALLOWED_MIME_TYPES=text/plain,text/markdown,application/octet-stream,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,image/png,image/jpeg,image/webp,image/gif,image/tiff
+RAG_MAX_BULK_EVENTS=500
+RAG_MAX_BULK_ROWS=5000
+RAG_MAX_SEARCH_LIMIT=100
+RAG_MAX_TAGS_PER_ITEM=64
+RAG_MAX_TAG_BYTES=128
+RAG_REQUEST_TIMEOUT_MS=30000
+RAG_SYNC_INGEST_TIMEOUT_MS=120000
+RAG_MAX_IN_FLIGHT_REQUESTS=256
+RAG_RATE_LIMIT_REQUESTS_PER_MINUTE=600
+RAG_CORS_ALLOWED_ORIGINS=*
+RAG_ALLOW_WILDCARD_CORS=false
 RAG_VECTOR_MATCH_ENABLED=true
 RAG_VECTOR_MATCH_WEIGHT=4.0
 RAG_VECTOR_MATCH_DOC_WEIGHT=2.0
 RAG_VECTOR_MATCH_MIN_SCORE=0.25
 RAG_INGEST_MAX_CONCURRENT_TASKS=2
+RAG_INGEST_QUEUE_CAPACITY=16
 RAG_INGEST_TASK_RETENTION_SECONDS=86400
 RAG_INGEST_CLEANUP_INTERVAL_SECONDS=300
 RAG_INGEST_WORKER_ENABLED=true
+RAG_SHUTDOWN_TIMEOUT_MS=30000
 RAG_LLM_PROVIDER=none
 RAG_LLM_MODEL=none
 RAG_LLM_REASONING_EFFORT=optional-low-medium-high-xhigh
@@ -110,6 +127,37 @@ and been verified. The compatibility path expires on 2026-10-01 / v0.13.0.
 
 `RAG_RUN_MODE` accepts only `development`, `test`, or `production`; unknown
 values are startup errors and never enable unauthenticated access by default.
+
+HTTP and ingest boundaries are typed startup configuration. Numeric limits
+must be positive, malformed values fail startup, and the synchronous ingest
+timeout must be at least the ordinary request timeout. Request, sync-ingest,
+and shutdown deadlines are capped at seven days so deadline arithmetic cannot
+overflow or panic. JSON requests are
+limited by `RAG_MAX_JSON_BYTES`; multipart file data is streamed to temporary
+storage and limited independently by `RAG_MAX_UPLOAD_BYTES` and
+`RAG_MAX_MULTIPART_FIELDS`. `RAG_UPLOAD_ALLOWED_MIME_TYPES` is a comma-separated
+list normalized to exact lowercase MIME types; wildcards, duplicates, and an
+empty list fail startup. The default allows plain text, Markdown, generic binary
+(`application/octet-stream`), PDF, OOXML Word/PowerPoint/Excel, and PNG, JPEG,
+WebP, GIF, and TIFF. Bulk event/row counts, tags, tag byte lengths, and search
+limits are rejected before mutation when they exceed their configured
+maximums. Limit failures use the normal error envelope and return 413 for body
+or upload size, 429 for rate/queue pressure, 503 for global capacity or a
+disabled/closing worker, and 504 for route timeouts. Pressure responses include
+`Retry-After`, and every response includes a server-generated `X-Request-Id`.
+
+`RAG_CORS_ALLOWED_ORIGINS` is a comma-separated list of exact `http://` or
+`https://` origins. Development and test default to `*`; production defaults
+to no allowed browser origin. A production wildcard is rejected unless it is
+the sole origin and `RAG_ALLOW_WILDCARD_CORS=true` is set explicitly.
+`RAG_MAX_IN_FLIGHT_REQUESTS` load-sheds excess work without consuming the
+`/livez` capacity or timeout path. `/readyz` remains public but has its own
+readiness-probe rate bucket. Rate limiting is keyed by the authenticated
+logical tenant/principal, so rotating or adding a second token does not create
+a new owner budget. CORS exposes `X-Request-Id` and `Retry-After` to allowed
+browser origins. See
+[ADR 0003](doc/adr/0003-http-ingest-runtime-boundaries.md) for middleware
+ordering, overload semantics, upload staging, and rollout.
 
 Use `RAG_STORE_BACKEND=meili` with `RAG_MEILI_URL` to mirror core writes to
 Meilisearch and search per-user event indexes through Meilisearch. Production
@@ -225,14 +273,33 @@ APIs are `POST /v1/ingest/tasks`, `GET /v1/ingest/tasks/{task_id}`,
 `POST /v1/ingest/uploads:sync`, and `POST /v1/ingest/files:sync`.
 `POST /v1/ingest/tasks` and `/v1/ingest/uploads` return queued task metadata
 immediately; background workers perform parsing, fragmenting, and indexing.
+Queue capacity defaults to eight times `RAG_INGEST_MAX_CONCURRENT_TASKS` and
+can be set explicitly with `RAG_INGEST_QUEUE_CAPACITY`. A full queue is rejected
+immediately without creating an orphan task. Disabling the worker rejects new
+asynchronous ingest while synchronous ingest remains available. Synchronous
+ingest uses a separate immediate load-shed lane capped by
+`RAG_INGEST_MAX_CONCURRENT_TASKS`; saturation returns 503 plus `Retry-After`
+before buffering a JSON or multipart body. SIGINT/SIGTERM stop new queue
+acceptance, allow supervised work to finish within
+`RAG_SHUTDOWN_TIMEOUT_MS`, and mark unfinished tasks as failed with
+`ingest_interrupted`; startup recovery applies the same terminal state to
+persisted nonterminal tasks from a prior process.
 Finished (`completed`/`failed`) task records and their stored results are
 pruned after `RAG_INGEST_TASK_RETENTION_SECONDS` (default 86400; set 0 to
 keep them forever), swept every `RAG_INGEST_CLEANUP_INTERVAL_SECONDS` —
 covering both the in-memory maps and the mirrored Meilisearch documents.
 Ingested fragments and source documents are unaffected; only the task
 bookkeeping expires.
-Multipart uploads send binary file bytes to MinerU when `parser_provider=mineru`;
-the builtin parser accepts UTF-8 text uploads.
+Multipart uploads are staged with a generated private filename, incrementally
+hashed, and deleted after parsing or on cancellation/error. Duplicate file
+parts, excess metadata fields, an empty file, invalid or disallowed MIME values,
+and a supplied checksum that is not exactly 64 hexadecimal SHA-256 characters
+or does not match the staged file are rejected. Each file part must carry a
+`Content-Type` in `RAG_UPLOAD_ALLOWED_MIME_TYPES`; an optional `content_type`
+metadata field must match it. A staged file cannot be combined with `content`,
+`content_list`, `content_list_v2`, `middle_json`, or `model_json`.
+MinerU receives a streaming file part when `parser_provider=mineru`; the builtin
+parser performs one bounded UTF-8 read.
 Parsed blocks become retrieval fragments; source documents and parse artifacts
 are stored for traceback/read flows but are not searched by default.
 `POST /v1/context/search` supports `compact`, `standard`, and `full` return

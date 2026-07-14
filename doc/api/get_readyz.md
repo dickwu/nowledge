@@ -37,6 +37,12 @@ counts, plan data, rate-limit budgets, and credits.
 - Public; no bearer token is required.
 - Returns 200 when ready and 503 when any mandatory dependency makes the service unready.
 - Dependency failures are represented only by the coarse status and ready fields; use authenticated `/healthz` for details.
+- The public readiness-probe rate bucket can return 429
+  `too_many_requests`; global in-flight pressure can return 503
+  `service_unavailable`. Both boundary responses use the shared error envelope
+  and include `Retry-After`, unlike an ordinary dependency-health 503.
+- `RAG_REQUEST_TIMEOUT_MS` can return 504 `timeout`. Every response includes
+  `X-Request-Id`.
 
 ## Internal Logic Call Graph
 ```mermaid
