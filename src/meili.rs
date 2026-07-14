@@ -1,7 +1,7 @@
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::Instant;
+use std::{collections::BTreeSet, time::Instant};
 
 use tokio::time::{sleep, timeout, Duration};
 
@@ -93,6 +93,27 @@ impl MeiliAdmin {
             });
         };
 
+        let provision = if reset {
+            true
+        } else {
+            let mut existing = Vec::new();
+            let mut missing = Vec::new();
+            for uid in FIXED_INDEXES {
+                if self.index_exists(uid).await? {
+                    existing.push(*uid);
+                } else {
+                    missing.push(*uid);
+                }
+            }
+            if !existing.is_empty() && !missing.is_empty() {
+                return Err(ApiError::Upstream(format!(
+                    "managed Meilisearch index set is incomplete; refusing automatic recreation of: {}",
+                    missing.join(", ")
+                )));
+            }
+            existing.is_empty()
+        };
+
         let mut task_uids = Vec::new();
         for uid in FIXED_INDEXES {
             if reset {
@@ -119,7 +140,11 @@ impl MeiliAdmin {
                 }
             }
 
-            task_uids.extend(self.ensure_index(uid, "id", true).await?);
+            if provision {
+                task_uids.extend(self.ensure_index(uid, "id", true).await?);
+            } else {
+                task_uids.extend(self.reconcile_existing_index(uid, true).await?);
+            }
         }
         self.wait_for_tasks(&task_uids).await?;
         let tasks = task_uids
@@ -250,7 +275,32 @@ impl MeiliAdmin {
         Ok(task_uids)
     }
 
-    async fn index_exists(&self, uid: &str) -> Result<bool, ApiError> {
+    /// Reconcile settings for an index that must already exist.
+    ///
+    /// Startup recovery uses this instead of [`Self::ensure_index`] so a
+    /// missing registered dynamic index is treated as data loss, not silently
+    /// recreated as an empty index.
+    pub async fn reconcile_existing_index(
+        &self,
+        uid: &str,
+        apply_settings: bool,
+    ) -> Result<Vec<String>, ApiError> {
+        if !self.index_exists(uid).await? {
+            return Err(ApiError::Upstream(format!(
+                "registered Meilisearch index {uid} is missing; refusing empty recreation"
+            )));
+        }
+        let mut task_uids = Vec::new();
+        if apply_settings {
+            if let Some(task_uid) = self.apply_settings(uid).await? {
+                self.wait_for_task(&task_uid).await?;
+                task_uids.push(task_uid);
+            }
+        }
+        Ok(task_uids)
+    }
+
+    pub async fn index_exists(&self, uid: &str) -> Result<bool, ApiError> {
         let Some(url) = &self.url else {
             return Ok(false);
         };
@@ -473,6 +523,64 @@ impl MeiliAdmin {
         }
     }
 
+    /// Fetch one filtered, deterministically sorted document page.
+    ///
+    /// This deliberately uses Meilisearch's documents fetch endpoint instead
+    /// of `/search`: repository hydration must be able to walk the complete
+    /// filtered corpus without `maxTotalHits` truncation. The unfiltered GET
+    /// reader above remains available to the tenant-scope migration tool.
+    pub async fn fetch_filtered_documents_page(
+        &self,
+        index_uid: &str,
+        filter: &str,
+        sort: &[String],
+        offset: usize,
+        limit: usize,
+    ) -> Result<DocumentPage, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(DocumentPage {
+                results: Vec::new(),
+                offset,
+                limit,
+                total: 0,
+            });
+        };
+        let response = self
+            .client
+            .post(format!(
+                "{}/indexes/{}/documents/fetch",
+                url.trim_end_matches('/'),
+                index_uid
+            ))
+            .headers(self.headers()?)
+            .json(&json!({
+                "offset": offset,
+                "limit": limit,
+                "filter": filter,
+                "sort": sort,
+            }))
+            .send()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+
+        if response.status().as_u16() == 404 {
+            return Err(ApiError::Upstream(format!(
+                "required Meilisearch index {index_uid} is missing during filtered scan"
+            )));
+        }
+        if response.status().is_success() {
+            response
+                .json::<DocumentPage>()
+                .await
+                .map_err(|error| ApiError::Upstream(error.to_string()))
+        } else {
+            Err(ApiError::Upstream(format!(
+                "failed to fetch filtered Meilisearch documents from {index_uid}: {}",
+                response.status()
+            )))
+        }
+    }
+
     pub async fn search_value(&self, index_uid: &str, body: Value) -> Result<Value, ApiError> {
         let Some(url) = &self.url else {
             return Ok(json!({ "hits": [] }));
@@ -552,6 +660,9 @@ impl MeiliAdmin {
             return Ok(None);
         };
         let settings = settings_for(uid);
+        if self.managed_settings_match(uid, &settings).await? {
+            return Ok(None);
+        }
         let response = self
             .client
             .patch(format!(
@@ -574,6 +685,34 @@ impl MeiliAdmin {
                 response.status()
             )))
         }
+    }
+
+    async fn managed_settings_match(&self, uid: &str, desired: &Value) -> Result<bool, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(true);
+        };
+        let response = self
+            .client
+            .get(format!(
+                "{}/indexes/{}/settings",
+                url.trim_end_matches('/'),
+                uid
+            ))
+            .headers(self.headers()?)
+            .send()
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(ApiError::Upstream(format!(
+                "failed to read Meilisearch settings for {uid}: {}",
+                response.status()
+            )));
+        }
+        let current = response
+            .json::<Value>()
+            .await
+            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+        Ok(managed_settings_equal(&current, desired))
     }
 
     fn headers(&self) -> Result<HeaderMap, ApiError> {
@@ -609,7 +748,7 @@ pub fn settings_for(uid: &str) -> Value {
     let mut settings = if uid.contains("context") {
         json!({
             "searchableAttributes": ["title", "body", "uri"],
-            "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id", "node_kind", "retrieval_role", "retrieval_enabled", "parent_uri", "source_document_uri", "fragment_index", "block_type", "page_idx", "heading_level"],
+            "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "index_uid", "index_kind", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id", "node_kind", "retrieval_role", "retrieval_enabled", "parent_uri", "source_document_uri", "fragment_index", "block_type", "page_idx", "heading_level"],
             "sortableAttributes": ["updated_at", "layer"]
         })
     } else if uid == "rag_source_documents" {
@@ -701,7 +840,47 @@ pub fn settings_for(uid: &str) -> Value {
         ensure_filterable_attribute(&mut settings, required);
     }
     ensure_searchable_attribute(&mut settings, "logical_id");
+    ensure_sortable_attribute(&mut settings, "id");
     settings
+}
+
+fn managed_settings_equal(current: &Value, desired: &Value) -> bool {
+    current.get("searchableAttributes") == desired.get("searchableAttributes")
+        && unordered_string_arrays_equal(
+            current.get("filterableAttributes"),
+            desired.get("filterableAttributes"),
+        )
+        && unordered_string_arrays_equal(
+            current.get("sortableAttributes"),
+            desired.get("sortableAttributes"),
+        )
+}
+
+fn unordered_string_arrays_equal(left: Option<&Value>, right: Option<&Value>) -> bool {
+    let (Some(left), Some(right)) = (
+        left.and_then(Value::as_array),
+        right.and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    if left.len() != right.len() {
+        return false;
+    }
+    let Some(left_set) = left
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<BTreeSet<_>>>()
+    else {
+        return false;
+    };
+    let Some(right_set) = right
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<BTreeSet<_>>>()
+    else {
+        return false;
+    };
+    left_set.len() == left.len() && right_set.len() == right.len() && left_set == right_set
 }
 
 fn ensure_filterable_attribute(settings: &mut Value, attribute: &str) {
@@ -728,9 +907,50 @@ fn ensure_searchable_attribute(settings: &mut Value, attribute: &str) {
     }
 }
 
+fn ensure_sortable_attribute(settings: &mut Value, attribute: &str) {
+    let Some(sortable) = settings
+        .get_mut("sortableAttributes")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if !sortable.iter().any(|value| value == attribute) {
+        sortable.push(Value::String(attribute.to_string()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_settings_treat_only_set_valued_attributes_as_unordered() {
+        let desired = json!({
+            "searchableAttributes": ["title", "body"],
+            "filterableAttributes": ["tenant_id", "status"],
+            "sortableAttributes": ["created_at", "id"]
+        });
+        let canonicalized = json!({
+            "searchableAttributes": ["title", "body"],
+            "filterableAttributes": ["status", "tenant_id"],
+            "sortableAttributes": ["id", "created_at"]
+        });
+        assert!(managed_settings_equal(&canonicalized, &desired));
+
+        let reordered_searchable = json!({
+            "searchableAttributes": ["body", "title"],
+            "filterableAttributes": ["status", "tenant_id"],
+            "sortableAttributes": ["id", "created_at"]
+        });
+        assert!(!managed_settings_equal(&reordered_searchable, &desired));
+
+        let duplicated_filter = json!({
+            "searchableAttributes": ["title", "body"],
+            "filterableAttributes": ["tenant_id", "tenant_id"],
+            "sortableAttributes": ["id", "created_at"]
+        });
+        assert!(!managed_settings_equal(&duplicated_filter, &desired));
+    }
 
     #[test]
     fn every_fixed_index_can_filter_by_tenant_and_logical_identity() {
@@ -756,12 +976,26 @@ mod tests {
     }
 
     #[test]
-    fn harness_components_sort_by_public_logical_identity() {
+    fn every_fixed_index_supports_a_stable_physical_id_tie_breaker() {
+        for uid in FIXED_INDEXES {
+            let settings = settings_for(uid);
+            let sortable = settings["sortableAttributes"]
+                .as_array()
+                .expect("sortable attributes");
+            assert!(
+                sortable.iter().any(|value| value == "id"),
+                "{uid} is missing stable id sorting"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_components_sort_by_public_logical_identity_and_physical_tie_breaker() {
         let settings = settings_for("rag_harness_components");
         let sortable = settings["sortableAttributes"]
             .as_array()
             .expect("sortable attributes");
         assert!(sortable.iter().any(|value| value == "logical_id"));
-        assert!(!sortable.iter().any(|value| value == "id"));
+        assert!(sortable.iter().any(|value| value == "id"));
     }
 }

@@ -8,7 +8,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::{
-    config::Config,
+    config::{Config, DEFAULT_MEILI_SCAN_MAX_DOCUMENTS, DEFAULT_MEILI_SCAN_PAGE_SIZE},
     error::{safe_cause_diagnostic, safe_value_fingerprint, ApiError},
     meili::{MeiliAdmin, SearchResponse},
     models::*,
@@ -46,6 +46,21 @@ pub trait KnowledgeRepository: Send + Sync {
         index: &UserEventIndex,
     ) -> Result<Vec<String>, ApiError>;
 
+    /// Reconcile a registry-owned dynamic index during startup without
+    /// creating a missing index. Backends without an asynchronous index
+    /// lifecycle may use the ordinary ensure behavior.
+    async fn reconcile_registered_user_event_index(
+        &self,
+        index: &UserEventIndex,
+    ) -> Result<Vec<String>, ApiError> {
+        self.ensure_user_event_index(index).await
+    }
+
+    async fn list_user_event_indexes(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<UserEventIndex>>, ApiError>;
+
     async fn append_event(&self, event: &HistoryEvent) -> Result<Option<String>, ApiError>;
 
     async fn upsert_context_nodes(
@@ -64,6 +79,12 @@ pub trait KnowledgeRepository: Send + Sync {
         tenant_id: &str,
     ) -> Result<Option<Vec<ContextNode>>, ApiError>;
 
+    async fn list_personal_context_nodes(
+        &self,
+        tenant_id: &str,
+        index_uid: &str,
+    ) -> Result<Option<Vec<ContextNode>>, ApiError>;
+
     /// Rehydrate every persisted CompanySource for `tenant_id` so the
     /// in-memory `sources` table survives a restart without crossing tenants.
     async fn list_company_sources(
@@ -80,6 +101,12 @@ pub trait KnowledgeRepository: Send + Sync {
     ) -> Result<Option<Vec<SourceRevision>>, ApiError>;
 
     async fn upsert_state_item(&self, item: &StateItem) -> Result<Option<String>, ApiError>;
+
+    async fn list_state_items(&self, tenant_id: &str) -> Result<Option<Vec<StateItem>>, ApiError>;
+
+    async fn upsert_insight(&self, insight: &InsightRecord) -> Result<Option<String>, ApiError>;
+
+    async fn list_insights(&self, tenant_id: &str) -> Result<Option<Vec<InsightRecord>>, ApiError>;
 
     async fn upsert_company_source(
         &self,
@@ -115,6 +142,15 @@ pub trait KnowledgeRepository: Send + Sync {
         snapshot: &StructuredSnapshot,
     ) -> Result<Option<String>, ApiError>;
 
+    async fn upsert_dataset(&self, dataset: &DatasetRecord) -> Result<Option<String>, ApiError>;
+
+    async fn list_datasets(&self, tenant_id: &str) -> Result<Option<Vec<DatasetRecord>>, ApiError>;
+
+    async fn list_structured_snapshots(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<StructuredSnapshot>>, ApiError>;
+
     async fn upsert_structured_rows(
         &self,
         tenant_id: &str,
@@ -127,9 +163,22 @@ pub trait KnowledgeRepository: Send + Sync {
         summary: &Value,
     ) -> Result<Option<String>, ApiError>;
 
+    async fn list_structured_summaries(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<Value>>, ApiError>;
+
+    async fn upsert_session(&self, session: &SessionRecord) -> Result<Option<String>, ApiError>;
+
+    async fn list_sessions(&self, tenant_id: &str) -> Result<Option<Vec<SessionRecord>>, ApiError>;
+
     async fn upsert_trace(&self, trace: &TraceRecord) -> Result<Option<String>, ApiError>;
 
+    async fn list_traces(&self, tenant_id: &str) -> Result<Option<Vec<TraceRecord>>, ApiError>;
+
     async fn upsert_links(&self, links: &[KnowledgeLink]) -> Result<Option<String>, ApiError>;
+
+    async fn list_links(&self, tenant_id: &str) -> Result<Option<Vec<KnowledgeLink>>, ApiError>;
 
     async fn upsert_harness_components(
         &self,
@@ -149,10 +198,28 @@ pub trait KnowledgeRepository: Send + Sync {
 
     async fn upsert_ingest_task(&self, task: &IngestTask) -> Result<Option<String>, ApiError>;
 
+    async fn upsert_ingest_tasks(&self, tasks: &[IngestTask]) -> Result<Vec<String>, ApiError> {
+        let mut task_uids = Vec::new();
+        for task in tasks {
+            if let Some(task_uid) = self.upsert_ingest_task(task).await? {
+                task_uids.push(task_uid);
+            }
+        }
+        Ok(task_uids)
+    }
+
     async fn upsert_ingest_result(
         &self,
         result: &IngestTaskResult,
     ) -> Result<Option<String>, ApiError>;
+
+    /// Confirm that previously accepted backend tasks have completed
+    /// successfully. Memory-backed repositories have no asynchronous commit
+    /// boundary, so the default is a no-op. Startup recovery uses this hook
+    /// unconditionally before publishing recovered state as ready.
+    async fn wait_for_tasks(&self, _task_uids: &[String]) -> Result<(), ApiError> {
+        Ok(())
+    }
 
     /// Remove expired ingest tasks (and their stored results) from the
     /// backing store, keyed by task id. The memory backend is a no-op — the
@@ -247,6 +314,20 @@ pub trait KnowledgeRepository: Send + Sync {
         run_id: &str,
     ) -> Result<Option<Vec<RagEvalCaseResult>>, ApiError>;
 
+    /// Load every persisted parse artifact for `tenant_id`, across company
+    /// scope and every private owner scope. Startup hydration uses this
+    /// tenant-wide contract because retained artifacts outlive operational
+    /// ingest task/result rows.
+    async fn list_tenant_parse_artifacts(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<ParseArtifact>>, ApiError> {
+        Ok(None)
+    }
+
+    /// Load parse artifacts for one exact owner scope. `owner_user_id = None`
+    /// means company scope only; use `list_tenant_parse_artifacts` when all
+    /// private owners must be included.
     async fn list_parse_artifacts(
         &self,
         tenant_id: &str,
@@ -287,6 +368,16 @@ pub trait KnowledgeRepository: Send + Sync {
         owner_user_id: Option<&str>,
         uri: &str,
     ) -> Result<Option<SourceDocument>, ApiError>;
+
+    /// Load every active tenant document matching a public ContextFS URI.
+    /// This is reserved for administrator reads without an explicit owner so
+    /// the Store can reject ambiguous private matches instead of selecting an
+    /// arbitrary owner.
+    async fn list_source_documents_by_uri(
+        &self,
+        tenant_id: &str,
+        uri: &str,
+    ) -> Result<Option<Vec<SourceDocument>>, ApiError>;
 
     async fn get_trace(
         &self,
@@ -330,6 +421,13 @@ impl KnowledgeRepository for MemoryRepository {
         Ok(Vec::new())
     }
 
+    async fn list_user_event_indexes(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<UserEventIndex>>, ApiError> {
+        Ok(None)
+    }
+
     async fn append_event(&self, _event: &HistoryEvent) -> Result<Option<String>, ApiError> {
         Ok(None)
     }
@@ -349,6 +447,14 @@ impl KnowledgeRepository for MemoryRepository {
         Ok(None)
     }
 
+    async fn list_personal_context_nodes(
+        &self,
+        _tenant_id: &str,
+        _index_uid: &str,
+    ) -> Result<Option<Vec<ContextNode>>, ApiError> {
+        Ok(None)
+    }
+
     async fn list_company_sources(
         &self,
         _tenant_id: &str,
@@ -364,6 +470,21 @@ impl KnowledgeRepository for MemoryRepository {
     }
 
     async fn upsert_state_item(&self, _item: &StateItem) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_state_items(&self, _tenant_id: &str) -> Result<Option<Vec<StateItem>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_insight(&self, _insight: &InsightRecord) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_insights(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<InsightRecord>>, ApiError> {
         Ok(None)
     }
 
@@ -410,6 +531,24 @@ impl KnowledgeRepository for MemoryRepository {
         Ok(None)
     }
 
+    async fn upsert_dataset(&self, _dataset: &DatasetRecord) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_datasets(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<DatasetRecord>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_structured_snapshots(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<StructuredSnapshot>>, ApiError> {
+        Ok(None)
+    }
+
     async fn upsert_structured_rows(
         &self,
         _tenant_id: &str,
@@ -426,11 +565,37 @@ impl KnowledgeRepository for MemoryRepository {
         Ok(None)
     }
 
+    async fn list_structured_summaries(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<Value>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_session(&self, _session: &SessionRecord) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_sessions(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<SessionRecord>>, ApiError> {
+        Ok(None)
+    }
+
     async fn upsert_trace(&self, _trace: &TraceRecord) -> Result<Option<String>, ApiError> {
         Ok(None)
     }
 
+    async fn list_traces(&self, _tenant_id: &str) -> Result<Option<Vec<TraceRecord>>, ApiError> {
+        Ok(None)
+    }
+
     async fn upsert_links(&self, _links: &[KnowledgeLink]) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_links(&self, _tenant_id: &str) -> Result<Option<Vec<KnowledgeLink>>, ApiError> {
         Ok(None)
     }
 
@@ -653,6 +818,14 @@ impl KnowledgeRepository for MemoryRepository {
         Ok(None)
     }
 
+    async fn list_source_documents_by_uri(
+        &self,
+        _tenant_id: &str,
+        _uri: &str,
+    ) -> Result<Option<Vec<SourceDocument>>, ApiError> {
+        Ok(None)
+    }
+
     async fn get_trace(
         &self,
         _tenant_id: &str,
@@ -691,13 +864,31 @@ impl KnowledgeRepository for MemoryRepository {
 pub struct MeiliRepository {
     admin: MeiliAdmin,
     wait_for_tasks: bool,
+    scan_page_size: usize,
+    scan_max_documents: usize,
 }
 
 impl MeiliRepository {
     pub fn new(admin: MeiliAdmin, wait_for_tasks: bool) -> Self {
+        Self::new_with_scan_limits(
+            admin,
+            wait_for_tasks,
+            DEFAULT_MEILI_SCAN_PAGE_SIZE,
+            DEFAULT_MEILI_SCAN_MAX_DOCUMENTS,
+        )
+    }
+
+    pub fn new_with_scan_limits(
+        admin: MeiliAdmin,
+        wait_for_tasks: bool,
+        scan_page_size: usize,
+        scan_max_documents: usize,
+    ) -> Self {
         Self {
             admin,
             wait_for_tasks,
+            scan_page_size,
+            scan_max_documents,
         }
     }
 
@@ -825,6 +1016,51 @@ impl KnowledgeRepository for MeiliRepository {
         Ok(task_uids)
     }
 
+    async fn reconcile_registered_user_event_index(
+        &self,
+        index: &UserEventIndex,
+    ) -> Result<Vec<String>, ApiError> {
+        let mut task_uids = self
+            .admin
+            .reconcile_existing_index(&index.event_index_uid, true)
+            .await?;
+        task_uids.extend(
+            self.admin
+                .reconcile_existing_index(&index.personal_context_index_uid, true)
+                .await?,
+        );
+        let registry_task = self
+            .upsert_values(
+                "rag_user_event_indexes",
+                &[tenant_document(
+                    &index.tenant_id,
+                    "rag_user_event_indexes",
+                    &index.id,
+                    index,
+                )?],
+            )
+            .await?;
+        if let Some(task_uid) = registry_task {
+            task_uids.push(task_uid);
+        }
+        if self.wait_for_tasks {
+            self.admin.wait_for_tasks(&task_uids).await?;
+        }
+        Ok(task_uids)
+    }
+
+    async fn list_user_event_indexes(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<UserEventIndex>>, ApiError> {
+        self.search_tenant_many(
+            "rag_user_event_indexes",
+            TenantFilter::new(tenant_id)?,
+            Some(&["created_at:asc"]),
+        )
+        .await
+    }
+
     async fn append_event(&self, event: &HistoryEvent) -> Result<Option<String>, ApiError> {
         let task_uid = self
             .upsert_values(&event.event_index_uid, &[to_document(event, &event.id)?])
@@ -851,7 +1087,19 @@ impl KnowledgeRepository for MeiliRepository {
         self.search_tenant_many(
             "rag_company_context",
             TenantFilter::new(tenant_id)?,
-            1000,
+            Some(&["updated_at:desc"]),
+        )
+        .await
+    }
+
+    async fn list_personal_context_nodes(
+        &self,
+        tenant_id: &str,
+        index_uid: &str,
+    ) -> Result<Option<Vec<ContextNode>>, ApiError> {
+        self.search_tenant_many(
+            index_uid,
+            TenantFilter::new(tenant_id)?,
             Some(&["updated_at:desc"]),
         )
         .await
@@ -861,7 +1109,7 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         tenant_id: &str,
     ) -> Result<Option<Vec<CompanySource>>, ApiError> {
-        self.search_tenant_many("rag_sources", TenantFilter::new(tenant_id)?, 1000, None)
+        self.search_tenant_many("rag_sources", TenantFilter::new(tenant_id)?, None)
             .await
     }
 
@@ -869,13 +1117,8 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         tenant_id: &str,
     ) -> Result<Option<Vec<SourceRevision>>, ApiError> {
-        self.search_tenant_many(
-            "rag_source_revisions",
-            TenantFilter::new(tenant_id)?,
-            2000,
-            None,
-        )
-        .await
+        self.search_tenant_many("rag_source_revisions", TenantFilter::new(tenant_id)?, None)
+            .await
     }
 
     async fn upsert_state_item(&self, item: &StateItem) -> Result<Option<String>, ApiError> {
@@ -887,6 +1130,37 @@ impl KnowledgeRepository for MeiliRepository {
                 &item.id,
                 item,
             )?],
+        )
+        .await
+    }
+
+    async fn list_state_items(&self, tenant_id: &str) -> Result<Option<Vec<StateItem>>, ApiError> {
+        self.search_tenant_many(
+            "rag_state_items",
+            TenantFilter::new(tenant_id)?,
+            Some(&["updated_at:desc"]),
+        )
+        .await
+    }
+
+    async fn upsert_insight(&self, insight: &InsightRecord) -> Result<Option<String>, ApiError> {
+        self.upsert_values(
+            "rag_insights",
+            &[tenant_document(
+                &insight.tenant_id,
+                "rag_insights",
+                &insight.id,
+                insight,
+            )?],
+        )
+        .await
+    }
+
+    async fn list_insights(&self, tenant_id: &str) -> Result<Option<Vec<InsightRecord>>, ApiError> {
+        self.search_tenant_many(
+            "rag_insights",
+            TenantFilter::new(tenant_id)?,
+            Some(&["updated_at:desc"]),
         )
         .await
     }
@@ -1057,6 +1331,40 @@ impl KnowledgeRepository for MeiliRepository {
         .await
     }
 
+    async fn upsert_dataset(&self, dataset: &DatasetRecord) -> Result<Option<String>, ApiError> {
+        self.upsert_values(
+            "rag_structured_datasets",
+            &[tenant_document(
+                &dataset.tenant_id,
+                "rag_structured_datasets",
+                &dataset.id,
+                dataset,
+            )?],
+        )
+        .await
+    }
+
+    async fn list_datasets(&self, tenant_id: &str) -> Result<Option<Vec<DatasetRecord>>, ApiError> {
+        self.search_tenant_many(
+            "rag_structured_datasets",
+            TenantFilter::new(tenant_id)?,
+            None,
+        )
+        .await
+    }
+
+    async fn list_structured_snapshots(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<StructuredSnapshot>>, ApiError> {
+        self.search_tenant_many(
+            "rag_structured_snapshots",
+            TenantFilter::new(tenant_id)?,
+            None,
+        )
+        .await
+    }
+
     async fn upsert_structured_rows(
         &self,
         tenant_id: &str,
@@ -1090,6 +1398,40 @@ impl KnowledgeRepository for MeiliRepository {
         .await
     }
 
+    async fn list_structured_summaries(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<Value>>, ApiError> {
+        self.search_tenant_many(
+            "rag_structured_summaries",
+            TenantFilter::new(tenant_id)?,
+            None,
+        )
+        .await
+    }
+
+    async fn upsert_session(&self, session: &SessionRecord) -> Result<Option<String>, ApiError> {
+        self.upsert_values(
+            "rag_sessions",
+            &[tenant_document(
+                &session.tenant_id,
+                "rag_sessions",
+                &session.id,
+                session,
+            )?],
+        )
+        .await
+    }
+
+    async fn list_sessions(&self, tenant_id: &str) -> Result<Option<Vec<SessionRecord>>, ApiError> {
+        self.search_tenant_many(
+            "rag_sessions",
+            TenantFilter::new(tenant_id)?,
+            Some(&["created_at:asc"]),
+        )
+        .await
+    }
+
     async fn upsert_trace(&self, trace: &TraceRecord) -> Result<Option<String>, ApiError> {
         self.upsert_values(
             "rag_traces",
@@ -1103,12 +1445,30 @@ impl KnowledgeRepository for MeiliRepository {
         .await
     }
 
+    async fn list_traces(&self, tenant_id: &str) -> Result<Option<Vec<TraceRecord>>, ApiError> {
+        self.search_tenant_many(
+            "rag_traces",
+            TenantFilter::new(tenant_id)?,
+            Some(&["created_at:asc"]),
+        )
+        .await
+    }
+
     async fn upsert_links(&self, links: &[KnowledgeLink]) -> Result<Option<String>, ApiError> {
         let documents = links
             .iter()
             .map(|link| tenant_document(&link.tenant_id, "rag_links", &link.id, link))
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values("rag_links", &documents).await
+    }
+
+    async fn list_links(&self, tenant_id: &str) -> Result<Option<Vec<KnowledgeLink>>, ApiError> {
+        self.search_tenant_many(
+            "rag_links",
+            TenantFilter::new(tenant_id)?,
+            Some(&["updated_at:desc"]),
+        )
+        .await
     }
 
     async fn upsert_harness_components(
@@ -1196,6 +1556,18 @@ impl KnowledgeRepository for MeiliRepository {
         .await
     }
 
+    async fn upsert_ingest_tasks(&self, tasks: &[IngestTask]) -> Result<Vec<String>, ApiError> {
+        let documents = tasks
+            .iter()
+            .map(|task| tenant_document(&task.tenant_id, "rag_ingest_tasks", &task.task_id, task))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self
+            .upsert_values("rag_ingest_tasks", &documents)
+            .await?
+            .into_iter()
+            .collect())
+    }
+
     async fn upsert_ingest_result(
         &self,
         result: &IngestTaskResult,
@@ -1220,6 +1592,10 @@ impl KnowledgeRepository for MeiliRepository {
             }
         }
         self.upsert_values("rag_ingest_results", &[document]).await
+    }
+
+    async fn wait_for_tasks(&self, task_uids: &[String]) -> Result<(), ApiError> {
+        self.admin.wait_for_tasks(task_uids).await
     }
 
     async fn delete_ingest_tasks(
@@ -1328,7 +1704,6 @@ impl KnowledgeRepository for MeiliRepository {
         self.search_tenant_many(
             "rag_harness_components",
             TenantFilter::new(tenant_id)?.eq("doc_kind", "component")?,
-            1000,
             Some(&["logical_id:asc"]),
         )
         .await
@@ -1343,13 +1718,8 @@ impl KnowledgeRepository for MeiliRepository {
         if let Some(component_id) = component_id {
             filter = filter.eq("component_id", component_id)?;
         }
-        self.search_tenant_many(
-            "rag_harness_components",
-            filter,
-            1000,
-            Some(&["iteration:asc"]),
-        )
-        .await
+        self.search_tenant_many("rag_harness_components", filter, Some(&["iteration:asc"]))
+            .await
     }
 
     async fn get_harness_change(
@@ -1371,7 +1741,6 @@ impl KnowledgeRepository for MeiliRepository {
         self.search_tenant_many(
             "rag_harness_changes",
             TenantFilter::new(tenant_id)?,
-            1000,
             Some(&["created_at:desc"]),
         )
         .await
@@ -1386,13 +1755,8 @@ impl KnowledgeRepository for MeiliRepository {
         if let Some(change_id) = change_id {
             filter = filter.eq("change_id", change_id)?;
         }
-        self.search_tenant_many(
-            "rag_harness_verdicts",
-            filter,
-            1000,
-            Some(&["created_at:desc"]),
-        )
-        .await
+        self.search_tenant_many("rag_harness_verdicts", filter, Some(&["created_at:desc"]))
+            .await
     }
 
     async fn get_ingest_task(
@@ -1426,7 +1790,6 @@ impl KnowledgeRepository for MeiliRepository {
         self.search_tenant_many(
             "rag_ingest_tasks",
             TenantFilter::new(tenant_id)?,
-            1000,
             Some(&["created_at:desc"]),
         )
         .await
@@ -1436,20 +1799,14 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         tenant_id: &str,
     ) -> Result<Option<Vec<IngestTaskResult>>, ApiError> {
-        self.search_tenant_many(
-            "rag_ingest_results",
-            TenantFilter::new(tenant_id)?,
-            1000,
-            None,
-        )
-        .await
+        self.search_tenant_many("rag_ingest_results", TenantFilter::new(tenant_id)?, None)
+            .await
     }
 
     async fn list_eval_cases(&self, tenant_id: &str) -> Result<Option<Vec<RagEvalCase>>, ApiError> {
         self.search_tenant_many(
             "rag_eval_cases",
             TenantFilter::new(tenant_id)?,
-            1000,
             Some(&["created_at:asc"]),
         )
         .await
@@ -1471,7 +1828,6 @@ impl KnowledgeRepository for MeiliRepository {
         self.search_tenant_many(
             "rag_eval_runs",
             TenantFilter::new(tenant_id)?,
-            1000,
             Some(&["created_at:desc"]),
         )
         .await
@@ -1497,8 +1853,19 @@ impl KnowledgeRepository for MeiliRepository {
         self.search_tenant_many(
             "rag_eval_case_results",
             TenantFilter::new(tenant_id)?.eq("run_id", run_id)?,
-            1000,
             None,
+        )
+        .await
+    }
+
+    async fn list_tenant_parse_artifacts(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<ParseArtifact>>, ApiError> {
+        self.search_tenant_many(
+            "rag_parse_artifacts",
+            TenantFilter::new(tenant_id)?,
+            Some(&["created_at:asc"]),
         )
         .await
     }
@@ -1522,13 +1889,8 @@ impl KnowledgeRepository for MeiliRepository {
         if let Some(revision_id) = revision_id {
             filter = filter.eq("revision_id", revision_id)?;
         }
-        self.search_tenant_many(
-            "rag_parse_artifacts",
-            filter,
-            1000,
-            Some(&["created_at:asc"]),
-        )
-        .await
+        self.search_tenant_many("rag_parse_artifacts", filter, Some(&["created_at:asc"]))
+            .await
     }
 
     async fn search_user_events(
@@ -1596,7 +1958,12 @@ impl KnowledgeRepository for MeiliRepository {
             request.limit
         };
 
-        let company_filter = context_filter(request.tenant_id, None, request.filters)?;
+        let company_filter = context_filter(
+            request.tenant_id,
+            None,
+            "rag_company_context",
+            request.filters,
+        )?;
         let company = self
             .search_context_index(
                 "rag_company_context",
@@ -1624,7 +1991,12 @@ impl KnowledgeRepository for MeiliRepository {
             let routing = request
                 .resolver
                 .resolve(request.tenant_id, owner, false, true)?;
-            let personal_filter = context_filter(request.tenant_id, Some(owner), request.filters)?;
+            let personal_filter = context_filter(
+                request.tenant_id,
+                Some(owner),
+                &routing.personal_context_index_uid,
+                request.filters,
+            )?;
             let personal = self
                 .search_context_index(
                     &routing.personal_context_index_uid,
@@ -1702,11 +2074,15 @@ impl KnowledgeRepository for MeiliRepository {
         resolver: &EventIndexResolver,
     ) -> Result<Option<ContextNode>, ApiError> {
         let target = strip_context_layer_suffix(uri);
-        let mut indexes = vec![("rag_company_context".to_string(), None)];
-        if let Some(owner) = owner_user_id {
+        let indexes = if let Some(owner) = owner_user_id {
             let routing = resolver.resolve(tenant_id, owner, false, true)?;
-            indexes.push((routing.personal_context_index_uid, Some(owner)));
-        }
+            vec![
+                (routing.personal_context_index_uid, Some(owner)),
+                ("rag_company_context".to_string(), None),
+            ]
+        } else {
+            vec![("rag_company_context".to_string(), None)]
+        };
 
         for (index_uid, owner) in indexes {
             let mut filters = vec![
@@ -1719,8 +2095,13 @@ impl KnowledgeRepository for MeiliRepository {
             if let Some(owner) = owner {
                 filters.push(format!("owner_user_id = {}", meili_string(owner)?));
                 filters.push("privacy = \"private\"".to_string());
+                filters.push(format!("index_uid = {}", meili_string(&index_uid)?));
+                filters.push("index_kind = \"personal\"".to_string());
             } else {
+                filters.push("(owner_user_id IS NULL OR owner_user_id NOT EXISTS)".to_string());
                 filters.push("privacy = \"company\"".to_string());
+                filters.push("index_uid = \"rag_company_context\"".to_string());
+                filters.push("index_kind = \"company\"".to_string());
             }
             let response = self
                 .search_context_index(&index_uid, &target, &filters.join(" AND "), 20)
@@ -1742,15 +2123,43 @@ impl KnowledgeRepository for MeiliRepository {
         owner_user_id: Option<&str>,
         uri: &str,
     ) -> Result<Option<SourceDocument>, ApiError> {
-        let mut filter = TenantFilter::new(tenant_id)?
-            .eq("uri", uri)?
-            .eq("status", "active")?;
         if let Some(owner) = owner_user_id {
-            filter = filter.eq_or_null("owner_user_id", owner)?;
-        } else {
-            filter = filter.is_null("owner_user_id");
+            if let Some(document) = self
+                .search_tenant_one(
+                    "rag_source_documents",
+                    TenantFilter::new(tenant_id)?
+                        .eq("uri", uri)?
+                        .eq("status", "active")?
+                        .eq("owner_user_id", owner)?,
+                )
+                .await?
+            {
+                return Ok(Some(document));
+            }
         }
-        self.search_tenant_one("rag_source_documents", filter).await
+        self.search_tenant_one(
+            "rag_source_documents",
+            TenantFilter::new(tenant_id)?
+                .eq("uri", uri)?
+                .eq("status", "active")?
+                .is_null("owner_user_id"),
+        )
+        .await
+    }
+
+    async fn list_source_documents_by_uri(
+        &self,
+        tenant_id: &str,
+        uri: &str,
+    ) -> Result<Option<Vec<SourceDocument>>, ApiError> {
+        self.search_tenant_many(
+            "rag_source_documents",
+            TenantFilter::new(tenant_id)?
+                .eq("uri", uri)?
+                .eq("status", "active")?,
+            Some(&["updated_at:desc"]),
+        )
+        .await
     }
 
     async fn get_trace(
@@ -1782,21 +2191,15 @@ impl KnowledgeRepository for MeiliRepository {
         tenant_id: &str,
         snapshot_id: &str,
     ) -> Result<Option<Vec<Value>>, ApiError> {
-        let response: SearchResponse<Value> = self
-            .admin
-            .search(
+        let documents = self
+            .scan_tenant_documents(
                 "rag_structured_rows",
-                json!({
-                    "q": "",
-                    "limit": 1000,
-                    "filter": TenantFilter::new(tenant_id)?
-                        .eq("snapshot_id", snapshot_id)?
-                        .finish()
-                }),
+                TenantFilter::new(tenant_id)?.eq("snapshot_id", snapshot_id)?,
+                None,
             )
             .await?;
         Ok(Some(
-            prefer_tenant_documents("rag_structured_rows", response.hits)
+            prefer_tenant_documents("rag_structured_rows", documents)
                 .into_iter()
                 .map(|document| restore_logical_id("rag_structured_rows", document))
                 .collect(),
@@ -1865,19 +2268,10 @@ impl MeiliRepository {
         &self,
         index_uid: &str,
         filter: TenantFilter,
-        limit: usize,
         sort: Option<&[&str]>,
     ) -> Result<Option<Vec<T>>, ApiError> {
-        let mut body = json!({
-            "q": "",
-            "limit": limit.max(1),
-            "filter": filter.finish()
-        });
-        if let Some(sort) = sort {
-            body["sort"] = json!(sort);
-        }
-        let response: SearchResponse<Value> = self.admin.search(index_uid, body).await?;
-        let hits = prefer_tenant_documents(index_uid, response.hits)
+        let documents = self.scan_tenant_documents(index_uid, filter, sort).await?;
+        let hits = prefer_tenant_documents(index_uid, documents)
             .into_iter()
             .map(|document| restore_logical_id(index_uid, document))
             .map(serde_json::from_value)
@@ -1888,6 +2282,140 @@ impl MeiliRepository {
                 ))
             })?;
         Ok(Some(hits))
+    }
+
+    async fn scan_tenant_documents(
+        &self,
+        index_uid: &str,
+        filter: TenantFilter,
+        sort: Option<&[&str]>,
+    ) -> Result<Vec<Value>, ApiError> {
+        if self.scan_page_size == 0 || self.scan_max_documents == 0 {
+            return Err(ApiError::Internal(
+                "Meilisearch scan limits must be greater than zero".to_string(),
+            ));
+        }
+        if self.scan_page_size > self.scan_max_documents {
+            return Err(ApiError::Internal(
+                "Meilisearch scan page size exceeds its document safety ceiling".to_string(),
+            ));
+        }
+
+        let filter = filter.finish();
+        let mut stable_sort = sort
+            .unwrap_or_default()
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        if !stable_sort
+            .iter()
+            .any(|value| value.split(':').next() == Some("id"))
+        {
+            stable_sort.push("id:asc".to_string());
+        }
+
+        let mut documents = Vec::new();
+        let mut physical_ids = HashSet::new();
+        let mut expected_total = None;
+        let mut offset = 0usize;
+
+        loop {
+            let remaining = self.scan_max_documents.checked_sub(offset).ok_or_else(|| {
+                ApiError::Upstream(format!(
+                    "Meilisearch {index_uid} scan exceeded its configured document ceiling"
+                ))
+            })?;
+            if remaining == 0 {
+                return Err(ApiError::Upstream(format!(
+                    "refusing to truncate Meilisearch {index_uid} scan at {} documents",
+                    self.scan_max_documents
+                )));
+            }
+            let requested_limit = self.scan_page_size.min(remaining);
+            let page = self
+                .admin
+                .fetch_filtered_documents_page(
+                    index_uid,
+                    &filter,
+                    &stable_sort,
+                    offset,
+                    requested_limit,
+                )
+                .await?;
+
+            if page.offset != offset {
+                return Err(ApiError::Upstream(format!(
+                    "Meilisearch {index_uid} scan returned offset {} while {} was requested",
+                    page.offset, offset
+                )));
+            }
+            if page.limit != requested_limit {
+                return Err(ApiError::Upstream(format!(
+                    "Meilisearch {index_uid} scan returned limit {} while {} was requested",
+                    page.limit, requested_limit
+                )));
+            }
+            if let Some(expected_total) = expected_total {
+                if page.total != expected_total {
+                    return Err(ApiError::Upstream(format!(
+                        "Meilisearch {index_uid} scan total changed from {expected_total} to {}",
+                        page.total
+                    )));
+                }
+            } else {
+                expected_total = Some(page.total);
+            }
+            if page.total > self.scan_max_documents {
+                return Err(ApiError::Upstream(format!(
+                    "refusing to truncate Meilisearch {index_uid} scan: total {} exceeds configured ceiling {}",
+                    page.total, self.scan_max_documents
+                )));
+            }
+            if page.results.len() > requested_limit {
+                return Err(ApiError::Upstream(format!(
+                    "Meilisearch {index_uid} scan returned more documents than requested"
+                )));
+            }
+
+            let next_offset = offset.checked_add(page.results.len()).ok_or_else(|| {
+                ApiError::Upstream(format!("Meilisearch {index_uid} scan offset overflowed"))
+            })?;
+            if next_offset > page.total {
+                return Err(ApiError::Upstream(format!(
+                    "Meilisearch {index_uid} scan returned more documents than its reported total"
+                )));
+            }
+            if page.results.is_empty() && offset < page.total {
+                return Err(ApiError::Upstream(format!(
+                    "Meilisearch {index_uid} scan returned an empty page before its reported total"
+                )));
+            }
+
+            for document in &page.results {
+                let physical_id = match document.get("id") {
+                    Some(Value::String(id)) => format!("string:{id}"),
+                    Some(Value::Number(id)) => format!("number:{id}"),
+                    _ => {
+                        return Err(ApiError::Upstream(format!(
+                            "Meilisearch {index_uid} scan returned a document without a valid physical id"
+                        )))
+                    }
+                };
+                if !physical_ids.insert(physical_id) {
+                    return Err(ApiError::Upstream(format!(
+                        "Meilisearch {index_uid} scan returned a duplicate physical document id"
+                    )));
+                }
+            }
+            documents.extend(page.results);
+
+            if next_offset == page.total {
+                break;
+            }
+            offset = next_offset;
+        }
+
+        Ok(documents)
     }
 
     async fn search_context_index(
@@ -1927,9 +2455,11 @@ impl MeiliRepository {
 
 pub fn repository_from_config(config: &Config) -> Arc<dyn KnowledgeRepository> {
     if config.store_backend == "meili" && config.meili_url.is_some() {
-        Arc::new(MeiliRepository::new(
+        Arc::new(MeiliRepository::new_with_scan_limits(
             MeiliAdmin::from_config(config),
             config.meili_wait_for_tasks,
+            config.meili_scan_page_size,
+            config.meili_scan_max_documents,
         ))
     } else {
         Arc::new(MemoryRepository)
@@ -2099,6 +2629,7 @@ fn tenant_document_key(index_uid: &str, document: &Value) -> Option<String> {
 fn context_filter(
     tenant_id: &str,
     owner_user_id: Option<&str>,
+    index_uid: &str,
     structured: &ContextStructuredFilters,
 ) -> Result<String, ApiError> {
     let mut filters = vec![
@@ -2110,9 +2641,13 @@ fn context_filter(
     if let Some(owner) = owner_user_id {
         filters.push(format!("owner_user_id = {}", meili_string(owner)?));
         filters.push("privacy = \"private\"".to_string());
+        filters.push("index_kind = \"personal\"".to_string());
     } else {
+        filters.push("(owner_user_id IS NULL OR owner_user_id NOT EXISTS)".to_string());
         filters.push("privacy = \"company\"".to_string());
+        filters.push("index_kind = \"company\"".to_string());
     }
+    filters.push(format!("index_uid = {}", meili_string(index_uid)?));
     filters.extend(context_filter_clauses(structured)?);
     Ok(filters.join(" AND "))
 }
@@ -2177,6 +2712,36 @@ fn strip_context_layer_suffix(uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_filters_pin_company_and_personal_index_identity() {
+        let filters = ContextStructuredFilters::default();
+        let company = context_filter("tenant-a", None, "rag_company_context", &filters).unwrap();
+        assert!(company.contains("owner_user_id IS NULL"), "{company}");
+        assert!(company.contains("owner_user_id NOT EXISTS"), "{company}");
+        assert!(company.contains("index_kind = \"company\""), "{company}");
+        assert!(
+            company.contains("index_uid = \"rag_company_context\""),
+            "{company}"
+        );
+
+        let personal = context_filter(
+            "tenant-a",
+            Some("owner-a"),
+            "rag_context__tenant__owner",
+            &filters,
+        )
+        .unwrap();
+        assert!(
+            personal.contains("owner_user_id = \"owner-a\""),
+            "{personal}"
+        );
+        assert!(personal.contains("index_kind = \"personal\""), "{personal}");
+        assert!(
+            personal.contains("index_uid = \"rag_context__tenant__owner\""),
+            "{personal}"
+        );
+    }
 
     #[test]
     fn compatibility_mirror_updates_only_an_existing_same_tenant_legacy_row() {

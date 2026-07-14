@@ -59,6 +59,8 @@ RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true
 RAG_MEILI_URL=http://127.0.0.1:7700
 RAG_MEILI_API_KEY=optional-meili-key
 RAG_MEILI_WAIT_FOR_TASKS=false
+RAG_MEILI_SCAN_PAGE_SIZE=500
+RAG_MEILI_SCAN_MAX_DOCUMENTS=100000
 RAG_PARSER_PROVIDER=builtin
 RAG_MINERU_API_URL=http://127.0.0.1:8000
 RAG_MINERU_BACKEND=hybrid-auto-engine
@@ -205,13 +207,16 @@ Health endpoints split process liveness from operational readiness:
   query Meilisearch or LLM providers.
 - `GET /readyz` is public for load balancers. It preserves the operational
   readiness decision and 200/503 status semantics while returning only coarse
-  dependency state; it does not expose raw provider payloads, usage/private
-  counts, plan data, credits, or credential sources.
+  dependency state. A Meilisearch-backed process remains unready until every
+  mandatory tenant domain has hydrated atomically; it does not expose raw
+  provider payloads, usage/private counts, plan data, credits, or credential
+  sources.
 - `GET /healthz` requires an admin bearer and checks Meilisearch plus the
-  configured parser and LLM provider/model, including auth validity,
-  quota/rate-limit state, stale probe state, and a compact usage summary. If
-  `RAG_HEALTH_REQUIRE_LLM=true`, an unconfigured or exhausted LLM makes the
-  service unhealthy.
+  tenant hydration report and configured parser and LLM provider/model,
+  including auth validity, quota/rate-limit state, stale probe state, and a
+  compact usage summary. If `RAG_HEALTH_REQUIRE_LLM=true`, an unconfigured or
+  exhausted LLM makes the service unhealthy.
+
 - The protected health `llm.rate_limits` block carries the freshest live
   provider budget snapshot. For `codex_auth` it is parsed from the ChatGPT Codex `x-codex-*`
   response headers on every health probe and real completion: `primary` (5h)
@@ -251,6 +256,15 @@ Health endpoints split process liveness from operational readiness:
   fragment boundaries. That second boundary prevents legacy data or a
   post-ingest credential rotation from sending split token halves to a provider
   or returning them in content-bearing JSON fields.
+
+Meilisearch startup is fail-closed. A fresh backend with none of Nowledge's
+managed fixed indexes is provisioned automatically, while a partial managed
+index set stops startup so missing durable data cannot be replaced by empty
+indexes. Existing registered per-user event and personal-context indexes are
+reconciled in place and are never recreated during hydration. Settings are
+updated only when the managed attributes differ, so ordinary restarts do not
+enqueue redundant Meilisearch mutations. Use the explicit administrative reset
+workflow only when destructive recreation is intended.
 
 Before restarting after a credential rotation, place any revoked value that
 can still occur in persisted documents in the comma-separated

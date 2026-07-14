@@ -5,7 +5,7 @@ use crate::{
 };
 
 pub const EVENT_INDEX_SCHEMA_VERSION: u32 = 1;
-pub const EVENT_SETTINGS_HASH: &str = "events-v1";
+pub const EVENT_SETTINGS_HASH: &str = "events-v3";
 
 #[derive(Debug, Clone)]
 pub struct EventIndexResolver {

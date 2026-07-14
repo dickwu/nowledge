@@ -1,7 +1,7 @@
 # GET /healthz
 
 ## Summary
-Admin-only operational diagnostics for Meilisearch, parser, LLM health, store backend, and compact usage.
+Admin-only operational diagnostics for Meilisearch, startup hydration, parser, LLM health, store backend, and compact usage.
 
 ## Handler
 - Rust handler: `healthz`
@@ -23,11 +23,12 @@ Schema: `HealthResponse`
 | Field | Type | Description |
 | --- | --- | --- |
 | status | string | ok, degraded, or unhealthy. |
-| ready | boolean | True when Meilisearch and required LLM checks allow traffic. |
+| ready | boolean | True when mandatory hydration completed and Meilisearch, parser, and required LLM checks allow traffic. |
 | version | string | Crate version baked in at compile time. |
 | git_rev | string | Short git revision of the build, `-dirty` suffix when built from a modified tree, `unknown` outside a git checkout. |
 | store_backend | string | Active store backend name. |
 | meilisearch | object | Meilisearch health payload. |
+| hydration | object | Tenant hydration status plus per-domain durability strategy, counts, recovery totals, and redacted failure diagnostics. |
 | parser | object | Parser health payload. |
 | llm | object | LLM health payload with provider, model, auth, quota, rate-limit, and stale status. |
 | usage | object | Compact usage summary. |
@@ -56,7 +57,7 @@ says when it was last observed. For `codex_auth` the windows come from the
 ## Errors and Access Rules
 - Missing or invalid bearer authentication returns 401.
 - Authenticated non-admin principals return 403.
-- Returns 200 when ready and 503 when mandatory dependency health makes the service unready.
+- Returns 200 when ready and 503 when mandatory hydration or dependency health makes the service unready.
 - This protected route may expose operational budgets and private aggregate counts to admins; public callers must use `/readyz`.
 
 ## Internal Logic Call Graph
@@ -66,7 +67,7 @@ flowchart TD
   n1["AdminGuard authenticates an admin principal"]
   n2["healthz calls detailed operational health"]
   n3["Store builds compact usage summary"]
-  n4["MeiliAdmin and parser health are checked"]
+  n4["Hydration status, MeiliAdmin, and parser health are checked"]
   n5["LlmHealthProbe checks configured provider"]
   n6["HTTP status is 200 when ready, 503 when unhealthy"]
   n0 --> n1
