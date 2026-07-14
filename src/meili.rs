@@ -63,6 +63,18 @@ pub struct SearchResponse<T> {
     pub processing_time_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentPage {
+    #[serde(default)]
+    pub results: Vec<Value>,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub limit: usize,
+    #[serde(default)]
+    pub total: usize,
+}
+
 impl MeiliAdmin {
     pub fn from_config(config: &Config) -> Self {
         Self {
@@ -81,7 +93,7 @@ impl MeiliAdmin {
             });
         };
 
-        let mut tasks = Vec::new();
+        let mut task_uids = Vec::new();
         for uid in FIXED_INDEXES {
             if reset {
                 let response = self
@@ -91,18 +103,29 @@ impl MeiliAdmin {
                     .send()
                     .await
                     .map_err(|e| ApiError::Upstream(e.to_string()))?;
-                if !response.status().is_success() && response.status().as_u16() != 404 {
+                let status = response.status();
+                if !status.is_success() && status.as_u16() != 404 {
                     return Err(ApiError::Upstream(format!(
                         "failed to delete Meilisearch index {uid}: {}",
-                        response.status()
+                        status
                     )));
+                }
+                if status.is_success() {
+                    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+                    if let Some(task_uid) = task_uid(&body) {
+                        self.wait_for_task(&task_uid).await?;
+                        task_uids.push(task_uid);
+                    }
                 }
             }
 
-            for task_uid in self.ensure_index(uid, "id", true).await? {
-                tasks.push(json!({ "taskUid": task_uid }));
-            }
+            task_uids.extend(self.ensure_index(uid, "id", true).await?);
         }
+        self.wait_for_tasks(&task_uids).await?;
+        let tasks = task_uids
+            .into_iter()
+            .map(|task_uid| json!({ "taskUid": task_uid }))
+            .collect();
 
         Ok(BootstrapResult {
             indexes: FIXED_INDEXES.iter().map(|s| s.to_string()).collect(),
@@ -193,19 +216,34 @@ impl MeiliAdmin {
                 .await
                 .map_err(|e| ApiError::Upstream(e.to_string()))?;
             if !response.status().is_success() {
-                return Err(ApiError::Upstream(format!(
-                    "failed to create Meilisearch index {uid}: {}",
-                    response.status()
-                )));
-            }
-            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-            if let Some(uid) = task_uid(&body) {
-                task_uids.push(uid);
+                let status = response.status();
+                if !self.index_exists(uid).await? {
+                    return Err(ApiError::Upstream(format!(
+                        "failed to create Meilisearch index {uid}: {status}"
+                    )));
+                }
+            } else {
+                let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+                if let Some(task_uid) = task_uid(&body) {
+                    match self.wait_for_task(&task_uid).await {
+                        Ok(()) => task_uids.push(task_uid),
+                        Err(error) => {
+                            if !self.index_exists(uid).await? {
+                                return Err(error);
+                            }
+                            tracing::info!(
+                                index_uid = uid,
+                                "concurrent Meilisearch index creation already satisfied"
+                            );
+                        }
+                    }
+                }
             }
         }
 
         if apply_settings {
             if let Some(uid) = self.apply_settings(uid).await? {
+                self.wait_for_task(&uid).await?;
                 task_uids.push(uid);
             }
         }
@@ -386,6 +424,55 @@ impl MeiliAdmin {
         }
     }
 
+    pub async fn fetch_documents_page(
+        &self,
+        index_uid: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<DocumentPage, ApiError> {
+        let limit = limit.clamp(1, 1000);
+        let Some(url) = &self.url else {
+            return Ok(DocumentPage {
+                results: Vec::new(),
+                offset,
+                limit,
+                total: 0,
+            });
+        };
+        let response = self
+            .client
+            .get(format!(
+                "{}/indexes/{}/documents",
+                url.trim_end_matches('/'),
+                index_uid
+            ))
+            .headers(self.headers()?)
+            .query(&[("offset", offset), ("limit", limit)])
+            .send()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+
+        if response.status().as_u16() == 404 {
+            return Ok(DocumentPage {
+                results: Vec::new(),
+                offset,
+                limit,
+                total: 0,
+            });
+        }
+        if response.status().is_success() {
+            response
+                .json::<DocumentPage>()
+                .await
+                .map_err(|error| ApiError::Upstream(error.to_string()))
+        } else {
+            Err(ApiError::Upstream(format!(
+                "failed to list Meilisearch documents from {index_uid}: {}",
+                response.status()
+            )))
+        }
+    }
+
     pub async fn search_value(&self, index_uid: &str, body: Value) -> Result<Value, ApiError> {
         let Some(url) = &self.url else {
             return Ok(json!({ "hits": [] }));
@@ -519,7 +606,7 @@ pub fn task_uid(value: &Value) -> Option<String> {
 }
 
 pub fn settings_for(uid: &str) -> Value {
-    if uid.contains("context") {
+    let mut settings = if uid.contains("context") {
         json!({
             "searchableAttributes": ["title", "body", "uri"],
             "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id", "node_kind", "retrieval_role", "retrieval_enabled", "parent_uri", "source_document_uri", "fragment_index", "block_type", "page_idx", "heading_level"],
@@ -553,7 +640,7 @@ pub fn settings_for(uid: &str) -> Value {
         json!({
             "searchableAttributes": ["id", "display_name", "description", "component_id", "manifest_id", "files", "created_by"],
             "filterableAttributes": ["id", "tenant_id", "doc_kind", "component_id", "status", "component_kind", "manifest_id", "created_by"],
-            "sortableAttributes": ["id", "created_at", "updated_at", "iteration"]
+            "sortableAttributes": ["logical_id", "created_at", "updated_at", "iteration"]
         })
     } else if uid == "rag_harness_changes" {
         json!({
@@ -609,5 +696,72 @@ pub fn settings_for(uid: &str) -> Value {
             "filterableAttributes": ["id", "tenant_id", "owner_user_id", "snapshot_id", "dataset_key", "status", "privacy", "source_id", "revision_id"],
             "sortableAttributes": ["created_at", "updated_at", "occurred_at"]
         })
+    };
+    for required in ["id", "logical_id", "tenant_id"] {
+        ensure_filterable_attribute(&mut settings, required);
+    }
+    ensure_searchable_attribute(&mut settings, "logical_id");
+    settings
+}
+
+fn ensure_filterable_attribute(settings: &mut Value, attribute: &str) {
+    let Some(filterable) = settings
+        .get_mut("filterableAttributes")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if !filterable.iter().any(|value| value == attribute) {
+        filterable.push(Value::String(attribute.to_string()));
+    }
+}
+
+fn ensure_searchable_attribute(settings: &mut Value, attribute: &str) {
+    let Some(searchable) = settings
+        .get_mut("searchableAttributes")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if !searchable.iter().any(|value| value == attribute) {
+        searchable.push(Value::String(attribute.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_fixed_index_can_filter_by_tenant_and_logical_identity() {
+        for uid in FIXED_INDEXES {
+            let settings = settings_for(uid);
+            let filterable = settings["filterableAttributes"]
+                .as_array()
+                .expect("filterable attributes");
+            for required in ["id", "logical_id", "tenant_id"] {
+                assert!(
+                    filterable.iter().any(|value| value == required),
+                    "{uid} is missing {required}"
+                );
+            }
+            let searchable = settings["searchableAttributes"]
+                .as_array()
+                .expect("searchable attributes");
+            assert!(
+                searchable.iter().any(|value| value == "logical_id"),
+                "{uid} is missing searchable logical_id"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_components_sort_by_public_logical_identity() {
+        let settings = settings_for("rag_harness_components");
+        let sortable = settings["sortableAttributes"]
+            .as_array()
+            .expect("sortable attributes");
+        assert!(sortable.iter().any(|value| value == "logical_id"));
+        assert!(!sortable.iter().any(|value| value == "id"));
     }
 }

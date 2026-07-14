@@ -347,6 +347,8 @@ pub struct DatasetSchemaUpsertRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetRecord {
     pub id: String,
+    #[serde(default)]
+    pub tenant_id: String,
     pub dataset_key: String,
     pub title: String,
     pub schema_version: u32,
@@ -411,6 +413,8 @@ pub struct InsightUpsertRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InsightRecord {
     pub id: String,
+    #[serde(default)]
+    pub tenant_id: String,
     pub insight_type: String,
     pub title: String,
     pub statement: String,
@@ -686,6 +690,8 @@ pub struct CreateStructuredSnapshotRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructuredSnapshot {
     pub id: String,
+    #[serde(default)]
+    pub tenant_id: String,
     pub dataset_key: String,
     pub owner_user_id: String,
     pub period_key: String,
@@ -1572,6 +1578,8 @@ pub struct RegressionGuardResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagEvalCaseResult {
     pub id: String,
+    #[serde(default)]
+    pub tenant_id: String,
     pub run_id: String,
     pub case_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1641,6 +1649,8 @@ pub struct FailurePatternCluster {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagEvalOverview {
+    #[serde(default)]
+    pub tenant_id: String,
     pub run_id: String,
     pub status: String,
     pub metrics: RagEvalMetrics,
@@ -1686,6 +1696,8 @@ pub struct RagEvalRun {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompanySource {
     pub id: String,
+    #[serde(default)]
+    pub tenant_id: String,
     pub title: String,
     pub canonical_key: String,
     pub source_uri: String,
@@ -1708,6 +1720,8 @@ pub struct DeleteSourceReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceRevision {
     pub id: String,
+    #[serde(default)]
+    pub tenant_id: String,
     pub source_id: String,
     pub title: String,
     pub source_uri: String,
@@ -1720,6 +1734,8 @@ pub struct SourceRevision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: String,
+    #[serde(default)]
+    pub tenant_id: String,
     pub owner_user_id: String,
     pub title: String,
     pub status: String,

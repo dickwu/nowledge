@@ -22,6 +22,12 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(config.clone());
     if config.store_backend == "meili" && config.meili_url.is_some() {
+        let bootstrap = state.meili.bootstrap(false).await?;
+        tracing::info!(
+            managed_indexes = bootstrap.indexes.len(),
+            completed_tasks = bootstrap.tasks.len(),
+            "reconciled Meilisearch settings before hydration"
+        );
         let hydrated = state
             .store
             .hydrate_from_repository(&config.tenant_id)

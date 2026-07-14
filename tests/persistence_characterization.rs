@@ -47,6 +47,9 @@ fn eventual_meili(
             )
                 .into_response();
         }
+        if method == Method::GET && path == "/tasks/1" {
+            return (StatusCode::OK, Json(json!({ "status": "succeeded" }))).into_response();
+        }
         if (method == Method::POST && path.ends_with("/documents"))
             || (method == Method::PATCH && path.ends_with("/settings"))
         {
@@ -77,6 +80,62 @@ struct ResetRecorder {
     requests: Arc<Mutex<Vec<String>>>,
 }
 
+#[derive(Clone, Default)]
+struct ConcurrentCreateRecorder {
+    requests: Arc<Mutex<Vec<String>>>,
+    index_checks: Arc<Mutex<usize>>,
+}
+
+async fn concurrent_create_meili_stub(
+    State(recorder): State<ConcurrentCreateRecorder>,
+    request: AxumRequest,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    recorder
+        .requests
+        .lock()
+        .unwrap()
+        .push(format!("{method} {path}"));
+
+    if method == Method::GET && path == "/indexes/concurrent-index" {
+        let mut checks = recorder.index_checks.lock().unwrap();
+        let status = if *checks == 0 {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::OK
+        };
+        *checks += 1;
+        return (status, Json(json!({ "uid": "concurrent-index" }))).into_response();
+    }
+    if method == Method::POST && path == "/indexes" {
+        return (StatusCode::ACCEPTED, Json(json!({ "taskUid": 21 }))).into_response();
+    }
+    if method == Method::GET && path == "/tasks/21" {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "status": "failed",
+                "error": { "code": "index_already_exists" }
+            })),
+        )
+            .into_response();
+    }
+    if method == Method::PATCH && path == "/indexes/concurrent-index/settings" {
+        return (StatusCode::ACCEPTED, Json(json!({ "taskUid": 22 }))).into_response();
+    }
+    if method == Method::GET && path == "/tasks/22" {
+        return (StatusCode::OK, Json(json!({ "status": "succeeded" }))).into_response();
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(
+            json!({ "message": format!("unexpected concurrent-create request: {method} {path}") }),
+        ),
+    )
+        .into_response()
+}
+
 async fn reset_meili_stub(State(recorder): State<ResetRecorder>, request: AxumRequest) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
@@ -97,6 +156,9 @@ async fn reset_meili_stub(State(recorder): State<ResetRecorder>, request: AxumRe
     }
     if method == Method::PATCH && path.ends_with("/settings") {
         return (StatusCode::ACCEPTED, Json(json!({ "taskUid": 12 }))).into_response();
+    }
+    if method == Method::GET && path.starts_with("/tasks/") {
+        return (StatusCode::OK, Json(json!({ "status": "succeeded" }))).into_response();
     }
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -261,7 +323,7 @@ async fn current_persistence_failure_leaves_the_failed_state_write_visible_in_me
 }
 
 #[tokio::test]
-async fn current_bootstrap_reset_recreates_indexes_without_waiting_for_delete_tasks() {
+async fn bootstrap_reset_waits_for_delete_create_and_settings_tasks() {
     let recorder = ResetRecorder::default();
     let app = Router::new()
         .fallback(reset_meili_stub)
@@ -283,12 +345,51 @@ async fn current_bootstrap_reset_recreates_indexes_without_waiting_for_delete_ta
 
     let requests = recorder.requests.lock().unwrap().clone();
     assert_eq!(requests[0], "DELETE /indexes/rag_company_context");
-    assert_eq!(requests[1], "GET /indexes/rag_company_context");
-    assert_eq!(requests[2], "POST /indexes");
-    assert_eq!(requests[3], "PATCH /indexes/rag_company_context/settings");
+    assert_eq!(requests[1], "GET /tasks/10");
+    assert_eq!(requests[2], "GET /indexes/rag_company_context");
+    assert_eq!(requests[3], "POST /indexes");
+    assert_eq!(requests[4], "GET /tasks/11");
+    assert_eq!(requests[5], "PATCH /indexes/rag_company_context/settings");
+    assert_eq!(
+        requests[6], "GET /tasks/12",
+        "ensure_index returned before its settings were usable: {requests:?}"
+    );
     assert!(
-        requests.iter().all(|request| !request.contains("/tasks/")),
-        "reset unexpectedly waited for a Meilisearch task: {requests:?}"
+        requests.iter().any(|request| request == "GET /tasks/12"),
+        "bootstrap did not wait for settings: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn ensure_index_tolerates_a_concurrent_create_winner_and_still_waits_for_settings() {
+    let recorder = ConcurrentCreateRecorder::default();
+    let app = Router::new()
+        .fallback(concurrent_create_meili_stub)
+        .with_state(recorder.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut config = Config::test();
+    config.meili_url = Some(format!("http://{addr}"));
+    let tasks = MeiliAdmin::from_config(&config)
+        .ensure_index("concurrent-index", "id", true)
+        .await
+        .expect("the other creator's finished index should satisfy provisioning");
+
+    assert_eq!(tasks, vec!["22"]);
+    assert_eq!(
+        recorder.requests.lock().unwrap().as_slice(),
+        [
+            "GET /indexes/concurrent-index",
+            "POST /indexes",
+            "GET /tasks/21",
+            "GET /indexes/concurrent-index",
+            "PATCH /indexes/concurrent-index/settings",
+            "GET /tasks/22",
+        ]
     );
 }
 
@@ -318,7 +419,14 @@ async fn current_source_revision_rehydration_requests_at_most_two_thousand_rows(
         .expect("Meilisearch repository should return persisted revisions");
 
     let requests = recorder.requests.lock().unwrap().clone();
-    assert_eq!(requests, vec![json!({ "q": "", "limit": 2000 })]);
+    assert_eq!(
+        requests,
+        vec![json!({
+            "q": "",
+            "limit": 2000,
+            "filter": "tenant_id = \"tenant-a\""
+        })]
+    );
     assert_eq!(recorder.corpus_size, 2001);
     assert_eq!(revisions.len(), 2000);
     assert_eq!(revisions.first().unwrap().id, "revision-0");

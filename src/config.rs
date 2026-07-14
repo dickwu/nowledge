@@ -592,6 +592,9 @@ impl Config {
         ) {
             anyhow::bail!("RAG_RUN_MODE must be development, test, or production");
         }
+        if self.tenant_id.trim().is_empty() {
+            anyhow::bail!("RAG_TENANT_ID must be non-empty");
+        }
         if self.store_backend == "meili" && self.meili_url.is_none() {
             anyhow::bail!("RAG_STORE_BACKEND=meili requires RAG_MEILI_URL");
         }
@@ -1749,6 +1752,18 @@ mod tests {
         config.run_mode = "prod".to_string();
         let error = config.validate_startup().unwrap_err().to_string();
         assert!(error.contains("RAG_RUN_MODE must be development, test, or production"));
+    }
+
+    #[test]
+    fn startup_rejects_blank_tenant_id() {
+        for tenant_id in ["", "   ", "\t\n"] {
+            let mut config = Config::test();
+            config.tenant_id = tenant_id.to_string();
+
+            let error = config.validate_startup().unwrap_err().to_string();
+
+            assert!(error.contains("RAG_TENANT_ID must be non-empty"));
+        }
     }
 
     #[test]

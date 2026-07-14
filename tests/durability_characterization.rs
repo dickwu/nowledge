@@ -421,8 +421,12 @@ fn source_document_read_through_is_mixed_by_owner_projection() {
     assert!(source_document.contains(
         "#[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub owner_user_id"
     ));
-    assert!(upsert_source_documents.contains("to_document(document, &document.id)"));
+    assert!(upsert_source_documents.contains("tenant_document("));
+    assert!(upsert_source_documents.contains("&document.tenant_id"));
+    assert!(upsert_source_documents.contains("\"rag_source_documents\""));
+    assert!(upsert_source_documents.contains("&document.id"));
     assert!(fs_read.contains(".read_source_document(tenant_id, owner_user_id, uri)"));
-    assert!(read_source_document.contains("owner_user_id = {} OR owner_user_id IS NULL"));
-    assert!(read_source_document.contains("owner_user_id IS NULL"));
+    assert!(read_source_document.contains("TenantFilter::new(tenant_id)"));
+    assert!(read_source_document.contains(".eq_or_null(\"owner_user_id\", owner)"));
+    assert!(read_source_document.contains(".is_null(\"owner_user_id\")"));
 }

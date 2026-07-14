@@ -13,6 +13,8 @@ pub mod resolver;
 pub mod routes;
 pub(crate) mod runtime;
 pub mod store;
+pub mod tenant_scope;
+pub mod tenant_scope_v1;
 pub mod util;
 pub mod vector_match;
 

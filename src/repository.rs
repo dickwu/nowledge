@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
@@ -10,6 +13,11 @@ use crate::{
     meili::{MeiliAdmin, SearchResponse},
     models::*,
     resolver::EventIndexResolver,
+    tenant_scope::{
+        is_tenant_document, owner_scoped_storage_identity, restore_logical_id,
+        scoped_storage_identity, tenant_document, tenant_document_with_storage_identity,
+        tenant_structured_row_document, TenantFilter,
+    },
     util::{hmac_hex, text_score},
 };
 
@@ -56,18 +64,16 @@ pub trait KnowledgeRepository: Send + Sync {
         tenant_id: &str,
     ) -> Result<Option<Vec<ContextNode>>, ApiError>;
 
-    /// Rehydrate every persisted CompanySource so the in-memory `sources`
-    /// table survives a restart. CompanySource has no tenant column today
-    /// (rag_sources is shared across tenants); tenant_id is accepted for
-    /// symmetry but the Meili backend returns every row.
+    /// Rehydrate every persisted CompanySource for `tenant_id` so the
+    /// in-memory `sources` table survives a restart without crossing tenants.
     async fn list_company_sources(
         &self,
         tenant_id: &str,
     ) -> Result<Option<Vec<CompanySource>>, ApiError>;
 
-    /// Rehydrate every persisted SourceRevision so revision history and the
-    /// edit / reindex flows keep working after a restart. Returned rows are
-    /// regrouped into `source_revisions` by source_id in the store.
+    /// Rehydrate every persisted SourceRevision for `tenant_id` so revision
+    /// history and edit/reindex flows keep working after a restart. Returned
+    /// rows are regrouped into `source_revisions` by source_id in the store.
     async fn list_source_revisions(
         &self,
         tenant_id: &str,
@@ -109,9 +115,17 @@ pub trait KnowledgeRepository: Send + Sync {
         snapshot: &StructuredSnapshot,
     ) -> Result<Option<String>, ApiError>;
 
-    async fn upsert_structured_rows(&self, rows: &[Value]) -> Result<Option<String>, ApiError>;
+    async fn upsert_structured_rows(
+        &self,
+        tenant_id: &str,
+        rows: &[Value],
+    ) -> Result<Option<String>, ApiError>;
 
-    async fn upsert_structured_summary(&self, summary: &Value) -> Result<Option<String>, ApiError>;
+    async fn upsert_structured_summary(
+        &self,
+        tenant_id: &str,
+        summary: &Value,
+    ) -> Result<Option<String>, ApiError>;
 
     async fn upsert_trace(&self, trace: &TraceRecord) -> Result<Option<String>, ApiError>;
 
@@ -143,7 +157,11 @@ pub trait KnowledgeRepository: Send + Sync {
     /// Remove expired ingest tasks (and their stored results) from the
     /// backing store, keyed by task id. The memory backend is a no-op — the
     /// in-memory maps are canonical there and the Store prunes them itself.
-    async fn delete_ingest_tasks(&self, task_ids: &[String]) -> Result<(), ApiError>;
+    async fn delete_ingest_tasks(
+        &self,
+        tenant_id: &str,
+        task_ids: &[String],
+    ) -> Result<(), ApiError>;
 
     async fn upsert_eval_case(&self, case: &RagEvalCase) -> Result<Option<String>, ApiError>;
 
@@ -270,14 +288,30 @@ pub trait KnowledgeRepository: Send + Sync {
         uri: &str,
     ) -> Result<Option<SourceDocument>, ApiError>;
 
-    async fn get_trace(&self, trace_id: &str) -> Result<Option<TraceRecord>, ApiError>;
+    async fn get_trace(
+        &self,
+        tenant_id: &str,
+        trace_id: &str,
+    ) -> Result<Option<TraceRecord>, ApiError>;
 
-    async fn get_snapshot(&self, snapshot_id: &str)
-        -> Result<Option<StructuredSnapshot>, ApiError>;
+    async fn get_snapshot(
+        &self,
+        tenant_id: &str,
+        snapshot_id: &str,
+    ) -> Result<Option<StructuredSnapshot>, ApiError>;
 
-    async fn list_rows(&self, snapshot_id: &str) -> Result<Option<Vec<Value>>, ApiError>;
+    async fn list_rows(
+        &self,
+        tenant_id: &str,
+        snapshot_id: &str,
+    ) -> Result<Option<Vec<Value>>, ApiError>;
 
-    async fn debug_search(&self, index_uid: &str, query: &str) -> Result<Option<Value>, ApiError>;
+    async fn debug_search(
+        &self,
+        tenant_id: &str,
+        index_uid: &str,
+        query: &str,
+    ) -> Result<Option<Value>, ApiError>;
 }
 
 #[derive(Debug)]
@@ -376,12 +410,17 @@ impl KnowledgeRepository for MemoryRepository {
         Ok(None)
     }
 
-    async fn upsert_structured_rows(&self, _rows: &[Value]) -> Result<Option<String>, ApiError> {
+    async fn upsert_structured_rows(
+        &self,
+        _tenant_id: &str,
+        _rows: &[Value],
+    ) -> Result<Option<String>, ApiError> {
         Ok(None)
     }
 
     async fn upsert_structured_summary(
         &self,
+        _tenant_id: &str,
         _summary: &Value,
     ) -> Result<Option<String>, ApiError> {
         Ok(None)
@@ -428,7 +467,11 @@ impl KnowledgeRepository for MemoryRepository {
         Ok(None)
     }
 
-    async fn delete_ingest_tasks(&self, _task_ids: &[String]) -> Result<(), ApiError> {
+    async fn delete_ingest_tasks(
+        &self,
+        _tenant_id: &str,
+        _task_ids: &[String],
+    ) -> Result<(), ApiError> {
         Ok(())
     }
 
@@ -610,23 +653,33 @@ impl KnowledgeRepository for MemoryRepository {
         Ok(None)
     }
 
-    async fn get_trace(&self, _trace_id: &str) -> Result<Option<TraceRecord>, ApiError> {
+    async fn get_trace(
+        &self,
+        _tenant_id: &str,
+        _trace_id: &str,
+    ) -> Result<Option<TraceRecord>, ApiError> {
         Ok(None)
     }
 
     async fn get_snapshot(
         &self,
+        _tenant_id: &str,
         _snapshot_id: &str,
     ) -> Result<Option<StructuredSnapshot>, ApiError> {
         Ok(None)
     }
 
-    async fn list_rows(&self, _snapshot_id: &str) -> Result<Option<Vec<Value>>, ApiError> {
+    async fn list_rows(
+        &self,
+        _tenant_id: &str,
+        _snapshot_id: &str,
+    ) -> Result<Option<Vec<Value>>, ApiError> {
         Ok(None)
     }
 
     async fn debug_search(
         &self,
+        _tenant_id: &str,
         _index_uid: &str,
         _query: &str,
     ) -> Result<Option<Value>, ApiError> {
@@ -665,9 +718,71 @@ impl MeiliRepository {
         if documents.is_empty() {
             return Ok(None);
         }
-        let task_uid = self.admin.add_documents(index_uid, documents).await?;
+        let legacy_documents = self
+            .load_same_tenant_legacy_documents(index_uid, documents)
+            .await?;
+        let mut write_documents = documents.to_vec();
+        write_documents.extend(legacy_mirror_documents(
+            index_uid,
+            documents,
+            &legacy_documents,
+        ));
+        let task_uid = self
+            .admin
+            .add_documents(index_uid, &write_documents)
+            .await?;
         self.maybe_wait(&task_uid).await?;
         Ok(task_uid)
+    }
+
+    async fn load_same_tenant_legacy_documents(
+        &self,
+        index_uid: &str,
+        documents: &[Value],
+    ) -> Result<Vec<Value>, ApiError> {
+        let mut candidates: HashMap<String, HashSet<String>> = HashMap::new();
+        for document in documents {
+            if !is_tenant_document(index_uid, document) {
+                continue;
+            }
+            let Some(tenant_id) = document.get("tenant_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(legacy_id) = legacy_document_id(index_uid, document) else {
+                continue;
+            };
+            candidates
+                .entry(tenant_id.to_string())
+                .or_default()
+                .insert(legacy_id);
+        }
+
+        let mut legacy_documents = Vec::new();
+        for (tenant_id, ids) in candidates {
+            let ids = ids.into_iter().collect::<Vec<_>>();
+            for chunk in ids.chunks(128) {
+                let response: SearchResponse<Value> = self
+                    .admin
+                    .search(
+                        index_uid,
+                        json!({
+                            "q": "",
+                            "limit": chunk.len().max(1),
+                            "filter": TenantFilter::new(&tenant_id)?
+                                .in_strings("id", chunk)?
+                                .finish()
+                        }),
+                    )
+                    .await?;
+                legacy_documents.extend(
+                    response
+                        .hits
+                        .into_iter()
+                        .filter(|document| !is_tenant_document(index_uid, document)),
+                );
+            }
+        }
+        Ok(legacy_documents)
     }
 }
 
@@ -691,7 +806,15 @@ impl KnowledgeRepository for MeiliRepository {
                 .await?,
         );
         let registry_task = self
-            .upsert_values("rag_user_event_indexes", &[to_document(index, &index.id)?])
+            .upsert_values(
+                "rag_user_event_indexes",
+                &[tenant_document(
+                    &index.tenant_id,
+                    "rag_user_event_indexes",
+                    &index.id,
+                    index,
+                )?],
+            )
             .await?;
         if let Some(task_uid) = registry_task {
             task_uids.push(task_uid);
@@ -716,7 +839,7 @@ impl KnowledgeRepository for MeiliRepository {
     ) -> Result<Option<String>, ApiError> {
         let documents = nodes
             .iter()
-            .map(|node| to_document(node, &context_document_id(&node.uri)))
+            .map(|node| tenant_document(&node.tenant_id, index_uid, &node.uri, node))
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values(index_uid, &documents).await
     }
@@ -725,9 +848,9 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         tenant_id: &str,
     ) -> Result<Option<Vec<ContextNode>>, ApiError> {
-        self.search_many(
+        self.search_tenant_many(
             "rag_company_context",
-            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            TenantFilter::new(tenant_id)?,
             1000,
             Some(&["updated_at:desc"]),
         )
@@ -736,52 +859,52 @@ impl KnowledgeRepository for MeiliRepository {
 
     async fn list_company_sources(
         &self,
-        _tenant_id: &str,
+        tenant_id: &str,
     ) -> Result<Option<Vec<CompanySource>>, ApiError> {
-        // rag_sources isn't tenant-keyed (CompanySource has no tenant_id),
-        // so pull every row. Use admin.search directly so we can omit the
-        // filter field instead of sending an empty string.
-        let response: SearchResponse<CompanySource> = self
-            .admin
-            .search(
-                "rag_sources",
-                json!({
-                    "q": "",
-                    "limit": 1000
-                }),
-            )
-            .await?;
-        Ok(Some(response.hits))
+        self.search_tenant_many("rag_sources", TenantFilter::new(tenant_id)?, 1000, None)
+            .await
     }
 
     async fn list_source_revisions(
         &self,
-        _tenant_id: &str,
+        tenant_id: &str,
     ) -> Result<Option<Vec<SourceRevision>>, ApiError> {
-        let response: SearchResponse<SourceRevision> = self
-            .admin
-            .search(
-                "rag_source_revisions",
-                json!({
-                    "q": "",
-                    "limit": 2000
-                }),
-            )
-            .await?;
-        Ok(Some(response.hits))
+        self.search_tenant_many(
+            "rag_source_revisions",
+            TenantFilter::new(tenant_id)?,
+            2000,
+            None,
+        )
+        .await
     }
 
     async fn upsert_state_item(&self, item: &StateItem) -> Result<Option<String>, ApiError> {
-        self.upsert_values("rag_state_items", &[to_document(item, &item.id)?])
-            .await
+        self.upsert_values(
+            "rag_state_items",
+            &[tenant_document(
+                &item.tenant_id,
+                "rag_state_items",
+                &item.id,
+                item,
+            )?],
+        )
+        .await
     }
 
     async fn upsert_company_source(
         &self,
         source: &CompanySource,
     ) -> Result<Option<String>, ApiError> {
-        self.upsert_values("rag_sources", &[to_document(source, &source.id)?])
-            .await
+        self.upsert_values(
+            "rag_sources",
+            &[tenant_document(
+                &source.tenant_id,
+                "rag_sources",
+                &source.id,
+                source,
+            )?],
+        )
+        .await
     }
 
     async fn upsert_source_revision(
@@ -790,23 +913,37 @@ impl KnowledgeRepository for MeiliRepository {
     ) -> Result<Option<String>, ApiError> {
         self.upsert_values(
             "rag_source_revisions",
-            &[to_document(revision, &revision.id)?],
+            &[tenant_document(
+                &revision.tenant_id,
+                "rag_source_revisions",
+                &revision.id,
+                revision,
+            )?],
         )
         .await
     }
 
     async fn delete_company_source(
         &self,
-        _tenant_id: &str,
+        tenant_id: &str,
         source_id: &str,
     ) -> Result<DeleteSourceReport, ApiError> {
-        let filter = format!("source_id = {}", meili_string(source_id)?);
+        let source_filter = TenantFilter::new(tenant_id)?
+            .logical_id(source_id)?
+            .finish();
+        let related_filter = TenantFilter::new(tenant_id)?
+            .eq("source_id", source_id)?
+            .finish();
+        let company_auxiliary_filter = TenantFilter::new(tenant_id)?
+            .eq("source_id", source_id)?
+            .is_null("owner_user_id")
+            .finish();
 
         // 1. Fragments — stop search hits immediately.
         let mut report = DeleteSourceReport {
             fragments_task: self
                 .admin
-                .delete_documents_by_filter("rag_company_context", &filter)
+                .delete_documents_by_filter("rag_company_context", &related_filter)
                 .await?,
             ..Default::default()
         };
@@ -815,14 +952,15 @@ impl KnowledgeRepository for MeiliRepository {
         // 2. Revision content blobs.
         report.revisions_task = self
             .admin
-            .delete_documents_by_filter("rag_source_revisions", &filter)
+            .delete_documents_by_filter("rag_source_revisions", &related_filter)
             .await?;
         self.maybe_wait(&report.revisions_task).await?;
 
-        // 3. Source pointer (doc id == source_id).
+        // 3. Source pointer. Legacy rows without proven tenant ownership are
+        // deliberately retained for tenant_scope_v1 quarantine/verification.
         report.source_task = self
             .admin
-            .delete_documents_by_ids("rag_sources", &[source_id.to_string()])
+            .delete_documents_by_filter("rag_sources", &source_filter)
             .await?;
         self.maybe_wait(&report.source_task).await?;
 
@@ -837,7 +975,7 @@ impl KnowledgeRepository for MeiliRepository {
         ] {
             match self
                 .admin
-                .delete_documents_by_filter(aux_uid, &filter)
+                .delete_documents_by_filter(aux_uid, &company_auxiliary_filter)
                 .await
             {
                 Ok(Some(task)) => {
@@ -870,7 +1008,14 @@ impl KnowledgeRepository for MeiliRepository {
     ) -> Result<Option<String>, ApiError> {
         let documents = documents
             .iter()
-            .map(|document| to_document(document, &document.id))
+            .map(|document| {
+                tenant_document(
+                    &document.tenant_id,
+                    "rag_source_documents",
+                    &document.id,
+                    document,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values("rag_source_documents", &documents).await
     }
@@ -881,7 +1026,17 @@ impl KnowledgeRepository for MeiliRepository {
     ) -> Result<Option<String>, ApiError> {
         let documents = artifacts
             .iter()
-            .map(|artifact| to_document(artifact, &artifact.id))
+            .map(|artifact| {
+                let storage_identity =
+                    owner_scoped_storage_identity(artifact.owner_user_id.as_deref(), &artifact.id)?;
+                tenant_document_with_storage_identity(
+                    &artifact.tenant_id,
+                    "rag_parse_artifacts",
+                    &artifact.id,
+                    &storage_identity,
+                    artifact,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values("rag_parse_artifacts", &documents).await
     }
@@ -892,44 +1047,66 @@ impl KnowledgeRepository for MeiliRepository {
     ) -> Result<Option<String>, ApiError> {
         self.upsert_values(
             "rag_structured_snapshots",
-            &[to_document(snapshot, &snapshot.id)?],
+            &[tenant_document(
+                &snapshot.tenant_id,
+                "rag_structured_snapshots",
+                &snapshot.id,
+                snapshot,
+            )?],
         )
         .await
     }
 
-    async fn upsert_structured_rows(&self, rows: &[Value]) -> Result<Option<String>, ApiError> {
+    async fn upsert_structured_rows(
+        &self,
+        tenant_id: &str,
+        rows: &[Value],
+    ) -> Result<Option<String>, ApiError> {
         let documents = rows
             .iter()
-            .map(|row| {
-                let id = row
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| context_document_id(&row.to_string()));
-                to_document(row, &id)
-            })
+            .map(|row| tenant_structured_row_document(tenant_id, row))
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values("rag_structured_rows", &documents).await
     }
 
-    async fn upsert_structured_summary(&self, summary: &Value) -> Result<Option<String>, ApiError> {
+    async fn upsert_structured_summary(
+        &self,
+        tenant_id: &str,
+        summary: &Value,
+    ) -> Result<Option<String>, ApiError> {
         let id = summary
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| ApiError::Internal("structured summary is missing id".to_string()))?;
-        self.upsert_values("rag_structured_summaries", &[to_document(summary, id)?])
-            .await
+        self.upsert_values(
+            "rag_structured_summaries",
+            &[tenant_document(
+                tenant_id,
+                "rag_structured_summaries",
+                id,
+                summary,
+            )?],
+        )
+        .await
     }
 
     async fn upsert_trace(&self, trace: &TraceRecord) -> Result<Option<String>, ApiError> {
-        self.upsert_values("rag_traces", &[to_document(trace, &trace.id)?])
-            .await
+        self.upsert_values(
+            "rag_traces",
+            &[tenant_document(
+                &trace.tenant_id,
+                "rag_traces",
+                &trace.id,
+                trace,
+            )?],
+        )
+        .await
     }
 
     async fn upsert_links(&self, links: &[KnowledgeLink]) -> Result<Option<String>, ApiError> {
         let documents = links
             .iter()
-            .map(|link| to_document(link, &link.id))
+            .map(|link| tenant_document(&link.tenant_id, "rag_links", &link.id, link))
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values("rag_links", &documents).await
     }
@@ -941,12 +1118,34 @@ impl KnowledgeRepository for MeiliRepository {
     ) -> Result<Option<String>, ApiError> {
         let mut documents = components
             .iter()
-            .map(|component| to_document_with_kind(component, &component.id, "component"))
+            .map(|component| {
+                tenant_document(
+                    &component.tenant_id,
+                    "rag_harness_components:component",
+                    &component.id,
+                    component,
+                )
+                .map(|mut document| {
+                    document["doc_kind"] = Value::String("component".to_string());
+                    document
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         documents.extend(
             revisions
                 .iter()
-                .map(|revision| to_document_with_kind(revision, &revision.id, "revision"))
+                .map(|revision| {
+                    tenant_document(
+                        &revision.tenant_id,
+                        "rag_harness_components:revision",
+                        &revision.id,
+                        revision,
+                    )
+                    .map(|mut document| {
+                        document["doc_kind"] = Value::String("revision".to_string());
+                        document
+                    })
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         );
         self.upsert_values("rag_harness_components", &documents)
@@ -959,7 +1158,9 @@ impl KnowledgeRepository for MeiliRepository {
     ) -> Result<Option<String>, ApiError> {
         let documents = changes
             .iter()
-            .map(|change| to_document(change, &change.id))
+            .map(|change| {
+                tenant_document(&change.tenant_id, "rag_harness_changes", &change.id, change)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values("rag_harness_changes", &documents).await
     }
@@ -970,21 +1171,41 @@ impl KnowledgeRepository for MeiliRepository {
     ) -> Result<Option<String>, ApiError> {
         let documents = verdicts
             .iter()
-            .map(|verdict| to_document(verdict, &verdict.id))
+            .map(|verdict| {
+                tenant_document(
+                    &verdict.tenant_id,
+                    "rag_harness_verdicts",
+                    &verdict.id,
+                    verdict,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values("rag_harness_verdicts", &documents).await
     }
 
     async fn upsert_ingest_task(&self, task: &IngestTask) -> Result<Option<String>, ApiError> {
-        self.upsert_values("rag_ingest_tasks", &[to_document(task, &task.task_id)?])
-            .await
+        self.upsert_values(
+            "rag_ingest_tasks",
+            &[tenant_document(
+                &task.tenant_id,
+                "rag_ingest_tasks",
+                &task.task_id,
+                task,
+            )?],
+        )
+        .await
     }
 
     async fn upsert_ingest_result(
         &self,
         result: &IngestTaskResult,
     ) -> Result<Option<String>, ApiError> {
-        let mut document = to_document(result, &result.task.task_id)?;
+        let mut document = tenant_document(
+            &result.task.tenant_id,
+            "rag_ingest_results",
+            &result.task.task_id,
+            result,
+        )?;
         if let Value::Object(map) = &mut document {
             map.insert(
                 "tenant_id".to_string(),
@@ -1001,16 +1222,23 @@ impl KnowledgeRepository for MeiliRepository {
         self.upsert_values("rag_ingest_results", &[document]).await
     }
 
-    async fn delete_ingest_tasks(&self, task_ids: &[String]) -> Result<(), ApiError> {
+    async fn delete_ingest_tasks(
+        &self,
+        tenant_id: &str,
+        task_ids: &[String],
+    ) -> Result<(), ApiError> {
         if task_ids.is_empty() {
             return Ok(());
         }
         // Best-effort on both indexes: a failed delete only delays cleanup
         // until the next sweep, so log and continue rather than abort.
         for index_uid in ["rag_ingest_tasks", "rag_ingest_results"] {
+            let filter = TenantFilter::new(tenant_id)?
+                .in_strings("task_id", task_ids)?
+                .finish();
             match self
                 .admin
-                .delete_documents_by_ids(index_uid, task_ids)
+                .delete_documents_by_filter(index_uid, &filter)
                 .await
             {
                 Ok(task) => {
@@ -1033,13 +1261,29 @@ impl KnowledgeRepository for MeiliRepository {
     }
 
     async fn upsert_eval_case(&self, case: &RagEvalCase) -> Result<Option<String>, ApiError> {
-        self.upsert_values("rag_eval_cases", &[to_document(case, &case.id)?])
-            .await
+        self.upsert_values(
+            "rag_eval_cases",
+            &[tenant_document(
+                &case.tenant_id,
+                "rag_eval_cases",
+                &case.id,
+                case,
+            )?],
+        )
+        .await
     }
 
     async fn upsert_eval_run(&self, run: &RagEvalRun) -> Result<Option<String>, ApiError> {
-        self.upsert_values("rag_eval_runs", &[to_document(run, &run.id)?])
-            .await
+        self.upsert_values(
+            "rag_eval_runs",
+            &[tenant_document(
+                &run.tenant_id,
+                "rag_eval_runs",
+                &run.id,
+                run,
+            )?],
+        )
+        .await
     }
 
     async fn upsert_eval_case_results(
@@ -1048,7 +1292,14 @@ impl KnowledgeRepository for MeiliRepository {
     ) -> Result<Option<String>, ApiError> {
         let documents = results
             .iter()
-            .map(|result| to_document(result, &result.id))
+            .map(|result| {
+                tenant_document(
+                    &result.tenant_id,
+                    "rag_eval_case_results",
+                    &result.id,
+                    result,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.upsert_values("rag_eval_case_results", &documents)
             .await
@@ -1060,7 +1311,12 @@ impl KnowledgeRepository for MeiliRepository {
     ) -> Result<Option<String>, ApiError> {
         self.upsert_values(
             "rag_eval_overviews",
-            &[to_document(overview, &overview.run_id)?],
+            &[tenant_document(
+                &overview.tenant_id,
+                "rag_eval_overviews",
+                &overview.run_id,
+                overview,
+            )?],
         )
         .await
     }
@@ -1069,14 +1325,11 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         tenant_id: &str,
     ) -> Result<Option<Vec<HarnessComponent>>, ApiError> {
-        self.search_many(
+        self.search_tenant_many(
             "rag_harness_components",
-            &format!(
-                "tenant_id = {} AND doc_kind = \"component\"",
-                meili_string(tenant_id)?
-            ),
+            TenantFilter::new(tenant_id)?.eq("doc_kind", "component")?,
             1000,
-            Some(&["id:asc"]),
+            Some(&["logical_id:asc"]),
         )
         .await
     }
@@ -1086,16 +1339,13 @@ impl KnowledgeRepository for MeiliRepository {
         tenant_id: &str,
         component_id: Option<&str>,
     ) -> Result<Option<Vec<HarnessComponentRevision>>, ApiError> {
-        let mut filters = vec![
-            format!("tenant_id = {}", meili_string(tenant_id)?),
-            "doc_kind = \"revision\"".to_string(),
-        ];
+        let mut filter = TenantFilter::new(tenant_id)?.eq("doc_kind", "revision")?;
         if let Some(component_id) = component_id {
-            filters.push(format!("component_id = {}", meili_string(component_id)?));
+            filter = filter.eq("component_id", component_id)?;
         }
-        self.search_many(
+        self.search_tenant_many(
             "rag_harness_components",
-            &filters.join(" AND "),
+            filter,
             1000,
             Some(&["iteration:asc"]),
         )
@@ -1107,13 +1357,9 @@ impl KnowledgeRepository for MeiliRepository {
         tenant_id: &str,
         change_id: &str,
     ) -> Result<Option<HarnessChangeManifest>, ApiError> {
-        self.search_one(
+        self.search_tenant_one(
             "rag_harness_changes",
-            &format!(
-                "tenant_id = {} AND id = {}",
-                meili_string(tenant_id)?,
-                meili_string(change_id)?
-            ),
+            TenantFilter::new(tenant_id)?.logical_id(change_id)?,
         )
         .await
     }
@@ -1122,9 +1368,9 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         tenant_id: &str,
     ) -> Result<Option<Vec<HarnessChangeManifest>>, ApiError> {
-        self.search_many(
+        self.search_tenant_many(
             "rag_harness_changes",
-            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            TenantFilter::new(tenant_id)?,
             1000,
             Some(&["created_at:desc"]),
         )
@@ -1136,13 +1382,13 @@ impl KnowledgeRepository for MeiliRepository {
         tenant_id: &str,
         change_id: Option<&str>,
     ) -> Result<Option<Vec<HarnessChangeVerdict>>, ApiError> {
-        let mut filters = vec![format!("tenant_id = {}", meili_string(tenant_id)?)];
+        let mut filter = TenantFilter::new(tenant_id)?;
         if let Some(change_id) = change_id {
-            filters.push(format!("change_id = {}", meili_string(change_id)?));
+            filter = filter.eq("change_id", change_id)?;
         }
-        self.search_many(
+        self.search_tenant_many(
             "rag_harness_verdicts",
-            &filters.join(" AND "),
+            filter,
             1000,
             Some(&["created_at:desc"]),
         )
@@ -1154,13 +1400,9 @@ impl KnowledgeRepository for MeiliRepository {
         tenant_id: &str,
         task_id: &str,
     ) -> Result<Option<IngestTask>, ApiError> {
-        self.search_one(
+        self.search_tenant_one(
             "rag_ingest_tasks",
-            &format!(
-                "tenant_id = {} AND task_id = {}",
-                meili_string(tenant_id)?,
-                meili_string(task_id)?
-            ),
+            TenantFilter::new(tenant_id)?.eq("task_id", task_id)?,
         )
         .await
     }
@@ -1170,13 +1412,9 @@ impl KnowledgeRepository for MeiliRepository {
         tenant_id: &str,
         task_id: &str,
     ) -> Result<Option<IngestTaskResult>, ApiError> {
-        self.search_one(
+        self.search_tenant_one(
             "rag_ingest_results",
-            &format!(
-                "tenant_id = {} AND task_id = {}",
-                meili_string(tenant_id)?,
-                meili_string(task_id)?
-            ),
+            TenantFilter::new(tenant_id)?.eq("task_id", task_id)?,
         )
         .await
     }
@@ -1185,9 +1423,9 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         tenant_id: &str,
     ) -> Result<Option<Vec<IngestTask>>, ApiError> {
-        self.search_many(
+        self.search_tenant_many(
             "rag_ingest_tasks",
-            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            TenantFilter::new(tenant_id)?,
             1000,
             Some(&["created_at:desc"]),
         )
@@ -1198,9 +1436,9 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         tenant_id: &str,
     ) -> Result<Option<Vec<IngestTaskResult>>, ApiError> {
-        self.search_many(
+        self.search_tenant_many(
             "rag_ingest_results",
-            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            TenantFilter::new(tenant_id)?,
             1000,
             None,
         )
@@ -1208,9 +1446,9 @@ impl KnowledgeRepository for MeiliRepository {
     }
 
     async fn list_eval_cases(&self, tenant_id: &str) -> Result<Option<Vec<RagEvalCase>>, ApiError> {
-        self.search_many(
+        self.search_tenant_many(
             "rag_eval_cases",
-            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            TenantFilter::new(tenant_id)?,
             1000,
             Some(&["created_at:asc"]),
         )
@@ -1222,21 +1460,17 @@ impl KnowledgeRepository for MeiliRepository {
         tenant_id: &str,
         run_id: &str,
     ) -> Result<Option<RagEvalRun>, ApiError> {
-        self.search_one(
+        self.search_tenant_one(
             "rag_eval_runs",
-            &format!(
-                "tenant_id = {} AND id = {}",
-                meili_string(tenant_id)?,
-                meili_string(run_id)?
-            ),
+            TenantFilter::new(tenant_id)?.logical_id(run_id)?,
         )
         .await
     }
 
     async fn list_eval_runs(&self, tenant_id: &str) -> Result<Option<Vec<RagEvalRun>>, ApiError> {
-        self.search_many(
+        self.search_tenant_many(
             "rag_eval_runs",
-            &format!("tenant_id = {}", meili_string(tenant_id)?),
+            TenantFilter::new(tenant_id)?,
             1000,
             Some(&["created_at:desc"]),
         )
@@ -1248,10 +1482,9 @@ impl KnowledgeRepository for MeiliRepository {
         tenant_id: &str,
         run_id: &str,
     ) -> Result<Option<RagEvalOverview>, ApiError> {
-        let _ = tenant_id;
-        self.search_one(
+        self.search_tenant_one(
             "rag_eval_overviews",
-            &format!("run_id = {}", meili_string(run_id)?),
+            TenantFilter::new(tenant_id)?.eq("run_id", run_id)?,
         )
         .await
     }
@@ -1261,10 +1494,9 @@ impl KnowledgeRepository for MeiliRepository {
         tenant_id: &str,
         run_id: &str,
     ) -> Result<Option<Vec<RagEvalCaseResult>>, ApiError> {
-        let _ = tenant_id;
-        self.search_many(
+        self.search_tenant_many(
             "rag_eval_case_results",
-            &format!("run_id = {}", meili_string(run_id)?),
+            TenantFilter::new(tenant_id)?.eq("run_id", run_id)?,
             1000,
             None,
         )
@@ -1278,21 +1510,21 @@ impl KnowledgeRepository for MeiliRepository {
         source_id: Option<&str>,
         revision_id: Option<&str>,
     ) -> Result<Option<Vec<ParseArtifact>>, ApiError> {
-        let mut filters = vec![format!("tenant_id = {}", meili_string(tenant_id)?)];
+        let mut filter = TenantFilter::new(tenant_id)?;
         if let Some(owner) = owner_user_id {
-            filters.push(format!("owner_user_id = {}", meili_string(owner)?));
+            filter = filter.eq("owner_user_id", owner)?;
         } else {
-            filters.push("owner_user_id IS NULL".to_string());
+            filter = filter.is_null("owner_user_id");
         }
         if let Some(source_id) = source_id {
-            filters.push(format!("source_id = {}", meili_string(source_id)?));
+            filter = filter.eq("source_id", source_id)?;
         }
         if let Some(revision_id) = revision_id {
-            filters.push(format!("revision_id = {}", meili_string(revision_id)?));
+            filter = filter.eq("revision_id", revision_id)?;
         }
-        self.search_many(
+        self.search_tenant_many(
             "rag_parse_artifacts",
-            &filters.join(" AND "),
+            filter,
             1000,
             Some(&["created_at:asc"]),
         )
@@ -1490,16 +1722,8 @@ impl KnowledgeRepository for MeiliRepository {
             } else {
                 filters.push("privacy = \"company\"".to_string());
             }
-            let response: SearchResponse<ContextNode> = self
-                .admin
-                .search(
-                    &index_uid,
-                    json!({
-                        "q": target,
-                        "limit": 20,
-                        "filter": filters.join(" AND ")
-                    }),
-                )
+            let response = self
+                .search_context_index(&index_uid, &target, &filters.join(" AND "), 20)
                 .await?;
             if let Some(node) = response
                 .hits
@@ -1518,67 +1742,46 @@ impl KnowledgeRepository for MeiliRepository {
         owner_user_id: Option<&str>,
         uri: &str,
     ) -> Result<Option<SourceDocument>, ApiError> {
-        let mut filters = vec![
-            format!("tenant_id = {}", meili_string(tenant_id)?),
-            format!("uri = {}", meili_string(uri)?),
-            "status = \"active\"".to_string(),
-        ];
+        let mut filter = TenantFilter::new(tenant_id)?
+            .eq("uri", uri)?
+            .eq("status", "active")?;
         if let Some(owner) = owner_user_id {
-            filters.push(format!(
-                "(owner_user_id = {} OR owner_user_id IS NULL)",
-                meili_string(owner)?
-            ));
+            filter = filter.eq_or_null("owner_user_id", owner)?;
         } else {
-            filters.push("owner_user_id IS NULL".to_string());
+            filter = filter.is_null("owner_user_id");
         }
-        let response: SearchResponse<SourceDocument> = self
-            .admin
-            .search(
-                "rag_source_documents",
-                json!({
-                    "q": "",
-                    "limit": 1,
-                    "filter": filters.join(" AND ")
-                }),
-            )
-            .await?;
-        Ok(response.hits.into_iter().next())
+        self.search_tenant_one("rag_source_documents", filter).await
     }
 
-    async fn get_trace(&self, trace_id: &str) -> Result<Option<TraceRecord>, ApiError> {
-        let response: SearchResponse<TraceRecord> = self
-            .admin
-            .search(
-                "rag_traces",
-                json!({
-                    "q": "",
-                    "limit": 1,
-                    "filter": format!("id = {}", meili_string(trace_id)?)
-                }),
-            )
-            .await?;
-        Ok(response.hits.into_iter().next())
+    async fn get_trace(
+        &self,
+        tenant_id: &str,
+        trace_id: &str,
+    ) -> Result<Option<TraceRecord>, ApiError> {
+        self.search_tenant_one(
+            "rag_traces",
+            TenantFilter::new(tenant_id)?.logical_id(trace_id)?,
+        )
+        .await
     }
 
     async fn get_snapshot(
         &self,
+        tenant_id: &str,
         snapshot_id: &str,
     ) -> Result<Option<StructuredSnapshot>, ApiError> {
-        let response: SearchResponse<StructuredSnapshot> = self
-            .admin
-            .search(
-                "rag_structured_snapshots",
-                json!({
-                    "q": "",
-                    "limit": 1,
-                    "filter": format!("id = {}", meili_string(snapshot_id)?)
-                }),
-            )
-            .await?;
-        Ok(response.hits.into_iter().next())
+        self.search_tenant_one(
+            "rag_structured_snapshots",
+            TenantFilter::new(tenant_id)?.logical_id(snapshot_id)?,
+        )
+        .await
     }
 
-    async fn list_rows(&self, snapshot_id: &str) -> Result<Option<Vec<Value>>, ApiError> {
+    async fn list_rows(
+        &self,
+        tenant_id: &str,
+        snapshot_id: &str,
+    ) -> Result<Option<Vec<Value>>, ApiError> {
         let response: SearchResponse<Value> = self
             .admin
             .search(
@@ -1586,65 +1789,105 @@ impl KnowledgeRepository for MeiliRepository {
                 json!({
                     "q": "",
                     "limit": 1000,
-                    "filter": format!("snapshot_id = {}", meili_string(snapshot_id)?)
+                    "filter": TenantFilter::new(tenant_id)?
+                        .eq("snapshot_id", snapshot_id)?
+                        .finish()
                 }),
             )
             .await?;
-        Ok(Some(response.hits))
+        Ok(Some(
+            prefer_tenant_documents("rag_structured_rows", response.hits)
+                .into_iter()
+                .map(|document| restore_logical_id("rag_structured_rows", document))
+                .collect(),
+        ))
     }
 
-    async fn debug_search(&self, index_uid: &str, query: &str) -> Result<Option<Value>, ApiError> {
-        Ok(Some(
-            self.admin
-                .search_value(
-                    index_uid,
-                    json!({
-                        "q": query,
-                        "limit": 20
-                    }),
-                )
-                .await?,
-        ))
+    async fn debug_search(
+        &self,
+        tenant_id: &str,
+        index_uid: &str,
+        query: &str,
+    ) -> Result<Option<Value>, ApiError> {
+        let mut response = self
+            .admin
+            .search_value(
+                index_uid,
+                json!({
+                    "q": query,
+                    "limit": 20,
+                    "filter": TenantFilter::new(tenant_id)?.finish()
+                }),
+            )
+            .await?;
+        if let Some(hits) = response.get_mut("hits").and_then(Value::as_array_mut) {
+            let preferred = prefer_tenant_documents(index_uid, std::mem::take(hits));
+            *hits = preferred
+                .into_iter()
+                .map(|document| restore_logical_id(index_uid, document))
+                .collect();
+        }
+        Ok(Some(response))
     }
 }
 
 impl MeiliRepository {
-    async fn search_one<T: DeserializeOwned>(
+    async fn search_tenant_one<T: DeserializeOwned>(
         &self,
         index_uid: &str,
-        filter: &str,
+        filter: TenantFilter,
     ) -> Result<Option<T>, ApiError> {
-        let response: SearchResponse<T> = self
+        let response: SearchResponse<Value> = self
             .admin
             .search(
                 index_uid,
                 json!({
                     "q": "",
-                    "limit": 1,
-                    "filter": filter
+                    "limit": 20,
+                    "filter": filter.finish()
                 }),
             )
             .await?;
-        Ok(response.hits.into_iter().next())
+        prefer_tenant_documents(index_uid, response.hits)
+            .into_iter()
+            .next()
+            .map(|document| restore_logical_id(index_uid, document))
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                ApiError::Internal(format!(
+                    "failed to decode tenant-scoped {index_uid} document: {error}"
+                ))
+            })
     }
 
-    async fn search_many<T: DeserializeOwned>(
+    async fn search_tenant_many<T: DeserializeOwned>(
         &self,
         index_uid: &str,
-        filter: &str,
+        filter: TenantFilter,
         limit: usize,
         sort: Option<&[&str]>,
     ) -> Result<Option<Vec<T>>, ApiError> {
         let mut body = json!({
             "q": "",
             "limit": limit.max(1),
-            "filter": filter
+            "filter": filter.finish()
         });
         if let Some(sort) = sort {
             body["sort"] = json!(sort);
         }
-        let response: SearchResponse<T> = self.admin.search(index_uid, body).await?;
-        Ok(Some(response.hits))
+        let response: SearchResponse<Value> = self.admin.search(index_uid, body).await?;
+        let hits = prefer_tenant_documents(index_uid, response.hits)
+            .into_iter()
+            .map(|document| restore_logical_id(index_uid, document))
+            .map(serde_json::from_value)
+            .collect::<Result<Vec<T>, _>>()
+            .map_err(|error| {
+                ApiError::Internal(format!(
+                    "failed to decode tenant-scoped {index_uid} documents: {error}"
+                ))
+            })?;
+        Ok(Some(hits))
     }
 
     async fn search_context_index(
@@ -1654,7 +1897,8 @@ impl MeiliRepository {
         filter: &str,
         limit: usize,
     ) -> Result<SearchResponse<ContextNode>, ApiError> {
-        self.admin
+        let response: SearchResponse<Value> = self
+            .admin
             .search(
                 index_uid,
                 json!({
@@ -1663,7 +1907,21 @@ impl MeiliRepository {
                     "filter": filter
                 }),
             )
-            .await
+            .await?;
+        let hits = prefer_tenant_documents(index_uid, response.hits)
+            .into_iter()
+            .map(|document| restore_logical_id(index_uid, document))
+            .map(serde_json::from_value)
+            .collect::<Result<Vec<ContextNode>, _>>()
+            .map_err(|error| {
+                ApiError::Internal(format!(
+                    "failed to decode tenant-scoped {index_uid} context documents: {error}"
+                ))
+            })?;
+        Ok(SearchResponse {
+            hits,
+            processing_time_ms: response.processing_time_ms,
+        })
     }
 }
 
@@ -1692,20 +1950,84 @@ fn to_document<T: Serialize + ?Sized>(value: &T, id: &str) -> Result<Value, ApiE
     Ok(Value::Object(document))
 }
 
-fn to_document_with_kind<T: Serialize + ?Sized>(
-    value: &T,
-    id: &str,
-    doc_kind: &str,
-) -> Result<Value, ApiError> {
-    let mut document = to_document(value, id)?;
-    if let Value::Object(map) = &mut document {
-        map.insert("doc_kind".to_string(), Value::String(doc_kind.to_string()));
+fn legacy_mirror_documents(
+    index_uid: &str,
+    new_documents: &[Value],
+    legacy_documents: &[Value],
+) -> Vec<Value> {
+    let mut mirrored_ids = HashSet::new();
+    let mut mirrors = Vec::new();
+    for legacy in legacy_documents {
+        let Some(legacy_id) = legacy.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if mirrored_ids.contains(legacy_id) {
+            continue;
+        }
+        let Some(current) = new_documents
+            .iter()
+            .rev()
+            .find(|current| legacy_mirror_matches(index_uid, legacy, current))
+        else {
+            continue;
+        };
+        mirrored_ids.insert(legacy_id.to_string());
+        let mut mirror = restore_logical_id(index_uid, current.clone());
+        let Some(object) = mirror.as_object_mut() else {
+            continue;
+        };
+        object.insert("id".to_string(), Value::String(legacy_id.to_string()));
+        mirrors.push(mirror);
     }
-    Ok(document)
+    mirrors
 }
 
-fn context_document_id(uri: &str) -> String {
-    format!("ctx_{}", hmac_hex(b"nowledge-context-doc", "uri", uri, 24))
+fn legacy_mirror_matches(index_uid: &str, legacy: &Value, current: &Value) -> bool {
+    if !is_tenant_document(index_uid, current) || is_tenant_document(index_uid, legacy) {
+        return false;
+    }
+    if legacy.get("tenant_id").and_then(Value::as_str)
+        != current.get("tenant_id").and_then(Value::as_str)
+    {
+        return false;
+    }
+    if legacy.get("id").and_then(Value::as_str) != legacy_document_id(index_uid, current).as_deref()
+    {
+        return false;
+    }
+    match index_uid {
+        "rag_harness_components" => {
+            legacy.get("doc_kind").and_then(Value::as_str)
+                == current.get("doc_kind").and_then(Value::as_str)
+        }
+        "rag_structured_rows" => {
+            legacy.get("snapshot_id").and_then(Value::as_str)
+                == current.get("snapshot_id").and_then(Value::as_str)
+        }
+        "rag_parse_artifacts" => {
+            optional_string(legacy, "owner_user_id") == optional_string(current, "owner_user_id")
+        }
+        uid if uid == "rag_company_context" || uid.starts_with("rag_context__") => {
+            legacy.get("uri").and_then(Value::as_str) == current.get("uri").and_then(Value::as_str)
+        }
+        _ => true,
+    }
+}
+
+fn legacy_document_id(index_uid: &str, document: &Value) -> Option<String> {
+    let logical_id = document.get("logical_id").and_then(Value::as_str)?;
+    if index_uid == "rag_company_context" || index_uid.starts_with("rag_context__") {
+        Some(format!(
+            "ctx_{}",
+            hmac_hex(b"nowledge-context-doc", "uri", logical_id, 24)
+        ))
+    } else {
+        Some(logical_id.to_string())
+    }
+}
+
+fn optional_string<'a>(document: &'a Value, field: &str) -> Option<&'a str> {
+    document.get(field).and_then(Value::as_str)
 }
 
 fn meili_string(value: &str) -> Result<String, ApiError> {
@@ -1714,6 +2036,64 @@ fn meili_string(value: &str) -> Result<String, ApiError> {
 
 fn meili_string_array(values: &[String]) -> Result<String, ApiError> {
     serde_json::to_string(values).map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+fn prefer_tenant_documents(index_uid: &str, documents: Vec<Value>) -> Vec<Value> {
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut preferred: Vec<Value> = Vec::with_capacity(documents.len());
+    for document in documents {
+        let Some(key) = tenant_document_key(index_uid, &document) else {
+            preferred.push(document);
+            continue;
+        };
+        if let Some(position) = positions.get(&key).copied() {
+            let candidate_is_migrated = is_tenant_document(index_uid, &document);
+            let current_is_migrated = is_tenant_document(index_uid, &preferred[position]);
+            if candidate_is_migrated && !current_is_migrated {
+                preferred[position] = document;
+            }
+            continue;
+        }
+        positions.insert(key, preferred.len());
+        preferred.push(document);
+    }
+    preferred
+}
+
+fn tenant_document_key(index_uid: &str, document: &Value) -> Option<String> {
+    let migrated = is_tenant_document(index_uid, document);
+    let logical_id = match index_uid {
+        uid if uid == "rag_company_context" || uid.starts_with("rag_context__") => {
+            document.get("uri").and_then(Value::as_str)
+        }
+        "rag_eval_overviews" => document.get("run_id").and_then(Value::as_str),
+        "rag_ingest_tasks" | "rag_ingest_results" => {
+            document.get("task_id").and_then(Value::as_str)
+        }
+        _ if migrated => document.get("logical_id").and_then(Value::as_str),
+        _ => document.get("id").and_then(Value::as_str),
+    }?;
+    if index_uid == "rag_structured_rows" {
+        let snapshot_id = document.get("snapshot_id").and_then(Value::as_str)?;
+        return scoped_storage_identity(snapshot_id, logical_id).ok();
+    }
+    if index_uid == "rag_parse_artifacts" {
+        let owner_user_id = match document.get("owner_user_id") {
+            Some(Value::String(owner_user_id)) => Some(owner_user_id.as_str()),
+            Some(Value::Null) | None => None,
+            Some(_) => return None,
+        };
+        return owner_scoped_storage_identity(owner_user_id, logical_id).ok();
+    }
+    if index_uid == "rag_harness_components" {
+        let kind = document
+            .get("doc_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        Some(format!("{kind}\0{logical_id}"))
+    } else {
+        Some(logical_id.to_string())
+    }
 }
 
 fn context_filter(
@@ -1792,4 +2172,255 @@ fn strip_context_layer_suffix(uri: &str) -> String {
         .or_else(|| uri.strip_suffix("/chunks/0001"))
         .unwrap_or(uri)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_mirror_updates_only_an_existing_same_tenant_legacy_row() {
+        let current = tenant_document(
+            "tenant-a",
+            "rag_source_documents",
+            "document-1",
+            &json!({
+                "tenant_id": "tenant-a",
+                "status": "superseded",
+                "content": "current"
+            }),
+        )
+        .unwrap();
+        let mirrors = legacy_mirror_documents(
+            "rag_source_documents",
+            std::slice::from_ref(&current),
+            &[
+                json!({
+                    "id": "document-1",
+                    "tenant_id": "tenant-b",
+                    "status": "active",
+                    "content": "other tenant"
+                }),
+                json!({
+                    "id": "document-1",
+                    "tenant_id": "tenant-a",
+                    "status": "active",
+                    "content": "stale"
+                }),
+            ],
+        );
+
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(mirrors[0]["id"], "document-1");
+        assert_eq!(mirrors[0]["tenant_id"], "tenant-a");
+        assert_eq!(mirrors[0]["status"], "superseded");
+        assert_eq!(mirrors[0]["content"], "current");
+        assert!(mirrors[0].get("logical_id").is_none());
+    }
+
+    #[test]
+    fn compatibility_mirror_preserves_structured_business_fields_and_snapshot_scope() {
+        let current = tenant_structured_row_document(
+            "tenant-a",
+            &json!({
+                "id": "row-1",
+                "tenant_id": "tenant-a",
+                "snapshot_id": "snapshot-a",
+                "logical_id": "business-value",
+                "value": "current"
+            }),
+        )
+        .unwrap();
+        let mirrors = legacy_mirror_documents(
+            "rag_structured_rows",
+            &[current],
+            &[
+                json!({
+                    "id": "row-1",
+                    "tenant_id": "tenant-a",
+                    "snapshot_id": "snapshot-b",
+                    "value": "other snapshot"
+                }),
+                json!({
+                    "id": "row-1",
+                    "tenant_id": "tenant-a",
+                    "snapshot_id": "snapshot-a",
+                    "value": "stale"
+                }),
+            ],
+        );
+
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(mirrors[0]["snapshot_id"], "snapshot-a");
+        assert_eq!(mirrors[0]["logical_id"], "business-value");
+        assert_eq!(mirrors[0]["value"], "current");
+    }
+
+    #[test]
+    fn parse_artifact_storage_and_legacy_mirroring_are_owner_scoped() {
+        let current_for = |owner_user_id: Option<&str>| {
+            let storage_identity =
+                owner_scoped_storage_identity(owner_user_id, "artifact-1").unwrap();
+            tenant_document_with_storage_identity(
+                "tenant-a",
+                "rag_parse_artifacts",
+                "artifact-1",
+                &storage_identity,
+                &json!({
+                    "tenant_id": "tenant-a",
+                    "owner_user_id": owner_user_id,
+                    "checksum": "current"
+                }),
+            )
+            .unwrap()
+        };
+        let owner_a = current_for(Some("owner-a"));
+        let owner_b = current_for(Some("owner-b"));
+        let company = current_for(None);
+
+        assert_ne!(owner_a["id"], owner_b["id"]);
+        assert_ne!(owner_a["id"], company["id"]);
+        assert_ne!(owner_b["id"], company["id"]);
+
+        let mirrors = legacy_mirror_documents(
+            "rag_parse_artifacts",
+            &[owner_a, owner_b, company],
+            &[json!({
+                "id": "artifact-1",
+                "tenant_id": "tenant-a",
+                "owner_user_id": "owner-b",
+                "checksum": "stale"
+            })],
+        );
+        assert_eq!(mirrors.len(), 1);
+        assert_eq!(mirrors[0]["id"], "artifact-1");
+        assert_eq!(mirrors[0]["owner_user_id"], "owner-b");
+        assert_eq!(mirrors[0]["checksum"], "current");
+    }
+
+    #[test]
+    fn dual_read_prefers_tenant_safe_copy_and_preserves_public_id() {
+        let migrated = tenant_document(
+            "tenant-a",
+            "rag_sources",
+            "source-1",
+            &json!({"title": "current"}),
+        )
+        .unwrap();
+        let documents = prefer_tenant_documents(
+            "rag_sources",
+            vec![
+                json!({
+                    "id": "source-1",
+                    "tenant_id": "tenant-a",
+                    "title": "legacy"
+                }),
+                migrated,
+            ],
+        );
+
+        assert_eq!(documents.len(), 1);
+        let restored = restore_logical_id("rag_sources", documents.into_iter().next().unwrap());
+        assert_eq!(restored["id"], "source-1");
+        assert_eq!(restored["title"], "current");
+        assert!(restored.get("logical_id").is_none());
+    }
+
+    #[test]
+    fn dual_read_deduplicates_legacy_company_context_by_uri() {
+        let migrated = tenant_document(
+            "tenant-a",
+            "rag_company_context",
+            "ctx://company/shared",
+            &json!({"uri": "ctx://company/shared"}),
+        )
+        .unwrap();
+        let migrated_id = migrated["id"].clone();
+        let documents = prefer_tenant_documents(
+            "rag_company_context",
+            vec![
+                json!({
+                    "id": "ctx_legacy_hash",
+                    "tenant_id": "tenant-a",
+                    "uri": "ctx://company/shared"
+                }),
+                migrated,
+            ],
+        );
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0]["id"], migrated_id);
+    }
+
+    #[test]
+    fn dual_read_keeps_distinct_harness_document_kinds() {
+        let documents = prefer_tenant_documents(
+            "rag_harness_components",
+            vec![
+                json!({
+                    "id": "same-id",
+                    "tenant_id": "tenant-a",
+                    "doc_kind": "component"
+                }),
+                json!({
+                    "id": "same-id",
+                    "tenant_id": "tenant-a",
+                    "doc_kind": "revision"
+                }),
+            ],
+        );
+
+        assert_eq!(documents.len(), 2);
+    }
+
+    #[test]
+    fn dual_read_deduplicates_structured_rows() {
+        let current = tenant_structured_row_document(
+            "tenant-a",
+            &json!({
+                "id": "row-1",
+                "tenant_id": "tenant-a",
+                "snapshot_id": "snapshot-1",
+                "logical_id": "business-current",
+                "value": "current"
+            }),
+        )
+        .unwrap();
+        let other = tenant_structured_row_document(
+            "tenant-a",
+            &json!({
+                "id": "row-1",
+                "tenant_id": "tenant-a",
+                "snapshot_id": "snapshot-2",
+                "logical_id": "business-other",
+                "value": "other"
+            }),
+        )
+        .unwrap();
+        let documents = prefer_tenant_documents(
+            "rag_structured_rows",
+            vec![
+                json!({
+                    "id": "row-1",
+                    "tenant_id": "tenant-a",
+                    "snapshot_id": "snapshot-1",
+                    "value": "legacy"
+                }),
+                current,
+                other,
+            ],
+        );
+
+        assert_eq!(documents.len(), 2);
+        let restored = documents
+            .into_iter()
+            .map(|row| restore_logical_id("rag_structured_rows", row))
+            .collect::<Vec<_>>();
+        assert!(restored
+            .iter()
+            .any(|row| { row["value"] == "current" && row["logical_id"] == "business-current" }));
+        assert!(restored
+            .iter()
+            .any(|row| { row["value"] == "other" && row["logical_id"] == "business-other" }));
+    }
 }

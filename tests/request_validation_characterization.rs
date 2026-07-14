@@ -312,9 +312,17 @@ async fn structured_row_bulk_limit_rejects_before_rows_or_history_are_mutated() 
         &format!("must contain at most {MAX_BULK_ITEMS} items"),
     );
 
-    let rows = state.store.list_rows_async(snapshot_id).await.unwrap();
+    let rows = state
+        .store
+        .list_rows_async(state.tenant_id(), snapshot_id)
+        .await
+        .unwrap();
     assert_eq!(rows["rows"], json!([]));
-    let stored_snapshot = state.store.get_snapshot_async(snapshot_id).await.unwrap();
+    let stored_snapshot = state
+        .store
+        .get_snapshot_async(state.tenant_id(), snapshot_id)
+        .await
+        .unwrap();
     assert_eq!(stored_snapshot.row_count, 0);
     let usage = state
         .store
