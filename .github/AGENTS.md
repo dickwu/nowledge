@@ -1,14 +1,16 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-20 | Updated: 2026-05-20 -->
+<!-- Generated: 2026-05-20 | Updated: 2026-07-15 -->
 
 # .github
 
 ## Purpose
-GitHub-specific configuration. Currently scoped to CI workflows; no issue
-templates, code owners, or Dependabot config are checked in.
+GitHub-specific configuration for CI and automated dependency updates. No issue
+templates or code owners are checked in.
 
 ## Key Files
-None at this level — see the `workflows/` subdirectory.
+| File | Description |
+|------|-------------|
+| `dependabot.yml` | Weekly grouped Cargo and GitHub Actions dependency updates. |
 
 ## Subdirectories
 | Directory | Purpose |
@@ -18,9 +20,8 @@ None at this level — see the `workflows/` subdirectory.
 ## For AI Agents
 
 ### Working In This Directory
-- Anything that lives under `.github/` is consumed by GitHub directly. Avoid
-  putting build-system artifacts or environment-specific files here — they
-  belong under `scripts/` or `.omc/`.
+- Anything that lives under `.github/` is consumed by GitHub directly. Keep
+  build artifacts and local runtime state out of this directory.
 - If issue/PR templates are added later, place them at `.github/ISSUE_TEMPLATE/`
   and `.github/PULL_REQUEST_TEMPLATE.md` per GitHub conventions and update this
   document.
@@ -31,17 +32,21 @@ None at this level — see the `workflows/` subdirectory.
   current `ci.yml`.
 
 ### Testing Requirements
-- Workflow changes can be smoke-tested by pushing to a branch and watching the
-  Actions tab. No local runner is wired up.
+- Parse workflow and Dependabot YAML locally, run the commands represented by
+  the workflow, and confirm third-party action inputs against their upstream
+  action definitions. GitHub-hosted execution remains the final integration
+  check.
 
 ### Common Patterns
-- Single-job, lint+test+package pipeline per `workflows/ci.yml`. Keep new
-  workflows similarly minimal unless there is a concrete need.
+- Separate stable quality, MSRV, RustSec, and dependency-policy jobs so each
+  failing contract is visible independently.
 
 ## Dependencies
 
 ### External
 - GitHub Actions runners (Ubuntu).
-- `dtolnay/rust-toolchain@stable` — toolchain pin for Rust jobs.
+- GitHub Dependabot.
+- Official/upstream Rust and dependency-policy actions listed in
+  `workflows/AGENTS.md`.
 
 <!-- MANUAL: -->

@@ -38,6 +38,18 @@ cargo run
 
 The default URL is `http://127.0.0.1:14242`.
 
+Nowledge requires Rust 1.88 or newer. For a safe local starting point, copy the
+checked-in example and explicitly load it into your shell; the binary does not
+load `.env` files itself:
+
+```sh
+cp .env.example .env
+set -a
+. ./.env
+set +a
+cargo run
+```
+
 Useful environment variables:
 
 ```sh
@@ -507,10 +519,15 @@ Link and analysis surfaces:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo check
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo check --locked --all-targets
+cargo test --locked
+cargo package --locked
 ```
+
+CI also checks the same lockfile with Rust 1.88, runs the exact route-manifest
+contract test, audits RustSec advisories, and enforces the dependency license,
+source, ban, and advisory policy in `deny.toml`.
 
 Optional Meilisearch integration tests run when `RAG_TEST_MEILI_URL` is set.
 If the server requires a key, set `RAG_TEST_MEILI_API_KEY` too:

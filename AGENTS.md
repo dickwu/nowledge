@@ -1,4 +1,4 @@
-<!-- Generated: 2026-05-20 | Updated: 2026-05-20 -->
+<!-- Generated: 2026-05-20 | Updated: 2026-07-15 -->
 
 # nowledge
 
@@ -13,22 +13,24 @@ RAG answer surfaces. Built as a single Rust + axum binary that runs on
 ## Key Files
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | Crate manifest. Name `nowledge`, edition 2021. Pins axum 0.8, meilisearch-sdk 0.33, reqwest 0.12, utoipa 5, uuid v7. |
+| `Cargo.toml` | Crate manifest. Name `nowledge`, edition 2021, MSRV 1.88. Pins axum 0.8, meilisearch-sdk 0.33, reqwest 0.12, and uuid v7. |
 | `Cargo.lock` | Locked dependency graph for reproducible builds. |
-| `README.md` | Public-facing run/verify guide. Lists environment variables, the verify command set (`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo check && cargo test`), and optional Meili/MinerU integration test gates. |
-| `.gitignore` | Standard Rust ignores. |
+| `README.md` | Public-facing run/verify guide. Lists environment variables, the locked verify/package command set, and optional Meili/MinerU integration test gates. |
+| `.env.example` | Safe, explicitly local development baseline with secret placeholders only. |
+| `SECURITY.md` | Supported-version and private vulnerability reporting policy. |
+| `.gitignore` | Rust build, local environment, deployment helper, and agent-state ignores. |
+| `deny.toml` | Cargo dependency advisory, license, ban, and source policy. |
 
 ## Subdirectories
 | Directory | Purpose |
 |-----------|---------|
-| `src/` | All Rust source. Flat module layout, no nested mods (see `src/AGENTS.md`). |
+| `src/` | Rust source and compatibility façades (see `src/AGENTS.md`). |
 | `tests/` | Integration tests against the full router (see `tests/AGENTS.md`). |
-| `scripts/` | Deployment helpers targeting the `gfit` host and a local Meili tunnel (see `scripts/AGENTS.md`). |
 | `doc/` | Per-endpoint API documentation generated to mirror `routes.rs` (see `doc/AGENTS.md`). |
-| `.github/` | GitHub Actions CI configuration (see `.github/AGENTS.md`). |
+| `.github/` | GitHub Actions CI and Dependabot configuration (see `.github/AGENTS.md`). |
 
-Skipped from AGENTS.md generation: `target/` (build output), `.git/`, and the
-`.omc/` / `.omx/` session-state caches.
+Ignored and excluded from AGENTS.md generation: `target/` (build output),
+`.git/`, local `scripts/`, and the `.omc/` / `.omx/` session-state caches.
 
 ## For AI Agents
 
@@ -66,8 +68,9 @@ Skipped from AGENTS.md generation: `target/` (build output), `.git/`, and the
   `cargo test --test meili_integration`.
 - Optional MinerU integration tests are gated by `RAG_TEST_MINERU_API_URL`:
   `cargo test --test mineru_integration`.
-- CI (`.github/workflows/ci.yml`) runs fmt, clippy with `-D warnings`, the full
-  test suite, and `cargo package --allow-dirty --no-verify` on every push/PR.
+- CI (`.github/workflows/ci.yml`) runs locked stable quality/package gates,
+  checks Rust 1.88 compatibility, audits RustSec advisories, and applies the
+  `cargo-deny` dependency policy on every push/PR.
 
 ### Common Patterns
 - One axum `Router` built in `src/routes.rs::build_router`, shared `AppState`
@@ -92,14 +95,12 @@ Skipped from AGENTS.md generation: `target/` (build output), `.git/`, and the
 - `reqwest` 0.12 — HTTP client for Meili admin, MinerU, and LLM providers.
 - `hmac` / `sha2` — per-user index HMAC derivation.
 - `serde` / `serde_json` — wire format.
-- `utoipa` 5 + `utoipa-swagger-ui` 9 — OpenAPI generation (pulled in but the
-  hand-written endpoint docs under `doc/` are the source of truth for humans).
 - `uuid` 1 (v7) — id minting.
 - `chrono` — timestamps.
 - `turbovec` 0.9 — TurboQuant quantized vector index behind
   `src/vector_match.rs` hybrid document matching. Links OpenBLAS on Linux
   (CI and Linux hosts need `libopenblas-dev`) and Accelerate on macOS.
-- `validator` 0.20, `thiserror` 2, `anyhow` 1, `secrecy` 0.10 — supporting.
+- `thiserror` 2, `anyhow` 1, and `secrecy` 0.10 — supporting.
 
 ### Runtime Services
 - Meilisearch (optional) — `RAG_MEILI_URL`, fixed indexes listed in

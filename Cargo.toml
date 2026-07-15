@@ -2,8 +2,11 @@
 name = "nowledge"
 version = "0.11.0"
 edition = "2021"
+rust-version = "1.88"
 description = "ContextFS-style State/History RAG service with per-user Meilisearch event indexes"
 license = "MIT"
+repository = "https://github.com/dickwu/nowledge"
+readme = "README.md"
 default-run = "nowledge"
 
 [[bin]]
@@ -40,10 +43,7 @@ tower-http = { version = "0.6", features = ["compression-gzip", "cors", "trace"]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 turbovec = "0.9"
-utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "9", features = ["axum"] }
 uuid = { version = "1", features = ["v7", "serde"] }
-validator = { version = "0.20", features = ["derive"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
