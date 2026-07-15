@@ -4,12 +4,12 @@ use std::{sync::Arc, time::Duration};
 use axum::http::StatusCode;
 use axum::{
     body::{to_bytes, Body},
-    extract::{DefaultBodyLimit, MatchedPath, Path, Request, State},
+    extract::{DefaultBodyLimit, MatchedPath, Request, State},
     http::header::{CONTENT_LENGTH, CONTENT_TYPE},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, patch, post, put},
-    Json, Router,
+    Router,
 };
 #[cfg(test)]
 use serde_json::json;
@@ -22,14 +22,10 @@ use tower_http::{
 pub use crate::app::{AppState, IngestTaskManager};
 
 use crate::{
-    auth::{AdminGuard, UserGuard},
     config::Config,
     error::ApiError,
-    health_service::llm_health_false_ready,
     http_boundary,
-    models::*,
     request_context::{self, RequestContextState, RequestId},
-    request_validation::validate_tags,
     route_analysis::analyze_insights,
     route_company_docs::{
         activate_revision, create_revision, delete_company_doc, get_company_doc, list_company_docs,
@@ -38,6 +34,16 @@ use crate::{
     route_context::{
         context_reveal, context_search, context_traceback, fs_abstract, fs_ls, fs_overview,
         fs_read, fs_tree,
+    },
+    route_eval::{
+        create_eval_case, create_eval_run, get_eval_case_analysis, get_eval_overview, get_eval_run,
+        get_eval_run_report, list_eval_cases,
+    },
+    route_harness::{
+        compare_harness_change, create_harness_change, create_harness_component_revision,
+        create_harness_verdict, get_harness_change, get_harness_change_delta,
+        get_harness_component, list_harness_changes, list_harness_components,
+        rollback_harness_component,
     },
     route_health::{
         bootstrap, debug_meili_search, get_trace, healthz, livez, llm_status, llm_test, readyz,
@@ -56,6 +62,7 @@ use crate::{
     route_llm::llm_title,
     route_rag::{prompt_preview, rag_answer, rag_debug, rag_stream},
     route_registry::declare_routes,
+    route_sessions::{add_session_message, commit_session, create_session},
     route_state::{
         get_state_fact, insight_events, patch_insight, patch_state_fact, search_insights,
         search_links, search_state, upsert_insight, upsert_link, upsert_state_fact,
@@ -287,235 +294,6 @@ async fn sanitize_json_response(response: Response, config: &Config, limit: usiz
     };
     parts.headers.remove(CONTENT_LENGTH);
     Response::from_parts(parts, Body::from(bytes))
-}
-
-async fn list_harness_components(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-) -> Result<Json<Vec<HarnessComponent>>, ApiError> {
-    Ok(Json(state.store.list_harness_components()?))
-}
-
-async fn get_harness_component(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Path(component_id): Path<String>,
-) -> Result<Json<HarnessComponentDetail>, ApiError> {
-    Ok(Json(state.store.harness_component_detail(&component_id)?))
-}
-
-async fn create_harness_component_revision(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Path(component_id): Path<String>,
-    Json(req): Json<CreateHarnessComponentRevisionRequest>,
-) -> Result<Json<HarnessComponentRevision>, ApiError> {
-    Ok(Json(
-        state
-            .store
-            .create_harness_component_revision_async(state.tenant_id(), &component_id, req)
-            .await?,
-    ))
-}
-
-async fn rollback_harness_component(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Path(component_id): Path<String>,
-    Json(req): Json<RollbackHarnessComponentRequest>,
-) -> Result<Json<HarnessRollbackResponse>, ApiError> {
-    Ok(Json(
-        state
-            .store
-            .rollback_harness_component_async(state.tenant_id(), &component_id, req)
-            .await?,
-    ))
-}
-
-async fn create_harness_change(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Json(req): Json<CreateHarnessChangeManifestRequest>,
-) -> Result<Json<HarnessChangeManifest>, ApiError> {
-    Ok(Json(
-        state
-            .store
-            .create_harness_change_async(state.tenant_id(), req)
-            .await?,
-    ))
-}
-
-async fn list_harness_changes(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-) -> Result<Json<Vec<HarnessChangeManifest>>, ApiError> {
-    Ok(Json(state.store.list_harness_changes()?))
-}
-
-async fn get_harness_change(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Path(change_id): Path<String>,
-) -> Result<Json<HarnessChangeManifest>, ApiError> {
-    Ok(Json(state.store.harness_change(&change_id)?))
-}
-
-async fn create_harness_verdict(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Path(change_id): Path<String>,
-    Json(req): Json<CreateHarnessChangeVerdictRequest>,
-) -> Result<Json<HarnessChangeVerdict>, ApiError> {
-    Ok(Json(
-        state
-            .store
-            .create_harness_verdict_async(state.tenant_id(), &change_id, req)
-            .await?,
-    ))
-}
-
-async fn compare_harness_change(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Path(change_id): Path<String>,
-    Json(req): Json<Value>,
-) -> Result<Json<EvalDeltaReport>, ApiError> {
-    let baseline = req
-        .get("baseline_eval_run_id")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let candidate = req
-        .get("candidate_eval_run_id")
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    Ok(Json(
-        state
-            .store
-            .compare_harness_change(&change_id, baseline, candidate)?,
-    ))
-}
-
-async fn get_harness_change_delta(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Path(change_id): Path<String>,
-) -> Result<Json<EvalDeltaReport>, ApiError> {
-    Ok(Json(
-        state.store.compare_harness_change(&change_id, None, None)?,
-    ))
-}
-
-async fn create_eval_case(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Json(req): Json<CreateRagEvalCaseRequest>,
-) -> Result<Json<RagEvalCase>, ApiError> {
-    validate_tags("tags", &req.tags, &state.config)?;
-    Ok(Json(
-        state
-            .store
-            .create_eval_case_async(state.tenant_id(), req)
-            .await?,
-    ))
-}
-
-async fn list_eval_cases(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-) -> Result<Json<Vec<RagEvalCase>>, ApiError> {
-    Ok(Json(state.store.list_eval_cases()?))
-}
-
-async fn create_eval_run(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Json(req): Json<CreateRagEvalRunRequest>,
-) -> Result<Json<RagEvalRun>, ApiError> {
-    let llm_false_ready = llm_health_false_ready(&state).await;
-    Ok(Json(
-        state
-            .store
-            .create_eval_run_async(state.tenant_id(), req, llm_false_ready)
-            .await?,
-    ))
-}
-
-async fn get_eval_run(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Path(run_id): Path<String>,
-) -> Result<Json<RagEvalRun>, ApiError> {
-    Ok(Json(state.store.get_eval_run(&run_id)?))
-}
-
-async fn get_eval_run_report(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Path(run_id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(state.store.eval_run_report(&run_id)?))
-}
-
-async fn get_eval_overview(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Path(run_id): Path<String>,
-) -> Result<Json<RagEvalOverview>, ApiError> {
-    Ok(Json(state.store.eval_overview(&run_id)?))
-}
-
-async fn get_eval_case_analysis(
-    _admin: AdminGuard,
-    State(state): State<AppState>,
-    Path((run_id, case_id)): Path<(String, String)>,
-) -> Result<Json<RagEvalCaseResult>, ApiError> {
-    Ok(Json(state.store.eval_case_result(&run_id, &case_id)?))
-}
-
-async fn create_session(
-    user: UserGuard,
-    State(state): State<AppState>,
-    Json(mut req): Json<SessionCreateRequest>,
-) -> Result<Json<SessionResponse>, ApiError> {
-    user.apply_owner_default(&mut req.owner_user_id)?;
-    Ok(Json(
-        state
-            .store
-            .create_session_async(state.tenant_id(), req)
-            .await?,
-    ))
-}
-
-async fn add_session_message(
-    user: UserGuard,
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Json(req): Json<SessionMessageRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let owner = state.store.session_owner_id(&session_id)?;
-    user.require_owner_access(&owner)?;
-    Ok(Json(
-        state
-            .store
-            .add_session_message_async(state.tenant_id(), &session_id, req)
-            .await?,
-    ))
-}
-
-async fn commit_session(
-    user: UserGuard,
-    State(state): State<AppState>,
-    Path(session_id): Path<String>,
-    Json(req): Json<SessionCommitRequest>,
-) -> Result<Json<SessionCommitResponse>, ApiError> {
-    let owner = state.store.session_owner_id(&session_id)?;
-    user.require_owner_access(&owner)?;
-    Ok(Json(
-        state
-            .store
-            .commit_session_async(state.tenant_id(), &session_id, req)
-            .await?,
-    ))
 }
 
 #[cfg(test)]
