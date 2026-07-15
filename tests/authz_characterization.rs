@@ -8,7 +8,7 @@ use axum::{
 use nowledge::{
     build_router,
     config::{AuthUserConfig, AuthUserScope, BearerTokenScope},
-    AppState, Config,
+    AppState, Config, RouteGuard, REGISTERED_ROUTES,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1742,14 +1742,6 @@ async fn operation_journal_actor_uses_authenticated_principal_scope_and_roles() 
     );
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GuardPolicy {
-    Public,
-    User,
-    CompanyWriter,
-    Admin,
-}
-
 #[derive(Debug, Deserialize)]
 struct ManifestEntry {
     method: String,
@@ -1759,27 +1751,27 @@ struct ManifestEntry {
     file: String,
 }
 
-fn expected_policy(entry: &ManifestEntry) -> GuardPolicy {
+fn expected_policy(entry: &ManifestEntry) -> RouteGuard {
     match entry.group.as_str() {
         "Health" => match entry.handler.as_str() {
-            "livez" | "readyz" => GuardPolicy::Public,
-            "healthz" => GuardPolicy::Admin,
+            "livez" | "readyz" => RouteGuard::Public,
+            "healthz" => RouteGuard::Admin,
             other => panic!("unclassified health handler: {other}"),
         },
-        "Admin" | "Harness" | "Debug" | "Eval" => GuardPolicy::Admin,
+        "Admin" | "Harness" | "Debug" | "Eval" => RouteGuard::Admin,
         "LLM" => match entry.handler.as_str() {
-            "llm_status" | "llm_title" => GuardPolicy::User,
-            "llm_test" => GuardPolicy::Admin,
+            "llm_status" | "llm_title" => RouteGuard::User,
+            "llm_test" => RouteGuard::Admin,
             other => panic!("unclassified LLM handler: {other}"),
         },
         "Company Docs" => match entry.handler.as_str() {
-            "preflight_doc" | "create_revision" | "activate_revision" => GuardPolicy::CompanyWriter,
-            "delete_company_doc" => GuardPolicy::Admin,
-            "list_company_docs" | "get_company_doc" | "list_revisions" => GuardPolicy::User,
+            "preflight_doc" | "create_revision" | "activate_revision" => RouteGuard::CompanyWriter,
+            "delete_company_doc" => RouteGuard::Admin,
+            "list_company_docs" | "get_company_doc" | "list_revisions" => RouteGuard::User,
             other => panic!("unclassified company-doc handler: {other}"),
         },
-        "Structured State" if entry.handler == "upsert_dataset" => GuardPolicy::CompanyWriter,
-        "RAG" if entry.handler == "rag_debug" => GuardPolicy::Admin,
+        "Structured State" if entry.handler == "upsert_dataset" => RouteGuard::CompanyWriter,
+        "RAG" if entry.handler == "rag_debug" => RouteGuard::Admin,
         "Analysis"
         | "Context"
         | "Context FS"
@@ -1794,72 +1786,47 @@ fn expected_policy(entry: &ManifestEntry) -> GuardPolicy {
         | "Sessions"
         | "State"
         | "Structured State"
-        | "Usage" => GuardPolicy::User,
+        | "Usage" => RouteGuard::User,
         other => panic!("unclassified route group: {other}"),
     }
-}
-
-fn handler_signature<'a>(source: &'a str, handler: &str) -> &'a str {
-    let marker = format!("async fn {handler}");
-    let start = source
-        .find(&marker)
-        .unwrap_or_else(|| panic!("handler {handler} is missing from routes.rs"));
-    let open = source[start + marker.len()..]
-        .find('(')
-        .map(|offset| start + marker.len() + offset)
-        .unwrap_or_else(|| panic!("handler {handler} has no parameter list"));
-    let bytes = source.as_bytes();
-    let mut depth = 0usize;
-    for index in open..bytes.len() {
-        match bytes[index] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &source[open + 1..index];
-                }
-            }
-            _ => {}
-        }
-    }
-    panic!("handler {handler} has an unterminated parameter list");
-}
-
-fn actual_policy(source: &str, handler: &str) -> GuardPolicy {
-    let signature = handler_signature(source, handler);
-    let policies = [
-        (signature.contains("UserGuard"), GuardPolicy::User),
-        (
-            signature.contains("CompanyWriterGuard"),
-            GuardPolicy::CompanyWriter,
-        ),
-        (signature.contains("AdminGuard"), GuardPolicy::Admin),
-    ];
-    let present: Vec<_> = policies
-        .into_iter()
-        .filter_map(|(present, policy)| present.then_some(policy))
-        .collect();
-    assert!(
-        present.len() <= 1,
-        "handler {handler} unexpectedly declares multiple guard types: {signature}"
-    );
-    present.first().copied().unwrap_or(GuardPolicy::Public)
 }
 
 #[test]
 fn route_policy_matrix_covers_every_manifest_handler_and_group() {
     let manifest: Vec<ManifestEntry> =
         serde_json::from_str(include_str!("../doc/api_manifest.json")).unwrap();
-    let routes = include_str!("../src/routes.rs");
     assert_eq!(
         manifest.len(),
         89,
         "the policy matrix must cover all routes"
     );
+    assert_eq!(
+        REGISTERED_ROUTES.len(),
+        manifest.len(),
+        "the route registry must cover every manifest endpoint"
+    );
 
     for entry in &manifest {
+        let matches: Vec<_> = REGISTERED_ROUTES
+            .iter()
+            .filter(|route| {
+                route.method == entry.method
+                    && route.path == entry.path
+                    && route.handler == entry.handler
+            })
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "route registry must contain exactly one {} {} ({}, {}, {})",
+            entry.method,
+            entry.path,
+            entry.handler,
+            entry.group,
+            entry.file
+        );
         let expected = expected_policy(entry);
-        let actual = actual_policy(routes, &entry.handler);
+        let actual = matches[0].guard;
         assert_eq!(
             actual, expected,
             "{} {} ({}, {}, {})",
@@ -1868,26 +1835,26 @@ fn route_policy_matrix_covers_every_manifest_handler_and_group() {
     }
 
     let policy_for = |handler: &str| {
-        let entry = manifest
+        REGISTERED_ROUTES
             .iter()
-            .find(|entry| entry.handler == handler)
-            .unwrap_or_else(|| panic!("manifest is missing {handler}"));
-        expected_policy(entry)
+            .find(|route| route.handler == handler)
+            .unwrap_or_else(|| panic!("route registry is missing {handler}"))
+            .guard
     };
-    assert_eq!(policy_for("livez"), GuardPolicy::Public);
-    assert_eq!(policy_for("readyz"), GuardPolicy::Public);
-    assert_eq!(policy_for("healthz"), GuardPolicy::Admin);
-    assert_eq!(policy_for("llm_status"), GuardPolicy::User);
-    assert_eq!(policy_for("llm_test"), GuardPolicy::Admin);
-    assert_eq!(policy_for("llm_title"), GuardPolicy::User);
-    assert_eq!(policy_for("preflight_doc"), GuardPolicy::CompanyWriter);
-    assert_eq!(policy_for("delete_company_doc"), GuardPolicy::Admin);
-    assert_eq!(policy_for("upsert_dataset"), GuardPolicy::CompanyWriter);
-    assert_eq!(policy_for("rag_debug"), GuardPolicy::Admin);
-    assert_eq!(policy_for("search_operations"), GuardPolicy::Admin);
-    assert_eq!(policy_for("reconcile_operations"), GuardPolicy::Admin);
+    assert_eq!(policy_for("livez"), RouteGuard::Public);
+    assert_eq!(policy_for("readyz"), RouteGuard::Public);
+    assert_eq!(policy_for("healthz"), RouteGuard::Admin);
+    assert_eq!(policy_for("llm_status"), RouteGuard::User);
+    assert_eq!(policy_for("llm_test"), RouteGuard::Admin);
+    assert_eq!(policy_for("llm_title"), RouteGuard::User);
+    assert_eq!(policy_for("preflight_doc"), RouteGuard::CompanyWriter);
+    assert_eq!(policy_for("delete_company_doc"), RouteGuard::Admin);
+    assert_eq!(policy_for("upsert_dataset"), RouteGuard::CompanyWriter);
+    assert_eq!(policy_for("rag_debug"), RouteGuard::Admin);
+    assert_eq!(policy_for("search_operations"), RouteGuard::Admin);
+    assert_eq!(policy_for("reconcile_operations"), RouteGuard::Admin);
     assert!(manifest
         .iter()
         .filter(|entry| entry.group == "Debug")
-        .all(|entry| expected_policy(entry) == GuardPolicy::Admin));
+        .all(|entry| expected_policy(entry) == RouteGuard::Admin));
 }

@@ -1,30 +1,36 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-20 | Updated: 2026-07-13 -->
+<!-- Generated: 2026-05-20 | Updated: 2026-07-15 -->
 
 # src
 
 ## Purpose
-All Rust source for the `nowledge` crate. Flat module layout (no nested `mod`
-directories) — every file under `src/` is a top-level module declared in
-`lib.rs`. The binary entrypoint `main.rs` consumes the library through
-`build_router(AppState::new(...))`.
+All Rust source for the `nowledge` crate. The filesystem stays flat (no nested
+module directories): top-level modules are declared in `lib.rs`, while the
+`models_*.rs` and `store_*.rs` feature companions are declared from their
+compatibility façades with `#[path]`. The binary entrypoint `main.rs` consumes
+the library through `build_router(AppState::new(...))`.
 
 ## Key Files
 | File | Description |
 |------|-------------|
 | `main.rs` | Binary entrypoint. Initializes JSON tracing, parses `Config::from_env()`, runs `validate_startup`, hydrates the repository-backed store when `store_backend=meili`, and serves the router with SIGINT/SIGTERM graceful shutdown through `AppState`. |
-| `lib.rs` | Module re-exports. Public surface: `Config`, `build_router`, `AppState`, plus the `auth`, `config`, `error`, `fragmenter`, `http_boundary`, `llm`, `meili`, `models`, `parser`, `repository`, `request_context`, `resolver`, `routes`, `store`, `util`, `vector_match` modules. |
+| `lib.rs` | Flat module declarations and compatibility re-exports. Public surface remains `Config`, `build_router`, `AppState`, `REGISTERED_ROUTES`, route metadata, and the established public modules. Feature route/service/model/store modules stay private behind those paths. |
+| `app.rs` | Owns `AppState`, the narrow extractor-only `AuthState`, ingest task lifecycle, runtime supervision, shutdown, and background cleanup. `routes.rs` re-exports `AppState` and `IngestTaskManager` for compatibility. |
 | `config.rs` | `Config`, `AuthUserConfig`, `AuthUserScope`, and `BearerTokenScope`. Parses `RAG_*` variables and rejects unknown run modes; malformed/zero HTTP, upload, bulk, search, queue, timeout, and shutdown limits; unsafe production CORS; plus malformed, duplicate, empty, short, or ambiguous credentials during `validate_startup()`. New production deployments require a random `RAG_INDEX_HASH_SECRET` with at least 32 bytes and 12 distinct byte values; an existing weak-key deployment may preserve its key only behind the bounded migration flag. Provides `Config::test()`, `analysis_llm_config()`, dynamic Codex-token history, and the configured-secret inventory including explicit restart-spanning previous secrets. |
 | `error.rs` | `ApiError` enum with the stable 400/401/403/404/409/413/429/502/503/504/500 status/code mappings and one `{ "error": { code, message, details } }` envelope. Validation errors identify the field; pressure errors carry `Retry-After`. Reusable safe-diagnostic helpers reduce raw causes to an allowlisted category and keyed fingerprint; private API errors then serialize stable generic messages plus a request ID. |
-| `auth.rs` | Explicit `PrincipalScope` (`Owner`, `TenantService`, `Admin`) plus `UserGuard`, `CompanyWriterGuard`, and `AdminGuard`. Authentication scans all configured credentials with constant-time comparison; owner scope and feature roles are enforced independently. |
+| `auth.rs` | Explicit `PrincipalScope` (`Owner`, `TenantService`, `Admin`) plus `UserGuard`, `CompanyWriterGuard`, and `AdminGuard`. Extractors depend on the small `app::AuthState`, not router/application state. Authentication scans all configured credentials with constant-time comparison; owner scope and feature roles are enforced independently. |
 | `request_context.rs` | Server-generated UUIDv7 request context. Overwrites untrusted inbound `x-request-id`, propagates the trusted ID to responses, supplies task-local correlation to audit/error logs, and creates keyed cause fingerprints without emitting raw diagnostics. |
 | `resolver.rs` | `EventIndexResolver` — HMAC-SHA256 derivation of `tenant_hash` (12 hex), `owner_user_id_hash` (16 hex), and `idempotency_hash` (24 hex). Produces `EventIndexRouting` with the canonical `rag_events__t_*__u_*` and `rag_context__t_*__u_*` UIDs. |
 | `util.rs` | Cross-cutting helpers: `now()`, `new_id()` (uuid v7 with prefix), `hmac_hex`, `sanitize_slug`, `validate_meili_uid`, `ancestor_uris` (ContextFS), `require_string`, `text_score` (lowercase contains scoring), `truncate_chars`, and exact/equal-length/boundary configured-secret sanitizers. |
-| `models.rs` (~54 KB) | All wire types and domain structs: `HistoryEvent`, `ContextNode`, `StateItem`, `InsightRecord`, `CompanySource`, `SourceRevision`, `SourceDocument`, `ParseArtifact`, `ParsedBlock`, `IngestTask`/`IngestTaskResult`, `StructuredSnapshot`, `KnowledgeLink`, `HarnessComponent`/`HarnessChange`/`HarnessChangeVerdict`, `RagEvalCase`/`RagEvalRun`/`RagEvalOverview`, plus every request/response DTO. |
+| `models.rs` | Compatibility façade that preserves `nowledge::models::*` while re-exporting twelve flat `models_*.rs` feature modules for common/defaults, history, state, company docs, structured data, context/RAG/LLM, insights/links/analysis, ingest, operations, sessions, and harness/eval types. |
 | `http_boundary.rs` | HTTP boundary middleware primitives: validated exact-origin CORS, bounded non-multipart bodies, immediate semaphore load shedding, fixed-window trusted-principal rate limiting, route deadlines, and `/livez` bypass. All generated failures use `ApiError`. |
 | `runtime.rs` | Internal watch/JoinHandle supervisor used by `AppState` to coordinate ingest dispatch, cleanup, and bounded shutdown without detached worker ownership. |
-| `routes.rs` (~74 KB) | `build_router`, `AppState`, `IngestTaskManager`, multipart staging, request validators, and every axum handler. Wires `/livez`, `/healthz`, `/readyz`, `/v1/usage`, `/v1/admin/*`, `/v1/state/*`, `/v1/history/*`, `/v1/context/*`, `/v1/rag/*`, `/v1/links/*`, `/v1/analysis/*`, `/v1/ingest/*`, `/v1/fs/*`, `/v1/sessions/*`, `/v1/llm/*`, `/v1/debug/*`. Adds request context, bounded HTTP middleware, compression, configured CORS, tracing, safe background-failure diagnostics, and a final dynamic configured-secret sanitizer for every JSON response. |
-| `store.rs` (~264 KB) | `Store` — `Arc<RwLock<StoreData>>` plus an `EventIndexResolver` and a boxed `KnowledgeRepository`. Authoritative in-memory state for events, context nodes, state items, insights, sources/revisions/documents, parse artifacts, ingest tasks, datasets/snapshots/rows, sessions, traces, links, harness components/changes/verdicts, and eval runs. Provides `hydrate_from_repository` for cold start under the Meili backend. |
+| `route_registry.rs` | Canonical route policy registry. Generates the Axum registrations and static 89-endpoint manifest together, and enforces at compile time that each handler's first extractor matches its declared `Public`, `User`, `CompanyWriter`, or `Admin` guard. |
+| `routes.rs` | Router façade only: assembles all feature handlers, request context, bounded HTTP middleware, compression, configured CORS, tracing, and the final fail-closed configured-secret sanitizer for JSON responses. Registered domain handlers live in flat `route_*.rs` modules. |
+| `route_*.rs` | Thin HTTP boundaries grouped by health, ingest, RAG/analysis/LLM, company docs, context, history, state, structured data, sessions, eval, and harness. They parse/authorize/validate and delegate orchestration to sibling services. |
+| `*_service.rs` | Axum-free feature orchestration for health, ingest, RAG/streaming/analysis/LLM, company docs, context, history, state, structured data, sessions, eval, and harness. |
+| `request_validation.rs` | Axum-free centralized request bounds used across canonical and alias routes so maximum item, tag, history bulk, and search-limit behavior cannot drift. |
+| `store.rs` | Core `Store`, `StoreData`, mutation gate, persistence coordination, hydration, and cross-feature retrieval/cache state. Feature APIs are split into nine flat `store_*.rs` modules for accessors, company docs, context, harness/eval, history, ingest, sessions, state/insights, and structured data. |
 | `repository.rs` (~45 KB) | `KnowledgeRepository` trait + concrete `MeiliKnowledgeRepository` (writes through `MeiliAdmin`) and `MemoryKnowledgeRepository` (no-op). `repository_from_config` returns the right impl. Also defines `RepositoryContextSearchQuery`, the fragment-search adapter, and best-effort cleanup logs that use bounded cause diagnostics plus fingerprinted source IDs. |
 | `meili.rs` (~20 KB) | `MeiliAdmin` — direct `reqwest` client for the admin surface (index create/delete, settings, primary keys, search). Lists `FIXED_INDEXES` (the 27 shared indexes: `rag_company_context`, `rag_state_items`, `rag_user_event_indexes`, sources, structured datasets, insights, links, sessions, traces, harness, ingest, eval, etc.). `bootstrap()` provisions or resets them. |
 | `llm.rs` (~34 KB) | `LlmClient` trait, plus `OpenAi*`, `Codex*`, `Mock`, and `None` implementations. `LlmHealthProbe` caches probe results with a TTL/stale window and surfaces `auth_valid`, `quota_state`, `rate_limit_state`, and `RateLimitSnapshot` to `/healthz` and `/v1/llm/status`. Codex auth resolution reads `RAG_CODEX_AUTH_PATH` / `CODEX_AUTH_PATH`. |
@@ -38,10 +44,12 @@ None. All Rust code lives at this level.
 ## For AI Agents
 
 ### Working In This Directory
-- Module additions must be declared in `lib.rs` to be reachable from `main.rs`
-  and the integration tests. Don't expect filename-based auto-discovery.
-- `AppState` is `Clone` and threads `Arc<Config>` plus the `Store` clone; every
-  handler takes `State<AppState>`. Mutations live behind `Store`'s `RwLock`.
+- Top-level module additions must be declared in `lib.rs`; feature companions
+  must be declared explicitly from their façade with `#[path]`. Don't expect
+  filename-based auto-discovery.
+- `AppState` is `Clone` and threads the shared runtime dependencies. HTTP
+  handlers use `State<AppState>`; authentication extractors use the narrower
+  `AuthState`. Mutations live behind `Store`'s lock and persistence coordinator.
 - Owner-scoped routes accept `owner_user_id` either as a path param or in the
   request body. Use `UserGuard::apply_owner_default` early so `Owner` principals
   receive their bound owner, then use `require_owner_read` / `require_owner_write`
@@ -94,11 +102,13 @@ None. All Rust code lives at this level.
 ## Dependencies
 
 ### Internal
-- `crate::auth` depends on `crate::routes::AppState` (extractor wiring).
+- `crate::auth` depends on `crate::app::AuthState` for extractor wiring and does
+  not depend on `routes` or `AppState`.
 - `crate::request_context` depends on `crate::config`, `crate::llm`, and
   `crate::util` for request correlation and secret-aware log redaction.
-- `crate::routes` depends on every other module in the crate.
-- `crate::store` depends on `crate::repository`, `crate::resolver`,
+- `crate::routes` depends on the feature `route_*` modules, config, request
+  context, and HTTP boundary middleware; route modules call Axum-free services.
+- `crate::store` and its feature modules depend on `crate::repository`, `crate::resolver`,
   `crate::fragmenter`, `crate::parser`, `crate::models`, `crate::util`.
 - `crate::repository` depends on `crate::meili`, `crate::models`,
   `crate::resolver`, `crate::util`.
