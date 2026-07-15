@@ -924,6 +924,7 @@ impl LlmClient for OpenAiResponsesClient {
             provider: &self.provider,
             model: &self.model,
             reasoning_effort: self.reasoning_effort.as_deref(),
+            codex_oauth: false,
             endpoint: "https://api.openai.com/v1/responses".to_string(),
             token: &api_key,
             account_id: None,
@@ -985,7 +986,7 @@ impl LlmClient for CodexResponsesClient {
 
         let started = Instant::now();
         let endpoint = codex_responses_endpoint(&self.base_url);
-        let payload = responses_payload(
+        let payload = codex_responses_payload(
             &self.model,
             &request,
             self.reasoning_effort.as_deref(),
@@ -1044,6 +1045,7 @@ impl LlmClient for CodexResponsesClient {
             provider: "codex_auth",
             model: &self.model,
             reasoning_effort: self.reasoning_effort.as_deref(),
+            codex_oauth: !uses_openai_endpoint,
             endpoint,
             token: &credentials.token,
             account_id: (!uses_openai_endpoint)
@@ -1063,6 +1065,7 @@ struct ResponsesStreamRequest<'a> {
     provider: &'a str,
     model: &'a str,
     reasoning_effort: Option<&'a str>,
+    codex_oauth: bool,
     endpoint: String,
     token: &'a str,
     account_id: Option<&'a str>,
@@ -1075,12 +1078,21 @@ async fn start_responses_stream(
     stream_request: ResponsesStreamRequest<'_>,
 ) -> Result<LlmTextStream, ApiError> {
     let started = Instant::now();
-    let payload = responses_payload(
-        stream_request.model,
-        stream_request.request,
-        stream_request.reasoning_effort,
-        true,
-    );
+    let payload = if stream_request.codex_oauth {
+        codex_responses_payload(
+            stream_request.model,
+            stream_request.request,
+            stream_request.reasoning_effort,
+            true,
+        )
+    } else {
+        responses_payload(
+            stream_request.model,
+            stream_request.request,
+            stream_request.reasoning_effort,
+            true,
+        )
+    };
     let client = stream_request.upstream.client();
     let endpoint = stream_request.endpoint;
     let token = stream_request.token.to_string();
@@ -1827,6 +1839,22 @@ fn responses_payload(
         });
     }
     set_reasoning_effort(&mut payload, reasoning_effort);
+    payload
+}
+
+fn codex_responses_payload(
+    model: &str,
+    request: &LlmRequest,
+    reasoning_effort: Option<&str>,
+    stream: bool,
+) -> Value {
+    let mut payload = responses_payload(model, request, reasoning_effort, stream);
+    if let Some(fields) = payload.as_object_mut() {
+        // The ChatGPT Codex backend rejects these standard Responses API controls.
+        // Keep request IDs and conservative budget accounting local instead.
+        fields.remove("max_output_tokens");
+        fields.remove("metadata");
+    }
     payload
 }
 
@@ -2641,7 +2669,7 @@ async fn probe_codex_responses(
         8,
         "health_probe",
     );
-    let payload = responses_payload(
+    let payload = codex_responses_payload(
         &model,
         &probe_request,
         config.llm_reasoning_effort.as_deref(),
@@ -3914,6 +3942,8 @@ mod tests {
         let payload = captured_request.split_once("\r\n\r\n").unwrap().1;
         let payload = serde_json::from_str::<Value>(payload).unwrap();
         assert_eq!(payload.get("stream").and_then(Value::as_bool), Some(true));
+        assert!(payload.get("max_output_tokens").is_none());
+        assert!(payload.get("metadata").is_none());
         assert_eq!(
             payload.pointer("/reasoning/effort").and_then(Value::as_str),
             Some("high")
@@ -4069,9 +4099,11 @@ mod tests {
         let handler_requests = requests.clone();
         let app = axum::Router::new().route(
             "/backend-api/codex/responses",
-            axum::routing::post(move || {
+            axum::routing::post(move |axum::Json(payload): axum::Json<Value>| {
                 let requests = handler_requests.clone();
                 async move {
+                    assert!(payload.get("max_output_tokens").is_none());
+                    assert!(payload.get("metadata").is_none());
                     requests.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     (
@@ -4204,7 +4236,7 @@ mod tests {
         assert!(!secured.evidence[0].id.contains(new_token));
         assert!(!secured.evidence[0].content.contains(new_token));
         assert!(!secured.metadata.request_id.contains(new_token));
-        assert!(!responses_payload("gpt-5.5", &secured, None, true)
+        assert!(!codex_responses_payload("gpt-5.5", &secured, None, true)
             .to_string()
             .contains(new_token));
     }
@@ -4299,6 +4331,22 @@ mod tests {
             Some(true)
         );
         assert_eq!(payload.pointer("/text/format/schema"), Some(&schema));
+    }
+
+    #[test]
+    fn codex_payload_differs_only_by_unsupported_openai_controls() {
+        let mut request = LlmRequest::text("system", "hello", 321, "rag.answer");
+        request.metadata.request_id = "req-dialect".to_string();
+
+        let mut expected = responses_payload("gpt-5.5", &request, Some("high"), true);
+        let expected_fields = expected.as_object_mut().unwrap();
+        assert!(expected_fields.remove("max_output_tokens").is_some());
+        assert!(expected_fields.remove("metadata").is_some());
+
+        assert_eq!(
+            codex_responses_payload("gpt-5.5", &request, Some("high"), true),
+            expected
+        );
     }
 
     #[tokio::test]
@@ -4553,7 +4601,7 @@ mod tests {
     #[test]
     fn codex_payload_includes_reasoning_effort() {
         let request = LlmRequest::text("system", "hello", 128, "test");
-        let payload = responses_payload("gpt-5.5", &request, Some("xhigh"), true);
+        let payload = codex_responses_payload("gpt-5.5", &request, Some("xhigh"), true);
 
         assert_eq!(
             payload
@@ -4562,12 +4610,14 @@ mod tests {
                 .and_then(Value::as_str),
             Some("xhigh")
         );
+        assert!(payload.get("max_output_tokens").is_none());
+        assert!(payload.get("metadata").is_none());
     }
 
     #[test]
     fn codex_payload_omits_empty_reasoning_effort() {
         let request = LlmRequest::text("system", "hello", 128, "test");
-        let payload = responses_payload("gpt-5.5", &request, Some(" "), true);
+        let payload = codex_responses_payload("gpt-5.5", &request, Some(" "), true);
 
         assert!(payload.get("reasoning").is_none());
     }
