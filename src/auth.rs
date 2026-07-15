@@ -1,15 +1,16 @@
 use axum::{
-    extract::FromRequestParts,
+    extract::{FromRef, FromRequestParts},
     http::{header::AUTHORIZATION, request::Parts},
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::{
+    app::AuthState,
     config::{AuthUserConfig, AuthUserScope, BearerTokenScope},
     error::ApiError,
     request_context::{self, RequestPrincipal, RequestPrincipalScope},
-    routes::{audit_shared_write_denial, AppState},
+    shared_audit::audit_shared_write_denial,
     util::hmac_hex,
 };
 
@@ -147,33 +148,37 @@ impl Principal {
     }
 }
 
-impl FromRequestParts<AppState> for UserGuard {
+impl<S> FromRequestParts<S> for UserGuard
+where
+    S: Send + Sync,
+    AuthState: FromRef<S>,
+{
     type Rejection = ApiError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let principal = authenticate(parts, state)?;
-        enforce_principal_rate_limit(&principal, state)?;
-        record_request_principal(&principal, state);
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let auth_state = AuthState::from_ref(state);
+        let principal = authenticate(parts, &auth_state)?;
+        enforce_principal_rate_limit(&principal, &auth_state)?;
+        record_request_principal(&principal, &auth_state);
         Ok(Self { principal })
     }
 }
 
-impl FromRequestParts<AppState> for CompanyWriterGuard {
+impl<S> FromRequestParts<S> for CompanyWriterGuard
+where
+    S: Send + Sync,
+    AuthState: FromRef<S>,
+{
     type Rejection = ApiError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let principal = match authenticate(parts, state) {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let auth_state = AuthState::from_ref(state);
+        let principal = match authenticate(parts, &auth_state) {
             Ok(principal) => principal,
             Err(error) => {
                 audit_shared_write_denial(
                     None,
-                    state,
+                    &auth_state,
                     &parts.method,
                     parts.uri.path(),
                     "authentication_failed",
@@ -182,12 +187,12 @@ impl FromRequestParts<AppState> for CompanyWriterGuard {
                 return Err(error);
             }
         };
-        enforce_principal_rate_limit(&principal, state)?;
+        enforce_principal_rate_limit(&principal, &auth_state)?;
         if let Err(error) = principal.require_company_write() {
-            if !state.config.allow_legacy_shared_writer {
+            if !auth_state.config().allow_legacy_shared_writer {
                 audit_shared_write_denial(
                     Some(&principal),
-                    state,
+                    &auth_state,
                     &parts.method,
                     parts.uri.path(),
                     "company_writer_required",
@@ -196,24 +201,26 @@ impl FromRequestParts<AppState> for CompanyWriterGuard {
                 return Err(error);
             }
         }
-        record_request_principal(&principal, state);
+        record_request_principal(&principal, &auth_state);
         Ok(Self { principal })
     }
 }
 
-impl FromRequestParts<AppState> for AdminGuard {
+impl<S> FromRequestParts<S> for AdminGuard
+where
+    S: Send + Sync,
+    AuthState: FromRef<S>,
+{
     type Rejection = ApiError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let principal = match authenticate(parts, state) {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let auth_state = AuthState::from_ref(state);
+        let principal = match authenticate(parts, &auth_state) {
             Ok(principal) => principal,
             Err(error) => {
                 audit_shared_write_denial(
                     None,
-                    state,
+                    &auth_state,
                     &parts.method,
                     parts.uri.path(),
                     "authentication_failed",
@@ -222,11 +229,11 @@ impl FromRequestParts<AppState> for AdminGuard {
                 return Err(error);
             }
         };
-        enforce_principal_rate_limit(&principal, state)?;
+        enforce_principal_rate_limit(&principal, &auth_state)?;
         if let Err(error) = principal.require_admin() {
             audit_shared_write_denial(
                 Some(&principal),
-                state,
+                &auth_state,
                 &parts.method,
                 parts.uri.path(),
                 "admin_required",
@@ -234,20 +241,16 @@ impl FromRequestParts<AppState> for AdminGuard {
             );
             return Err(error);
         }
-        record_request_principal(&principal, state);
+        record_request_principal(&principal, &auth_state);
         Ok(Self { principal })
     }
 }
 
-fn record_request_principal(principal: &Principal, state: &AppState) {
+fn record_request_principal(principal: &Principal, state: &AuthState) {
+    let config = state.config();
     let scope = match &principal.scope {
         PrincipalScope::Owner { owner_user_id } => RequestPrincipalScope::Owner {
-            owner_user_id_hash: hmac_hex(
-                &state.config.index_hash_secret,
-                "user",
-                owner_user_id,
-                16,
-            ),
+            owner_user_id_hash: hmac_hex(&config.index_hash_secret, "user", owner_user_id, 16),
         },
         PrincipalScope::TenantService => RequestPrincipalScope::TenantService,
         PrincipalScope::Admin => RequestPrincipalScope::Admin,
@@ -258,9 +261,9 @@ fn record_request_principal(principal: &Principal, state: &AppState) {
     });
 }
 
-fn enforce_principal_rate_limit(principal: &Principal, state: &AppState) -> Result<(), ApiError> {
-    let key = principal.rate_limit_key(&state.config.index_hash_secret);
-    state.http_boundary.check_rate_limit(&key)
+fn enforce_principal_rate_limit(principal: &Principal, state: &AuthState) -> Result<(), ApiError> {
+    let key = principal.rate_limit_key(&state.config().index_hash_secret);
+    state.http_boundary().check_rate_limit(&key)
 }
 
 impl UserGuard {
@@ -281,8 +284,8 @@ impl UserGuard {
     }
 }
 
-fn authenticate(parts: &Parts, state: &AppState) -> Result<Principal, ApiError> {
-    let config = &state.config;
+fn authenticate(parts: &Parts, state: &AuthState) -> Result<Principal, ApiError> {
+    let config = state.config();
     if !config.has_any_auth() {
         if config.allow_unsafe_unauthenticated {
             return Ok(Principal {
