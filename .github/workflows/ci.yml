@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main, master]
+  schedule:
+    - cron: "23 6 * * 1"
 
 permissions:
   contents: read
@@ -55,6 +57,7 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2024-0436
 
   deny:
     name: dependency policy

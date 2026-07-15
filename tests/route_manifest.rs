@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nowledge::{RouteMetadata, REGISTERED_ROUTES};
+use nowledge::{RouteGuard, RouteMetadata, REGISTERED_ROUTES};
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -102,6 +102,30 @@ fn every_manifest_entry_has_one_readme_row_and_endpoint_file_with_no_orphans() {
             file.is_file(),
             "manifest endpoint file is missing: {}",
             file.display()
+        );
+        let route = REGISTERED_ROUTES
+            .iter()
+            .find(|route| {
+                route.method == entry.method
+                    && route.path == entry.path
+                    && route.handler == entry.handler
+            })
+            .expect("the endpoint triple was already proven to match the registry");
+        let expected_guard = match route.guard {
+            RouteGuard::Public => "None",
+            RouteGuard::User => "UserGuard",
+            RouteGuard::CompanyWriter => "CompanyWriterGuard",
+            RouteGuard::Admin => "AdminGuard",
+        };
+        let endpoint_doc = fs::read_to_string(&file).unwrap();
+        let documented_guard = endpoint_doc
+            .lines()
+            .find(|line| line.starts_with("- Authentication:"));
+        assert!(
+            documented_guard.is_some_and(|line| line.contains(expected_guard)),
+            "route guard drift for {} {}: registry requires {expected_guard}, documentation has {documented_guard:?}",
+            entry.method,
+            entry.path
         );
         assert!(
             expected_files.insert(entry.file.clone()),

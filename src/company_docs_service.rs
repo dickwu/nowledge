@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::{
-    audit_service::AuditRecorder,
+    audit_service::{caller_supplied_audit_reason, AuditRecorder},
     auth::Principal,
     config::Config,
     error::ApiError,
@@ -83,8 +83,8 @@ impl CompanyDocsService {
         let audit_reason = request
             .reason
             .as_deref()
-            .unwrap_or("activation_reason_unspecified")
-            .to_string();
+            .map(caller_supplied_audit_reason)
+            .unwrap_or_else(|| "activation_reason_unspecified".to_string());
         let store = self.store.clone();
         let tenant_id = self.config.tenant_id.clone();
         audit_shared_write(

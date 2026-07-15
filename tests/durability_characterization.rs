@@ -15,7 +15,7 @@ use axum::{
 };
 use nowledge::{
     build_router,
-    meili::MeiliAdmin,
+    meili::{settings_for, MeiliAdmin},
     models::HydrationStatus,
     repository::{KnowledgeRepository, MeiliRepository},
     store::Store,
@@ -651,6 +651,25 @@ async fn meili_stub(State(state): State<MeiliStubState>, request: AxumRequest) -
 
     if method == Method::GET && path == "/health" {
         return (StatusCode::OK, Json(json!({ "status": "available" }))).into_response();
+    }
+    if method == Method::GET && path.ends_with("/settings") {
+        let uid = path
+            .strip_prefix("/indexes/")
+            .and_then(|path| path.strip_suffix("/settings"))
+            .expect("settings request should contain an index UID");
+        return (StatusCode::OK, Json(settings_for(uid))).into_response();
+    }
+    if method == Method::GET && path.starts_with("/indexes/") {
+        let uid = path.trim_start_matches("/indexes/");
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "uid": uid,
+                "primaryKey": "id",
+                "createdAt": "2026-07-14T00:00:00Z"
+            })),
+        )
+            .into_response();
     }
     if method == Method::GET
         && path.starts_with("/tasks/")

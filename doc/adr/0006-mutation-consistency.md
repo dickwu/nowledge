@@ -159,7 +159,8 @@ incomplete, so an upgraded binary will fail closed until `operations_v1` has
 created and verified the new index.
 
 Back up Meilisearch before rollout. Build the maintenance binary from the exact
-application revision and provide `RAG_MEILI_URL` plus `RAG_MEILI_API_KEY` when
+application revision and provide `RAG_MEILI_URL` plus
+`RAG_MEILI_ADMIN_API_KEY` when
 required:
 
 ```sh
@@ -168,8 +169,10 @@ cargo run --bin operations_v1 -- apply \
   --plan /secure/operations-v1-plan.json --dry-run
 cargo run --bin operations_v1 -- apply \
   --plan /secure/operations-v1-plan.json
+cargo run --bin operations_v1 -- plan \
+  --out /secure/operations-v1-verify-plan.json
 cargo run --bin operations_v1 -- verify \
-  --plan /secure/operations-v1-plan.json
+  --plan /secure/operations-v1-verify-plan.json
 ```
 
 Stop writers before the plan/apply/verify sequence and audit the existing
@@ -182,9 +185,18 @@ keys against the upgraded service.
 The migration is non-destructive and manages only `rag_operations`. It creates
 the index when absent or reconciles its managed settings when present, requires
 the exact primary key `id`, waits for all returned tasks, rejects tampered
-plans, and is idempotent. It refuses
+plans, and refuses
 to recreate an index that existed during planning but disappeared before
 apply, because doing so could hide data loss.
+An absent-index plan is deliberately not reusable after its UID appears. If
+creation was accepted but the command outcome became ambiguous, operators must
+stop, preserve and inspect Meilisearch task history for the exact UID, time, and
+result, then generate and review a fresh plan. `already_present` proceeds to
+verify; `settings_drift` requires dry-run/apply and verify with that
+generation-bound plan; `missing` starts a new full sequence only after task
+history confirms the create failed. `primary_key_mismatch` or an unexplained
+generation is an incident/restore stop. Operators must not retry the original
+absent-index artifact or adopt an unexplained generation.
 The `verify` command exits nonzero when any readiness check fails; rollout
 automation must not infer success merely because it received a JSON report.
 

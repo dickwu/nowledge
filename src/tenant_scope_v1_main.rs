@@ -107,18 +107,29 @@ async fn run() -> Result<Value> {
             let plan: MigrationPlan = read_json(&plan_path)?;
             let admin = configured_admin()?;
             let report = verify_plan(&admin, &plan).await?;
+            ensure_verification_ready(report.ready_to_cutover, &report.failures)?;
             Ok(serde_json::to_value(report)?)
         }
         other => bail!("unknown mode {other}; expected plan, apply, verify, or rollback-plan"),
     }
 }
 
-fn configured_admin() -> Result<MeiliAdmin> {
-    let admin = MeiliAdmin::from_config(&Config::from_env());
-    if !admin.configured() {
-        bail!("RAG_MEILI_URL is required for tenant_scope_v1 maintenance");
+fn ensure_verification_ready(ready: bool, failures: &[String]) -> Result<()> {
+    if ready {
+        return Ok(());
     }
-    Ok(admin)
+    let reason = if failures.is_empty() {
+        "verification did not reach ready-to-cutover state".to_string()
+    } else {
+        failures.join("; ")
+    };
+    bail!("tenant_scope_v1 verification failed: {reason}")
+}
+
+fn configured_admin() -> Result<MeiliAdmin> {
+    let config = Config::from_env();
+    config.validate_meili_maintenance()?;
+    Ok(MeiliAdmin::from_admin_config(&config))
 }
 
 #[derive(Debug)]
@@ -280,5 +291,18 @@ mod tests {
         ])
         .unwrap();
         assert!(command.require_only(&["plan"]).is_err());
+    }
+
+    #[test]
+    fn failed_verification_is_an_error_for_deployment_automation() {
+        ensure_verification_ready(true, &[]).unwrap();
+        let error = ensure_verification_ready(
+            false,
+            &["one migrated document changed after apply".to_string()],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("one migrated document changed after apply"));
     }
 }

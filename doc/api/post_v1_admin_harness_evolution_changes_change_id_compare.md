@@ -2,6 +2,12 @@
 
 Compute a before/after eval delta for a harness change.
 
+## Handler
+
+- Rust handler: `compare_harness_change`
+- Route registration: `src/routes.rs::build_router`
+- Authentication: AdminGuard required
+
 ## Request
 
 ```json

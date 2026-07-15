@@ -1184,6 +1184,7 @@ impl KnowledgeRepository for MemoryRepository {
 #[derive(Debug, Clone)]
 pub struct MeiliRepository {
     admin: MeiliAdmin,
+    index_admin: MeiliAdmin,
     wait_for_tasks: bool,
     scan_page_size: usize,
     scan_max_documents: usize,
@@ -1491,7 +1492,8 @@ fn decode_operation_candidate_documents(
 
 impl MeiliRepository {
     pub fn new(admin: MeiliAdmin, wait_for_tasks: bool) -> Self {
-        Self::new_with_scan_limits(
+        Self::new_with_admins_and_scan_limits(
+            admin.clone(),
             admin,
             wait_for_tasks,
             DEFAULT_MEILI_SCAN_PAGE_SIZE,
@@ -1505,8 +1507,25 @@ impl MeiliRepository {
         scan_page_size: usize,
         scan_max_documents: usize,
     ) -> Self {
+        Self::new_with_admins_and_scan_limits(
+            admin.clone(),
+            admin,
+            wait_for_tasks,
+            scan_page_size,
+            scan_max_documents,
+        )
+    }
+
+    pub(crate) fn new_with_admins_and_scan_limits(
+        admin: MeiliAdmin,
+        index_admin: MeiliAdmin,
+        wait_for_tasks: bool,
+        scan_page_size: usize,
+        scan_max_documents: usize,
+    ) -> Self {
         Self {
             admin,
+            index_admin,
             wait_for_tasks,
             scan_page_size,
             scan_max_documents,
@@ -1530,6 +1549,10 @@ impl MeiliRepository {
         if documents.is_empty() {
             return Ok(None);
         }
+        let durable_fixed_index = matches!(index_uid, "rag_operations" | "rag_audit_records");
+        if durable_fixed_index {
+            self.admin.verify_durable_index_for_write(index_uid).await?;
+        }
         let legacy_documents = self
             .load_same_tenant_legacy_documents(index_uid, documents)
             .await?;
@@ -1543,12 +1566,17 @@ impl MeiliRepository {
             .admin
             .add_documents(index_uid, &write_documents)
             .await?;
-        if task_uid.is_none() {
-            return Err(ApiError::Upstream(format!(
+        let accepted_task_uid = task_uid.as_deref().ok_or_else(|| {
+            ApiError::Upstream(format!(
                 "Meilisearch accepted a non-empty {index_uid} document mutation without a task UID"
-            )));
+            ))
+        })?;
+        if durable_fixed_index {
+            self.admin.wait_for_task(accepted_task_uid).await?;
+            self.admin.verify_durable_index_for_write(index_uid).await?;
+        } else {
+            self.maybe_wait(&task_uid).await?;
         }
-        self.maybe_wait(&task_uid).await?;
         Ok(task_uid)
     }
 
@@ -1614,11 +1642,11 @@ impl KnowledgeRepository for MeiliRepository {
         index: &UserEventIndex,
     ) -> Result<Vec<String>, ApiError> {
         let mut task_uids = self
-            .admin
+            .index_admin
             .ensure_index(&index.event_index_uid, "id", true)
             .await?;
         task_uids.extend(
-            self.admin
+            self.index_admin
                 .ensure_index(&index.personal_context_index_uid, "id", true)
                 .await?,
         );
@@ -1647,11 +1675,11 @@ impl KnowledgeRepository for MeiliRepository {
         index: &UserEventIndex,
     ) -> Result<Vec<String>, ApiError> {
         let mut task_uids = self
-            .admin
+            .index_admin
             .reconcile_existing_index(&index.event_index_uid, true)
             .await?;
         task_uids.extend(
-            self.admin
+            self.index_admin
                 .reconcile_existing_index(&index.personal_context_index_uid, true)
                 .await?,
         );
@@ -3463,8 +3491,10 @@ impl MeiliRepository {
 
 pub fn repository_from_config(config: &Config) -> Arc<dyn KnowledgeRepository> {
     if config.store_backend == "meili" && config.meili_url.is_some() {
-        Arc::new(MeiliRepository::new_with_scan_limits(
-            MeiliAdmin::from_config(config),
+        let (runtime, index_admin) = MeiliAdmin::pair_from_config(config);
+        Arc::new(MeiliRepository::new_with_admins_and_scan_limits(
+            runtime,
+            index_admin,
             config.meili_wait_for_tasks,
             config.meili_scan_page_size,
             config.meili_scan_max_documents,
@@ -3472,6 +3502,23 @@ pub fn repository_from_config(config: &Config) -> Arc<dyn KnowledgeRepository> {
     } else {
         Arc::new(MemoryRepository)
     }
+}
+
+pub(crate) fn repository_from_meili_admins(
+    config: &Config,
+    runtime: MeiliAdmin,
+    index_admin: MeiliAdmin,
+) -> Arc<dyn KnowledgeRepository> {
+    if config.store_backend != "meili" || config.meili_url.is_none() {
+        return Arc::new(MemoryRepository);
+    }
+    Arc::new(MeiliRepository::new_with_admins_and_scan_limits(
+        runtime,
+        index_admin,
+        config.meili_wait_for_tasks,
+        config.meili_scan_page_size,
+        config.meili_scan_max_documents,
+    ))
 }
 
 fn to_document<T: Serialize + ?Sized>(value: &T, id: &str) -> Result<Value, ApiError> {

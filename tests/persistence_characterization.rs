@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -17,10 +18,13 @@ use chrono::Utc;
 use nowledge::{
     build_router,
     config::WriteConsistency,
+    error::ApiError,
     meili::{settings_for, MeiliAdmin, FIXED_INDEXES},
     models::{
-        ContextNode, HistoryEvent, OperationActor, OperationActorScope, OperationPlan,
-        OperationResource, OperationStep, OperationStepRole, SourceRef, UserEventIndex,
+        AuditAction, AuditOutcome, AuditPrincipalScope, AuditReasonCode, AuditRecord, ContextNode,
+        HistoryEvent, OperationActor, OperationActorScope, OperationPlan, OperationRecord,
+        OperationResource, OperationStep, OperationStepRole, RepositoryWriteReceipt, SourceRef,
+        UserEventIndex,
     },
     mutation::{
         operation_record_from_plan, operation_step_completed, OPERATION_PLAN_SCHEMA_VERSION,
@@ -53,8 +57,24 @@ fn eventual_meili(
     Box::pin(async move {
         let path = request.uri().path();
         let method = request.method();
+        if method == Method::GET && path.ends_with("/settings") {
+            let index_uid = path
+                .strip_prefix("/indexes/")
+                .and_then(|path| path.strip_suffix("/settings"))
+                .unwrap();
+            return (StatusCode::OK, Json(settings_for(index_uid))).into_response();
+        }
         if method == Method::GET && path.starts_with("/indexes/") {
-            return (StatusCode::OK, Json(json!({ "uid": "stub-index" }))).into_response();
+            let index_uid = path.strip_prefix("/indexes/").unwrap();
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "uid": index_uid,
+                    "primaryKey": "id",
+                    "createdAt": "2026-07-15T00:00:00Z"
+                })),
+            )
+                .into_response();
         }
         if method == Method::POST && path.ends_with("/search") {
             return (
@@ -336,7 +356,11 @@ async fn startup_registry_meili_stub(
         let index_uid = path.strip_prefix("/indexes/").unwrap();
         return (
             StatusCode::OK,
-            Json(json!({ "uid": index_uid, "primaryKey": "id" })),
+            Json(json!({
+                "uid": index_uid,
+                "primaryKey": "id",
+                "createdAt": "2026-07-15T00:00:00Z"
+            })),
         )
             .into_response();
     }
@@ -363,12 +387,14 @@ async fn startup_registry_meili_stub(
 #[derive(Clone, Default)]
 struct ResetRecorder {
     requests: Arc<Mutex<Vec<String>>>,
+    indexes: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone, Default)]
 struct ConcurrentCreateRecorder {
     requests: Arc<Mutex<Vec<String>>>,
     index_checks: Arc<Mutex<usize>>,
+    incompatible_primary_key: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -466,7 +492,16 @@ async fn concurrent_create_meili_stub(
             StatusCode::OK
         };
         *checks += 1;
-        return (status, Json(json!({ "uid": "concurrent-index" }))).into_response();
+        let primary_key = if recorder.incompatible_primary_key.load(Ordering::SeqCst) {
+            "legacy_id"
+        } else {
+            "id"
+        };
+        return (
+            status,
+            Json(json!({ "uid": "concurrent-index", "primaryKey": primary_key })),
+        )
+            .into_response();
     }
     if method == Method::GET && path == "/indexes/concurrent-index/settings" {
         return (StatusCode::OK, Json(json!({}))).into_response();
@@ -509,15 +544,47 @@ async fn reset_meili_stub(State(recorder): State<ResetRecorder>, request: AxumRe
         .push(format!("{method} {path}"));
 
     if method == Method::DELETE && path.starts_with("/indexes/") {
+        let index_uid = path.strip_prefix("/indexes/").unwrap();
+        recorder.indexes.lock().unwrap().remove(index_uid);
         return (StatusCode::ACCEPTED, Json(json!({ "taskUid": 10 }))).into_response();
     }
     if method == Method::GET && path.ends_with("/settings") {
-        return (StatusCode::OK, Json(json!({}))).into_response();
+        let index_uid = path
+            .strip_prefix("/indexes/")
+            .and_then(|path| path.strip_suffix("/settings"))
+            .unwrap();
+        let status = if recorder.indexes.lock().unwrap().contains(index_uid) {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        return (status, Json(json!({}))).into_response();
     }
     if method == Method::GET && path.starts_with("/indexes/") {
+        let index_uid = path.strip_prefix("/indexes/").unwrap();
+        if recorder.indexes.lock().unwrap().contains(index_uid) {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "uid": index_uid,
+                    "primaryKey": "id",
+                    "createdAt": "2026-07-15T00:00:00Z"
+                })),
+            )
+                .into_response();
+        }
         return (StatusCode::NOT_FOUND, Json(json!({}))).into_response();
     }
     if method == Method::POST && path == "/indexes" {
+        let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let index_uid = body["uid"].as_str().unwrap();
+        assert_eq!(body["primaryKey"], "id");
+        recorder
+            .indexes
+            .lock()
+            .unwrap()
+            .insert(index_uid.to_string());
         return (StatusCode::ACCEPTED, Json(json!({ "taskUid": 11 }))).into_response();
     }
     if method == Method::PATCH && path.ends_with("/settings") {
@@ -572,6 +639,165 @@ async fn matching_settings_meili_stub(
         ),
     )
         .into_response()
+}
+
+#[derive(Clone)]
+struct DurableWriteRecorder {
+    index_uid: String,
+    missing: bool,
+    drift_after_task: bool,
+    generation: Arc<AtomicU64>,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl DurableWriteRecorder {
+    fn new(index_uid: &str, missing: bool, drift_after_task: bool) -> Self {
+        Self {
+            index_uid: index_uid.to_string(),
+            missing,
+            drift_after_task,
+            generation: Arc::new(AtomicU64::new(1)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+async fn durable_write_meili_stub(
+    State(recorder): State<DurableWriteRecorder>,
+    request: AxumRequest,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    recorder
+        .requests
+        .lock()
+        .unwrap()
+        .push(format!("{method} {path}"));
+
+    let index_path = format!("/indexes/{}", recorder.index_uid);
+    if method == Method::GET && path == format!("{index_path}/settings") {
+        return (StatusCode::OK, Json(settings_for(&recorder.index_uid))).into_response();
+    }
+    if method == Method::GET && path == index_path {
+        if recorder.missing {
+            return (StatusCode::NOT_FOUND, Json(json!({}))).into_response();
+        }
+        let created_at = if recorder.generation.load(Ordering::SeqCst) == 1 {
+            "2026-07-15T00:00:00Z"
+        } else {
+            "2026-07-15T00:00:01Z"
+        };
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "uid": recorder.index_uid,
+                "primaryKey": "id",
+                "createdAt": created_at
+            })),
+        )
+            .into_response();
+    }
+    if method == Method::POST && path == format!("{index_path}/search") {
+        return (
+            StatusCode::OK,
+            Json(json!({ "hits": [], "processingTimeMs": 0 })),
+        )
+            .into_response();
+    }
+    if method == Method::POST && path == format!("{index_path}/documents") {
+        return (StatusCode::ACCEPTED, Json(json!({ "taskUid": 41 }))).into_response();
+    }
+    if method == Method::GET && path == "/tasks/41" {
+        if recorder.drift_after_task {
+            recorder.generation.store(2, Ordering::SeqCst);
+        }
+        return (StatusCode::OK, Json(json!({ "status": "succeeded" }))).into_response();
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "message": format!("unexpected durable-write request: {method} {path}") })),
+    )
+        .into_response()
+}
+
+async fn spawn_durable_write_stub(recorder: DurableWriteRecorder) -> String {
+    let app = Router::new()
+        .fallback(durable_write_meili_stub)
+        .with_state(recorder);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+fn durable_operation_record() -> OperationRecord {
+    let at = Utc::now();
+    operation_record_from_plan(OperationPlan {
+        schema_version: OPERATION_PLAN_SCHEMA_VERSION,
+        id: format!("durable-operation-{}", uuid::Uuid::now_v7().simple()),
+        tenant_id: "tenant-durable-write".to_string(),
+        operation_kind: "structured_rows.test".to_string(),
+        actor: OperationActor {
+            scope: OperationActorScope::TenantService,
+            owner_user_id_hash: None,
+            roles: vec!["writer".to_string()],
+            request_id: Some("durable-write-request".to_string()),
+        },
+        idempotency_key_hash: None,
+        primary: OperationStep {
+            id: "primary".to_string(),
+            role: OperationStepRole::Primary,
+            resource: OperationResource::StructuredRows {
+                rows: vec![json!({ "id": "durable-row" })],
+            },
+        },
+        side_effects: Vec::new(),
+        redacted_metadata: json!({ "fixture": "durable write continuity" }),
+        response_snapshot: json!({ "ok": true }),
+        created_at: at,
+    })
+    .expect("durable operation fixture must be valid")
+}
+
+fn durable_audit_record() -> AuditRecord {
+    let at = Utc::now();
+    AuditRecord {
+        id: format!("audit_{}", uuid::Uuid::now_v7().simple()),
+        tenant_id: "tenant-durable-write".to_string(),
+        request_id: uuid::Uuid::now_v7().to_string(),
+        principal_scope: AuditPrincipalScope::Admin,
+        principal_owner_user_id_hash: None,
+        resource_id_hash: format!("hmac:{}", "b".repeat(32)),
+        action: AuditAction::CompanyDocDelete,
+        reason_code: AuditReasonCode::AdminDelete,
+        reason_fingerprint: format!("hmac:{}", "c".repeat(32)),
+        outcome: AuditOutcome::Attempted,
+        error_kind: None,
+        operation_id: None,
+        occurred_at: at,
+        updated_at: at,
+    }
+}
+
+async fn upsert_durable_fixture(
+    repository: &MeiliRepository,
+    index_uid: &str,
+) -> Result<RepositoryWriteReceipt, ApiError> {
+    match index_uid {
+        "rag_operations" => {
+            repository
+                .upsert_operation(&durable_operation_record())
+                .await
+        }
+        "rag_audit_records" => {
+            repository
+                .upsert_audit_record(&durable_audit_record())
+                .await
+        }
+        _ => unreachable!("unsupported durable fixture index: {index_uid}"),
+    }
 }
 
 fn meili_backed_app(url: String) -> Router {
@@ -728,10 +954,11 @@ async fn bootstrap_reset_waits_for_delete_create_and_settings_tasks() {
     assert_eq!(requests[2], "GET /indexes/rag_company_context");
     assert_eq!(requests[3], "POST /indexes");
     assert_eq!(requests[4], "GET /tasks/11");
-    assert_eq!(requests[5], "GET /indexes/rag_company_context/settings");
-    assert_eq!(requests[6], "PATCH /indexes/rag_company_context/settings");
+    assert_eq!(requests[5], "GET /indexes/rag_company_context");
+    assert_eq!(requests[6], "GET /indexes/rag_company_context/settings");
+    assert_eq!(requests[7], "PATCH /indexes/rag_company_context/settings");
     assert_eq!(
-        requests[7], "GET /tasks/12",
+        requests[8], "GET /tasks/12",
         "ensure_index returned before its settings were usable: {requests:?}"
     );
     assert!(
@@ -770,6 +997,128 @@ async fn bootstrap_provisions_all_fixed_indexes_only_when_the_managed_set_is_emp
     assert!(!requests
         .iter()
         .any(|request| request.starts_with("DELETE ")));
+}
+
+#[tokio::test]
+async fn production_bootstrap_refuses_implicit_initial_provision_when_all_indexes_are_missing() {
+    let recorder = ResetRecorder::default();
+    let app = Router::new()
+        .fallback(reset_meili_stub)
+        .with_state(recorder.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut config = Config::test();
+    config.run_mode = "production".to_string();
+    config.meili_allow_initial_provision = false;
+    config.meili_url = Some(format!("http://{addr}"));
+    let error = MeiliAdmin::from_config(&config)
+        .bootstrap(false)
+        .await
+        .expect_err("production must not implicitly provision an empty managed backend");
+
+    assert!(
+        error
+            .to_string()
+            .contains("refusing implicit initial provision"),
+        "{error}"
+    );
+    let requests = recorder.requests.lock().unwrap().clone();
+    assert!(
+        !requests.iter().any(|request| request == "POST /indexes"),
+        "production bootstrap mutated an empty backend: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn durable_writes_refuse_a_missing_index_before_any_post() {
+    for index_uid in ["rag_operations", "rag_audit_records"] {
+        let recorder = DurableWriteRecorder::new(index_uid, true, false);
+        let url = spawn_durable_write_stub(recorder.clone()).await;
+        let mut config = Config::test();
+        config.meili_url = Some(url);
+        let repository = MeiliRepository::new(MeiliAdmin::from_config(&config), false);
+
+        let error = upsert_durable_fixture(&repository, index_uid)
+            .await
+            .expect_err("a missing durable index must fail before persistence");
+
+        assert!(
+            error.to_string().contains("refusing persistence"),
+            "{error}"
+        );
+        let requests = recorder.requests.lock().unwrap().clone();
+        assert_eq!(requests, [format!("GET /indexes/{index_uid}")]);
+        assert!(
+            !requests.iter().any(|request| request.starts_with("POST ")),
+            "missing durable index reached a POST endpoint: {requests:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn durable_writes_wait_for_the_task_even_when_repository_waits_are_disabled() {
+    for index_uid in ["rag_operations", "rag_audit_records"] {
+        let recorder = DurableWriteRecorder::new(index_uid, false, false);
+        let url = spawn_durable_write_stub(recorder.clone()).await;
+        let mut config = Config::test();
+        config.meili_url = Some(url);
+        let repository = MeiliRepository::new(MeiliAdmin::from_config(&config), false);
+
+        let receipt = upsert_durable_fixture(&repository, index_uid)
+            .await
+            .expect("a stable durable index should accept the write");
+
+        assert_eq!(receipt.task_uids, ["41"]);
+        let requests = recorder.requests.lock().unwrap().clone();
+        let document_post = requests
+            .iter()
+            .position(|request| request == &format!("POST /indexes/{index_uid}/documents"))
+            .expect("durable document POST was not issued");
+        let task_wait = requests
+            .iter()
+            .position(|request| request == "GET /tasks/41")
+            .expect("durable task was not awaited");
+        assert!(task_wait > document_post, "{requests:?}");
+        assert!(
+            requests
+                .iter()
+                .skip(task_wait + 1)
+                .any(|request| request == &format!("GET /indexes/{index_uid}")),
+            "durable generation was not verified after task completion: {requests:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn durable_writes_fail_when_the_index_generation_drifts_after_task_completion() {
+    for index_uid in ["rag_operations", "rag_audit_records"] {
+        let recorder = DurableWriteRecorder::new(index_uid, false, true);
+        let url = spawn_durable_write_stub(recorder.clone()).await;
+        let mut config = Config::test();
+        config.meili_url = Some(url);
+        let repository = MeiliRepository::new(MeiliAdmin::from_config(&config), false);
+
+        let error = upsert_durable_fixture(&repository, index_uid)
+            .await
+            .expect_err("post-task index replacement must fail the durable write");
+
+        assert!(error.to_string().contains("generation changed"), "{error}");
+        let requests = recorder.requests.lock().unwrap().clone();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request == &format!("POST /indexes/{index_uid}/documents")),
+            "the test did not reach the accepted durable write: {requests:?}"
+        );
+        assert!(
+            requests.iter().any(|request| request == "GET /tasks/41"),
+            "generation drift was not triggered after task completion: {requests:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -922,11 +1271,46 @@ async fn ensure_index_tolerates_a_concurrent_create_winner_and_still_waits_for_s
             "POST /indexes",
             "GET /tasks/21",
             "GET /indexes/concurrent-index",
+            "GET /indexes/concurrent-index",
             "GET /indexes/concurrent-index/settings",
             "PATCH /indexes/concurrent-index/settings",
             "GET /tasks/22",
         ]
     );
+}
+
+#[tokio::test]
+async fn ensure_index_refuses_a_concurrent_create_with_an_incompatible_primary_key() {
+    let recorder = ConcurrentCreateRecorder::default();
+    recorder
+        .incompatible_primary_key
+        .store(true, Ordering::SeqCst);
+    let app = Router::new()
+        .fallback(concurrent_create_meili_stub)
+        .with_state(recorder.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut config = Config::test();
+    config.meili_url = Some(format!("http://{addr}"));
+    let error = MeiliAdmin::from_config(&config)
+        .ensure_index("concurrent-index", "id", true)
+        .await
+        .expect_err("incompatible concurrent creation must fail before settings mutation");
+
+    assert!(
+        error.to_string().contains("incompatible primary key"),
+        "{error}"
+    );
+    assert!(!recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request.starts_with("PATCH ")));
 }
 
 #[tokio::test]

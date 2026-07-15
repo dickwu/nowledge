@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(config.clone());
     if config.store_backend == "meili" && config.meili_url.is_some() {
-        let bootstrap = state.meili.bootstrap(false).await?;
+        let bootstrap = state.meili.prepare_for_startup().await?;
         tracing::info!(
             managed_indexes = bootstrap.indexes.len(),
             completed_tasks = bootstrap.tasks.len(),

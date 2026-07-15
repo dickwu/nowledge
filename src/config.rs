@@ -48,6 +48,8 @@ const DEFAULT_PARSER_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_LLM_RATE_LIMIT_REQUESTS_PER_MINUTE: u64 = 30;
 const DEFAULT_LLM_RATE_LIMIT_TOKENS_PER_MINUTE: u64 = 100_000;
 const MAX_BOUNDARY_DEADLINE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const MIN_VECTOR_MATCH_SCORE: f32 = 0.001;
+const MAX_VECTOR_MATCH_SCORE: f32 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,8 +99,13 @@ pub struct Config {
     pub allow_unsafe_unauthenticated: bool,
     pub index_hash_secret: Vec<u8>,
     pub store_backend: String,
+    pub allow_ephemeral_production: bool,
     pub meili_url: Option<String>,
     pub meili_api_key: Option<String>,
+    pub meili_admin_api_key: Option<String>,
+    pub meili_allow_initial_provision: bool,
+    pub meili_operations_index_created_at: Option<String>,
+    pub meili_audit_index_created_at: Option<String>,
     pub write_consistency: WriteConsistency,
     /// Compatibility projection for repository code that has not yet moved to
     /// the typed write-consistency policy.
@@ -320,8 +327,20 @@ impl Config {
             index_hash_secret,
             store_backend: std::env::var("RAG_STORE_BACKEND")
                 .unwrap_or_else(|_| "memory".to_string()),
+            allow_ephemeral_production: std::env::var("RAG_ALLOW_EPHEMERAL_PRODUCTION")
+                .map(|v| truthy(&v))
+                .unwrap_or(false),
             meili_url: std::env::var("RAG_MEILI_URL").ok(),
             meili_api_key: std::env::var("RAG_MEILI_API_KEY").ok(),
+            meili_admin_api_key: std::env::var("RAG_MEILI_ADMIN_API_KEY").ok(),
+            meili_allow_initial_provision: std::env::var("RAG_MEILI_ALLOW_INITIAL_PROVISION")
+                .map(|value| truthy(&value))
+                .unwrap_or(run_mode != "production"),
+            meili_operations_index_created_at: std::env::var(
+                "RAG_MEILI_OPERATIONS_INDEX_CREATED_AT",
+            )
+            .ok(),
+            meili_audit_index_created_at: std::env::var("RAG_MEILI_AUDIT_INDEX_CREATED_AT").ok(),
             write_consistency,
             meili_wait_for_tasks,
             meili_scan_page_size: parse_env_number(
@@ -507,49 +526,55 @@ impl Config {
             health_llm_enabled: std::env::var("RAG_HEALTH_LLM_ENABLED")
                 .map(|v| truthy(&v))
                 .unwrap_or(true),
-            health_llm_probe_interval_seconds: std::env::var(
+            health_llm_probe_interval_seconds: parse_env_number(
                 "RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS",
-            )
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30),
-            health_llm_probe_ttl_seconds: std::env::var("RAG_HEALTH_LLM_PROBE_TTL_SECONDS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
-            health_llm_max_stale_seconds: std::env::var("RAG_HEALTH_LLM_MAX_STALE_SECONDS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(120),
-            health_llm_timeout_ms: std::env::var("RAG_HEALTH_LLM_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10_000),
+                30,
+                &mut boundary_errors,
+            ),
+            health_llm_probe_ttl_seconds: parse_env_number(
+                "RAG_HEALTH_LLM_PROBE_TTL_SECONDS",
+                60,
+                &mut boundary_errors,
+            ),
+            health_llm_max_stale_seconds: parse_env_number(
+                "RAG_HEALTH_LLM_MAX_STALE_SECONDS",
+                120,
+                &mut boundary_errors,
+            ),
+            health_llm_timeout_ms: parse_env_number(
+                "RAG_HEALTH_LLM_TIMEOUT_MS",
+                10_000,
+                &mut boundary_errors,
+            ),
             health_require_llm: std::env::var("RAG_HEALTH_REQUIRE_LLM")
                 .map(|v| truthy(&v))
                 .unwrap_or(true),
-            health_llm_failure_threshold: std::env::var("RAG_HEALTH_LLM_FAILURE_THRESHOLD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3),
+            health_llm_failure_threshold: parse_env_number(
+                "RAG_HEALTH_LLM_FAILURE_THRESHOLD",
+                3,
+                &mut boundary_errors,
+            ),
             health_llm_rate_limit_unhealthy: std::env::var("RAG_HEALTH_LLM_RATE_LIMIT_UNHEALTHY")
                 .map(|v| truthy(&v))
                 .unwrap_or(false),
             vector_match_enabled: std::env::var("RAG_VECTOR_MATCH_ENABLED")
                 .map(|v| truthy(&v))
                 .unwrap_or(true),
-            vector_match_weight: std::env::var("RAG_VECTOR_MATCH_WEIGHT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(4.0),
-            vector_match_doc_weight: std::env::var("RAG_VECTOR_MATCH_DOC_WEIGHT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2.0),
-            vector_match_min_score: std::env::var("RAG_VECTOR_MATCH_MIN_SCORE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.25),
+            vector_match_weight: parse_env_number(
+                "RAG_VECTOR_MATCH_WEIGHT",
+                4.0,
+                &mut boundary_errors,
+            ),
+            vector_match_doc_weight: parse_env_number(
+                "RAG_VECTOR_MATCH_DOC_WEIGHT",
+                2.0,
+                &mut boundary_errors,
+            ),
+            vector_match_min_score: parse_env_number(
+                "RAG_VECTOR_MATCH_MIN_SCORE",
+                0.25,
+                &mut boundary_errors,
+            ),
             auth_config_error: (!auth_errors.is_empty()).then(|| auth_errors.join("; ")),
             boundary_config_error: (!boundary_errors.is_empty())
                 .then(|| boundary_errors.join("; ")),
@@ -591,6 +616,9 @@ impl Config {
         }
         secrets.extend(self.auth_users.iter().map(|user| user.token.clone()));
         if let Some(key) = &self.meili_api_key {
+            secrets.push(key.clone());
+        }
+        if let Some(key) = &self.meili_admin_api_key {
             secrets.push(key.clone());
         }
         if let Some(key) = &self.openai_api_key {
@@ -746,24 +774,158 @@ impl Config {
         inventory.active_credentials = Some(credentials);
     }
 
-    pub fn validate_startup(&self) -> anyhow::Result<()> {
+    fn validate_run_mode(&self) -> anyhow::Result<()> {
         if !matches!(
             self.run_mode.as_str(),
             "development" | "test" | "production"
         ) {
             anyhow::bail!("RAG_RUN_MODE must be development, test, or production");
         }
+        Ok(())
+    }
+
+    /// Validate the narrow configuration contract used by offline Meilisearch
+    /// maintenance binaries. This intentionally does not require unrelated
+    /// application settings such as HTTP authentication or durable-index pins.
+    pub fn validate_meili_maintenance(&self) -> anyhow::Result<()> {
+        self.validate_run_mode()?;
+
+        let meili_url = self.meili_url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("RAG_MEILI_URL is required for Meilisearch maintenance")
+        })?;
+        validate_absolute_http_url("RAG_MEILI_URL", meili_url)?;
+
+        if self.run_mode == "production" {
+            let admin_key = self
+                .meili_admin_api_key
+                .as_deref()
+                .filter(|key| !key.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "production Meilisearch maintenance requires an explicit non-empty RAG_MEILI_ADMIN_API_KEY"
+                    )
+                })?;
+            if self.meili_api_key.as_deref() == Some(admin_key) {
+                anyhow::bail!(
+                    "RAG_MEILI_API_KEY and RAG_MEILI_ADMIN_API_KEY must be distinct for production Meilisearch maintenance"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_startup(&self) -> anyhow::Result<()> {
+        self.validate_run_mode()?;
         if self.run_mode == "production" && self.write_consistency == WriteConsistency::Eventual {
             anyhow::bail!(
                 "RAG_WRITE_CONSISTENCY=eventual is not allowed in production; use read_your_writes or wait_for_index"
             );
         }
-        if self.tenant_id.trim().is_empty() {
-            anyhow::bail!("RAG_TENANT_ID must be non-empty");
+        if self.tenant_id.trim().is_empty() || self.tenant_id.chars().count() > 256 {
+            anyhow::bail!("RAG_TENANT_ID must contain between 1 and 256 characters");
+        }
+        if !matches!(self.store_backend.as_str(), "memory" | "meili") {
+            anyhow::bail!("RAG_STORE_BACKEND must be memory or meili");
         }
         if self.store_backend == "meili" && self.meili_url.is_none() {
             anyhow::bail!("RAG_STORE_BACKEND=meili requires RAG_MEILI_URL");
         }
+        if self.run_mode == "production"
+            && self.store_backend == "memory"
+            && !self.allow_ephemeral_production
+        {
+            anyhow::bail!(
+                "RAG_RUN_MODE=production requires RAG_STORE_BACKEND=meili; ephemeral memory storage requires explicit RAG_ALLOW_EPHEMERAL_PRODUCTION=true"
+            );
+        }
+        if self.run_mode == "production" && self.store_backend == "meili" {
+            let runtime_key = self
+                .meili_api_key
+                .as_deref()
+                .filter(|key| !key.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "production Meilisearch requires a least-privilege RAG_MEILI_API_KEY"
+                    )
+                })?;
+            let admin_key = self
+                .meili_admin_api_key
+                .as_deref()
+                .filter(|key| !key.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "production Meilisearch requires a separate RAG_MEILI_ADMIN_API_KEY"
+                    )
+                })?;
+            if runtime_key == admin_key {
+                anyhow::bail!(
+                    "RAG_MEILI_API_KEY and RAG_MEILI_ADMIN_API_KEY must be distinct in production"
+                );
+            }
+            if !self.meili_allow_initial_provision {
+                for (name, value) in [
+                    (
+                        "RAG_MEILI_OPERATIONS_INDEX_CREATED_AT",
+                        self.meili_operations_index_created_at.as_deref(),
+                    ),
+                    (
+                        "RAG_MEILI_AUDIT_INDEX_CREATED_AT",
+                        self.meili_audit_index_created_at.as_deref(),
+                    ),
+                ] {
+                    if value.is_none() {
+                        anyhow::bail!(
+                            "production Meilisearch requires {name} to pin durable index continuity"
+                        );
+                    }
+                }
+            }
+        }
+        for (name, value) in [
+            (
+                "RAG_MEILI_OPERATIONS_INDEX_CREATED_AT",
+                self.meili_operations_index_created_at.as_deref(),
+            ),
+            (
+                "RAG_MEILI_AUDIT_INDEX_CREATED_AT",
+                self.meili_audit_index_created_at.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                if value.trim() != value || chrono::DateTime::parse_from_rfc3339(value).is_err() {
+                    anyhow::bail!("{name} must be an exact RFC3339 timestamp");
+                }
+            }
+        }
+        let provider_allowed = |provider: &str| {
+            matches!(provider, "none" | "mock" | "openai_api_key" | "codex_auth")
+                || (self.run_mode == "test"
+                    && matches!(
+                        provider,
+                        "mock_auth_failure"
+                            | "mock_quota_exhausted"
+                            | "mock_rate_limited"
+                            | "mock_server_error"
+                            | "mock_timeout"
+                    ))
+        };
+        if !provider_allowed(&self.llm_provider) {
+            anyhow::bail!("RAG_LLM_PROVIDER must be none, mock, openai_api_key, or codex_auth");
+        }
+        if !provider_allowed(&self.analysis_llm_provider) {
+            anyhow::bail!(
+                "RAG_ANALYSIS_LLM_PROVIDER must be none, mock, openai_api_key, or codex_auth"
+            );
+        }
+        validate_reasoning_effort(
+            "RAG_LLM_REASONING_EFFORT",
+            self.llm_reasoning_effort.as_deref(),
+        )?;
+        validate_reasoning_effort(
+            "RAG_ANALYSIS_LLM_REASONING_EFFORT",
+            self.analysis_llm_reasoning_effort.as_deref(),
+        )?;
         if !matches!(self.parser_provider.as_str(), "builtin" | "mineru") {
             anyhow::bail!("RAG_PARSER_PROVIDER must be builtin or mineru");
         }
@@ -774,6 +936,29 @@ impl Config {
             anyhow::bail!(
                 "RAG_PROVIDER_MAX_RETRIES must not exceed {}",
                 crate::upstream::MAX_UPSTREAM_RETRIES
+            );
+        }
+
+        if let Some(meili_url) = self.meili_url.as_deref() {
+            validate_absolute_http_url("RAG_MEILI_URL", meili_url)?;
+        }
+        validate_absolute_http_url("RAG_MINERU_API_URL", &self.mineru_api_url)?;
+        validate_absolute_http_url("RAG_CODEX_BASE_URL", &self.codex_base_url)?;
+
+        for (name, value) in [
+            ("RAG_VECTOR_MATCH_WEIGHT", self.vector_match_weight),
+            ("RAG_VECTOR_MATCH_DOC_WEIGHT", self.vector_match_doc_weight),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                anyhow::bail!("{name} must be finite and non-negative");
+            }
+        }
+        if !self.vector_match_min_score.is_finite()
+            || !(MIN_VECTOR_MATCH_SCORE..=MAX_VECTOR_MATCH_SCORE)
+                .contains(&self.vector_match_min_score)
+        {
+            anyhow::bail!(
+                "RAG_VECTOR_MATCH_MIN_SCORE must be finite and between {MIN_VECTOR_MATCH_SCORE} and {MAX_VECTOR_MATCH_SCORE}"
             );
         }
 
@@ -868,6 +1053,26 @@ impl Config {
             ),
             ("RAG_LLM_TIMEOUT_MS", self.llm_timeout_ms as u128),
             ("RAG_PARSER_TIMEOUT_MS", self.parser_timeout_ms as u128),
+            (
+                "RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS",
+                self.health_llm_probe_interval_seconds as u128,
+            ),
+            (
+                "RAG_HEALTH_LLM_PROBE_TTL_SECONDS",
+                self.health_llm_probe_ttl_seconds as u128,
+            ),
+            (
+                "RAG_HEALTH_LLM_MAX_STALE_SECONDS",
+                self.health_llm_max_stale_seconds as u128,
+            ),
+            (
+                "RAG_HEALTH_LLM_TIMEOUT_MS",
+                self.health_llm_timeout_ms as u128,
+            ),
+            (
+                "RAG_HEALTH_LLM_FAILURE_THRESHOLD",
+                self.health_llm_failure_threshold as u128,
+            ),
             ("RAG_LLM_MAX_INPUT_CHARS", self.llm_max_input_chars as u128),
             (
                 "RAG_LLM_MAX_OUTPUT_TOKENS",
@@ -906,6 +1111,7 @@ impl Config {
             ),
             ("RAG_LLM_TIMEOUT_MS", self.llm_timeout_ms),
             ("RAG_PARSER_TIMEOUT_MS", self.parser_timeout_ms),
+            ("RAG_HEALTH_LLM_TIMEOUT_MS", self.health_llm_timeout_ms),
         ] {
             if value > MAX_BOUNDARY_DEADLINE_MS {
                 anyhow::bail!("{name} must not exceed {MAX_BOUNDARY_DEADLINE_MS} milliseconds");
@@ -924,6 +1130,11 @@ impl Config {
         }
         if self.provider_connect_timeout_ms > self.parser_timeout_ms {
             anyhow::bail!("RAG_PROVIDER_CONNECT_TIMEOUT_MS must not exceed RAG_PARSER_TIMEOUT_MS");
+        }
+        if self.health_llm_probe_ttl_seconds > self.health_llm_max_stale_seconds {
+            anyhow::bail!(
+                "RAG_HEALTH_LLM_PROBE_TTL_SECONDS must not exceed RAG_HEALTH_LLM_MAX_STALE_SECONDS"
+            );
         }
         if self.meili_scan_page_size > MAX_MEILI_SCAN_PAGE_SIZE {
             anyhow::bail!("RAG_MEILI_SCAN_PAGE_SIZE must not exceed {MAX_MEILI_SCAN_PAGE_SIZE}");
@@ -964,6 +1175,10 @@ impl Config {
 
     fn validate_redaction_secret_sources(&self) -> anyhow::Result<()> {
         validate_redaction_secret("RAG_MEILI_API_KEY", self.meili_api_key.as_deref())?;
+        validate_redaction_secret(
+            "RAG_MEILI_ADMIN_API_KEY",
+            self.meili_admin_api_key.as_deref(),
+        )?;
         validate_redaction_secret("RAG_OPENAI_API_KEY", self.openai_api_key.as_deref())?;
         if let Ok(secret) = std::str::from_utf8(&self.index_hash_secret) {
             validate_redaction_secret("RAG_INDEX_HASH_SECRET", Some(secret))?;
@@ -1204,8 +1419,13 @@ impl Config {
             allow_unsafe_unauthenticated: true,
             index_hash_secret: b"test-secret".to_vec(),
             store_backend: "memory".to_string(),
+            allow_ephemeral_production: false,
             meili_url: None,
             meili_api_key: None,
+            meili_admin_api_key: None,
+            meili_allow_initial_provision: true,
+            meili_operations_index_created_at: None,
+            meili_audit_index_created_at: None,
             write_consistency: WriteConsistency::WaitForIndex,
             meili_wait_for_tasks: true,
             meili_scan_page_size: DEFAULT_MEILI_SCAN_PAGE_SIZE,
@@ -1413,10 +1633,26 @@ where
     match value.parse() {
         Ok(value) => value,
         Err(_) => {
-            errors.push(format!("{name} must be a valid non-negative integer"));
+            errors.push(format!("{name} must be a valid number"));
             default
         }
     }
+}
+
+fn validate_absolute_http_url(name: &str, value: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| anyhow::anyhow!("{name} must be a valid absolute HTTP(S) URL"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        anyhow::bail!("{name} must be a valid absolute HTTP(S) URL");
+    }
+    Ok(())
+}
+
+fn validate_reasoning_effort(name: &str, value: Option<&str>) -> anyhow::Result<()> {
+    if value.is_some_and(|effort| !matches!(effort, "low" | "medium" | "high" | "xhigh")) {
+        anyhow::bail!("{name} must be low, medium, high, or xhigh when configured");
+    }
+    Ok(())
 }
 
 fn parse_cors_allowed_origins(value: &str) -> Vec<String> {
@@ -1784,6 +2020,142 @@ mod tests {
     }
 
     #[test]
+    fn startup_rejects_unknown_store_backends_including_production_typos() {
+        for backend in ["meilii", "Memory", " meili", "meili ", ""] {
+            let mut config = Config::test();
+            config.run_mode = "production".to_string();
+            config.store_backend = backend.to_string();
+            config.index_hash_secret = b"7Qv!n2$La9@Xm4#Rp8%Wd3&Ks6*Hy1+Tz5".to_vec();
+
+            let error = config.validate_startup().unwrap_err().to_string();
+
+            assert!(
+                error.contains("RAG_STORE_BACKEND must be memory or meili"),
+                "backend {backend:?} returned {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_memory_backend_requires_an_explicit_ephemeral_acknowledgement() {
+        let mut config = Config::test();
+        config.run_mode = "production".to_string();
+        config.index_hash_secret = b"7Qv!n2$La9@Xm4#Rp8%Wd3&Ks6*Hy1+Tz5".to_vec();
+
+        let error = config.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("RAG_STORE_BACKEND=meili"), "{error}");
+        assert!(error.contains("RAG_ALLOW_EPHEMERAL_PRODUCTION"), "{error}");
+
+        config.allow_ephemeral_production = true;
+        assert!(config.validate_startup().is_ok());
+    }
+
+    #[test]
+    fn production_meili_requires_distinct_runtime_and_index_admin_keys() {
+        let mut config = Config::test();
+        config.run_mode = "production".to_string();
+        config.store_backend = "meili".to_string();
+        config.meili_url = Some("http://127.0.0.1:7700".to_string());
+        config.meili_allow_initial_provision = false;
+        config.index_hash_secret = b"7Qv!n2$La9@Xm4#Rp8%Wd3&Ks6*Hy1+Tz5".to_vec();
+
+        let error = config.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("RAG_MEILI_API_KEY"), "{error}");
+
+        config.meili_api_key = Some("runtime-key".to_string());
+        let error = config.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("RAG_MEILI_ADMIN_API_KEY"), "{error}");
+
+        config.meili_admin_api_key = Some("runtime-key".to_string());
+        let error = config.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("must be distinct"), "{error}");
+
+        config.meili_admin_api_key = Some("index-admin-key".to_string());
+        let error = config.validate_startup().unwrap_err().to_string();
+        assert!(
+            error.contains("RAG_MEILI_OPERATIONS_INDEX_CREATED_AT"),
+            "{error}"
+        );
+
+        config.meili_operations_index_created_at = Some("2026-07-14T12:00:00Z".to_string());
+        let error = config.validate_startup().unwrap_err().to_string();
+        assert!(
+            error.contains("RAG_MEILI_AUDIT_INDEX_CREATED_AT"),
+            "{error}"
+        );
+
+        config.meili_audit_index_created_at = Some("2026-07-14T12:00:01Z".to_string());
+        assert!(config.validate_startup().is_ok());
+    }
+
+    #[test]
+    fn maintenance_validation_is_narrow_but_fail_closed_in_production() {
+        let mut config = Config::test();
+
+        let error = config.validate_meili_maintenance().unwrap_err().to_string();
+        assert!(error.contains("RAG_MEILI_URL"), "{error}");
+
+        config.meili_url = Some("meili.internal:7700".to_string());
+        let error = config.validate_meili_maintenance().unwrap_err().to_string();
+        assert!(error.contains("absolute HTTP(S) URL"), "{error}");
+
+        config.meili_url = Some("http://127.0.0.1:7700".to_string());
+        config.run_mode = "prod".to_string();
+        let error = config.validate_meili_maintenance().unwrap_err().to_string();
+        assert!(error.contains("RAG_RUN_MODE"), "{error}");
+
+        config.run_mode = "production".to_string();
+        config.meili_api_key = Some("runtime-key".to_string());
+        let error = config.validate_meili_maintenance().unwrap_err().to_string();
+        assert!(error.contains("RAG_MEILI_ADMIN_API_KEY"), "{error}");
+
+        config.meili_admin_api_key = Some("  ".to_string());
+        let error = config.validate_meili_maintenance().unwrap_err().to_string();
+        assert!(error.contains("non-empty"), "{error}");
+
+        config.meili_admin_api_key = Some("runtime-key".to_string());
+        let error = config.validate_meili_maintenance().unwrap_err().to_string();
+        assert!(error.contains("must be distinct"), "{error}");
+
+        config.meili_admin_api_key = Some("maintenance-key".to_string());
+        assert!(config.validate_meili_maintenance().is_ok());
+    }
+
+    #[test]
+    fn development_maintenance_accepts_the_legacy_runtime_only_key_shape() {
+        let mut config = Config::test();
+        config.run_mode = "development".to_string();
+        config.meili_url = Some("http://127.0.0.1:7700".to_string());
+        config.meili_api_key = Some("development-key".to_string());
+
+        assert!(config.validate_meili_maintenance().is_ok());
+    }
+
+    #[test]
+    fn startup_rejects_unknown_primary_and_analysis_llm_providers() {
+        let mut primary = Config::test();
+        primary.llm_provider = "openai_api_keey".to_string();
+        let error = primary.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("RAG_LLM_PROVIDER"), "{error}");
+
+        let mut analysis = Config::test();
+        analysis.analysis_llm_provider = "openai_api_keey".to_string();
+        let error = analysis.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("RAG_ANALYSIS_LLM_PROVIDER"), "{error}");
+    }
+
+    #[test]
+    fn startup_rejects_tenant_ids_that_audit_records_cannot_persist() {
+        let mut config = Config::test();
+        config.tenant_id = "t".repeat(257);
+
+        let error = config.validate_startup().unwrap_err().to_string();
+
+        assert!(error.contains("RAG_TENANT_ID"), "{error}");
+        assert!(error.contains("256"), "{error}");
+    }
+
+    #[test]
     fn analysis_llm_config_uses_analysis_reasoning_effort() {
         let mut config = Config::test();
         config.llm_reasoning_effort = Some("high".to_string());
@@ -1794,6 +2166,139 @@ mod tests {
         assert_eq!(
             analysis_config.llm_reasoning_effort.as_deref(),
             Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn startup_rejects_invalid_provider_urls() {
+        for (name, configure) in [
+            (
+                "RAG_MEILI_URL",
+                (|config: &mut Config| config.meili_url = Some("meili.internal:7700".to_string()))
+                    as fn(&mut Config),
+            ),
+            (
+                "RAG_MINERU_API_URL",
+                (|config: &mut Config| config.mineru_api_url = "file:///tmp/mineru".to_string())
+                    as fn(&mut Config),
+            ),
+            (
+                "RAG_CODEX_BASE_URL",
+                (|config: &mut Config| config.codex_base_url = "not a url".to_string())
+                    as fn(&mut Config),
+            ),
+        ] {
+            let mut config = Config::test();
+            configure(&mut config);
+
+            let error = config.validate_startup().unwrap_err().to_string();
+
+            assert!(error.contains(name), "unexpected error: {error}");
+            assert!(error.contains("absolute HTTP(S) URL"), "{error}");
+        }
+    }
+
+    #[test]
+    fn startup_rejects_invalid_reasoning_effort_for_each_profile() {
+        let mut primary = Config::test();
+        primary.llm_reasoning_effort = Some("banana".to_string());
+        let error = primary.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("RAG_LLM_REASONING_EFFORT"), "{error}");
+
+        let mut analysis = Config::test();
+        analysis.analysis_llm_reasoning_effort = Some("x-high".to_string());
+        let error = analysis.validate_startup().unwrap_err().to_string();
+        assert!(
+            error.contains("RAG_ANALYSIS_LLM_REASONING_EFFORT"),
+            "{error}"
+        );
+
+        for effort in ["low", "medium", "high", "xhigh"] {
+            let mut config = Config::test();
+            config.llm_reasoning_effort = Some(effort.to_string());
+            config.analysis_llm_reasoning_effort = Some(effort.to_string());
+            assert!(config.validate_startup().is_ok(), "{effort}");
+        }
+    }
+
+    #[test]
+    fn startup_rejects_non_finite_or_out_of_range_vector_configuration() {
+        for (name, configure) in [
+            (
+                "RAG_VECTOR_MATCH_WEIGHT",
+                (|config: &mut Config| config.vector_match_weight = f32::INFINITY)
+                    as fn(&mut Config),
+            ),
+            (
+                "RAG_VECTOR_MATCH_DOC_WEIGHT",
+                (|config: &mut Config| config.vector_match_doc_weight = -0.01) as fn(&mut Config),
+            ),
+            (
+                "RAG_VECTOR_MATCH_MIN_SCORE",
+                (|config: &mut Config| config.vector_match_min_score = f32::NAN) as fn(&mut Config),
+            ),
+            (
+                "RAG_VECTOR_MATCH_MIN_SCORE",
+                (|config: &mut Config| config.vector_match_min_score = 0.0) as fn(&mut Config),
+            ),
+            (
+                "RAG_VECTOR_MATCH_MIN_SCORE",
+                (|config: &mut Config| config.vector_match_min_score = 1.01) as fn(&mut Config),
+            ),
+        ] {
+            let mut config = Config::test();
+            configure(&mut config);
+
+            let error = config.validate_startup().unwrap_err().to_string();
+
+            assert!(error.contains(name), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn startup_rejects_invalid_health_probe_boundaries() {
+        for (name, configure) in [
+            (
+                "RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS",
+                (|config: &mut Config| config.health_llm_probe_interval_seconds = 0)
+                    as fn(&mut Config),
+            ),
+            (
+                "RAG_HEALTH_LLM_PROBE_TTL_SECONDS",
+                (|config: &mut Config| config.health_llm_probe_ttl_seconds = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_HEALTH_LLM_MAX_STALE_SECONDS",
+                (|config: &mut Config| config.health_llm_max_stale_seconds = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_HEALTH_LLM_TIMEOUT_MS",
+                (|config: &mut Config| config.health_llm_timeout_ms = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_HEALTH_LLM_FAILURE_THRESHOLD",
+                (|config: &mut Config| config.health_llm_failure_threshold = 0) as fn(&mut Config),
+            ),
+        ] {
+            let mut config = Config::test();
+            configure(&mut config);
+
+            let error = config.validate_startup().unwrap_err().to_string();
+
+            assert!(error.contains(name), "unexpected error: {error}");
+        }
+
+        let mut inverted = Config::test();
+        inverted.health_llm_probe_ttl_seconds = 121;
+        inverted.health_llm_max_stale_seconds = 120;
+        let error = inverted.validate_startup().unwrap_err().to_string();
+        assert!(
+            error.contains("RAG_HEALTH_LLM_PROBE_TTL_SECONDS"),
+            "{error}"
+        );
+        assert!(
+            error.contains("RAG_HEALTH_LLM_MAX_STALE_SECONDS"),
+            "{error}"
         );
     }
 
@@ -2120,6 +2625,7 @@ mod tests {
     fn production_rejects_the_public_development_index_hash_secret() {
         let mut config = Config::test();
         config.run_mode = "production".to_string();
+        config.allow_ephemeral_production = true;
         config.index_hash_secret = DEVELOPMENT_INDEX_HASH_SECRET.as_bytes().to_vec();
 
         let error = config.validate_startup().unwrap_err().to_string();
@@ -2147,6 +2653,7 @@ mod tests {
 
         let mut config = Config::test();
         config.run_mode = "production".to_string();
+        config.allow_ephemeral_production = true;
         config.index_hash_secret = b"7Qv!n2$La9@Xm4#Rp8%Wd3&Ks6*Hy1+Tz5".to_vec();
         config.codex_auth_path = Some(auth_path_text.clone());
 
@@ -2278,6 +2785,7 @@ mod tests {
     fn legacy_weak_index_hash_secrets_require_an_explicit_bounded_compatibility_flag() {
         let mut config = Config::test();
         config.run_mode = "production".to_string();
+        config.allow_ephemeral_production = true;
         config.allow_unsafe_unauthenticated = false;
         config.admin_token = Some("admin-test-token".to_string());
         config.allow_legacy_weak_index_hash_secret = true;
@@ -2300,6 +2808,7 @@ mod tests {
     fn production_rejects_the_documented_placeholder_even_with_legacy_compatibility() {
         let mut config = Config::test();
         config.run_mode = "production".to_string();
+        config.allow_ephemeral_production = true;
         config.index_hash_secret = REJECTED_INDEX_HASH_SECRET_PLACEHOLDER.as_bytes().to_vec();
         config.allow_legacy_weak_index_hash_secret = true;
 
@@ -2313,6 +2822,7 @@ mod tests {
     fn production_rejects_short_or_insufficiently_varied_index_hash_secrets() {
         let mut config = Config::test();
         config.run_mode = "production".to_string();
+        config.allow_ephemeral_production = true;
 
         let short_secret = "short-but-varied-secret";
         config.index_hash_secret = short_secret.as_bytes().to_vec();
@@ -2334,6 +2844,7 @@ mod tests {
         assert!(config.validate_startup().is_ok());
 
         config.run_mode = "production".to_string();
+        config.allow_ephemeral_production = true;
         config.index_hash_secret = b"7Qv!n2$La9@Xm4#Rp8%Wd3&Ks6*Hy1+Tz5".to_vec();
         assert!(config.validate_startup().is_ok());
     }
@@ -2356,7 +2867,7 @@ mod tests {
 
             let error = config.validate_startup().unwrap_err().to_string();
 
-            assert!(error.contains("RAG_TENANT_ID must be non-empty"));
+            assert!(error.contains("RAG_TENANT_ID must contain between 1 and 256 characters"));
         }
     }
 

@@ -10,7 +10,7 @@ use axum::{
     body::{to_bytes, Body, Bytes, HttpBody},
     extract::{MatchedPath, Request, State},
     http::{
-        header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, LINK, RETRY_AFTER},
+        header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, LINK, RETRY_AFTER},
         HeaderName, HeaderValue, Method,
     },
     middleware::Next,
@@ -218,6 +218,13 @@ impl HttpBody for MetricsBody {
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
         let polled = this.inner.as_mut().poll_frame(cx);
+        if let Poll::Ready(Some(Ok(frame))) = &polled {
+            if let Some(data) = frame.data_ref() {
+                if let Some(observation) = this.observation.as_mut() {
+                    observation.add_response_bytes(data.len());
+                }
+            }
+        }
         if matches!(&polled, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
             this.observation.take();
         }
@@ -243,7 +250,19 @@ pub(crate) async fn record_metrics(
         .get::<MatchedPath>()
         .map(MatchedPath::as_str)
         .unwrap_or("unmatched");
-    let observation = metrics.begin_http_request(request.method().as_str(), route);
+    let request_bytes = request
+        .body()
+        .size_hint()
+        .exact()
+        .or_else(|| {
+            request
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    let observation = metrics.begin_http_request(request.method().as_str(), route, request_bytes);
     let response = next.run(request).await;
     let status = response.status().as_u16();
     let (parts, body) = response.into_parts();

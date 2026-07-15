@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use serde_json::{json, Value};
 
 use crate::{
@@ -79,10 +81,20 @@ async fn answer_rag_with_llm(
     is_admin: bool,
     provider_budget_key: &str,
 ) -> Result<RagAnswerResponse, ApiError> {
-    let mut answer = state
+    let retrieval_started_at = Instant::now();
+    let retrieval = state
         .store
         .answer_rag_async(state.tenant_id(), req.clone(), is_admin)
-        .await?;
+        .await;
+    state.metrics.record_rag_stage(
+        "retrieval",
+        retrieval_started_at.elapsed().as_secs_f64(),
+        retrieval.is_ok(),
+    );
+    let mut answer = retrieval?;
+    state
+        .metrics
+        .observe_rag_candidates("retrieval", answer.citations.len());
     let config = state.effective_config();
     if config.llm_provider != "none" {
         let security = state.config.provider_security_snapshot();
@@ -93,10 +105,17 @@ async fn answer_rag_with_llm(
             &security.secrets,
             state.config.llm_max_output_tokens,
         );
-        let llm = state
+        let generation_started_at = Instant::now();
+        let generation = state
             .llm_providers
             .complete_text(LlmProfile::Primary, provider_budget_key, llm_request)
-            .await?;
+            .await;
+        state.metrics.record_rag_stage(
+            "generation",
+            generation_started_at.elapsed().as_secs_f64(),
+            generation.is_ok(),
+        );
+        let llm = generation?;
         answer.answer = redact_text_for_state(state, &llm.text);
         let mut usage = json!({
             "provider": status.provider,

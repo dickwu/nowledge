@@ -2,6 +2,12 @@
 
 Synchronously ingest a multipart file upload and return the completed `IngestTaskResult`.
 
+## Handler
+
+- Rust handler: `ingest_upload_sync`
+- Route registration: `src/routes.rs::build_router`
+- Authentication: UserGuard; owner write scope required
+
 ## Multipart Fields
 
 Same fields as `POST /v1/ingest/uploads`.

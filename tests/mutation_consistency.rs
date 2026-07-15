@@ -14,7 +14,8 @@ use axum::{
     Json, Router,
 };
 use nowledge::{
-    build_router, config::WriteConsistency, models::EnsureUserEventIndexRequest, AppState, Config,
+    build_router, config::WriteConsistency, meili::settings_for,
+    models::EnsureUserEventIndexRequest, AppState, Config,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -70,13 +71,24 @@ async fn history_side_effect_failure_meili(
         .push(format!("{method} {path}"));
 
     if method == Method::GET && path.ends_with("/settings") {
+        let uid = path
+            .strip_prefix("/indexes/")
+            .and_then(|path| path.strip_suffix("/settings"))
+            .expect("settings request should contain an index UID");
+        if uid == "rag_operations" {
+            return (StatusCode::OK, Json(settings_for(uid))).into_response();
+        }
         return (StatusCode::OK, Json(json!({}))).into_response();
     }
     if method == Method::GET && path.starts_with("/indexes/") {
         let uid = path.trim_start_matches("/indexes/");
         return (
             StatusCode::OK,
-            Json(json!({ "uid": uid, "primaryKey": "id" })),
+            Json(json!({
+                "uid": uid,
+                "primaryKey": "id",
+                "createdAt": "2026-07-14T00:00:00Z"
+            })),
         )
             .into_response();
     }

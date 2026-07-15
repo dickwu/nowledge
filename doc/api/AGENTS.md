@@ -7,8 +7,8 @@
 One markdown document per HTTP endpoint exposed by `src/routes.rs::build_router`.
 Each document captures the request shape, response shape, access rules, error
 behavior, and a Mermaid flowchart of the internal call graph so callers can
-review behavior without reading Rust source. The directory currently holds 89
-endpoint files plus no index of its own (the index lives in `../README.md`).
+review behavior without reading Rust source. The index lives in
+`../README.md`, and the route-manifest test owns exact file-count coverage.
 
 ## Key Files
 Examples (one of every documented HTTP verb):
@@ -55,11 +55,8 @@ None.
   against `api_manifest.json` to detect drift from `src/routes.rs`.
 
 ### Testing Requirements
-- No automated test. Manual cross-check against the router when adding a route:
-  ```sh
-  grep -nE '\.route\("' src/routes.rs | wc -l   # should equal the number of doc files
-  ls doc/api/ | wc -l
-  ```
+- Run `cargo test --locked --test route_manifest`. It compares the canonical
+  router registry, JSON manifest, README endpoint rows, and endpoint files.
 
 ### Common Patterns
 - Authentication notes use one of `None`, `UserGuard`, `UserGuard; owner default

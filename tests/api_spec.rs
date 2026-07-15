@@ -1,4 +1,7 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, RwLock},
+};
 
 use axum::{
     body::{to_bytes, Body},
@@ -88,6 +91,8 @@ fn llm_health_app(provider: &str) -> Router {
     let mut config = Config::test();
     config.llm_provider = provider.to_string();
     config.llm_model = Some("health-model".to_string());
+    config.analysis_llm_provider = provider.to_string();
+    config.analysis_llm_model = Some("health-model".to_string());
     config.auth_users = vec![AuthUserConfig {
         token: "admin-token".to_string(),
         scope: AuthUserScope::Admin,
@@ -109,6 +114,8 @@ fn stale_llm_health_app() -> Router {
     let mut config = Config::test();
     config.llm_provider = "mock".to_string();
     config.llm_model = Some("health-model".to_string());
+    config.analysis_llm_provider = "mock".to_string();
+    config.analysis_llm_model = Some("health-model".to_string());
     config.health_llm_probe_interval_seconds = 999;
     config.health_llm_probe_ttl_seconds = 0;
     config.health_llm_max_stale_seconds = 0;
@@ -355,6 +362,68 @@ async fn spawn_codex_analysis_stub(token: &str) -> (String, Arc<RwLock<String>>)
     (format!("http://{addr}"), output)
 }
 
+async fn spawn_counting_codex_health_stub(
+    token: &str,
+) -> (String, Arc<Mutex<HashMap<String, usize>>>) {
+    #[derive(Clone)]
+    struct HealthState {
+        token: String,
+        requests_by_model: Arc<Mutex<HashMap<String, usize>>>,
+    }
+
+    async fn responses(
+        State(state): State<HealthState>,
+        headers: HeaderMap,
+        Json(request): Json<Value>,
+    ) -> impl IntoResponse {
+        let expected_authorization = format!("Bearer {}", state.token);
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_authorization.as_str())
+        );
+        let model = request["model"]
+            .as_str()
+            .expect("health probe request should include a model")
+            .to_string();
+        *state
+            .requests_by_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(model)
+            .or_default() += 1;
+        sleep(Duration::from_millis(100)).await;
+        let terminal = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "content": [{ "type": "output_text", "text": "ok" }]
+                }]
+            }
+        });
+        (
+            [(CONTENT_TYPE, "text/event-stream")],
+            format!("data: {terminal}\n\n"),
+        )
+    }
+
+    let requests_by_model = Arc::new(Mutex::new(HashMap::new()));
+    let app = Router::new()
+        .route("/responses", post(responses))
+        .with_state(HealthState {
+            token: token.to_string(),
+            requests_by_model: requests_by_model.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), requests_by_model)
+}
+
 fn event_body(owner: &str, entity: &str, text: &str) -> Value {
     json!({
         "event_type": "note.created",
@@ -533,9 +602,31 @@ async fn livez_is_minimal_process_liveness() {
 
 #[tokio::test]
 async fn operational_metrics_are_admin_only_openmetrics_and_low_cardinality() {
-    let app = authed_app();
+    let mut config = Config::test();
+    config.llm_provider = "mock".to_string();
+    config.llm_model = Some("metrics-model-must-not-be-a-label".to_string());
+    let app = authed_app_with_config(config);
     let (status, _) = call(app.clone(), Method::GET, "/livez", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
+
+    let (status, title) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/llm/title",
+        json!({ "content": "metrics-request-secret" }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{title}");
+    let (status, rag) = call_with_token(
+        app.clone(),
+        Method::POST,
+        "/v1/rag/answer",
+        json!({ "question": "metrics-rag-secret" }),
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rag}");
 
     let (status, _, _) =
         call_text_with_token(app.clone(), Method::GET, "/v1/admin/metrics", None).await;
@@ -576,8 +667,35 @@ async fn operational_metrics_are_admin_only_openmetrics_and_low_cardinality() {
     assert!(body.contains("route=\"unmatched\""), "{body}");
     assert!(body.contains("nowledge_ingest_queue_depth"), "{body}");
     assert!(body.contains("nowledge_operations"), "{body}");
+    assert!(body.contains("nowledge_http_request_bytes_total"), "{body}");
+    assert!(
+        body.contains("nowledge_http_response_bytes_total"),
+        "{body}"
+    );
+    assert!(
+        body.contains("nowledge_rag_stage_duration_seconds"),
+        "{body}"
+    );
+    assert!(body.contains("nowledge_rag_stage_candidates"), "{body}");
+    assert!(
+        body.contains("nowledge_llm_request_duration_seconds"),
+        "{body}"
+    );
+    assert!(body.contains("nowledge_llm_tokens_total"), "{body}");
+    assert!(
+        body.contains("profile=\"primary\",provider=\"mock\""),
+        "{body}"
+    );
     assert!(body.ends_with("# EOF\n"), "{body}");
-    for forbidden in ["admin-token", "u1-token", "owner-secret", "query-secret"] {
+    for forbidden in [
+        "admin-token",
+        "u1-token",
+        "owner-secret",
+        "query-secret",
+        "metrics-request-secret",
+        "metrics-rag-secret",
+        "metrics-model-must-not-be-a-label",
+    ] {
         assert!(
             !body.contains(forbidden),
             "metrics leaked {forbidden}: {body}"
@@ -604,8 +722,117 @@ async fn admin_healthz_includes_llm_health_and_usage() {
     assert_eq!(body["llm"]["provider"], "mock");
     assert_eq!(body["llm"]["auth_valid"], true);
     assert_eq!(body["llm"]["quota_state"], "available");
+    assert_eq!(body["analysis_llm"]["provider"], "mock");
+    assert_eq!(body["analysis_llm"]["auth_valid"], true);
     assert!(body.get("usage").is_some());
     assert!(body["usage"].get("history_events").is_some());
+}
+
+#[tokio::test]
+async fn same_profile_readiness_cache_is_reused_by_admin_usage() {
+    let app = llm_health_app("mock");
+    let (status, ready) = call(app.clone(), Method::GET, "/readyz", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{ready}");
+
+    let (status, usage) = call_with_token(
+        app,
+        Method::GET,
+        "/v1/usage",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{usage}");
+    assert_eq!(usage["providers"]["llm"]["status"], "ok", "{usage}");
+    assert_eq!(
+        usage["providers"]["analysis_llm"]["status"], "ok",
+        "{usage}"
+    );
+    assert_ne!(
+        usage["providers"]["analysis_llm"]["error_kind"], "not_probed",
+        "{usage}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_readiness_misses_probe_each_llm_profile_once() {
+    let token = "header.payload.signature";
+    let auth_path = std::env::temp_dir().join(format!(
+        "nowledge-ready-single-flight-{}.json",
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::write(&auth_path, json!({ "access_token": token }).to_string()).unwrap();
+    let (codex_base_url, requests_by_model) = spawn_counting_codex_health_stub(token).await;
+
+    let mut config = Config::test();
+    config.llm_provider = "codex_auth".to_string();
+    config.llm_model = Some("primary-ready-model".to_string());
+    config.analysis_llm_provider = "codex_auth".to_string();
+    config.analysis_llm_model = Some("analysis-ready-model".to_string());
+    config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
+    config.codex_base_url = codex_base_url;
+    config.health_llm_probe_interval_seconds = 60;
+    config.health_llm_timeout_ms = 2_000;
+    config.refresh_configured_secret_values();
+    let app = build_router(AppState::new(Arc::new(config)));
+    let barrier = Arc::new(tokio::sync::Barrier::new(33));
+    let mut checks = Vec::new();
+    for _ in 0..32 {
+        let app = app.clone();
+        let barrier = barrier.clone();
+        checks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            call(app, Method::GET, "/readyz", Value::Null).await
+        }));
+    }
+    barrier.wait().await;
+    for check in checks {
+        let (status, body) = check.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ready"], true, "{body}");
+    }
+
+    let requests_by_model = requests_by_model
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(requests_by_model.get("primary-ready-model"), Some(&1));
+    assert_eq!(requests_by_model.get("analysis-ready-model"), Some(&1));
+    assert_eq!(requests_by_model.len(), 2, "{requests_by_model:?}");
+    drop(requests_by_model);
+    let _ = std::fs::remove_file(auth_path);
+}
+
+#[tokio::test]
+async fn analysis_llm_failure_makes_readiness_unhealthy_even_when_primary_is_healthy() {
+    let mut config = Config::test();
+    config.llm_provider = "mock".to_string();
+    config.llm_model = Some("primary-health-model".to_string());
+    config.analysis_llm_provider = "mock_auth_failure".to_string();
+    config.analysis_llm_model = Some("analysis-health-model".to_string());
+    config.auth_users = vec![AuthUserConfig {
+        token: "admin-token".to_string(),
+        scope: AuthUserScope::Admin,
+        roles: vec!["admin".to_string()],
+    }];
+    let app = build_router(AppState::new(Arc::new(config)));
+
+    let (status, ready) = call(app.clone(), Method::GET, "/readyz", Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{ready}");
+    assert_eq!(ready["ready"], false);
+    assert_eq!(ready["dependencies"]["llm"], "ok");
+    assert_eq!(ready["dependencies"]["analysis_llm"], "unhealthy");
+
+    let (status, detail) = call_with_token(
+        app,
+        Method::GET,
+        "/healthz",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{detail}");
+    assert_eq!(detail["llm"]["status"], "ok");
+    assert_eq!(detail["analysis_llm"]["auth_valid"], false);
 }
 
 #[tokio::test]

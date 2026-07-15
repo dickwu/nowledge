@@ -7,6 +7,7 @@ use sha2::Sha256;
 
 use crate::{
     app::AuthState,
+    audit_service::DenialPrincipalIdentity,
     config::{AuthUserConfig, AuthUserScope, BearerTokenScope},
     error::ApiError,
     request_context::{self, RequestPrincipal, RequestPrincipalScope},
@@ -132,6 +133,17 @@ impl Principal {
         hmac_hex(index_hash_secret, "rate-limit-principal", &identity, 32)
     }
 
+    pub(crate) fn denial_audit_identity(
+        &self,
+        index_hash_secret: &[u8],
+    ) -> DenialPrincipalIdentity {
+        // Denial admission intentionally shares the credential-independent
+        // logical identity used by the HTTP limiter. Tokens, tenant IDs, and
+        // owner IDs never become map keys in the audit recorder.
+        DenialPrincipalIdentity::from_hmac_hex(self.rate_limit_key(index_hash_secret))
+            .expect("the logical principal HMAC has the required bounded format")
+    }
+
     /// Stable, non-secret identity for application-scoped upstream budgets.
     /// It intentionally reuses the authenticated principal scope but a
     /// distinct HMAC domain so provider accounting cannot reveal raw owner or
@@ -183,8 +195,7 @@ where
                     parts.uri.path(),
                     "authentication_failed",
                     &error,
-                )
-                .await;
+                );
                 return Err(error);
             }
         };
@@ -198,8 +209,7 @@ where
                     parts.uri.path(),
                     "company_writer_required",
                     &error,
-                )
-                .await;
+                );
                 return Err(error);
             }
         }
@@ -227,8 +237,7 @@ where
                     parts.uri.path(),
                     "authentication_failed",
                     &error,
-                )
-                .await;
+                );
                 return Err(error);
             }
         };
@@ -241,8 +250,7 @@ where
                 parts.uri.path(),
                 "admin_required",
                 &error,
-            )
-            .await;
+            );
             return Err(error);
         }
         record_request_principal(&principal, &auth_state);
@@ -502,5 +510,15 @@ mod tests {
             first.rate_limit_key(secret),
             principal(PrincipalScope::TenantService, &["user"]).rate_limit_key(secret)
         );
+
+        let denial_identity = first.denial_audit_identity(secret);
+        assert_eq!(denial_identity.as_str(), first.rate_limit_key(secret));
+        assert_eq!(denial_identity.as_str().len(), 32);
+        assert!(denial_identity
+            .as_str()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!denial_identity.as_str().contains("tenant"));
+        assert!(!denial_identity.as_str().contains("u1"));
     }
 }

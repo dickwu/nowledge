@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use crate::{
     app::AppState,
     auth::Principal,
+    config::Config,
     error::ApiError,
     llm::{LlmHealthProbeResult, LlmProfile, LlmProviderRegistry, LlmRequest},
     models::{
@@ -22,7 +23,8 @@ pub(crate) struct HealthPayload {
 struct OperationalCheck {
     meili: Value,
     hydration: HydrationReport,
-    llm: LlmHealthProbeResult,
+    primary_llm: LlmHealthProbeResult,
+    analysis_llm: LlmHealthProbeResult,
     parser: Value,
     ready: bool,
     status: &'static str,
@@ -55,7 +57,8 @@ impl HealthService {
             "store_backend": state.store.backend_name(),
             "meilisearch": sanitize_dependency_health(check.meili, "Meilisearch health check failed"),
             "hydration": check.hydration,
-            "llm": llm_health_json(&check.llm, &state.llm_providers),
+            "llm": llm_health_json(&check.primary_llm, &state.llm_providers),
+            "analysis_llm": llm_health_json(&check.analysis_llm, &state.llm_providers),
             "parser": sanitize_dependency_health(check.parser, "parser health check failed"),
             "usage": usage
         });
@@ -69,16 +72,10 @@ impl HealthService {
         let check = operational_check(state).await;
         let meili_status = dependency_status(&check.meili);
         let parser_status = dependency_status(&check.parser);
-        let llm_status = if check.llm.status == "unhealthy"
-            || check.llm.quota_state == "exhausted"
-            || (!check.llm.auth_valid && state.config.health_require_llm)
-        {
-            "unhealthy"
-        } else if check.llm.status == "degraded" || check.llm.stale {
-            "degraded"
-        } else {
-            "ok"
-        };
+        let primary_llm_status =
+            llm_dependency_status(&check.primary_llm, state.config.health_require_llm);
+        let analysis_llm_status =
+            llm_dependency_status(&check.analysis_llm, state.config.health_require_llm);
         HealthPayload {
             ready: check.ready,
             body: json!({
@@ -89,7 +86,8 @@ impl HealthService {
                 "dependencies": {
                     "meilisearch": meili_status,
                     "hydration": check.hydration.status,
-                    "llm": llm_status,
+                    "llm": primary_llm_status,
+                    "analysis_llm": analysis_llm_status,
                     "parser": parser_status
                 }
             }),
@@ -109,35 +107,26 @@ impl HealthService {
         if let Some(providers) = snapshot.get_mut("providers").and_then(Value::as_object_mut) {
             if is_admin {
                 let config = state.effective_config();
-                let llm =
+                let llm = state
+                    .llm_health
+                    .cached(&config)
+                    .unwrap_or_else(|| unprobed_llm_health(&config));
+                let analysis_config = config.analysis_llm_config();
+                let profiles_match = config.llm_provider == analysis_config.llm_provider
+                    && config.llm_model == analysis_config.llm_model
+                    && config.llm_reasoning_effort == analysis_config.llm_reasoning_effort;
+                let analysis_llm = if profiles_match {
+                    llm.clone()
+                } else {
                     state
-                        .llm_health
-                        .cached(&config)
-                        .unwrap_or_else(|| LlmHealthProbeResult {
-                            provider: config.llm_provider.clone(),
-                            model: config
-                                .llm_model
-                                .clone()
-                                .unwrap_or_else(|| "none".to_string()),
-                            reasoning_effort: config.llm_reasoning_effort.clone(),
-                            status: "unknown".to_string(),
-                            can_call: false,
-                            auth_valid: false,
-                            quota_state: "unknown".to_string(),
-                            rate_limit_state: "unknown".to_string(),
-                            checked_at: chrono::Utc::now(),
-                            latency_ms: 0,
-                            stale: true,
-                            age_seconds: 0,
-                            consecutive_failures: 0,
-                            rate_limits: crate::llm::RateLimitSnapshot::default(),
-                            error_kind: Some("not_probed".to_string()),
-                            message: Some("LLM health has not been probed yet".to_string()),
-                        });
+                        .analysis_llm_health
+                        .cached(&analysis_config)
+                        .unwrap_or_else(|| unprobed_llm_health(&analysis_config))
+                };
                 providers.insert(
                     "meilisearch".to_string(),
                     json!({
-                        "configured": state.meili.configured(),
+                        "configured": state.runtime_meili.configured(),
                         "store_backend": state.store.backend_name()
                     }),
                 );
@@ -160,6 +149,10 @@ impl HealthService {
                 providers.insert(
                     "llm".to_string(),
                     llm_health_json(&llm, &state.llm_providers),
+                );
+                providers.insert(
+                    "analysis_llm".to_string(),
+                    llm_health_json(&analysis_llm, &state.llm_providers),
                 );
             } else {
                 providers.remove("nowledge_api");
@@ -254,7 +247,7 @@ impl DiagnosticsService {
 
 async fn operational_check(state: &AppState) -> OperationalCheck {
     let config = state.effective_config();
-    let meili = state.meili.health_status().await;
+    let meili = state.runtime_meili.health_status().await;
     let hydration = state
         .store
         .hydration_report()
@@ -267,25 +260,47 @@ async fn operational_check(state: &AppState) -> OperationalCheck {
             completed_at: None,
             domains: Default::default(),
         });
-    let llm = state
-        .llm_health
-        .check_with_registry(&config, &state.llm_providers)
-        .await;
+    let analysis_config = config.analysis_llm_config();
+    let profiles_match = config.llm_provider == analysis_config.llm_provider
+        && config.llm_model == analysis_config.llm_model
+        && config.llm_reasoning_effort == analysis_config.llm_reasoning_effort;
+    let (primary_llm, analysis_llm) = if profiles_match {
+        let primary = state
+            .llm_health
+            .check_with_registry(&config, &state.llm_providers)
+            .await;
+        (primary.clone(), primary)
+    } else {
+        tokio::join!(
+            state
+                .llm_health
+                .check_with_registry(&config, &state.llm_providers),
+            state
+                .analysis_llm_health
+                .check_with_registry(&analysis_config, &state.llm_providers)
+        )
+    };
     let parser = state.store.parser_health_status(&config).await;
     let meili_healthy = meili
         .get("healthy")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let llm_unhealthy = llm.status == "unhealthy"
-        || llm.quota_state == "exhausted"
-        || (!llm.auth_valid && config.health_require_llm);
+    let primary_llm_unhealthy = llm_is_unhealthy(&primary_llm, config.health_require_llm);
+    let analysis_llm_unhealthy = llm_is_unhealthy(&analysis_llm, config.health_require_llm);
     let parser_unhealthy = config.parser_provider == "mineru"
         && !parser
             .get("healthy")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let degraded = llm.status == "degraded" || llm.stale;
-    let ready = meili_healthy && hydration.ready && !llm_unhealthy && !parser_unhealthy;
+    let degraded = primary_llm.status == "degraded"
+        || primary_llm.stale
+        || analysis_llm.status == "degraded"
+        || analysis_llm.stale;
+    let ready = meili_healthy
+        && hydration.ready
+        && !primary_llm_unhealthy
+        && !analysis_llm_unhealthy
+        && !parser_unhealthy;
     let status = if !ready {
         "unhealthy"
     } else if degraded {
@@ -296,7 +311,8 @@ async fn operational_check(state: &AppState) -> OperationalCheck {
     OperationalCheck {
         meili,
         hydration,
-        llm,
+        primary_llm,
+        analysis_llm,
         parser,
         ready,
         status,
@@ -306,10 +322,23 @@ async fn operational_check(state: &AppState) -> OperationalCheck {
 pub(crate) async fn llm_health_false_ready(state: &AppState) -> bool {
     let check = operational_check(state).await;
     let config = state.effective_config();
-    let llm_unhealthy = check.llm.status == "unhealthy"
-        || check.llm.quota_state == "exhausted"
-        || (!check.llm.auth_valid && config.health_require_llm);
+    let llm_unhealthy = llm_is_unhealthy(&check.primary_llm, config.health_require_llm)
+        || llm_is_unhealthy(&check.analysis_llm, config.health_require_llm);
     llm_health_false_ready_signal(check.ready, llm_unhealthy)
+}
+
+fn llm_is_unhealthy(llm: &LlmHealthProbeResult, required: bool) -> bool {
+    llm.status == "unhealthy" || llm.quota_state == "exhausted" || (!llm.auth_valid && required)
+}
+
+fn llm_dependency_status(llm: &LlmHealthProbeResult, required: bool) -> &'static str {
+    if llm_is_unhealthy(llm, required) {
+        "unhealthy"
+    } else if llm.status == "degraded" || llm.stale {
+        "degraded"
+    } else {
+        "ok"
+    }
 }
 
 fn llm_health_false_ready_signal(ready: bool, llm_unhealthy: bool) -> bool {
@@ -361,6 +390,30 @@ fn llm_health_json(llm: &LlmHealthProbeResult, registry: &LlmProviderRegistry) -
         "error_kind": &llm.error_kind,
         "message": public_message
     })
+}
+
+fn unprobed_llm_health(config: &Config) -> LlmHealthProbeResult {
+    LlmHealthProbeResult {
+        provider: config.llm_provider.clone(),
+        model: config
+            .llm_model
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+        reasoning_effort: config.llm_reasoning_effort.clone(),
+        status: "unknown".to_string(),
+        can_call: false,
+        auth_valid: false,
+        quota_state: "unknown".to_string(),
+        rate_limit_state: "unknown".to_string(),
+        checked_at: chrono::Utc::now(),
+        latency_ms: 0,
+        stale: true,
+        age_seconds: 0,
+        consecutive_failures: 0,
+        rate_limits: crate::llm::RateLimitSnapshot::default(),
+        error_kind: Some("not_probed".to_string()),
+        message: Some("LLM health has not been probed yet".to_string()),
+    }
 }
 
 fn compact_usage_summary(usage: Value) -> Value {

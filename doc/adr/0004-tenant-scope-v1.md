@@ -114,7 +114,8 @@ Legacy-row cleanup is a later, separately reviewed migration.
 ## Operator procedure
 
 Build the maintenance binary from the exact application revision and provide
-`RAG_MEILI_URL` plus `RAG_MEILI_API_KEY` when the server requires one. Store
+`RAG_MEILI_URL` plus a maintenance-scoped `RAG_MEILI_ADMIN_API_KEY` with the
+required temporary document read/write actions. Store
 artifacts on encrypted operator storage; the plan contains full document
 copies and is written with mode `0600` on Unix.
 

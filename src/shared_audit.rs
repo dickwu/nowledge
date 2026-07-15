@@ -78,7 +78,7 @@ where
         .await
 }
 
-pub(crate) async fn audit_shared_write_denial(
+pub(crate) fn audit_shared_write_denial(
     principal: Option<&Principal>,
     state: &AuthState,
     method: &Method,
@@ -89,17 +89,17 @@ pub(crate) async fn audit_shared_write_denial(
     let Some(target) = shared_mutation_audit_target(method, path) else {
         return;
     };
-    state
-        .audit_recorder()
-        .record_denial(
-            principal_scope(principal),
-            principal.and_then(Principal::owner_user_id),
-            target.action,
-            &target.resource_identity,
-            reason,
-            error,
-        )
-        .await;
+    let denial_identity = principal
+        .map(|principal| principal.denial_audit_identity(&state.config().index_hash_secret));
+    state.audit_recorder().record_denial(
+        principal_scope(principal),
+        denial_identity.as_ref(),
+        principal.and_then(Principal::owner_user_id),
+        target.action,
+        &target.resource_identity,
+        reason,
+        error,
+    );
 }
 
 fn shared_mutation_audit_target(method: &Method, path: &str) -> Option<SharedMutationAuditTarget> {
@@ -109,18 +109,57 @@ fn shared_mutation_audit_target(method: &Method, path: &str) -> Option<SharedMut
             Some(company_doc_preflight_target())
         }
         (&Method::POST, ["v1", "state", "company-docs", source_id, "revisions"]) => {
-            Some(company_doc_create_revision_target(source_id))
+            let source_id = percent_decode_path_segment(source_id);
+            Some(company_doc_create_revision_target(&source_id))
         }
         (
             &Method::POST,
             ["v1", "state", "company-docs", source_id, "revisions", revision_id, "activate"],
-        ) => Some(company_doc_activate_revision_target(source_id, revision_id)),
+        ) => {
+            let source_id = percent_decode_path_segment(source_id);
+            let revision_id = percent_decode_path_segment(revision_id);
+            Some(company_doc_activate_revision_target(
+                &source_id,
+                &revision_id,
+            ))
+        }
         (&Method::PUT, ["v1", "state", "structured", "datasets", dataset_key]) => {
-            Some(dataset_upsert_schema_target(dataset_key))
+            let dataset_key = percent_decode_path_segment(dataset_key);
+            Some(dataset_upsert_schema_target(&dataset_key))
         }
         (&Method::DELETE, ["v1", "state", "company-docs", source_id]) => {
-            Some(company_doc_delete_target(source_id))
+            let source_id = percent_decode_path_segment(source_id);
+            Some(company_doc_delete_target(&source_id))
         }
+        _ => None,
+    }
+}
+
+fn percent_decode_path_segment(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| segment.to_string())
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
 }
@@ -165,5 +204,24 @@ mod tests {
             length_prefixed_identity(&["a:b", "c"]),
             length_prefixed_identity(&["a", "b:c"])
         );
+    }
+
+    #[test]
+    fn denial_targets_match_axum_decoded_path_identities() {
+        for (encoded, decoded) in [
+            ("source%41", "sourceA"),
+            ("%E7%9F%A5%E8%AF%86", "知识"),
+            ("source%2Fchild", "source/child"),
+        ] {
+            let target = shared_mutation_audit_target(
+                &Method::POST,
+                &format!("/v1/state/company-docs/{encoded}/revisions"),
+            )
+            .unwrap();
+            assert_eq!(
+                target.resource_identity,
+                company_doc_create_revision_target(decoded).resource_identity
+            );
+        }
     }
 }

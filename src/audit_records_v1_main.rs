@@ -86,11 +86,9 @@ fn ensure_verification_ready(ready: bool, failures: &[String]) -> Result<()> {
 }
 
 fn configured_admin() -> Result<MeiliAdmin> {
-    let admin = MeiliAdmin::from_config(&Config::from_env());
-    if !admin.configured() {
-        bail!("RAG_MEILI_URL is required for audit_records_v1 maintenance");
-    }
-    Ok(admin)
+    let config = Config::from_env();
+    config.validate_meili_maintenance()?;
+    Ok(MeiliAdmin::from_admin_config(&config))
 }
 
 #[derive(Debug)]

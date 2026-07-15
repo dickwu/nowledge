@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::Instant};
 
 use serde_json::{json, Value};
 
@@ -22,10 +22,20 @@ impl RagStreamService {
         provider_budget_key: &str,
         request_id: &str,
     ) -> Result<RagStreamSession, ApiError> {
-        let answer = state
+        let retrieval_started_at = Instant::now();
+        let retrieval = state
             .store
             .answer_rag_async(state.tenant_id(), req.clone(), is_admin)
-            .await?;
+            .await;
+        state.metrics.record_rag_stage(
+            "retrieval",
+            retrieval_started_at.elapsed().as_secs_f64(),
+            retrieval.is_ok(),
+        );
+        let answer = retrieval?;
+        state
+            .metrics
+            .observe_rag_candidates("retrieval", answer.citations.len());
         let status = state.llm_providers.status(LlmProfile::Primary).await;
         let grounded = !answer.citations.is_empty();
         let backend = state.store.backend_name().to_string();

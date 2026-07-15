@@ -128,7 +128,10 @@ async fn prepare_audit_records_index(config: &Config) -> Result<(), String> {
     audit_records_v1::apply_plan(&admin, &plan, false)
         .await
         .map_err(|error| format!("audit migration apply failed: {error}"))?;
-    let verification = audit_records_v1::verify_plan(&admin, &plan)
+    let verification_plan = audit_records_v1::create_plan(&admin)
+        .await
+        .map_err(|error| format!("post-create audit migration planning failed: {error}"))?;
+    let verification = audit_records_v1::verify_plan(&admin, &verification_plan)
         .await
         .map_err(|error| format!("audit migration verify failed: {error}"))?;
     if !verification.ready {
@@ -735,20 +738,28 @@ async fn meili_persists_final_shared_mutation_and_auth_denial_audits_without_raw
             ));
         }
 
-        let response: nowledge::meili::SearchResponse<Value> = admin
-            .search(
-                "rag_audit_records",
-                json!({
-                    "q": "",
-                    "limit": 10,
-                    "filter": TenantFilter::new(&tenant_id)
-                        .map_err(|error| format!("audit tenant filter failed: {error}"))?
-                        .finish(),
-                    "sort": ["occurred_at:asc", "id:asc"]
-                }),
-            )
-            .await
-            .map_err(|error| format!("audit search failed: {error}"))?;
+        let audit_filter = TenantFilter::new(&tenant_id)
+            .map_err(|error| format!("audit tenant filter failed: {error}"))?
+            .finish();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let response: nowledge::meili::SearchResponse<Value> = loop {
+            let response = admin
+                .search(
+                    "rag_audit_records",
+                    json!({
+                        "q": "",
+                        "limit": 10,
+                        "filter": audit_filter,
+                        "sort": ["occurred_at:asc", "id:asc"]
+                    }),
+                )
+                .await
+                .map_err(|error| format!("audit search failed: {error}"))?;
+            if response.hits.len() == 2 || tokio::time::Instant::now() >= deadline {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
         if response.hits.len() != 2 {
             return Err(format!(
                 "expected one finalized mutation and one denial, got {:?}",

@@ -2,8 +2,6 @@
 
 This directory contains one standalone English document for every HTTP API registered in `src/routes.rs::build_router`.
 
-Total documented APIs: 89.
-
 Each endpoint file includes request parameters, response fields, access rules, and a Mermaid internal logic call graph.
 
 ## Retrieval and Source Documents

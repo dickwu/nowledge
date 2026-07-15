@@ -41,8 +41,10 @@ Ignored and excluded from AGENTS.md generation: `target/` (build output),
   excludes local deployment scripts and runtime artifacts.
 - Default bind address is `127.0.0.1:14242`. Override with `RAG_HOST` / `RAG_PORT`.
 - Storage backend is `memory` by default. Set `RAG_STORE_BACKEND=meili` plus
-  `RAG_MEILI_URL` (and `RAG_MEILI_API_KEY` if the server is keyed) to mirror
-  writes to Meilisearch and search per-user event indexes through Meilisearch.
+  `RAG_MEILI_URL` to use Meilisearch. Production also requires distinct
+  least-privilege `RAG_MEILI_API_KEY` (runtime document/search) and
+  `RAG_MEILI_ADMIN_API_KEY` (managed index/settings) credentials, with pinned
+  `createdAt` identities for the durable operations and audit indexes.
 - Auth modes: `RAG_BEARER_TOKEN`, `RAG_ADMIN_TOKEN`, or a comma-separated
   `RAG_AUTH_USERS=owner:token:role|role` list. Production mode requires one of
   these unless `RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true` is set explicitly.
@@ -59,9 +61,11 @@ Ignored and excluded from AGENTS.md generation: `target/` (build output),
 - Default verify gauntlet:
   ```sh
   cargo fmt --check
-  cargo clippy --all-targets -- -D warnings
-  cargo check
-  cargo test
+  cargo clippy --locked --all-targets -- -D warnings
+  cargo check --locked --all-targets
+  cargo test --locked --test route_manifest
+  cargo test --locked
+  cargo package --locked
   ```
 - Optional Meili integration tests are gated by `RAG_TEST_MEILI_URL`
   (and `RAG_TEST_MEILI_API_KEY` when the server requires a key):
@@ -70,12 +74,12 @@ Ignored and excluded from AGENTS.md generation: `target/` (build output),
   `cargo test --test mineru_integration`.
 - CI (`.github/workflows/ci.yml`) runs locked stable quality/package gates,
   checks Rust 1.88 compatibility, audits RustSec advisories, and applies the
-  `cargo-deny` dependency policy on every push/PR.
+  `cargo-deny` dependency policy on every push/PR and on a weekly schedule.
 
 ### Common Patterns
 - One axum `Router` built in `src/routes.rs::build_router`, shared `AppState`
-  composed of `Config`, `Store`, `MeiliAdmin`, `LlmHealthProbe`, and
-  `IngestTaskManager`.
+  composed of `Config`, `Store`, `MeiliAdmin`, provider health/runtime state,
+  `IngestTaskManager`, protected metrics, and a narrow audit recorder.
 - All errors flow through `error::ApiError` and serialize as a single
   `{ "error": { "code", "message", "details" } }` envelope.
 - ContextFS URIs use the `ctx://` scheme; `util::ancestor_uris` walks parent
@@ -100,6 +104,7 @@ Ignored and excluded from AGENTS.md generation: `target/` (build output),
 - `turbovec` 0.9 — TurboQuant quantized vector index behind
   `src/vector_match.rs` hybrid document matching. Links OpenBLAS on Linux
   (CI and Linux hosts need `libopenblas-dev`) and Accelerate on macOS.
+- `prometheus-client` 0.25 — OpenMetrics encoding and bounded process metrics.
 - `thiserror` 2, `anyhow` 1, and `secrecy` 0.10 — supporting.
 
 ### Runtime Services

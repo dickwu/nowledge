@@ -2,6 +2,12 @@
 
 Return the stored-manifest before/after eval delta for a harness change.
 
+## Handler
+
+- Rust handler: `get_harness_change_delta`
+- Route registration: `src/routes.rs::build_router`
+- Authentication: AdminGuard required
+
 ## Response
 
 `EvalDeltaReport`.

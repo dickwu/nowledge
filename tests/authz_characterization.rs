@@ -517,6 +517,7 @@ fn production_rejects_ambiguous_or_incomplete_legacy_bearer_scope() {
     ambiguous.run_mode = "production".to_string();
     ambiguous.index_hash_secret = STRONG_INDEX_HASH_SECRET.to_vec();
     ambiguous.allow_unsafe_unauthenticated = false;
+    ambiguous.allow_ephemeral_production = true;
     let error = ambiguous.validate_startup().unwrap_err().to_string();
     assert!(error.contains("RAG_BEARER_TOKEN requires"), "{error}");
 
@@ -524,6 +525,7 @@ fn production_rejects_ambiguous_or_incomplete_legacy_bearer_scope() {
     owner_without_id.run_mode = "production".to_string();
     owner_without_id.index_hash_secret = STRONG_INDEX_HASH_SECRET.to_vec();
     owner_without_id.allow_unsafe_unauthenticated = false;
+    owner_without_id.allow_ephemeral_production = true;
     let error = owner_without_id.validate_startup().unwrap_err().to_string();
     assert!(
         error.contains("requires RAG_BEARER_TOKEN_OWNER_USER_ID"),
@@ -535,6 +537,7 @@ fn production_rejects_ambiguous_or_incomplete_legacy_bearer_scope() {
     explicit_service.run_mode = "production".to_string();
     explicit_service.index_hash_secret = STRONG_INDEX_HASH_SECRET.to_vec();
     explicit_service.allow_unsafe_unauthenticated = false;
+    explicit_service.allow_ephemeral_production = true;
     explicit_service.validate_startup().unwrap();
 }
 
@@ -909,6 +912,8 @@ async fn healthz_requires_admin_and_retains_detailed_admin_diagnostics() {
     let mut config = characterized_config();
     config.llm_provider = "mock".to_string();
     config.llm_model = Some("health-model".to_string());
+    config.analysis_llm_provider = "mock".to_string();
+    config.analysis_llm_model = Some("analysis-health-model".to_string());
     let app = build_router(AppState::new(Arc::new(config)));
 
     let (status, body) = call(app.clone(), Method::GET, "/healthz", Value::Null, None).await;
@@ -941,6 +946,7 @@ async fn production_admin_token_accesses_healthz_without_granting_owner_admin_sc
     config.run_mode = "production".to_string();
     config.index_hash_secret = STRONG_INDEX_HASH_SECRET.to_vec();
     config.allow_unsafe_unauthenticated = false;
+    config.allow_ephemeral_production = true;
     config.admin_token = Some(PRODUCTION_ADMIN_TOKEN.to_string());
     config.auth_users = vec![auth_user(
         OWNER_U1_TOKEN,
@@ -951,6 +957,8 @@ async fn production_admin_token_accesses_healthz_without_granting_owner_admin_sc
     )];
     config.llm_provider = "mock".to_string();
     config.llm_model = Some("health-model".to_string());
+    config.analysis_llm_provider = "mock".to_string();
+    config.analysis_llm_model = Some("analysis-health-model".to_string());
     config.validate_startup().unwrap();
     let app = build_router(AppState::new(Arc::new(config)));
 

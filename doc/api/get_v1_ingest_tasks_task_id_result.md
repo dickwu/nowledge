@@ -2,6 +2,12 @@
 
 Return the completed `IngestTaskResult` for a visible ingest task.
 
+## Handler
+
+- Rust handler: `get_ingest_task_result`
+- Route registration: `src/routes.rs::build_router`
+- Authentication: UserGuard; task owner scope enforced
+
 ## Query
 
 | Field | Type | Notes |

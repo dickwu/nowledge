@@ -6,12 +6,12 @@
 ## Purpose
 GitHub Actions workflow definitions. The Rust CI workflow runs independent
 quality, MSRV, advisory, and dependency-policy jobs on every pull request and
-on every push to `main` or `master`.
+on every push to `main` or `master`, plus a weekly scheduled security refresh.
 
 ## Key Files
 | File | Description |
 |------|-------------|
-| `ci.yml` | Rust CI pipeline. The stable job runs locked fmt, clippy, all-target check, route-manifest, full-test, and package gates; separate jobs check Rust 1.88, RustSec advisories, and `cargo-deny`. Triggers: `pull_request` and `push` to `main` or `master`. |
+| `ci.yml` | Rust CI pipeline. The stable job runs locked fmt, clippy, all-target check, route-manifest, full-test, and package gates; separate jobs check Rust 1.88, RustSec advisories, and `cargo-deny`. Triggers: `pull_request`, `push` to `main` or `master`, and a weekly schedule. |
 
 ## Subdirectories
 None.

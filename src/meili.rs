@@ -1,7 +1,11 @@
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, RwLock},
+    time::Instant,
+};
 
 use tokio::time::{sleep, timeout, Duration};
 
@@ -41,12 +45,34 @@ pub const FIXED_INDEXES: &[&str] = &[
 
 const MEILI_TASK_WAIT_ATTEMPTS: usize = 600;
 const MEILI_TASK_WAIT_INTERVAL_MS: u64 = 100;
+const DURABLE_FIXED_INDEXES: [&str; 2] = ["rag_operations", "rag_audit_records"];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableIndexIdentity {
+    uid: String,
+    primary_key: String,
+    created_at: String,
+}
+
+#[derive(Clone)]
 pub struct MeiliAdmin {
     url: Option<String>,
     api_key: Option<String>,
     client: reqwest::Client,
+    durable_index_identities: Arc<RwLock<BTreeMap<String, DurableIndexIdentity>>>,
+    require_captured_durable_identities: bool,
+    allow_initial_provision: bool,
+    expected_durable_created_at: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for MeiliAdmin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MeiliAdmin")
+            .field("configured", &self.url.is_some())
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -79,11 +105,290 @@ pub struct DocumentPage {
 
 impl MeiliAdmin {
     pub fn from_config(config: &Config) -> Self {
+        Self::with_key(
+            config,
+            config.meili_api_key.clone(),
+            Arc::new(RwLock::new(BTreeMap::new())),
+        )
+    }
+
+    pub fn from_admin_config(config: &Config) -> Self {
+        Self::with_key(
+            config,
+            Self::admin_api_key(config),
+            Arc::new(RwLock::new(BTreeMap::new())),
+        )
+    }
+
+    pub(crate) fn pair_from_config(config: &Config) -> (Self, Self) {
+        let identities = Arc::new(RwLock::new(BTreeMap::new()));
+        let runtime = Self::with_key(config, config.meili_api_key.clone(), identities.clone());
+        let index_admin = Self::with_key(config, Self::admin_api_key(config), identities);
+        (runtime, index_admin)
+    }
+
+    fn admin_api_key(config: &Config) -> Option<String> {
+        match (
+            config.meili_admin_api_key.as_ref(),
+            config.run_mode.as_str(),
+        ) {
+            (Some(admin_key), _) => Some(admin_key.clone()),
+            (None, "development" | "test") => config.meili_api_key.clone(),
+            (None, _) => None,
+        }
+    }
+
+    fn with_key(
+        config: &Config,
+        api_key: Option<String>,
+        durable_index_identities: Arc<RwLock<BTreeMap<String, DurableIndexIdentity>>>,
+    ) -> Self {
+        let expected_durable_created_at = [
+            (
+                "rag_operations",
+                config.meili_operations_index_created_at.as_ref(),
+            ),
+            (
+                "rag_audit_records",
+                config.meili_audit_index_created_at.as_ref(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(uid, created_at)| {
+            created_at.map(|created_at| (uid.to_string(), created_at.clone()))
+        })
+        .collect();
         Self {
             url: config.meili_url.clone(),
-            api_key: config.meili_api_key.clone(),
+            api_key,
             client: reqwest::Client::new(),
+            durable_index_identities,
+            require_captured_durable_identities: config.run_mode == "production",
+            allow_initial_provision: config.meili_allow_initial_provision,
+            expected_durable_created_at,
         }
+    }
+
+    /// Reconcile the managed index set without mutating a fully provisioned
+    /// backend until its durable deployment identities have been validated.
+    pub async fn prepare_for_startup(&self) -> Result<BootstrapResult, ApiError> {
+        self.preflight_durable_index_pins().await?;
+        let bootstrap = self.bootstrap(false).await?;
+        self.capture_durable_index_identities().await?;
+        Ok(bootstrap)
+    }
+
+    async fn preflight_durable_index_pins(&self) -> Result<(), ApiError> {
+        if self.url.is_none() {
+            return Ok(());
+        }
+
+        // Production defaults to requiring durable identity pins. The sole
+        // exception is an explicitly approved first provision after every
+        // managed index has been observed missing through read-only requests.
+        if self.allow_initial_provision
+            && self.expected_durable_created_at.is_empty()
+            && self.meili_instance_is_empty().await?
+        {
+            return Ok(());
+        }
+
+        if !self.require_captured_durable_identities && self.expected_durable_created_at.is_empty()
+        {
+            return Ok(());
+        }
+
+        for uid in DURABLE_FIXED_INDEXES {
+            let Some(expected_created_at) = self.expected_durable_created_at.get(uid) else {
+                if self.require_captured_durable_identities {
+                    return Err(ApiError::Upstream(format!(
+                        "Meilisearch durable index {uid} deployment identity pin is missing; refusing startup reconciliation"
+                    )));
+                }
+                continue;
+            };
+            let identity = self.read_durable_index_identity(uid).await?;
+            if &identity.created_at != expected_created_at {
+                return Err(ApiError::Upstream(format!(
+                    "Meilisearch durable index {uid} does not match the pinned deployment identity"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn meili_instance_is_empty(&self) -> Result<bool, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(true);
+        };
+        let response = self
+            .client
+            .get(format!("{}/indexes", url.trim_end_matches('/')))
+            .headers(self.headers()?)
+            .query(&[("limit", 1_usize)])
+            .send()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(ApiError::Upstream(format!(
+                "failed to prove that the Meilisearch instance is empty: {}",
+                response.status()
+            )));
+        }
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        let total = body.get("total").and_then(Value::as_u64).ok_or_else(|| {
+            ApiError::Upstream(
+                "Meilisearch index listing omitted a valid total; refusing initial provision"
+                    .to_string(),
+            )
+        })?;
+        let results = body
+            .get("results")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ApiError::Upstream(
+                    "Meilisearch index listing omitted valid results; refusing initial provision"
+                        .to_string(),
+                )
+            })?;
+        Ok(total == 0 && results.is_empty())
+    }
+
+    pub async fn capture_durable_index_identities(&self) -> Result<(), ApiError> {
+        if self.url.is_none() {
+            return Ok(());
+        }
+        let mut captured = BTreeMap::new();
+        for uid in DURABLE_FIXED_INDEXES {
+            let identity = self.read_stable_durable_index_identity(uid).await?;
+            if let Some(expected_created_at) = self.expected_durable_created_at.get(uid) {
+                if &identity.created_at != expected_created_at {
+                    return Err(ApiError::Upstream(format!(
+                        "Meilisearch durable index {uid} does not match the pinned deployment identity"
+                    )));
+                }
+            }
+            captured.insert(uid.to_string(), identity);
+        }
+        *self
+            .durable_index_identities
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = captured;
+        Ok(())
+    }
+
+    pub async fn verify_durable_index_for_write(&self, uid: &str) -> Result<(), ApiError> {
+        if !DURABLE_FIXED_INDEXES.contains(&uid) || self.url.is_none() {
+            return Ok(());
+        }
+        let current = self.read_stable_durable_index_identity(uid).await?;
+        let mut identities = self
+            .durable_index_identities
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match identities.get(uid) {
+            Some(expected) if expected != &current => Err(ApiError::Upstream(format!(
+                "Meilisearch durable index {uid} generation changed; refusing persistence"
+            ))),
+            Some(_) => Ok(()),
+            None if !self.require_captured_durable_identities => {
+                identities.insert(uid.to_string(), current);
+                Ok(())
+            }
+            None => Err(ApiError::Upstream(format!(
+                "Meilisearch durable index {uid} startup identity was not captured; refusing persistence"
+            ))),
+        }
+    }
+
+    async fn verify_captured_durable_index_identities(&self) -> Result<(), ApiError> {
+        let expected = self
+            .durable_index_identities
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if self.require_captured_durable_identities && expected.len() != DURABLE_FIXED_INDEXES.len()
+        {
+            return Err(ApiError::Upstream(
+                "Meilisearch durable index startup identities are incomplete".to_string(),
+            ));
+        }
+        for (uid, expected_identity) in expected {
+            let current = self.read_stable_durable_index_identity(&uid).await?;
+            if current != expected_identity {
+                return Err(ApiError::Upstream(format!(
+                    "Meilisearch durable index {uid} continuity check failed"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_stable_durable_index_identity(
+        &self,
+        uid: &str,
+    ) -> Result<DurableIndexIdentity, ApiError> {
+        let before = self.read_durable_index_identity(uid).await?;
+        if !self.index_settings_match(uid).await? {
+            return Err(ApiError::Upstream(format!(
+                "Meilisearch durable index {uid} does not match managed settings"
+            )));
+        }
+        let after = self.read_durable_index_identity(uid).await?;
+        if before != after {
+            return Err(ApiError::Upstream(format!(
+                "Meilisearch durable index {uid} changed during continuity validation"
+            )));
+        }
+        Ok(after)
+    }
+
+    async fn read_durable_index_identity(
+        &self,
+        uid: &str,
+    ) -> Result<DurableIndexIdentity, ApiError> {
+        let Some(url) = &self.url else {
+            return Err(ApiError::Upstream(format!(
+                "Meilisearch durable index {uid} is unavailable"
+            )));
+        };
+        let response = self
+            .client
+            .get(format!("{}/indexes/{uid}", url.trim_end_matches('/')))
+            .headers(self.headers()?)
+            .send()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(ApiError::Upstream(format!(
+                "Meilisearch durable index {uid} is unavailable; refusing persistence"
+            )));
+        }
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        let returned_uid = body.get("uid").and_then(Value::as_str);
+        let primary_key = body.get("primaryKey").and_then(Value::as_str);
+        let created_at = body.get("createdAt").and_then(Value::as_str);
+        if returned_uid != Some(uid) || primary_key != Some("id") || created_at.is_none() {
+            return Err(ApiError::Upstream(format!(
+                "Meilisearch durable index {uid} returned invalid identity metadata"
+            )));
+        }
+        let created_at = created_at.ok_or_else(|| {
+            ApiError::Upstream(format!(
+                "Meilisearch durable index {uid} returned invalid identity metadata"
+            ))
+        })?;
+        Ok(DurableIndexIdentity {
+            uid: uid.to_string(),
+            primary_key: "id".to_string(),
+            created_at: created_at.to_string(),
+        })
     }
 
     pub async fn bootstrap(&self, reset: bool) -> Result<BootstrapResult, ApiError> {
@@ -115,6 +420,12 @@ impl MeiliAdmin {
                     "managed Meilisearch index set is incomplete; refusing automatic recreation of: {}",
                     missing.join(", ")
                 )));
+            }
+            if existing.is_empty() && !self.allow_initial_provision {
+                return Err(ApiError::Upstream(
+                    "all managed Meilisearch indexes are missing; refusing implicit initial provision"
+                        .to_string(),
+                ));
             }
             existing.is_empty()
         };
@@ -196,28 +507,43 @@ impl MeiliAdmin {
                     })
                 }
             });
-        let response = timeout(Duration::from_secs(2), request.send()).await;
-        match response {
-            Ok(Ok(response)) if response.status().is_success() => json!({
-                "status": "ok",
-                "healthy": true,
-                "configured": true,
-                "latency_ms": started.elapsed().as_millis() as u64
-            }),
-            Ok(Ok(response)) => json!({
-                "status": "unhealthy",
-                "healthy": false,
-                "configured": true,
-                "http_status": response.status().as_u16(),
-                "latency_ms": started.elapsed().as_millis() as u64
-            }),
-            Ok(Err(err)) => json!({
-                "status": "unhealthy",
-                "healthy": false,
-                "configured": true,
-                "error": err.to_string(),
-                "latency_ms": started.elapsed().as_millis() as u64
-            }),
+        let health_check = async {
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    match self.verify_captured_durable_index_identities().await {
+                        Ok(()) => json!({
+                            "status": "ok",
+                            "healthy": true,
+                            "configured": true,
+                            "latency_ms": started.elapsed().as_millis() as u64
+                        }),
+                        Err(_) => json!({
+                            "status": "unhealthy",
+                            "healthy": false,
+                            "configured": true,
+                            "error": "Meilisearch durable index continuity check failed",
+                            "latency_ms": started.elapsed().as_millis() as u64
+                        }),
+                    }
+                }
+                Ok(response) => json!({
+                    "status": "unhealthy",
+                    "healthy": false,
+                    "configured": true,
+                    "http_status": response.status().as_u16(),
+                    "latency_ms": started.elapsed().as_millis() as u64
+                }),
+                Err(err) => json!({
+                    "status": "unhealthy",
+                    "healthy": false,
+                    "configured": true,
+                    "error": err.to_string(),
+                    "latency_ms": started.elapsed().as_millis() as u64
+                }),
+            }
+        };
+        match timeout(Duration::from_secs(2), health_check).await {
+            Ok(status) => status,
             Err(_) => json!({
                 "status": "unhealthy",
                 "healthy": false,
@@ -277,6 +603,11 @@ impl MeiliAdmin {
             }
         }
 
+        // The index may have been created by another actor between the
+        // existence check and the create task. Never apply managed settings
+        // until the resulting index proves it has the expected identity.
+        self.require_index_primary_key(uid, primary_key).await?;
+
         if apply_settings {
             if let Some(uid) = self.apply_settings(uid).await? {
                 self.wait_for_task(&uid).await?;
@@ -284,6 +615,91 @@ impl MeiliAdmin {
             }
         }
         Ok(task_uids)
+    }
+
+    /// Create an index only when this request is the sole creator.
+    ///
+    /// Migration plans that observed a missing durable index use this path so
+    /// a concurrently-created same-UID index is never adopted or reconciled.
+    /// Unlike [`Self::ensure_index`], any rejected or failed create task is a
+    /// hard error, even when an index with the requested UID is visible later.
+    pub async fn create_index_strict(
+        &self,
+        uid: &str,
+        primary_key: &str,
+        apply_settings: bool,
+    ) -> Result<Vec<String>, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(Vec::new());
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/indexes", url.trim_end_matches('/')))
+            .headers(self.headers()?)
+            .json(&json!({ "uid": uid, "primaryKey": primary_key }))
+            .send()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(ApiError::Upstream(format!(
+                "failed to strictly create Meilisearch index {uid}: {}; refusing to adopt any concurrently-created index",
+                response.status()
+            )));
+        }
+
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        let create_task_uid =
+            required_task_uid(&body, &format!("strictly create Meilisearch index {uid}"))?;
+        self.wait_for_task(&create_task_uid).await.map_err(|error| {
+            ApiError::Upstream(format!(
+                "strict creation of Meilisearch index {uid} did not succeed; refusing to adopt any concurrently-created index: {error}"
+            ))
+        })?;
+        let mut task_uids = vec![create_task_uid];
+
+        self.require_index_primary_key(uid, primary_key).await?;
+        let created_at = self.index_created_at(uid).await?.ok_or_else(|| {
+            ApiError::Upstream(format!(
+                "strictly-created Meilisearch index {uid} returned no createdAt generation"
+            ))
+        })?;
+
+        if apply_settings {
+            if let Some(settings_task_uid) = self.apply_settings(uid).await? {
+                self.wait_for_task(&settings_task_uid).await?;
+                task_uids.push(settings_task_uid);
+            }
+        }
+
+        self.require_index_primary_key(uid, primary_key).await?;
+        if self.index_created_at(uid).await?.as_deref() != Some(created_at.as_str()) {
+            return Err(ApiError::Upstream(format!(
+                "Meilisearch index {uid} generation changed during strict creation"
+            )));
+        }
+        Ok(task_uids)
+    }
+
+    /// Reconcile an existing index only after confirming its primary key.
+    /// Unlike [`Self::ensure_index`], this path never recreates a disappeared
+    /// index and is therefore suitable for non-destructive migration retries.
+    pub async fn reconcile_existing_index_with_primary_key(
+        &self,
+        uid: &str,
+        primary_key: &str,
+        apply_settings: bool,
+    ) -> Result<Vec<String>, ApiError> {
+        if !self.index_exists(uid).await? {
+            return Err(ApiError::Upstream(format!(
+                "registered Meilisearch index {uid} is missing; refusing empty recreation"
+            )));
+        }
+        self.require_index_primary_key(uid, primary_key).await?;
+        self.reconcile_existing_index(uid, apply_settings).await
     }
 
     /// Reconcile settings for an index that must already exist.
@@ -368,6 +784,47 @@ impl MeiliAdmin {
             Some(Value::Null) => Ok(None),
             _ => Err(ApiError::Upstream(format!(
                 "Meilisearch index {uid} returned an invalid primaryKey field"
+            ))),
+        }
+    }
+
+    /// Return the immutable Meilisearch creation timestamp used to identify
+    /// one concrete generation of a same-UID index.
+    pub async fn index_created_at(&self, uid: &str) -> Result<Option<String>, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(None);
+        };
+        let response = self
+            .client
+            .get(format!("{}/indexes/{}", url.trim_end_matches('/'), uid))
+            .headers(self.headers()?)
+            .send()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(ApiError::Upstream(format!(
+                "failed to inspect Meilisearch createdAt for {uid}: {}",
+                response.status()
+            )));
+        }
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        if body.get("uid").and_then(Value::as_str) != Some(uid) {
+            return Err(ApiError::Upstream(format!(
+                "Meilisearch index {uid} returned mismatched identity metadata"
+            )));
+        }
+        match body.get("createdAt") {
+            Some(Value::String(created_at)) if !created_at.trim().is_empty() => {
+                Ok(Some(created_at.clone()))
+            }
+            _ => Err(ApiError::Upstream(format!(
+                "Meilisearch index {uid} returned an invalid createdAt field"
             ))),
         }
     }
@@ -873,7 +1330,7 @@ pub fn settings_for(uid: &str) -> Value {
     let mut settings = if uid == "rag_audit_records" {
         json!({
             "searchableAttributes": ["action", "reason_code", "error_kind"],
-            "filterableAttributes": ["id", "logical_id", "tenant_id", "request_id", "principal_scope", "principal_owner_user_id_hash", "resource_id_hash", "action", "reason_code", "outcome", "error_kind", "operation_id"],
+            "filterableAttributes": ["id", "logical_id", "tenant_id", "request_id", "principal_scope", "principal_owner_user_id_hash", "resource_id_hash", "action", "reason_code", "outcome", "error_kind", "operation_id", "occurred_at", "updated_at"],
             "sortableAttributes": ["occurred_at", "updated_at", "id"]
         })
     } else if uid == "rag_operations" {
@@ -1058,7 +1515,91 @@ fn ensure_sortable_attribute(settings: &mut Value, attribute: &str) {
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        extract::Request,
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        Router,
+    };
+
     use super::*;
+
+    async fn healthy_then_stalled_meili(request: Request) -> Response {
+        if request.uri().path() == "/health" {
+            return StatusCode::OK.into_response();
+        }
+        std::future::pending::<Response>().await
+    }
+
+    #[tokio::test]
+    async fn health_deadline_covers_durable_continuity_requests() {
+        let app = Router::new().fallback(healthy_then_stalled_meili);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = Config::test();
+        config.meili_url = Some(format!("http://{address}"));
+        let admin = MeiliAdmin::from_config(&config);
+        admin.durable_index_identities.write().unwrap().insert(
+            "rag_operations".to_string(),
+            DurableIndexIdentity {
+                uid: "rag_operations".to_string(),
+                primary_key: "id".to_string(),
+                created_at: "2026-07-15T00:00:00Z".to_string(),
+            },
+        );
+
+        let status = tokio::time::timeout(Duration::from_secs(3), admin.health_status())
+            .await
+            .expect("health status exceeded its full-operation deadline");
+        assert_eq!(status["healthy"], false, "{status}");
+        assert_eq!(
+            status["error"], "Meilisearch health check timed out",
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn debug_output_never_exposes_meilisearch_credentials() {
+        let mut config = Config::test();
+        config.meili_url = Some("https://meili.internal".to_string());
+        config.meili_api_key = Some("runtime-super-secret".to_string());
+        let rendered = format!("{:?}", MeiliAdmin::from_config(&config));
+
+        assert!(rendered.contains("configured: true"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("runtime-super-secret"), "{rendered}");
+        assert!(!rendered.contains("meili.internal"), "{rendered}");
+    }
+
+    #[test]
+    fn production_admin_clients_never_fall_back_to_the_runtime_key() {
+        let mut config = Config::test();
+        config.run_mode = "production".to_string();
+        config.meili_api_key = Some("runtime-only-key".to_string());
+
+        let standalone = MeiliAdmin::from_admin_config(&config);
+        let (_, paired) = MeiliAdmin::pair_from_config(&config);
+
+        assert_eq!(standalone.api_key, None);
+        assert_eq!(paired.api_key, None);
+    }
+
+    #[test]
+    fn development_admin_clients_preserve_the_runtime_key_fallback() {
+        let mut config = Config::test();
+        config.run_mode = "development".to_string();
+        config.meili_api_key = Some("development-key".to_string());
+
+        let standalone = MeiliAdmin::from_admin_config(&config);
+        let (_, paired) = MeiliAdmin::pair_from_config(&config);
+
+        assert_eq!(standalone.api_key.as_deref(), Some("development-key"));
+        assert_eq!(paired.api_key.as_deref(), Some("development-key"));
+    }
 
     #[test]
     fn managed_settings_treat_only_set_valued_attributes_as_unordered() {
@@ -1179,6 +1720,8 @@ mod tests {
             "outcome",
             "error_kind",
             "operation_id",
+            "occurred_at",
+            "updated_at",
         ] {
             assert!(
                 filterable.iter().any(|value| value == required),

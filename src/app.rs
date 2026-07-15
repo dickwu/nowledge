@@ -360,8 +360,10 @@ pub(crate) fn log_ingest_failure(task_id: &str, err: &ApiError, message: &'stati
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Store,
+    pub(crate) runtime_meili: MeiliAdmin,
     pub meili: MeiliAdmin,
     pub llm_health: LlmHealthProbe,
+    pub analysis_llm_health: LlmHealthProbe,
     pub llm_providers: LlmProviderRegistry,
     pub ingest_manager: IngestTaskManager,
     pub(crate) metrics: Metrics,
@@ -403,19 +405,32 @@ impl FromRef<AppState> for AuthState {
 
 impl AppState {
     pub fn new(config: Arc<Config>) -> Self {
-        let store = Store::new(&config);
-        let audit_recorder = AuditRecorder::new(config.clone(), store.clone());
-        let runtime = RuntimeSupervisor::new();
-        let http_boundary = HttpBoundaryState::new(&config);
-        let llm_providers = LlmProviderRegistry::new(config.clone());
+        let (runtime_meili, index_admin) = MeiliAdmin::pair_from_config(&config);
         let metrics = Metrics::new();
+        let store = Store::new_with_meili_admins_and_metrics(
+            &config,
+            runtime_meili.clone(),
+            index_admin.clone(),
+            metrics.clone(),
+        );
+        let runtime = RuntimeSupervisor::new();
+        let audit_recorder = AuditRecorder::new(
+            config.clone(),
+            store.clone(),
+            runtime.clone(),
+            metrics.clone(),
+        );
+        let http_boundary = HttpBoundaryState::new(&config);
+        let llm_providers = LlmProviderRegistry::new_with_metrics(config.clone(), metrics.clone());
         config.start_codex_secret_refresh_task();
         let ingest_manager = IngestTaskManager::new(store.clone(), config.clone(), runtime.clone());
         spawn_ingest_task_cleanup(store.clone(), &config, &runtime);
         Self {
             store,
-            meili: MeiliAdmin::from_config(&config),
+            runtime_meili,
+            meili: index_admin,
             llm_health: LlmHealthProbe::new(),
+            analysis_llm_health: LlmHealthProbe::new(),
             llm_providers,
             ingest_manager,
             metrics,

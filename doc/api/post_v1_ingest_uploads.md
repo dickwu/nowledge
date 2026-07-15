@@ -2,6 +2,12 @@
 
 Create an asynchronous ingest task from a multipart file upload.
 
+## Handler
+
+- Rust handler: `create_ingest_upload`
+- Route registration: `src/routes.rs::build_router`
+- Authentication: UserGuard; owner write scope required
+
 ## Multipart Fields
 
 | Field | Notes |

@@ -2,6 +2,12 @@
 
 Synchronously ingest JSON text or supplied parser output and return the completed `IngestTaskResult`.
 
+## Handler
+
+- Rust handler: `ingest_file_sync`
+- Route registration: `src/routes.rs::build_router`
+- Authentication: UserGuard; owner write scope required
+
 ## Request
 
 JSON `IngestTaskRequest`.
