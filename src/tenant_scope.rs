@@ -259,10 +259,73 @@ impl TenantFilter {
         Ok(self)
     }
 
+    /// Add one parenthesized OR group of string-set predicates while retaining
+    /// the mandatory tenant clause. This keeps multi-field destructive filters
+    /// value-encoded instead of admitting caller-built filter fragments.
+    pub fn any_in_strings(
+        mut self,
+        conditions: &[(&'static str, &[String])],
+    ) -> Result<Self, ApiError> {
+        if conditions.is_empty() {
+            return Err(ApiError::Internal(
+                "tenant filter OR string-set clause must not be empty".to_string(),
+            ));
+        }
+        let clauses = conditions
+            .iter()
+            .map(|(field, values)| {
+                if values.is_empty() {
+                    return Err(ApiError::Internal(format!(
+                        "tenant filter {field} string-set must not be empty"
+                    )));
+                }
+                for value in *values {
+                    require_non_empty(field, value)?;
+                }
+                let values = serde_json::to_string(values)
+                    .map_err(|error| ApiError::Internal(error.to_string()))?;
+                Ok(format!("{field} IN {values}"))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        self.clauses.push(format!("({})", clauses.join(" OR ")));
+        Ok(self)
+    }
+
+    pub fn any_not_eq(mut self, conditions: &[(&'static str, &str)]) -> Result<Self, ApiError> {
+        if conditions.is_empty() {
+            return Err(ApiError::Internal(
+                "tenant filter OR clause must not be empty".to_string(),
+            ));
+        }
+        let clauses = conditions
+            .iter()
+            .map(|(field, value)| Ok(format!("{field} != {}", meili_string(value)?)))
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        self.clauses.push(format!("({})", clauses.join(" OR ")));
+        Ok(self)
+    }
+
     pub fn logical_id(mut self, logical_id: &str) -> Result<Self, ApiError> {
         let value = meili_string(logical_id)?;
         self.clauses.push(format!(
             "(logical_id = {value} OR ((logical_id NOT EXISTS OR logical_id IS NULL) AND id = {value}))"
+        ));
+        Ok(self)
+    }
+
+    pub fn logical_ids(mut self, logical_ids: &[String]) -> Result<Self, ApiError> {
+        if logical_ids.is_empty() {
+            return Err(ApiError::Internal(
+                "tenant filter logical-id set must not be empty".to_string(),
+            ));
+        }
+        for logical_id in logical_ids {
+            require_non_empty("logical_id", logical_id)?;
+        }
+        let values = serde_json::to_string(logical_ids)
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        self.clauses.push(format!(
+            "(logical_id IN {values} OR ((logical_id NOT EXISTS OR logical_id IS NULL) AND id IN {values}))"
         ));
         Ok(self)
     }
@@ -435,6 +498,73 @@ mod tests {
             .finish();
         assert!(ownerless.contains("owner_user_id IS NULL"));
         assert!(ownerless.contains("owner_user_id NOT EXISTS"));
+    }
+
+    #[test]
+    fn tenant_filter_batches_current_and_legacy_logical_ids() {
+        let filter = TenantFilter::new("tenant-a")
+            .unwrap()
+            .logical_ids(&["operation-1".to_string(), "operation-\"2".to_string()])
+            .unwrap()
+            .finish();
+
+        assert!(filter.starts_with("tenant_id = \"tenant-a\" AND "));
+        assert!(
+            filter.contains("logical_id IN [\"operation-1\",\"operation-\\\"2\"]"),
+            "{filter}"
+        );
+        assert!(filter.contains("logical_id NOT EXISTS"), "{filter}");
+        assert!(filter.contains("logical_id IS NULL"), "{filter}");
+        assert!(
+            filter.contains("id IN [\"operation-1\",\"operation-\\\"2\"]"),
+            "{filter}"
+        );
+
+        assert!(TenantFilter::new("tenant-a")
+            .unwrap()
+            .logical_ids(&[])
+            .is_err());
+        assert!(TenantFilter::new("tenant-a")
+            .unwrap()
+            .logical_ids(&["  ".to_string()])
+            .is_err());
+    }
+
+    #[test]
+    fn tenant_filter_encodes_multi_field_string_set_or_groups() {
+        let ids = ["link-1".to_string(), "link-\"2".to_string()];
+        let uris = ["ctx://company/source/custom".to_string()];
+        let filter = TenantFilter::new("tenant-a")
+            .unwrap()
+            .any_in_strings(&[
+                ("logical_id", &ids),
+                ("source_uri", &uris),
+                ("target_uri", &uris),
+            ])
+            .unwrap()
+            .finish();
+
+        assert!(
+            filter.starts_with("tenant_id = \"tenant-a\" AND ("),
+            "{filter}"
+        );
+        assert!(
+            filter.contains("logical_id IN [\"link-1\",\"link-\\\"2\"]"),
+            "{filter}"
+        );
+        assert!(
+            filter.contains("source_uri IN [\"ctx://company/source/custom\"]"),
+            "{filter}"
+        );
+        assert!(filter.contains(" OR target_uri IN "), "{filter}");
+        assert!(TenantFilter::new("tenant-a")
+            .unwrap()
+            .any_in_strings(&[])
+            .is_err());
+        assert!(TenantFilter::new("tenant-a")
+            .unwrap()
+            .any_in_strings(&[("source_uri", &[])])
+            .is_err());
     }
 
     #[test]

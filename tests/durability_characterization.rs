@@ -55,6 +55,21 @@ struct DurabilityDomain {
 
 const DURABILITY_MATRIX: &[DurabilityDomain] = &[
     DurabilityDomain {
+        name: "operation_journal",
+        store_fields: &["operations"],
+        durability: DurabilityClass::DurableCanonical,
+        strategy: RestartStrategy::StartupHydrated,
+        repository_writes: &["upsert_operation"],
+        repository_reads: &[
+            "get_operation",
+            "list_operations_by_ids",
+            "list_oldest_reconcilable_operations",
+        ],
+        startup_methods: &["list_oldest_reconcilable_operations"],
+        report_domains: &["operations"],
+        evidence: "immutable mutation plans and progress checkpoints are reconciled before domain hydration",
+    },
+    DurabilityDomain {
         name: "user_events",
         store_fields: &[
             "user_indexes",
@@ -146,7 +161,11 @@ const DURABILITY_MATRIX: &[DurabilityDomain] = &[
         durability: DurabilityClass::DurableCanonical,
         strategy: RestartStrategy::ReadThrough,
         repository_writes: &["upsert_source_documents"],
-        repository_reads: &["read_source_document"],
+        repository_reads: &[
+            "read_source_document",
+            "list_source_documents_by_uri",
+            "list_company_source_documents",
+        ],
         startup_methods: &[],
         report_domains: &["source_documents"],
         evidence: "source bodies are high-volume and are resolved through tenant-aware reads",
@@ -1016,10 +1035,14 @@ async fn interrupted_ingest_recovery_is_persisted_once_and_is_restart_idempotent
     let config = meili_config(url, "tenant-recovery");
 
     let first = Store::new(&config);
-    first
+    let first_hydration = first
         .hydrate_from_repository(&config.tenant_id)
         .await
         .expect("first recovery should persist the terminalized task before publish");
+    assert_eq!(
+        first_hydration["domains"]["operations"]["loaded"], 1,
+        "startup repair must be represented by a completed journal operation: {first_hydration}"
+    );
     let recovered = first
         .get_ingest_task("task-queued", Some("owner-a"), false)
         .expect("recovered task should be published");

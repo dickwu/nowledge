@@ -293,16 +293,20 @@ async fn run_ingest_dispatcher(
     }
 
     let deadline = tokio::time::Instant::now() + shutdown_grace;
-    let mut interrupted_tasks = Vec::new();
     queue.close();
     while let Some(mut job) = queue.recv().await {
         job.queue_depth.take();
-        match store.mark_ingest_task_interrupted_local(&job.task_id) {
-            Ok(Some(task)) => interrupted_tasks.push(task),
-            Ok(None) => {}
-            Err(err) => {
+        match tokio::time::timeout_at(
+            deadline,
+            store.mark_ingest_task_interrupted_async(&job.task_id),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
                 log_ingest_failure(&job.task_id, &err, "failed to interrupt queued ingest task")
             }
+            Err(_) => break,
         }
     }
 
@@ -338,31 +342,14 @@ async fn run_ingest_dispatcher(
         }
     }
     for task_id in active_task_ids.into_values() {
-        match store.mark_ingest_task_interrupted_local(&task_id) {
-            Ok(Some(task)) => interrupted_tasks.push(task),
-            Ok(None) => {}
-            Err(err) => {
+        match tokio::time::timeout_at(deadline, store.mark_ingest_task_interrupted_async(&task_id))
+            .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
                 log_ingest_failure(&task_id, &err, "failed to interrupt active ingest task")
             }
-        }
-    }
-    if !interrupted_tasks.is_empty() {
-        match tokio::time::timeout_at(
-            deadline,
-            store.persist_ingest_task_records(&interrupted_tasks),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => log_ingest_failure(
-                &interrupted_tasks[0].task_id,
-                &err,
-                "failed to persist interrupted ingest tasks",
-            ),
-            Err(_) => tracing::warn!(
-                interrupted_tasks = interrupted_tasks.len(),
-                "ingest dispatcher deadline elapsed before task states were persisted"
-            ),
+            Err(_) => break,
         }
     }
 }
@@ -427,19 +414,12 @@ async fn enforce_sync_ingest_timeout(
         Ok(response) => {
             if response.status().is_client_error() || response.status().is_server_error() {
                 if let Some(task_id) = tracker.task_id() {
-                    match state.store.mark_ingest_task_failed_local(&task_id) {
-                        Ok(Some(task)) => supervise_ingest_task_persistence(
-                            &state,
-                            task,
-                            "failed to persist failed sync ingest task",
-                        ),
-                        Ok(None) => {}
-                        Err(err) => log_ingest_failure(
-                            &task_id,
-                            &err,
-                            "failed to finalize sync ingest task",
-                        ),
-                    }
+                    supervise_ingest_task_transition(
+                        &state,
+                        task_id,
+                        IngestTerminalTransition::Failed,
+                        "failed to finalize sync ingest task",
+                    );
                 }
             }
             response
@@ -449,37 +429,40 @@ async fn enforce_sync_ingest_timeout(
                 if let Ok(result) = state.store.get_ingest_task_result(&task_id, None, true) {
                     return Json(result).into_response();
                 }
-                match state.store.mark_ingest_task_interrupted_local(&task_id) {
-                    Ok(Some(task)) => supervise_ingest_task_persistence(
-                        &state,
-                        task,
-                        "failed to persist timed-out ingest task",
-                    ),
-                    Ok(None) => {}
-                    Err(err) => {
-                        log_ingest_failure(
-                            &task_id,
-                            &err,
-                            "failed to interrupt timed-out ingest task",
-                        );
-                    }
-                }
+                supervise_ingest_task_transition(
+                    &state,
+                    task_id,
+                    IngestTerminalTransition::Interrupted,
+                    "failed to interrupt timed-out ingest task",
+                );
             }
             ApiError::timeout().into_response()
         }
     }
 }
 
-fn supervise_ingest_task_persistence(
+#[derive(Clone, Copy)]
+enum IngestTerminalTransition {
+    Failed,
+    Interrupted,
+}
+
+fn supervise_ingest_task_transition(
     state: &SyncIngestTimeoutState,
-    task: IngestTask,
+    task_id: String,
+    transition: IngestTerminalTransition,
     message: &'static str,
 ) {
     let store = state.store.clone();
-    let task_id = task.task_id.clone();
     let rejected_task_id = task_id.clone();
     if !state.runtime.spawn(async move {
-        if let Err(err) = store.persist_ingest_task_record(&task).await {
+        let result = match transition {
+            IngestTerminalTransition::Failed => store.mark_ingest_task_failed_async(&task_id).await,
+            IngestTerminalTransition::Interrupted => {
+                store.mark_ingest_task_interrupted_async(&task_id).await
+            }
+        };
+        if let Err(err) = result {
             log_ingest_failure(&task_id, &err, message);
         }
     }) {
@@ -553,31 +536,15 @@ impl AppState {
     pub async fn shutdown_until(&self, deadline: tokio::time::Instant) {
         self.begin_shutdown();
         self.runtime.shutdown_until(deadline).await;
-        match self
-            .store
-            .interrupt_nonterminal_ingest_tasks_local(self.tenant_id())
+        match tokio::time::timeout_at(
+            deadline,
+            self.store
+                .interrupt_nonterminal_ingest_tasks_async(self.tenant_id()),
+        )
+        .await
         {
-            Ok(tasks) if !tasks.is_empty() => {
-                match tokio::time::timeout_at(
-                    deadline,
-                    self.store.persist_ingest_task_records(&tasks),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => log_ingest_failure(
-                        &tasks[0].task_id,
-                        &err,
-                        "failed to persist interrupted ingest tasks during shutdown",
-                    ),
-                    Err(_) => tracing::warn!(
-                        interrupted_tasks = tasks.len(),
-                        "shutdown deadline elapsed before interrupted task states were persisted"
-                    ),
-                }
-            }
-            Ok(_) => {}
-            Err(err) => {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
                 let diagnostic = safe_cause_diagnostic(&err);
                 tracing::warn!(
                     cause_category = diagnostic.category,
@@ -585,6 +552,9 @@ impl AppState {
                     "failed to finalize interrupted ingest tasks during shutdown"
                 );
             }
+            Err(_) => tracing::warn!(
+                "shutdown deadline elapsed before interrupted task states were journaled"
+            ),
         }
     }
 }
@@ -809,6 +779,8 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/admin/history/user-event-indexes:reconcile",
             post(reconcile_user_event_indexes),
         )
+        .route("/v1/admin/operations/search", post(search_operations))
+        .route("/v1/admin/operations:reconcile", post(reconcile_operations))
         .route("/v1/history/events", post(append_event_alias))
         .route("/v1/history/events:bulk", post(append_events_bulk_alias))
         .route("/v1/history/search", post(search_events_alias))
@@ -1478,6 +1450,29 @@ async fn reconcile_user_event_indexes(
         state
             .store
             .reconcile_user_indexes_async(state.tenant_id(), req)
+            .await?,
+    ))
+}
+
+async fn search_operations(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Json(req): Json<OperationListRequest>,
+) -> Result<Json<OperationListResponse>, ApiError> {
+    Ok(Json(
+        state.store.list_operations(state.tenant_id(), req).await?,
+    ))
+}
+
+async fn reconcile_operations(
+    _admin: AdminGuard,
+    State(state): State<AppState>,
+    Json(req): Json<ReconcileOperationsRequest>,
+) -> Result<Json<ReconcileOperationsResponse>, ApiError> {
+    Ok(Json(
+        state
+            .store
+            .reconcile_operations_async(state.tenant_id(), req)
             .await?,
     ))
 }

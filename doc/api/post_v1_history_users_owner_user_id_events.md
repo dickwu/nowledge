@@ -34,7 +34,7 @@ Schema: `AppendHistoryEventRequest`
 | tags | string[] | optional, default [] | Search and grouping tags; at most `RAG_MAX_TAGS_PER_ITEM`, each at most `RAG_MAX_TAG_BYTES` UTF-8 bytes. |
 | privacy | string | optional, default private | Privacy label for the event. |
 | promote_policy | string | optional, default none | Policy hint for promoting the event into state or context. |
-| idempotency_key | string | optional | Client key used to deduplicate writes for the owner. |
+| idempotency_key | string | optional | Client key bound to this owner and canonical request; reuse with a different request returns 409. |
 | event_index_hint | object | optional | Caller hint about the expected event index routing. |
 
 ## Response
@@ -46,7 +46,14 @@ Schema: `HistoryEventResponse`
 | duplicate | boolean | True when idempotency matched an existing event. |
 | materialization_job_id | string? | Context materialization job id when created. |
 | routing | EventIndexRouting | Owner index routing used for the write. |
-| meili_task_uid | string? | Meilisearch indexing task id when available. |
+| meili_task_uid | string? | Last primary event-batch Meilisearch task id when available. |
+| persistence | PersistenceMetadata? | Durable operation id, status, indexing state, ordered primary task ids, and all task ids. |
+
+If the event primary is committed but a derived context write fails, the
+response still returns the stable event with
+`persistence.status=partially_failed`. Retrying the same path owner and
+`idempotency_key` reconciles unfinished steps and replays the original response
+with `duplicate=true` and the same operation id.
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.

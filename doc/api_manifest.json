@@ -113,6 +113,20 @@
   },
   {
     "method": "POST",
+    "path": "/v1/admin/operations:reconcile",
+    "handler": "reconcile_operations",
+    "group": "Admin",
+    "file": "api/post_v1_admin_operations_reconcile.md"
+  },
+  {
+    "method": "POST",
+    "path": "/v1/admin/operations/search",
+    "handler": "search_operations",
+    "group": "Admin",
+    "file": "api/post_v1_admin_operations_search.md"
+  },
+  {
+    "method": "POST",
     "path": "/v1/analysis/insights",
     "handler": "analyze_insights",
     "group": "Analysis",

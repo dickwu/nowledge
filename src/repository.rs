@@ -4,14 +4,18 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde::{de::DeserializeOwned, Serialize};
+use chrono::{DateTime, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::{
     config::{Config, DEFAULT_MEILI_SCAN_MAX_DOCUMENTS, DEFAULT_MEILI_SCAN_PAGE_SIZE},
-    error::{safe_cause_diagnostic, safe_value_fingerprint, ApiError},
+    error::ApiError,
     meili::{MeiliAdmin, SearchResponse},
     models::*,
+    mutation::{
+        operation_list_item, validate_operation_record, validate_operation_step_for_tenant,
+    },
     resolver::EventIndexResolver,
     tenant_scope::{
         is_tenant_document, owner_scoped_storage_identity, restore_logical_id,
@@ -35,6 +39,22 @@ pub struct RepositoryContextSearchQuery<'a> {
     pub limit: usize,
     pub filters: &'a ContextStructuredFilters,
     pub resolver: &'a EventIndexResolver,
+}
+
+pub struct RepositoryOperationListQuery<'a> {
+    pub tenant_id: &'a str,
+    pub statuses: &'a [OperationStatus],
+    pub operation_kinds: &'a [String],
+    pub offset: usize,
+    pub previous_operation_id: Option<&'a str>,
+    pub limit: usize,
+    pub include_plan: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepositoryOperationPage {
+    pub operations: Vec<OperationListItem>,
+    pub has_more: bool,
 }
 
 #[async_trait]
@@ -62,6 +82,87 @@ pub trait KnowledgeRepository: Send + Sync {
     ) -> Result<Option<Vec<UserEventIndex>>, ApiError>;
 
     async fn append_event(&self, event: &HistoryEvent) -> Result<Option<String>, ApiError>;
+
+    async fn append_events(
+        &self,
+        events: &[HistoryEvent],
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        let mut receipt = RepositoryWriteReceipt::empty();
+        for event in events {
+            receipt.extend(RepositoryWriteReceipt::from_task_uid(
+                self.append_event(event).await?,
+            ));
+        }
+        Ok(receipt)
+    }
+
+    async fn upsert_operation(
+        &self,
+        operation: &OperationRecord,
+    ) -> Result<RepositoryWriteReceipt, ApiError>;
+
+    async fn get_operation(
+        &self,
+        tenant_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<OperationRecord>, ApiError>;
+
+    /// Return all matching tenant-scoped operation records. Empty `statuses`
+    /// means all statuses. Meili-backed implementations page through the full
+    /// bounded tenant scan rather than relying on a single search result page.
+    async fn list_operations(
+        &self,
+        tenant_id: &str,
+        statuses: &[OperationStatus],
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError>;
+
+    /// Return at most `limit` tenant-scoped operation records matching the
+    /// supplied logical IDs and statuses. Implementations should issue one
+    /// bounded repository query rather than one query per operation ID.
+    async fn list_operations_by_ids(
+        &self,
+        tenant_id: &str,
+        operation_ids: &[String],
+        statuses: &[OperationStatus],
+        limit: usize,
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError>;
+
+    /// Return one filtered, deterministically ordered operation-summary page.
+    /// Backends that cannot page at the repository boundary return `None` so
+    /// the store can apply the same cursor semantics to its local journal.
+    async fn list_operation_page(
+        &self,
+        _query: RepositoryOperationListQuery<'_>,
+    ) -> Result<Option<RepositoryOperationPage>, ApiError> {
+        Ok(None)
+    }
+
+    /// Return only records that still need write or indexing reconciliation.
+    /// Startup uses this bounded working set instead of retained history.
+    async fn list_reconcilable_operations(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError> {
+        Ok(self.list_operations(tenant_id, &[]).await?.map(|records| {
+            records
+                .into_iter()
+                .filter(|record| {
+                    record.status != OperationStatus::Completed
+                        || record.indexing_state != OperationIndexingState::Completed
+                })
+                .collect()
+        }))
+    }
+
+    /// Return the oldest bounded set of tenant-scoped operation records that
+    /// still need write or indexing reconciliation. Empty `statuses` means all
+    /// statuses. Backends without a durable journal return `None`.
+    async fn list_oldest_reconcilable_operations(
+        &self,
+        tenant_id: &str,
+        statuses: &[OperationStatus],
+        limit: usize,
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError>;
 
     async fn upsert_context_nodes(
         &self,
@@ -125,7 +226,19 @@ pub trait KnowledgeRepository: Send + Sync {
         &self,
         tenant_id: &str,
         source_id: &str,
+        source_document_uris: &[String],
+        link_ids: &[String],
     ) -> Result<DeleteSourceReport, ApiError>;
+
+    /// Apply one ordered company-source deletion step. Journaled mutations
+    /// use this narrow surface so every accepted backend task is checkpointed
+    /// before the following managed index is touched.
+    async fn delete_company_source_index(
+        &self,
+        tenant_id: &str,
+        source_id: &str,
+        target: &CompanySourceDeleteTarget,
+    ) -> Result<Option<String>, ApiError>;
 
     async fn upsert_source_documents(
         &self,
@@ -228,7 +341,7 @@ pub trait KnowledgeRepository: Send + Sync {
         &self,
         tenant_id: &str,
         task_ids: &[String],
-    ) -> Result<(), ApiError>;
+    ) -> Result<RepositoryWriteReceipt, ApiError>;
 
     async fn upsert_eval_case(&self, case: &RagEvalCase) -> Result<Option<String>, ApiError>;
 
@@ -243,6 +356,119 @@ pub trait KnowledgeRepository: Send + Sync {
         &self,
         overview: &RagEvalOverview,
     ) -> Result<Option<String>, ApiError>;
+
+    /// Apply one validated, typed step from an immutable operation plan. This
+    /// method deliberately delegates to the ordinary aggregate persistence
+    /// methods so reconciliation and request-time writes share one code path.
+    async fn apply_operation_step(
+        &self,
+        tenant_id: &str,
+        step: &OperationStep,
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        validate_operation_step_for_tenant(tenant_id, step).map_err(|error| {
+            ApiError::Internal(format!("invalid persisted operation step: {error}"))
+        })?;
+        let receipt = match &step.resource {
+            OperationResource::EnsureUserEventIndex { index } => RepositoryWriteReceipt {
+                task_uids: self.ensure_user_event_index(index).await?,
+            },
+            OperationResource::HistoryEvents { events } => self.append_events(events).await?,
+            OperationResource::ContextNodes { index_uid, nodes } => {
+                RepositoryWriteReceipt::from_task_uid(
+                    self.upsert_context_nodes(index_uid, nodes).await?,
+                )
+            }
+            OperationResource::StateItem { item } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_state_item(item).await?)
+            }
+            OperationResource::Insight { insight } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_insight(insight).await?)
+            }
+            OperationResource::CompanySource { source } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_company_source(source).await?)
+            }
+            OperationResource::SourceRevision { revision } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_source_revision(revision).await?)
+            }
+            OperationResource::DeleteCompanySourceIndex { source_id, target } => {
+                RepositoryWriteReceipt::from_task_uid(
+                    self.delete_company_source_index(tenant_id, source_id, target)
+                        .await?,
+                )
+            }
+            OperationResource::SourceDocuments { documents } => {
+                RepositoryWriteReceipt::from_task_uid(
+                    self.upsert_source_documents(documents).await?,
+                )
+            }
+            OperationResource::ParseArtifacts { artifacts } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_parse_artifacts(artifacts).await?)
+            }
+            OperationResource::StructuredSnapshot { snapshot } => {
+                RepositoryWriteReceipt::from_task_uid(
+                    self.upsert_structured_snapshot(snapshot).await?,
+                )
+            }
+            OperationResource::Dataset { dataset } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_dataset(dataset).await?)
+            }
+            OperationResource::StructuredRows { rows } => RepositoryWriteReceipt::from_task_uid(
+                self.upsert_structured_rows(tenant_id, rows).await?,
+            ),
+            OperationResource::StructuredSummary { summary } => {
+                RepositoryWriteReceipt::from_task_uid(
+                    self.upsert_structured_summary(tenant_id, summary).await?,
+                )
+            }
+            OperationResource::Session { session } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_session(session).await?)
+            }
+            OperationResource::Trace { trace } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_trace(trace).await?)
+            }
+            OperationResource::Links { links } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_links(links).await?)
+            }
+            OperationResource::HarnessComponents {
+                components,
+                revisions,
+            } => RepositoryWriteReceipt::from_task_uid(
+                self.upsert_harness_components(components, revisions)
+                    .await?,
+            ),
+            OperationResource::HarnessChanges { changes } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_harness_changes(changes).await?)
+            }
+            OperationResource::HarnessVerdicts { verdicts } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_harness_verdicts(verdicts).await?)
+            }
+            OperationResource::IngestTask { task } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_ingest_task(task).await?)
+            }
+            OperationResource::IngestTasks { tasks } => RepositoryWriteReceipt {
+                task_uids: self.upsert_ingest_tasks(tasks).await?,
+            },
+            OperationResource::DeleteIngestTasks { task_ids } => {
+                self.delete_ingest_tasks(tenant_id, task_ids).await?
+            }
+            OperationResource::IngestResult { result } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_ingest_result(result).await?)
+            }
+            OperationResource::EvalCase { case } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_eval_case(case).await?)
+            }
+            OperationResource::EvalRun { run } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_eval_run(run).await?)
+            }
+            OperationResource::EvalCaseResults { results } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_eval_case_results(results).await?)
+            }
+            OperationResource::EvalOverview { overview } => {
+                RepositoryWriteReceipt::from_task_uid(self.upsert_eval_overview(overview).await?)
+            }
+        };
+        Ok(receipt)
+    }
 
     async fn list_harness_components(
         &self,
@@ -379,6 +605,15 @@ pub trait KnowledgeRepository: Send + Sync {
         uri: &str,
     ) -> Result<Option<Vec<SourceDocument>>, ApiError>;
 
+    /// Load the complete company-owned source-document set for one source.
+    /// Destructive source operations use this read-through boundary so their
+    /// immutable replay plan includes URIs that were not startup-hydrated.
+    async fn list_company_source_documents(
+        &self,
+        tenant_id: &str,
+        source_id: &str,
+    ) -> Result<Option<Vec<SourceDocument>>, ApiError>;
+
     async fn get_trace(
         &self,
         tenant_id: &str,
@@ -429,6 +664,58 @@ impl KnowledgeRepository for MemoryRepository {
     }
 
     async fn append_event(&self, _event: &HistoryEvent) -> Result<Option<String>, ApiError> {
+        Ok(None)
+    }
+
+    async fn upsert_operation(
+        &self,
+        operation: &OperationRecord,
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        validate_operation_record(operation).map_err(|error| {
+            ApiError::Internal(format!("invalid operation journal record: {error}"))
+        })?;
+        Ok(RepositoryWriteReceipt::empty())
+    }
+
+    async fn get_operation(
+        &self,
+        _tenant_id: &str,
+        _operation_id: &str,
+    ) -> Result<Option<OperationRecord>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_operations(
+        &self,
+        _tenant_id: &str,
+        _statuses: &[OperationStatus],
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_operations_by_ids(
+        &self,
+        _tenant_id: &str,
+        _operation_ids: &[String],
+        _statuses: &[OperationStatus],
+        _limit: usize,
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_reconcilable_operations(
+        &self,
+        _tenant_id: &str,
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError> {
+        Ok(None)
+    }
+
+    async fn list_oldest_reconcilable_operations(
+        &self,
+        _tenant_id: &str,
+        _statuses: &[OperationStatus],
+        _limit: usize,
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError> {
         Ok(None)
     }
 
@@ -506,8 +793,19 @@ impl KnowledgeRepository for MemoryRepository {
         &self,
         _tenant_id: &str,
         _source_id: &str,
+        _source_document_uris: &[String],
+        _link_ids: &[String],
     ) -> Result<DeleteSourceReport, ApiError> {
         Ok(DeleteSourceReport::default())
+    }
+
+    async fn delete_company_source_index(
+        &self,
+        _tenant_id: &str,
+        _source_id: &str,
+        _target: &CompanySourceDeleteTarget,
+    ) -> Result<Option<String>, ApiError> {
+        Ok(None)
     }
 
     async fn upsert_source_documents(
@@ -636,8 +934,8 @@ impl KnowledgeRepository for MemoryRepository {
         &self,
         _tenant_id: &str,
         _task_ids: &[String],
-    ) -> Result<(), ApiError> {
-        Ok(())
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        Ok(RepositoryWriteReceipt::empty())
     }
 
     async fn upsert_eval_case(&self, _case: &RagEvalCase) -> Result<Option<String>, ApiError> {
@@ -826,6 +1124,14 @@ impl KnowledgeRepository for MemoryRepository {
         Ok(None)
     }
 
+    async fn list_company_source_documents(
+        &self,
+        _tenant_id: &str,
+        _source_id: &str,
+    ) -> Result<Option<Vec<SourceDocument>>, ApiError> {
+        Ok(None)
+    }
+
     async fn get_trace(
         &self,
         _tenant_id: &str,
@@ -866,6 +1172,306 @@ pub struct MeiliRepository {
     wait_for_tasks: bool,
     scan_page_size: usize,
     scan_max_documents: usize,
+}
+
+const OPERATION_IDENTITY_FIELDS: &[&str] = &["id", "logical_id", "tenant_id"];
+const MAX_OPERATION_CANDIDATE_LIMIT: usize = 1_000;
+const OPERATION_SUMMARY_FIELDS: &[&str] = &[
+    "id",
+    "logical_id",
+    "tenant_id",
+    "operation_kind",
+    "actor_scope",
+    "idempotency_key_hash",
+    "status",
+    "indexing_state",
+    "progress",
+    "created_at",
+    "updated_at",
+    "completed_at",
+    "last_error_category",
+    "last_error_fingerprint",
+];
+const OPERATION_WITH_PLAN_FIELDS: &[&str] = &[
+    "id",
+    "logical_id",
+    "tenant_id",
+    "operation_kind",
+    "actor_scope",
+    "idempotency_key_hash",
+    "plan",
+    "status",
+    "indexing_state",
+    "progress",
+    "created_at",
+    "updated_at",
+    "completed_at",
+    "last_error_category",
+    "last_error_fingerprint",
+];
+
+#[derive(Debug, Deserialize)]
+struct OperationSummaryDocument {
+    id: String,
+    tenant_id: String,
+    operation_kind: String,
+    actor_scope: OperationActorScope,
+    #[serde(default)]
+    idempotency_key_hash: Option<String>,
+    status: OperationStatus,
+    indexing_state: OperationIndexingState,
+    progress: OperationProgress,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    #[serde(default)]
+    completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_error_category: Option<String>,
+    #[serde(default)]
+    last_error_fingerprint: Option<String>,
+}
+
+impl OperationSummaryDocument {
+    fn into_summary(self) -> OperationSummary {
+        OperationSummary {
+            id: self.id,
+            tenant_id: self.tenant_id,
+            operation_kind: self.operation_kind,
+            actor_scope: self.actor_scope,
+            idempotency_key_hash: self.idempotency_key_hash,
+            status: self.status,
+            indexing_state: self.indexing_state,
+            attempt_count: self.progress.attempt_count,
+            pending_steps: self
+                .progress
+                .steps
+                .values()
+                .filter(|progress| {
+                    matches!(
+                        progress.status,
+                        OperationStepStatus::Pending | OperationStepStatus::Submitted
+                    )
+                })
+                .count(),
+            failed_steps: self
+                .progress
+                .steps
+                .values()
+                .filter(|progress| progress.status == OperationStepStatus::Failed)
+                .count(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            completed_at: self.completed_at,
+            last_error_category: self.last_error_category,
+            last_error_fingerprint: self.last_error_fingerprint,
+        }
+    }
+}
+
+fn operation_document_logical_id<'a>(
+    tenant_id: &str,
+    document: &'a Value,
+) -> Result<&'a str, ApiError> {
+    if !is_tenant_document("rag_operations", document) {
+        return Err(ApiError::Internal(
+            "operation journal returned an invalid tenant-scoped document".to_string(),
+        ));
+    }
+    if document.get("tenant_id").and_then(Value::as_str) != Some(tenant_id) {
+        return Err(ApiError::Internal(
+            "operation journal returned a cross-tenant document".to_string(),
+        ));
+    }
+    document
+        .get("logical_id")
+        .and_then(Value::as_str)
+        .filter(|operation_id| !operation_id.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::Internal(
+                "operation journal returned a document without a logical id".to_string(),
+            )
+        })
+}
+
+fn decode_operation_page_item(
+    tenant_id: &str,
+    document: Value,
+    include_plan: bool,
+) -> Result<OperationListItem, ApiError> {
+    operation_document_logical_id(tenant_id, &document)?;
+    let document = restore_logical_id("rag_operations", document);
+    if include_plan {
+        let record = serde_json::from_value::<OperationRecord>(document).map_err(|error| {
+            ApiError::Internal(format!(
+                "failed to decode tenant-scoped rag_operations document: {error}"
+            ))
+        })?;
+        if record.tenant_id != tenant_id {
+            return Err(ApiError::Internal(
+                "operation journal returned a cross-tenant record".to_string(),
+            ));
+        }
+        validate_operation_record(&record).map_err(|error| {
+            ApiError::Internal(format!(
+                "operation journal returned an invalid record: {error}"
+            ))
+        })?;
+        return Ok(operation_list_item(&record, true));
+    }
+
+    let summary =
+        serde_json::from_value::<OperationSummaryDocument>(document).map_err(|error| {
+            ApiError::Internal(format!(
+                "failed to decode tenant-scoped rag_operations summary: {error}"
+            ))
+        })?;
+    if summary.tenant_id != tenant_id
+        || summary.id.trim().is_empty()
+        || summary.operation_kind.trim().is_empty()
+    {
+        return Err(ApiError::Internal(
+            "operation journal returned an invalid summary record".to_string(),
+        ));
+    }
+    Ok(OperationListItem {
+        summary: summary.into_summary(),
+        plan: None,
+    })
+}
+
+fn validate_operation_candidate_limit(limit: usize) -> Result<(), ApiError> {
+    if !(1..=MAX_OPERATION_CANDIDATE_LIMIT).contains(&limit) {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {MAX_OPERATION_CANDIDATE_LIMIT}"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_operation_candidate_ids(operation_ids: &[String]) -> Result<Vec<String>, ApiError> {
+    if operation_ids.len() > MAX_OPERATION_CANDIDATE_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "operation_ids must contain at most {MAX_OPERATION_CANDIDATE_LIMIT} values"
+        )));
+    }
+    let mut seen = HashSet::with_capacity(operation_ids.len());
+    let mut normalized = Vec::with_capacity(operation_ids.len());
+    for operation_id in operation_ids {
+        if operation_id.trim().is_empty() {
+            return Err(ApiError::bad_request(
+                "operation_ids must not contain empty values",
+            ));
+        }
+        if seen.insert(operation_id.clone()) {
+            normalized.push(operation_id.clone());
+        }
+    }
+    Ok(normalized)
+}
+
+fn operation_candidate_document_logical_id<'a>(
+    tenant_id: &str,
+    document: &'a Value,
+) -> Result<&'a str, ApiError> {
+    if document.get("tenant_id").and_then(Value::as_str) != Some(tenant_id) {
+        return Err(ApiError::Internal(
+            "operation candidate query returned a cross-tenant document".to_string(),
+        ));
+    }
+    match document.get("logical_id") {
+        Some(Value::String(logical_id)) => {
+            if logical_id.trim().is_empty() || !is_tenant_document("rag_operations", document) {
+                return Err(ApiError::Internal(
+                    "operation candidate query returned an invalid tenant-scoped document"
+                        .to_string(),
+                ));
+            }
+            Ok(logical_id)
+        }
+        Some(Value::Null) | None => document
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|operation_id| !operation_id.trim().is_empty())
+            .ok_or_else(|| {
+                ApiError::Internal(
+                    "operation candidate query returned a legacy document without an id"
+                        .to_string(),
+                )
+            }),
+        Some(_) => Err(ApiError::Internal(
+            "operation candidate query returned an invalid logical id".to_string(),
+        )),
+    }
+}
+
+fn decode_operation_candidate_documents(
+    tenant_id: &str,
+    documents: Vec<Value>,
+    statuses: &[OperationStatus],
+    expected_ids: Option<&HashSet<String>>,
+    reconcilable_only: bool,
+    limit: usize,
+) -> Result<Vec<OperationRecord>, ApiError> {
+    if documents.len() > limit {
+        return Err(ApiError::Upstream(
+            "Meilisearch rag_operations candidate query returned more documents than requested"
+                .to_string(),
+        ));
+    }
+
+    let mut seen_ids = HashSet::with_capacity(documents.len());
+    let mut records = Vec::with_capacity(documents.len());
+    for document in prefer_tenant_documents("rag_operations", documents) {
+        let logical_id = operation_candidate_document_logical_id(tenant_id, &document)?.to_string();
+        let document = restore_logical_id("rag_operations", document);
+        let record = serde_json::from_value::<OperationRecord>(document).map_err(|error| {
+            ApiError::Internal(format!(
+                "failed to decode tenant-scoped rag_operations candidate: {error}"
+            ))
+        })?;
+        if record.tenant_id != tenant_id || record.id != logical_id {
+            return Err(ApiError::Internal(
+                "operation candidate query returned a record with invalid tenant or logical identity"
+                    .to_string(),
+            ));
+        }
+        validate_operation_record(&record).map_err(|error| {
+            ApiError::Internal(format!(
+                "operation candidate query returned an invalid record: {error}"
+            ))
+        })?;
+        if expected_ids.is_some_and(|operation_ids| !operation_ids.contains(&record.id)) {
+            return Err(ApiError::Internal(
+                "operation candidate query returned an unrequested operation".to_string(),
+            ));
+        }
+        if !statuses.is_empty() && !statuses.contains(&record.status) {
+            return Err(ApiError::Internal(
+                "operation candidate query returned an operation with an unrequested status"
+                    .to_string(),
+            ));
+        }
+        if reconcilable_only
+            && record.status == OperationStatus::Completed
+            && record.indexing_state == OperationIndexingState::Completed
+        {
+            return Err(ApiError::Internal(
+                "operation candidate query returned a fully reconciled operation".to_string(),
+            ));
+        }
+        if !seen_ids.insert(record.id.clone()) {
+            return Err(ApiError::Internal(
+                "operation candidate query returned a duplicate logical id".to_string(),
+            ));
+        }
+        records.push(record);
+    }
+    records.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(records)
 }
 
 impl MeiliRepository {
@@ -922,6 +1528,11 @@ impl MeiliRepository {
             .admin
             .add_documents(index_uid, &write_documents)
             .await?;
+        if task_uid.is_none() {
+            return Err(ApiError::Upstream(format!(
+                "Meilisearch accepted a non-empty {index_uid} document mutation without a task UID"
+            )));
+        }
         self.maybe_wait(&task_uid).await?;
         Ok(task_uid)
     }
@@ -1061,11 +1672,314 @@ impl KnowledgeRepository for MeiliRepository {
         .await
     }
 
+    async fn list_operations_by_ids(
+        &self,
+        tenant_id: &str,
+        operation_ids: &[String],
+        statuses: &[OperationStatus],
+        limit: usize,
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError> {
+        validate_operation_candidate_limit(limit)?;
+        let operation_ids = normalize_operation_candidate_ids(operation_ids)?;
+        if operation_ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let expected_ids = operation_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut filter = TenantFilter::new(tenant_id)?.logical_ids(&operation_ids)?;
+        if !statuses.is_empty() {
+            let statuses = statuses
+                .iter()
+                .map(|status| status.as_str().to_string())
+                .collect::<Vec<_>>();
+            filter = filter.in_strings("status", &statuses)?;
+        }
+        let response: SearchResponse<Value> = self
+            .admin
+            .search(
+                "rag_operations",
+                json!({
+                    "q": "",
+                    "limit": limit,
+                    "filter": filter.finish(),
+                    "sort": ["created_at:asc", "id:asc"]
+                }),
+            )
+            .await?;
+        Ok(Some(decode_operation_candidate_documents(
+            tenant_id,
+            response.hits,
+            statuses,
+            Some(&expected_ids),
+            false,
+            limit,
+        )?))
+    }
+
     async fn append_event(&self, event: &HistoryEvent) -> Result<Option<String>, ApiError> {
         let task_uid = self
             .upsert_values(&event.event_index_uid, &[to_document(event, &event.id)?])
             .await?;
         Ok(task_uid)
+    }
+
+    async fn append_events(
+        &self,
+        events: &[HistoryEvent],
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        let Some(first) = events.first() else {
+            return Ok(RepositoryWriteReceipt::empty());
+        };
+        if events.iter().any(|event| {
+            event.tenant_id != first.tenant_id
+                || event.owner_user_id_hash != first.owner_user_id_hash
+                || event.event_index_uid != first.event_index_uid
+        }) {
+            return Err(ApiError::Internal(
+                "history-event batch crosses tenant, owner, or event-index scope".to_string(),
+            ));
+        }
+        let documents = events
+            .iter()
+            .map(|event| to_document(event, &event.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RepositoryWriteReceipt::from_task_uid(
+            self.upsert_values(&first.event_index_uid, &documents)
+                .await?,
+        ))
+    }
+
+    async fn upsert_operation(
+        &self,
+        operation: &OperationRecord,
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        validate_operation_record(operation).map_err(|error| {
+            ApiError::Internal(format!("invalid operation journal record: {error}"))
+        })?;
+        let document = tenant_document(
+            &operation.tenant_id,
+            "rag_operations",
+            &operation.id,
+            operation,
+        )?;
+        Ok(RepositoryWriteReceipt::from_task_uid(
+            self.upsert_values("rag_operations", &[document]).await?,
+        ))
+    }
+
+    async fn get_operation(
+        &self,
+        tenant_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<OperationRecord>, ApiError> {
+        self.search_tenant_one(
+            "rag_operations",
+            TenantFilter::new(tenant_id)?.logical_id(operation_id)?,
+        )
+        .await
+    }
+
+    async fn list_operations(
+        &self,
+        tenant_id: &str,
+        statuses: &[OperationStatus],
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError> {
+        let mut filter = TenantFilter::new(tenant_id)?;
+        if !statuses.is_empty() {
+            let statuses = statuses
+                .iter()
+                .map(|status| status.as_str().to_string())
+                .collect::<Vec<_>>();
+            filter = filter.in_strings("status", &statuses)?;
+        }
+        self.search_tenant_many(
+            "rag_operations",
+            filter,
+            Some(&["created_at:asc", "updated_at:asc"]),
+        )
+        .await
+    }
+
+    async fn list_operation_page(
+        &self,
+        query: RepositoryOperationListQuery<'_>,
+    ) -> Result<Option<RepositoryOperationPage>, ApiError> {
+        if query.limit == 0 || query.limit > 500 {
+            return Err(ApiError::bad_request("limit must be between 1 and 500"));
+        }
+        match (query.offset, query.previous_operation_id) {
+            (0, None) => {}
+            (0, Some(_)) | (_, None) => {
+                return Err(ApiError::bad_request("cursor is invalid or stale"));
+            }
+            (_, Some(operation_id)) if operation_id.trim().is_empty() => {
+                return Err(ApiError::bad_request("cursor is invalid or stale"));
+            }
+            _ => {}
+        }
+
+        let mut filter = TenantFilter::new(query.tenant_id)?;
+        if !query.statuses.is_empty() {
+            let statuses = query
+                .statuses
+                .iter()
+                .map(|status| status.as_str().to_string())
+                .collect::<Vec<_>>();
+            filter = filter.in_strings("status", &statuses)?;
+        }
+        if !query.operation_kinds.is_empty() {
+            filter = filter.in_strings("operation_kind", query.operation_kinds)?;
+        }
+        let filter = filter.finish();
+        let sort = vec!["created_at:desc".to_string(), "id:desc".to_string()];
+
+        if let Some(previous_operation_id) = query.previous_operation_id {
+            let previous_offset = query
+                .offset
+                .checked_sub(1)
+                .ok_or_else(|| ApiError::bad_request("cursor is invalid or stale"))?;
+            let previous = self
+                .admin
+                .fetch_projected_documents_page(
+                    "rag_operations",
+                    &filter,
+                    &sort,
+                    previous_offset,
+                    1,
+                    OPERATION_IDENTITY_FIELDS,
+                )
+                .await?;
+            if previous.offset != previous_offset
+                || previous.limit != 1
+                || previous.results.len() != 1
+            {
+                return Err(ApiError::bad_request("cursor is invalid or stale"));
+            }
+            let actual_operation_id =
+                operation_document_logical_id(query.tenant_id, &previous.results[0])?;
+            if actual_operation_id != previous_operation_id {
+                return Err(ApiError::bad_request("cursor is invalid or stale"));
+            }
+        }
+
+        let fields = if query.include_plan {
+            OPERATION_WITH_PLAN_FIELDS
+        } else {
+            OPERATION_SUMMARY_FIELDS
+        };
+        let page = self
+            .admin
+            .fetch_projected_documents_page(
+                "rag_operations",
+                &filter,
+                &sort,
+                query.offset,
+                query.limit,
+                fields,
+            )
+            .await?;
+        if page.offset != query.offset || page.limit != query.limit {
+            return Err(ApiError::Upstream(format!(
+                "Meilisearch rag_operations page returned offset {} and limit {} while offset {} and limit {} were requested",
+                page.offset, page.limit, query.offset, query.limit
+            )));
+        }
+        if page.results.len() > query.limit {
+            return Err(ApiError::Upstream(
+                "Meilisearch rag_operations page returned more documents than requested"
+                    .to_string(),
+            ));
+        }
+        let end = query
+            .offset
+            .checked_add(page.results.len())
+            .ok_or_else(|| ApiError::bad_request("cursor is invalid or stale"))?;
+        if end > page.total || (page.results.is_empty() && query.offset < page.total) {
+            return Err(ApiError::Upstream(
+                "Meilisearch rag_operations page returned inconsistent pagination metadata"
+                    .to_string(),
+            ));
+        }
+        let operations = page
+            .results
+            .into_iter()
+            .map(|document| {
+                decode_operation_page_item(query.tenant_id, document, query.include_plan)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Some(RepositoryOperationPage {
+            operations,
+            has_more: end < page.total,
+        }))
+    }
+
+    async fn list_reconcilable_operations(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError> {
+        let filter = TenantFilter::new(tenant_id)?.any_not_eq(&[
+            ("status", OperationStatus::Completed.as_str()),
+            ("indexing_state", OperationIndexingState::Completed.as_str()),
+        ])?;
+        self.search_tenant_many(
+            "rag_operations",
+            filter,
+            Some(&["created_at:asc", "updated_at:asc"]),
+        )
+        .await
+    }
+
+    async fn list_oldest_reconcilable_operations(
+        &self,
+        tenant_id: &str,
+        statuses: &[OperationStatus],
+        limit: usize,
+    ) -> Result<Option<Vec<OperationRecord>>, ApiError> {
+        validate_operation_candidate_limit(limit)?;
+        let mut filter = TenantFilter::new(tenant_id)?.any_not_eq(&[
+            ("status", OperationStatus::Completed.as_str()),
+            ("indexing_state", OperationIndexingState::Completed.as_str()),
+        ])?;
+        if !statuses.is_empty() {
+            let statuses = statuses
+                .iter()
+                .map(|status| status.as_str().to_string())
+                .collect::<Vec<_>>();
+            filter = filter.in_strings("status", &statuses)?;
+        }
+        let filter = filter.finish();
+        let sort = vec!["created_at:asc".to_string(), "id:asc".to_string()];
+        let page = self
+            .admin
+            .fetch_filtered_documents_page("rag_operations", &filter, &sort, 0, limit)
+            .await?;
+        if page.offset != 0 || page.limit != limit {
+            return Err(ApiError::Upstream(format!(
+                "Meilisearch rag_operations candidate page returned offset {} and limit {} while offset 0 and limit {limit} were requested",
+                page.offset, page.limit
+            )));
+        }
+        if page.results.len() > limit {
+            return Err(ApiError::Upstream(
+                "Meilisearch rag_operations candidate page returned more documents than requested"
+                    .to_string(),
+            ));
+        }
+        if page.results.len() > page.total || (page.results.is_empty() && page.total > 0) {
+            return Err(ApiError::Upstream(
+                "Meilisearch rag_operations candidate page returned inconsistent pagination metadata"
+                    .to_string(),
+            ));
+        }
+        Ok(Some(decode_operation_candidate_documents(
+            tenant_id,
+            page.results,
+            statuses,
+            None,
+            true,
+            limit,
+        )?))
     }
 
     async fn upsert_context_nodes(
@@ -1201,79 +2115,141 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         tenant_id: &str,
         source_id: &str,
+        source_document_uris: &[String],
+        link_ids: &[String],
     ) -> Result<DeleteSourceReport, ApiError> {
-        let source_filter = TenantFilter::new(tenant_id)?
-            .logical_id(source_id)?
-            .finish();
-        let related_filter = TenantFilter::new(tenant_id)?
-            .eq("source_id", source_id)?
-            .finish();
-        let company_auxiliary_filter = TenantFilter::new(tenant_id)?
-            .eq("source_id", source_id)?
-            .is_null("owner_user_id")
-            .finish();
-
-        // 1. Fragments — stop search hits immediately.
-        let mut report = DeleteSourceReport {
-            fragments_task: self
-                .admin
-                .delete_documents_by_filter("rag_company_context", &related_filter)
-                .await?,
-            ..Default::default()
-        };
-        self.maybe_wait(&report.fragments_task).await?;
-
-        // 2. Revision content blobs.
-        report.revisions_task = self
-            .admin
-            .delete_documents_by_filter("rag_source_revisions", &related_filter)
-            .await?;
-        self.maybe_wait(&report.revisions_task).await?;
-
-        // 3. Source pointer. Legacy rows without proven tenant ownership are
-        // deliberately retained for tenant_scope_v1 quarantine/verification.
-        report.source_task = self
-            .admin
-            .delete_documents_by_filter("rag_sources", &source_filter)
-            .await?;
-        self.maybe_wait(&report.source_task).await?;
-
-        // 4. Auxiliary indices — best-effort. Orphan rows here are
-        //    harmless once the canonical source is gone, but cleaning
-        //    them keeps Meili lean. Errors are logged, not fatal.
-        for aux_uid in [
-            "rag_source_documents",
-            "rag_parse_artifacts",
-            "rag_ingest_tasks",
-            "rag_ingest_results",
-        ] {
-            match self
-                .admin
-                .delete_documents_by_filter(aux_uid, &company_auxiliary_filter)
-                .await
-            {
-                Ok(Some(task)) => {
-                    let wait_task = Some(task.clone());
-                    let _ = self.maybe_wait(&wait_task).await;
-                    report.auxiliary_tasks.push(task);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    let diagnostic = safe_cause_diagnostic(&e);
-                    let source_fingerprint = safe_value_fingerprint("company_source_id", source_id);
-                    tracing::warn!(
-                        target: "nowledge::delete_company_source",
-                        index_kind = aux_uid,
-                        %source_fingerprint,
-                        cause_category = diagnostic.category,
-                        cause_fingerprint = %diagnostic.fingerprint,
-                        "auxiliary cleanup failed; continuing"
-                    );
+        let mut report = DeleteSourceReport::default();
+        let mut targets = vec![
+            CompanySourceDeleteTarget::Fragments,
+            CompanySourceDeleteTarget::Revisions,
+            CompanySourceDeleteTarget::Source,
+            CompanySourceDeleteTarget::SourceDocuments,
+            CompanySourceDeleteTarget::ParseArtifacts,
+            CompanySourceDeleteTarget::IngestTasks,
+            CompanySourceDeleteTarget::IngestResults,
+        ];
+        if !link_ids.is_empty() || !source_document_uris.is_empty() {
+            targets.push(CompanySourceDeleteTarget::Links {
+                link_ids: link_ids.to_vec(),
+                related_uris: source_document_uris.to_vec(),
+            });
+        }
+        for target in targets {
+            let task = self
+                .delete_company_source_index(tenant_id, source_id, &target)
+                .await?;
+            match target {
+                CompanySourceDeleteTarget::Fragments => report.fragments_task = task,
+                CompanySourceDeleteTarget::Revisions => report.revisions_task = task,
+                CompanySourceDeleteTarget::Source => report.source_task = task,
+                CompanySourceDeleteTarget::SourceDocuments
+                | CompanySourceDeleteTarget::ParseArtifacts
+                | CompanySourceDeleteTarget::IngestTasks
+                | CompanySourceDeleteTarget::IngestResults
+                | CompanySourceDeleteTarget::Links { .. } => {
+                    if let Some(task) = task {
+                        report.auxiliary_tasks.push(task);
+                    }
                 }
             }
         }
-
         Ok(report)
+    }
+
+    async fn delete_company_source_index(
+        &self,
+        tenant_id: &str,
+        source_id: &str,
+        target: &CompanySourceDeleteTarget,
+    ) -> Result<Option<String>, ApiError> {
+        if matches!(
+            target,
+            CompanySourceDeleteTarget::Links {
+                link_ids,
+                related_uris,
+            } if link_ids.is_empty() && related_uris.is_empty()
+        ) {
+            return Ok(None);
+        }
+        let (index_uid, filter) = match target {
+            CompanySourceDeleteTarget::Fragments => (
+                "rag_company_context",
+                TenantFilter::new(tenant_id)?
+                    .eq("source_id", source_id)?
+                    .finish(),
+            ),
+            CompanySourceDeleteTarget::Revisions => (
+                "rag_source_revisions",
+                TenantFilter::new(tenant_id)?
+                    .eq("source_id", source_id)?
+                    .finish(),
+            ),
+            CompanySourceDeleteTarget::Source => (
+                "rag_sources",
+                TenantFilter::new(tenant_id)?
+                    .logical_id(source_id)?
+                    .finish(),
+            ),
+            CompanySourceDeleteTarget::SourceDocuments => (
+                "rag_source_documents",
+                TenantFilter::new(tenant_id)?
+                    .eq("source_id", source_id)?
+                    .is_null("owner_user_id")
+                    .finish(),
+            ),
+            CompanySourceDeleteTarget::ParseArtifacts => (
+                "rag_parse_artifacts",
+                TenantFilter::new(tenant_id)?
+                    .eq("source_id", source_id)?
+                    .is_null("owner_user_id")
+                    .finish(),
+            ),
+            CompanySourceDeleteTarget::IngestTasks => (
+                "rag_ingest_tasks",
+                TenantFilter::new(tenant_id)?
+                    .eq("source_id", source_id)?
+                    .is_null("owner_user_id")
+                    .finish(),
+            ),
+            CompanySourceDeleteTarget::IngestResults => (
+                "rag_ingest_results",
+                TenantFilter::new(tenant_id)?
+                    .eq("source_id", source_id)?
+                    .is_null("owner_user_id")
+                    .finish(),
+            ),
+            CompanySourceDeleteTarget::Links {
+                link_ids,
+                related_uris,
+            } => {
+                let mut conditions = Vec::<(&'static str, &[String])>::new();
+                if !link_ids.is_empty() {
+                    conditions.push(("logical_id", link_ids));
+                    conditions.push(("id", link_ids));
+                }
+                if !related_uris.is_empty() {
+                    conditions.push(("source_uri", related_uris));
+                    conditions.push(("target_uri", related_uris));
+                }
+                (
+                    "rag_links",
+                    TenantFilter::new(tenant_id)?
+                        .any_in_strings(&conditions)?
+                        .finish(),
+                )
+            }
+        };
+        let task = self
+            .admin
+            .delete_documents_by_filter(index_uid, &filter)
+            .await?;
+        if task.is_none() && self.admin.configured() {
+            return Err(ApiError::Upstream(format!(
+                "Meilisearch did not return a task UID for required company-source deletion index {index_uid}"
+            )));
+        }
+        self.maybe_wait(&task).await?;
+        Ok(task)
     }
 
     async fn upsert_source_documents(
@@ -1602,38 +2578,27 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         tenant_id: &str,
         task_ids: &[String],
-    ) -> Result<(), ApiError> {
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
         if task_ids.is_empty() {
-            return Ok(());
+            return Ok(RepositoryWriteReceipt::empty());
         }
-        // Best-effort on both indexes: a failed delete only delays cleanup
-        // until the next sweep, so log and continue rather than abort.
+        let mut receipt = RepositoryWriteReceipt::empty();
         for index_uid in ["rag_ingest_tasks", "rag_ingest_results"] {
             let filter = TenantFilter::new(tenant_id)?
                 .in_strings("task_id", task_ids)?
                 .finish();
-            match self
+            let task_uid = self
                 .admin
                 .delete_documents_by_filter(index_uid, &filter)
-                .await
-            {
-                Ok(task) => {
-                    let _ = self.maybe_wait(&task).await;
-                }
-                Err(e) => {
-                    let diagnostic = safe_cause_diagnostic(&e);
-                    tracing::warn!(
-                        target: "nowledge::ingest_cleanup",
-                        index_kind = index_uid,
-                        document_count = task_ids.len(),
-                        cause_category = diagnostic.category,
-                        cause_fingerprint = %diagnostic.fingerprint,
-                        "failed to delete expired ingest documents"
-                    );
-                }
+                .await?;
+            self.maybe_wait(&task_uid).await?;
+            if let Some(task_uid) = task_uid {
+                receipt.task_uids.push(task_uid);
             }
         }
-        Ok(())
+        let mut ordered = RepositoryWriteReceipt::empty();
+        ordered.extend(receipt);
+        Ok(ordered)
     }
 
     async fn upsert_eval_case(&self, case: &RagEvalCase) -> Result<Option<String>, ApiError> {
@@ -2158,6 +3123,21 @@ impl KnowledgeRepository for MeiliRepository {
                 .eq("uri", uri)?
                 .eq("status", "active")?,
             Some(&["updated_at:desc"]),
+        )
+        .await
+    }
+
+    async fn list_company_source_documents(
+        &self,
+        tenant_id: &str,
+        source_id: &str,
+    ) -> Result<Option<Vec<SourceDocument>>, ApiError> {
+        self.search_tenant_many(
+            "rag_source_documents",
+            TenantFilter::new(tenant_id)?
+                .eq("source_id", source_id)?
+                .is_null("owner_user_id"),
+            Some(&["updated_at:asc"]),
         )
         .await
     }
@@ -2712,6 +3692,302 @@ fn strip_context_layer_suffix(uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    use axum::{
+        body::to_bytes,
+        extract::{Request as AxumRequest, State},
+        http::{Method, StatusCode},
+        response::{IntoResponse, Response},
+        Json, Router,
+    };
+
+    use crate::{
+        config::Config,
+        mutation::{
+            operation_record_from_plan, operation_step_completed, OPERATION_PLAN_SCHEMA_VERSION,
+        },
+    };
+
+    #[derive(Clone)]
+    struct OperationQueryStub {
+        response: Value,
+        requests: Arc<Mutex<Vec<(Method, String, Value)>>>,
+    }
+
+    async fn operation_query_stub(
+        State(stub): State<OperationQueryStub>,
+        request: AxumRequest,
+    ) -> Response {
+        let method = request.method().clone();
+        let path = request.uri().path().to_string();
+        let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap();
+        stub.requests.lock().unwrap().push((method, path, body));
+        (StatusCode::OK, Json(stub.response)).into_response()
+    }
+
+    async fn spawn_operation_query_repository(
+        response: Value,
+    ) -> (MeiliRepository, Arc<Mutex<Vec<(Method, String, Value)>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stub = OperationQueryStub {
+            response,
+            requests: Arc::clone(&requests),
+        };
+        let app = Router::new()
+            .fallback(operation_query_stub)
+            .with_state(stub);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = Config::test();
+        config.meili_url = Some(format!("http://{address}"));
+        (
+            MeiliRepository::new(MeiliAdmin::from_config(&config), false),
+            requests,
+        )
+    }
+
+    fn operation_candidate_record(
+        tenant_id: &str,
+        operation_id: &str,
+        created_at: &str,
+    ) -> OperationRecord {
+        let created_at = DateTime::parse_from_rfc3339(created_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        operation_record_from_plan(OperationPlan {
+            schema_version: OPERATION_PLAN_SCHEMA_VERSION,
+            id: operation_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            operation_kind: "state_upsert".to_string(),
+            actor: OperationActor {
+                scope: OperationActorScope::TenantService,
+                owner_user_id_hash: None,
+                roles: Vec::new(),
+                request_id: None,
+            },
+            idempotency_key_hash: None,
+            primary: OperationStep {
+                id: "primary".to_string(),
+                role: OperationStepRole::Primary,
+                resource: OperationResource::StructuredSummary {
+                    summary: json!({"id": operation_id}),
+                },
+            },
+            side_effects: Vec::new(),
+            redacted_metadata: json!({}),
+            response_snapshot: Value::Null,
+            created_at,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn operation_id_batch_uses_one_scoped_search_and_restores_legacy_ids() {
+        let newer = operation_candidate_record("tenant-a", "operation-2", "2026-07-14T02:00:00Z");
+        let older = operation_candidate_record("tenant-a", "operation-1", "2026-07-14T01:00:00Z");
+        let newer = tenant_document("tenant-a", "rag_operations", "operation-2", &newer).unwrap();
+        let older = serde_json::to_value(older).unwrap();
+        let (repository, requests) = spawn_operation_query_repository(json!({
+            "hits": [newer, older]
+        }))
+        .await;
+
+        let operations = repository
+            .list_operations_by_ids(
+                "tenant-a",
+                &["operation-2".to_string(), "operation-1".to_string()],
+                &[OperationStatus::Pending],
+                2,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| operation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["operation-1", "operation-2"]
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "batch query must use one Meili call");
+        assert_eq!(requests[0].0, Method::POST);
+        assert_eq!(requests[0].1, "/indexes/rag_operations/search");
+        assert_eq!(requests[0].2["limit"], 2);
+        assert_eq!(requests[0].2["sort"], json!(["created_at:asc", "id:asc"]));
+        let filter = requests[0].2["filter"].as_str().unwrap();
+        assert!(filter.contains("tenant_id = \"tenant-a\""), "{filter}");
+        assert!(filter.contains("logical_id IN"), "{filter}");
+        assert!(filter.contains("id IN"), "{filter}");
+        assert!(filter.contains("status IN [\"pending\"]"), "{filter}");
+    }
+
+    #[tokio::test]
+    async fn oldest_reconcilable_query_uses_one_bounded_document_page() {
+        let newer = operation_candidate_record("tenant-a", "operation-2", "2026-07-14T02:00:00Z");
+        let older = operation_candidate_record("tenant-a", "operation-1", "2026-07-14T01:00:00Z");
+        let newer = tenant_document("tenant-a", "rag_operations", "operation-2", &newer).unwrap();
+        let older = serde_json::to_value(older).unwrap();
+        let (repository, requests) = spawn_operation_query_repository(json!({
+            "results": [newer, older],
+            "offset": 0,
+            "limit": 2,
+            "total": 7
+        }))
+        .await;
+
+        let operations = repository
+            .list_oldest_reconcilable_operations("tenant-a", &[OperationStatus::Pending], 2)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| operation.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["operation-1", "operation-2"]
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "bounded query must use one Meili call");
+        assert_eq!(requests[0].0, Method::POST);
+        assert_eq!(requests[0].1, "/indexes/rag_operations/documents/fetch");
+        assert_eq!(requests[0].2["offset"], 0);
+        assert_eq!(requests[0].2["limit"], 2);
+        assert_eq!(requests[0].2["sort"], json!(["created_at:asc", "id:asc"]));
+        let filter = requests[0].2["filter"].as_str().unwrap();
+        assert!(filter.contains("tenant_id = \"tenant-a\""), "{filter}");
+        assert!(filter.contains("status != \"completed\""), "{filter}");
+        assert!(
+            filter.contains("indexing_state != \"completed\""),
+            "{filter}"
+        );
+        assert!(filter.contains("status IN [\"pending\"]"), "{filter}");
+    }
+
+    #[tokio::test]
+    async fn memory_operation_candidate_queries_are_unsupported() {
+        let repository = MemoryRepository;
+        assert!(repository
+            .list_operations_by_ids("tenant-a", &["operation-1".to_string()], &[], 1)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repository
+            .list_oldest_reconcilable_operations("tenant-a", &[], 1)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn operation_candidate_inputs_are_hard_bounded() {
+        assert!(matches!(
+            validate_operation_candidate_limit(0),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(validate_operation_candidate_limit(MAX_OPERATION_CANDIDATE_LIMIT).is_ok());
+        assert!(matches!(
+            validate_operation_candidate_limit(MAX_OPERATION_CANDIDATE_LIMIT + 1),
+            Err(ApiError::BadRequest(_))
+        ));
+        let too_many_ids = (0..=MAX_OPERATION_CANDIDATE_LIMIT)
+            .map(|index| format!("operation-{index}"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            normalize_operation_candidate_ids(&too_many_ids),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn operation_candidate_decoder_enforces_returned_scope_and_state() {
+        let pending = operation_candidate_record("tenant-a", "operation-1", "2026-07-14T01:00:00Z");
+        let expected_ids = HashSet::from(["operation-1".to_string()]);
+
+        assert!(decode_operation_candidate_documents(
+            "tenant-b",
+            vec![serde_json::to_value(&pending).unwrap()],
+            &[],
+            Some(&expected_ids),
+            false,
+            1,
+        )
+        .is_err());
+        assert!(decode_operation_candidate_documents(
+            "tenant-a",
+            vec![serde_json::to_value(&pending).unwrap()],
+            &[OperationStatus::Failed],
+            Some(&expected_ids),
+            false,
+            1,
+        )
+        .is_err());
+
+        let completed = operation_step_completed(
+            &pending,
+            "primary",
+            pending.created_at + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+        assert!(decode_operation_candidate_documents(
+            "tenant-a",
+            vec![serde_json::to_value(completed).unwrap()],
+            &[],
+            Some(&expected_ids),
+            true,
+            1,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn generic_operation_step_application_is_typed_and_memory_deterministic() {
+        let repository = MemoryRepository;
+        let step = OperationStep {
+            id: "summary".to_string(),
+            role: OperationStepRole::Primary,
+            resource: OperationResource::StructuredSummary {
+                summary: json!({"id": "summary-1"}),
+            },
+        };
+        let receipt = repository
+            .apply_operation_step("tenant-a", &step)
+            .await
+            .unwrap();
+        assert_eq!(receipt, RepositoryWriteReceipt::empty());
+    }
+
+    #[tokio::test]
+    async fn generic_operation_step_rejects_cross_tenant_resources() {
+        let repository = MemoryRepository;
+        let step = OperationStep {
+            id: "dataset".to_string(),
+            role: OperationStepRole::Primary,
+            resource: OperationResource::Dataset {
+                dataset: DatasetRecord {
+                    id: "dataset-1".to_string(),
+                    tenant_id: "tenant-b".to_string(),
+                    dataset_key: "daily".to_string(),
+                    title: "Daily".to_string(),
+                    schema_version: 1,
+                    status: "active".to_string(),
+                    columns: Vec::new(),
+                },
+            },
+        };
+        assert!(repository
+            .apply_operation_step("tenant-a", &step)
+            .await
+            .is_err());
+    }
 
     #[test]
     fn context_filters_pin_company_and_personal_index_identity() {

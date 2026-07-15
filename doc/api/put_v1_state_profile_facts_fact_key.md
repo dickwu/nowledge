@@ -22,7 +22,7 @@ Schema: `UpsertStateFactRequest`
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
 | owner_user_id | string | optional, auth default may apply | Owner for the state fact. Required after auth defaults are applied. |
-| state_type | string | required | State category such as profile, preference, or memory. |
+| state_type | string | required | State category such as profile, preference, or memory. Immutable after this fact is created. |
 | title | string | optional | Display title for the fact. |
 | statement | string | required | Canonical natural-language statement. Keep this as a summary when `document` is supplied. |
 | value | JSON value | optional, default null | Structured value for the fact. |
@@ -34,7 +34,7 @@ Schema: `UpsertStateFactRequest`
 | document | object | optional | Full document payload to store as a non-retrieval `SourceDocument` and split into fragments. |
 | fragment_policy | object | optional | Fragmenting policy applied when `document` is provided. |
 | merge_policy | string | optional, default merge | How to merge with existing facts with the same key. |
-| idempotency_key | string | optional | Client deduplication key. |
+| idempotency_key | string | optional | Client deduplication key, bound to this exact fact target and canonical request payload. |
 
 ### Document Fields
 | Field | Type | Requirement | Description |
@@ -73,6 +73,14 @@ Schema: `StateItemResponse`
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Tenant-service principals must provide `owner_user_id`; the service never
   infers a write target from existing tenant data.
+- Changing `state_type` for an existing fact returns 409; moving a fact between
+  physical state aggregates requires an explicit future migration API.
+- A distinct raw `state_type`/`fact_key` pair that normalizes to an existing
+  physical context path returns 409 before any state or document write.
+- Reusing an `idempotency_key` with a different fact target or request payload
+  returns 409 instead of replaying the first fact's response.
+- A newer update returns 409 while an older operation for the same physical
+  state aggregate remains reconcilable.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph

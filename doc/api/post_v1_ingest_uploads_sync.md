@@ -13,6 +13,7 @@ Completed `IngestTaskResult`.
 ## Rules
 
 - Text files can use `parser_provider=builtin`.
+- `idempotency_key` is rejected with 400 and is never silently ignored.
 - PDF/DOCX/PPTX/XLSX/image bytes should use `parser_provider=mineru`.
 - The same streamed temporary-file, upload/field limits, duplicate-file,
   filename, MIME, exact 64-hex SHA-256 checksum, and cleanup rules as the

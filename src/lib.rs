@@ -6,6 +6,7 @@ pub mod http_boundary;
 pub mod llm;
 pub mod meili;
 pub mod models;
+pub mod mutation;
 pub mod parser;
 pub mod repository;
 pub mod request_context;

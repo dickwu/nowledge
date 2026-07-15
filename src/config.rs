@@ -36,6 +36,37 @@ const DEFAULT_INGEST_QUEUE_MULTIPLIER: usize = 8;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
 const MAX_BOUNDARY_DEADLINE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteConsistency {
+    Eventual,
+    ReadYourWrites,
+    WaitForIndex,
+}
+
+impl WriteConsistency {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eventual => "eventual",
+            Self::ReadYourWrites => "read_your_writes",
+            Self::WaitForIndex => "wait_for_index",
+        }
+    }
+}
+
+impl std::str::FromStr for WriteConsistency {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "eventual" => Ok(Self::Eventual),
+            "read_your_writes" => Ok(Self::ReadYourWrites),
+            "wait_for_index" => Ok(Self::WaitForIndex),
+            _ => Err("RAG_WRITE_CONSISTENCY must be eventual, read_your_writes, or wait_for_index"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub host: String,
@@ -55,6 +86,9 @@ pub struct Config {
     pub store_backend: String,
     pub meili_url: Option<String>,
     pub meili_api_key: Option<String>,
+    pub write_consistency: WriteConsistency,
+    /// Compatibility projection for repository code that has not yet moved to
+    /// the typed write-consistency policy.
     pub meili_wait_for_tasks: bool,
     pub meili_scan_page_size: usize,
     pub meili_scan_max_documents: usize,
@@ -210,6 +244,25 @@ impl Config {
         let upload_allowed_mime_types = std::env::var("RAG_UPLOAD_ALLOWED_MIME_TYPES")
             .map(|value| parse_csv_values(&value))
             .unwrap_or_else(|_| default_upload_allowed_mime_types());
+        let configured_write_consistency = std::env::var("RAG_WRITE_CONSISTENCY").ok();
+        let legacy_wait_for_tasks = std::env::var("RAG_MEILI_WAIT_FOR_TASKS").ok();
+        let write_consistency = resolve_write_consistency(
+            &run_mode,
+            configured_write_consistency.as_deref(),
+            legacy_wait_for_tasks.as_deref(),
+        )
+        .unwrap_or_else(|error| {
+            boundary_errors.push(error);
+            default_write_consistency(&run_mode)
+        });
+        if configured_write_consistency.is_none() && legacy_wait_for_tasks.is_some() {
+            tracing::warn!(
+                removal_date = "2026-10-01",
+                removal_version = "v0.13.0",
+                "RAG_MEILI_WAIT_FOR_TASKS is deprecated; set RAG_WRITE_CONSISTENCY instead"
+            );
+        }
+        let meili_wait_for_tasks = write_consistency == WriteConsistency::WaitForIndex;
 
         let config = Self {
             host: std::env::var("RAG_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
@@ -245,9 +298,8 @@ impl Config {
                 .unwrap_or_else(|_| "memory".to_string()),
             meili_url: std::env::var("RAG_MEILI_URL").ok(),
             meili_api_key: std::env::var("RAG_MEILI_API_KEY").ok(),
-            meili_wait_for_tasks: std::env::var("RAG_MEILI_WAIT_FOR_TASKS")
-                .map(|v| truthy(&v))
-                .unwrap_or(false),
+            write_consistency,
+            meili_wait_for_tasks,
             meili_scan_page_size: parse_env_number(
                 "RAG_MEILI_SCAN_PAGE_SIZE",
                 DEFAULT_MEILI_SCAN_PAGE_SIZE,
@@ -606,6 +658,11 @@ impl Config {
             "development" | "test" | "production"
         ) {
             anyhow::bail!("RAG_RUN_MODE must be development, test, or production");
+        }
+        if self.run_mode == "production" && self.write_consistency == WriteConsistency::Eventual {
+            anyhow::bail!(
+                "RAG_WRITE_CONSISTENCY=eventual is not allowed in production; use read_your_writes or wait_for_index"
+            );
         }
         if self.tenant_id.trim().is_empty() {
             anyhow::bail!("RAG_TENANT_ID must be non-empty");
@@ -991,6 +1048,7 @@ impl Config {
             store_backend: "memory".to_string(),
             meili_url: None,
             meili_api_key: None,
+            write_consistency: WriteConsistency::WaitForIndex,
             meili_wait_for_tasks: true,
             meili_scan_page_size: DEFAULT_MEILI_SCAN_PAGE_SIZE,
             meili_scan_max_documents: DEFAULT_MEILI_SCAN_MAX_DOCUMENTS,
@@ -1227,6 +1285,37 @@ fn default_allow_unsafe_unauthenticated(run_mode: &str) -> bool {
     matches!(run_mode, "development" | "test")
 }
 
+fn default_write_consistency(run_mode: &str) -> WriteConsistency {
+    if run_mode == "test" {
+        WriteConsistency::WaitForIndex
+    } else {
+        WriteConsistency::ReadYourWrites
+    }
+}
+
+fn resolve_write_consistency(
+    run_mode: &str,
+    configured: Option<&str>,
+    legacy_wait_for_tasks: Option<&str>,
+) -> Result<WriteConsistency, String> {
+    if configured.is_some() && legacy_wait_for_tasks.is_some() {
+        return Err(
+            "RAG_WRITE_CONSISTENCY cannot be combined with RAG_MEILI_WAIT_FOR_TASKS".to_string(),
+        );
+    }
+    if let Some(configured) = configured {
+        return configured.parse().map_err(str::to_string);
+    }
+    if let Some(legacy_wait_for_tasks) = legacy_wait_for_tasks {
+        return Ok(if truthy(legacy_wait_for_tasks) {
+            WriteConsistency::WaitForIndex
+        } else {
+            WriteConsistency::ReadYourWrites
+        });
+    }
+    Ok(default_write_consistency(run_mode))
+}
+
 fn truthy(value: &str) -> bool {
     matches!(value, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
 }
@@ -1365,6 +1454,84 @@ fn parse_auth_users(value: &str) -> anyhow::Result<Vec<AuthUserConfig>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_consistency_parser_accepts_only_canonical_values() {
+        assert_eq!("eventual".parse(), Ok(WriteConsistency::Eventual));
+        assert_eq!(
+            "read_your_writes".parse(),
+            Ok(WriteConsistency::ReadYourWrites)
+        );
+        assert_eq!("wait_for_index".parse(), Ok(WriteConsistency::WaitForIndex));
+
+        for invalid in [
+            "",
+            "Eventual",
+            "read-your-writes",
+            " wait_for_index",
+            "wait_for_index ",
+            "unknown",
+        ] {
+            assert!(
+                invalid.parse::<WriteConsistency>().is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_consistency_defaults_are_mode_specific() {
+        assert_eq!(
+            default_write_consistency("test"),
+            WriteConsistency::WaitForIndex
+        );
+        assert_eq!(
+            default_write_consistency("development"),
+            WriteConsistency::ReadYourWrites
+        );
+        assert_eq!(
+            default_write_consistency("production"),
+            WriteConsistency::ReadYourWrites
+        );
+
+        let config = Config::test();
+        assert_eq!(config.write_consistency, WriteConsistency::WaitForIndex);
+        assert!(config.meili_wait_for_tasks);
+    }
+
+    #[test]
+    fn write_consistency_legacy_setting_maps_to_typed_policy() {
+        assert_eq!(
+            resolve_write_consistency("development", None, Some("true")),
+            Ok(WriteConsistency::WaitForIndex)
+        );
+        assert_eq!(
+            resolve_write_consistency("development", None, Some("false")),
+            Ok(WriteConsistency::ReadYourWrites)
+        );
+    }
+
+    #[test]
+    fn write_consistency_rejects_new_and_legacy_settings_together() {
+        let error =
+            resolve_write_consistency("development", Some("read_your_writes"), Some("false"))
+                .unwrap_err();
+
+        assert!(error.contains("RAG_WRITE_CONSISTENCY"));
+        assert!(error.contains("RAG_MEILI_WAIT_FOR_TASKS"));
+    }
+
+    #[test]
+    fn production_rejects_eventual_write_consistency() {
+        let mut config = Config::test();
+        config.run_mode = "production".to_string();
+        config.write_consistency = WriteConsistency::Eventual;
+        config.meili_wait_for_tasks = false;
+
+        let error = config.validate_startup().unwrap_err().to_string();
+
+        assert!(error.contains("RAG_WRITE_CONSISTENCY=eventual"));
+    }
 
     #[test]
     fn analysis_llm_config_uses_analysis_reasoning_effort() {

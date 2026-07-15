@@ -21,6 +21,8 @@ scrubbed.
 ## Rules
 
 - Kept for tests and caller flows that need immediate completion.
+- `idempotency_key` is rejected with 400 before task creation and is never
+  silently ignored.
 - Uses the same parser, fragmenter, source-document, ACL, and retrieval safety rules as asynchronous ingest.
 - The JSON body is bounded by `RAG_MAX_JSON_BYTES`; the route is bounded by
   `RAG_SYNC_INGEST_TIMEOUT_MS`. Timeout returns 504 and terminalizes the task as

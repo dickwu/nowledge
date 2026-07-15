@@ -1727,6 +1727,49 @@ async fn structured_rows_are_idempotent_by_row_id() {
         assert_eq!(rows["inserted"], expected.0);
         assert_eq!(rows["duplicates"], expected.1);
     }
+
+    let idless_batch = json!({
+        "rows": [
+            { "stress_score": 4.0 },
+            { "stress_score": 8.0 }
+        ],
+        "idempotency_key": "idless-row-batch"
+    });
+    let (status, inserted) = call(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/history/structured/snapshots/{snapshot_id}/rows:bulk"),
+        idless_batch.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{inserted}");
+    assert_eq!(inserted["inserted"], 2, "{inserted}");
+    let row_ids = inserted["row_ids"].as_array().unwrap();
+    assert_eq!(row_ids.len(), 2, "{inserted}");
+    assert_ne!(row_ids[0], row_ids[1], "{inserted}");
+
+    let (status, replayed) = call(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/history/structured/snapshots/{snapshot_id}/rows:bulk"),
+        idless_batch,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed["row_ids"], inserted["row_ids"], "{replayed}");
+
+    let (status, rejected) = call(
+        app,
+        Method::POST,
+        &format!("/v1/history/structured/snapshots/{snapshot_id}/rows:bulk"),
+        json!({
+            "rows": [{ "stress_score": 99.0 }],
+            "idempotency_key": "idless-row-batch"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "conflict", "{rejected}");
 }
 
 #[tokio::test]

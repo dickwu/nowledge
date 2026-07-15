@@ -1645,6 +1645,102 @@ async fn representative_runtime_routes_enforce_their_guard_classes() {
     assert_eq!(status, StatusCode::OK, "admin route: {body}");
 }
 
+#[tokio::test]
+async fn operation_journal_routes_require_admin_scope() {
+    let app = characterized_app();
+
+    for (uri, body) in [
+        ("/v1/admin/operations/search", json!({})),
+        ("/v1/admin/operations:reconcile", json!({ "dry_run": true })),
+    ] {
+        let (status, response) = call(app.clone(), Method::POST, uri, body.clone(), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {response}");
+
+        let (status, response) = call(
+            app.clone(),
+            Method::POST,
+            uri,
+            body.clone(),
+            Some(OWNER_U1_TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {response}");
+
+        let (status, response) =
+            call(app.clone(), Method::POST, uri, body, Some(ADMIN_TOKEN)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {response}");
+        assert!(response["operations"].is_array(), "{uri}: {response}");
+        if uri.ends_with(":reconcile") {
+            assert_eq!(response["checked"], 0, "{uri}: {response}");
+            assert!(response["errors"].is_array(), "{uri}: {response}");
+        }
+    }
+}
+
+async fn index_mutation_plan(token: &str, owner_user_id: &str) -> Value {
+    let app = characterized_app();
+    let (status, response) = call(
+        app.clone(),
+        Method::PUT,
+        &format!("/v1/history/users/{owner_user_id}/event-index"),
+        json!({}),
+        Some(token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    let (status, journal) = call(
+        app,
+        Method::POST,
+        "/v1/admin/operations/search",
+        json!({
+            "operation_kinds": ["user_event_index.ensure"],
+            "include_plan": true
+        }),
+        Some(ADMIN_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{journal}");
+    let operations = journal["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 1, "{journal}");
+    operations[0]["plan"].clone()
+}
+
+#[tokio::test]
+async fn operation_journal_actor_uses_authenticated_principal_scope_and_roles() {
+    let owner_plan = index_mutation_plan(OWNER_U1_TOKEN, "u1").await;
+    assert_eq!(owner_plan["actor"]["scope"], "owner", "{owner_plan}");
+    assert_eq!(owner_plan["actor"]["roles"], json!(["user"]));
+    let owner_hash = owner_plan["actor"]["owner_user_id_hash"]
+        .as_str()
+        .expect("owner actors retain only an HMAC-derived owner identity");
+    assert!(!owner_hash.is_empty(), "{owner_plan}");
+    assert_ne!(owner_hash, "u1", "{owner_plan}");
+    assert!(
+        owner_plan["actor"]["request_id"].as_str().is_some(),
+        "{owner_plan}"
+    );
+
+    let service_plan = index_mutation_plan(TENANT_SERVICE_TOKEN, "service-owner").await;
+    assert_eq!(
+        service_plan["actor"]["scope"], "tenant_service",
+        "{service_plan}"
+    );
+    assert_eq!(service_plan["actor"]["roles"], json!(["user"]));
+    assert!(
+        service_plan["actor"].get("owner_user_id_hash").is_none(),
+        "{service_plan}"
+    );
+
+    let admin_plan = index_mutation_plan(ADMIN_TOKEN, "admin-owner").await;
+    assert_eq!(admin_plan["actor"]["scope"], "admin", "{admin_plan}");
+    assert_eq!(admin_plan["actor"]["roles"], json!(["admin"]));
+    assert!(
+        admin_plan["actor"].get("owner_user_id_hash").is_none(),
+        "{admin_plan}"
+    );
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GuardPolicy {
     Public,
@@ -1756,7 +1852,7 @@ fn route_policy_matrix_covers_every_manifest_handler_and_group() {
     let routes = include_str!("../src/routes.rs");
     assert_eq!(
         manifest.len(),
-        87,
+        89,
         "the policy matrix must cover all routes"
     );
 
@@ -1787,6 +1883,8 @@ fn route_policy_matrix_covers_every_manifest_handler_and_group() {
     assert_eq!(policy_for("delete_company_doc"), GuardPolicy::Admin);
     assert_eq!(policy_for("upsert_dataset"), GuardPolicy::CompanyWriter);
     assert_eq!(policy_for("rag_debug"), GuardPolicy::Admin);
+    assert_eq!(policy_for("search_operations"), GuardPolicy::Admin);
+    assert_eq!(policy_for("reconcile_operations"), GuardPolicy::Admin);
     assert!(manifest
         .iter()
         .filter(|entry| entry.group == "Debug")

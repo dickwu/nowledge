@@ -58,7 +58,7 @@ RAG_RUN_MODE=development
 RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true
 RAG_MEILI_URL=http://127.0.0.1:7700
 RAG_MEILI_API_KEY=optional-meili-key
-RAG_MEILI_WAIT_FOR_TASKS=false
+RAG_WRITE_CONSISTENCY=read_your_writes
 RAG_MEILI_SCAN_PAGE_SIZE=500
 RAG_MEILI_SCAN_MAX_DOCUMENTS=100000
 RAG_PARSER_PROVIDER=builtin
@@ -129,6 +129,69 @@ and been verified. The compatibility path expires on 2026-10-01 / v0.13.0.
 
 `RAG_RUN_MODE` accepts only `development`, `test`, or `production`; unknown
 values are startup errors and never enable unauthenticated access by default.
+
+`RAG_WRITE_CONSISTENCY` accepts only `eventual`, `read_your_writes`, or
+`wait_for_index`. Development and production default to `read_your_writes`;
+test mode defaults to `wait_for_index`. Production rejects `eventual` because
+it cannot guarantee visibility of a completed write. The deprecated
+`RAG_MEILI_WAIT_FOR_TASKS` is consulted only when `RAG_WRITE_CONSISTENCY` is
+unset: `true` maps to `wait_for_index`, while `false` maps to
+`read_your_writes`. Setting both variables is a startup error. This legacy
+compatibility path expires on 2026-10-01 / v0.13.0.
+
+History mutation responses include additive `persistence` metadata with the
+durable operation ID, operation/indexing states, ordered primary task UIDs,
+and all task UIDs. If an event batch is committed but a derived context write
+fails, the response is explicit (`status=partially_failed`) and retrying the
+same owner-scoped idempotency key reconciles unfinished work while replaying
+the original stable event IDs. Other legacy response shapes continue to fail
+safely when a derived write is partial; operators can inspect and retry the
+journal through the admin operation endpoints.
+
+Every supported operation-level `idempotency_key` is bound to the canonical
+tenant, target, and request payload. An exact retry replays the stable result;
+reusing the key for a different request returns 409. History bulk writes accept
+only the top-level batch key (nested `events[].idempotency_key` is rejected),
+and ingest requests reject `idempotency_key` because ingest idempotency is not
+yet supported. Keyed structured-row batches generate a distinct stable ID for
+each ID-less row by batch position.
+
+Before starting this revision against an existing Meilisearch deployment,
+back up Meilisearch and add the tenant-safe operation journal. The managed
+fixed-index bootstrap fails closed when the old index set exists without
+`rag_operations`; it will not recreate the missing index automatically.
+Drain writers during this cutover and audit existing documents for legacy
+idempotency metadata. `operations_v1` starts the durable journal; it cannot
+reconstruct request fingerprints or response snapshots for keys accepted by an
+older binary. Treat pre-journal keys as retired and do not replay them after
+the upgrade.
+
+```sh
+cargo run --bin operations_v1 -- plan --out /secure/operations-v1-plan.json
+cargo run --bin operations_v1 -- apply \
+  --plan /secure/operations-v1-plan.json --dry-run
+cargo run --bin operations_v1 -- apply \
+  --plan /secure/operations-v1-plan.json
+cargo run --bin operations_v1 -- verify \
+  --plan /secure/operations-v1-plan.json
+```
+
+Use the same `RAG_MEILI_URL` and, when required, `RAG_MEILI_API_KEY` as the
+service. `operations_v1` manages only `rag_operations`, waits for every task,
+requires the exact primary key `id`, is non-destructive and idempotent, and
+rejects a tampered plan. `verify` exits nonzero whenever the index, primary
+key, or managed settings are not ready, so deployment automation must treat
+that command as a hard gate. The previous
+application revision ignores this additional index, so rollback does not
+require deleting it. See
+[ADR 0006](doc/adr/0006-mutation-consistency.md) for consistency and recovery
+semantics.
+
+The operation journal currently requires one writer process per tenant.
+Do not run active-active Nowledge writer replicas against the same tenant until
+a durable lease or compare-and-set protocol is introduced; the in-process
+mutation gate is not distributed consensus. Read replicas are outside this
+revision's supported deployment topology.
 
 HTTP and ingest boundaries are typed startup configuration. Numeric limits
 must be positive, malformed values fail startup, and the synchronous ingest
@@ -287,6 +350,8 @@ APIs are `POST /v1/ingest/tasks`, `GET /v1/ingest/tasks/{task_id}`,
 `POST /v1/ingest/uploads:sync`, and `POST /v1/ingest/files:sync`.
 `POST /v1/ingest/tasks` and `/v1/ingest/uploads` return queued task metadata
 immediately; background workers perform parsing, fragmenting, and indexing.
+Ingest requests do not currently support `idempotency_key`; supplying one
+returns 400 before a task record is created.
 Queue capacity defaults to eight times `RAG_INGEST_MAX_CONCURRENT_TASKS` and
 can be set explicitly with `RAG_INGEST_QUEUE_CAPACITY`. A full queue is rejected
 immediately without creating an orphan task. Disabling the worker rejects new

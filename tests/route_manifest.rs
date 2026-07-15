@@ -348,7 +348,7 @@ fn router_and_api_manifest_have_the_same_exact_endpoint_triples() {
     let manifest = manifest();
     let documented: BTreeSet<_> = manifest.iter().map(RouteTriple::from).collect();
 
-    assert_eq!(manifest.len(), 87, "the endpoint manifest count changed");
+    assert_eq!(manifest.len(), 89, "the endpoint manifest count changed");
     assert_eq!(
         documented.len(),
         manifest.len(),
