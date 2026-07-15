@@ -592,6 +592,159 @@ impl UpstreamHttpClient {
             attempts: policy.max_retries.saturating_add(1),
         })
     }
+
+    /// Start a response whose successful body will be consumed incrementally.
+    ///
+    /// Request construction, response headers, retry backoff, and every body
+    /// chunk share one overall deadline. Retryable status responses are read
+    /// with the configured bound before classification. Once a successful
+    /// response has been accepted, its body is never retried: chunk failures,
+    /// deadline exhaustion, and cumulative size-limit violations are terminal.
+    /// Dropping the returned response drops the owned upstream response and
+    /// cancels any unread body.
+    pub async fn execute_stream<F, Fut>(
+        &self,
+        operation: UpstreamOperation,
+        policy: &OperationPolicy,
+        request_id: &str,
+        mut make_request: F,
+    ) -> Result<StreamingResponse, UpstreamError>
+    where
+        F: FnMut(u8) -> Fut,
+        Fut: Future<Output = Result<RequestBuilder, RequestFactoryError>>,
+    {
+        policy
+            .validate()
+            .map_err(|violation| UpstreamError::InvalidPolicy {
+                operation,
+                violation,
+            })?;
+        let request_id = HeaderValue::from_str(request_id)
+            .map_err(|_| UpstreamError::InvalidRequestId { operation })?;
+        let deadline =
+            OperationDeadline::from_now(policy.deadline).ok_or(UpstreamError::InvalidPolicy {
+                operation,
+                violation: PolicyViolation::DeadlineOverflow,
+            })?;
+
+        for attempt in 1..=policy.max_retries.saturating_add(1) {
+            let request = deadline
+                .run(make_request(attempt))
+                .await
+                .map_err(|_| UpstreamError::DeadlineExceeded {
+                    operation,
+                    attempts: attempt.saturating_sub(1),
+                })?
+                .map_err(|kind| UpstreamError::RequestBuild {
+                    operation,
+                    kind,
+                    attempt,
+                })?;
+            let remaining = deadline
+                .remaining()
+                .ok_or(UpstreamError::DeadlineExceeded {
+                    operation,
+                    attempts: attempt.saturating_sub(1),
+                })?;
+            let request = request
+                .header(X_CLIENT_REQUEST_ID, request_id.clone())
+                .timeout(remaining);
+            let response = match deadline.run(request.send()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    let kind = classify_transport_error(&error);
+                    if is_retryable_pre_response_transport(kind) && attempt <= policy.max_retries {
+                        wait_for_retry(&deadline, policy, attempt, None, request_id.as_bytes())
+                            .await
+                            .map_err(|_| UpstreamError::DeadlineExceeded {
+                                operation,
+                                attempts: attempt,
+                            })?;
+                        continue;
+                    }
+                    return Err(UpstreamError::Transport {
+                        operation,
+                        kind,
+                        attempts: attempt,
+                    });
+                }
+                Err(_) => {
+                    return Err(UpstreamError::DeadlineExceeded {
+                        operation,
+                        attempts: attempt,
+                    });
+                }
+            };
+
+            let status = response.status();
+            if status.is_success() {
+                return StreamingResponse::new(
+                    response,
+                    operation,
+                    deadline,
+                    policy.max_response_bytes,
+                    attempt,
+                );
+            }
+
+            let headers = response.headers().clone();
+            let retry_after = retry_after_from_headers(&headers, SystemTime::now());
+            let body =
+                match read_bounded_response(response, policy.max_response_bytes, deadline).await {
+                    Ok(body) => body,
+                    Err(BoundedReadError::DeadlineExceeded) => {
+                        return Err(UpstreamError::DeadlineExceeded {
+                            operation,
+                            attempts: attempt,
+                        });
+                    }
+                    Err(BoundedReadError::TooLarge) => {
+                        return Err(UpstreamError::ResponseTooLarge {
+                            operation,
+                            attempts: attempt,
+                        });
+                    }
+                    Err(BoundedReadError::Transport(kind)) => {
+                        return Err(UpstreamError::Transport {
+                            operation,
+                            kind,
+                            attempts: attempt,
+                        });
+                    }
+                };
+
+            match classify_response(status, &body) {
+                ResponseDisposition::Success => unreachable!("success handled before body read"),
+                ResponseDisposition::Retryable(_) if attempt <= policy.max_retries => {
+                    wait_for_retry(
+                        &deadline,
+                        policy,
+                        attempt,
+                        retry_after,
+                        request_id.as_bytes(),
+                    )
+                    .await
+                    .map_err(|_| UpstreamError::DeadlineExceeded {
+                        operation,
+                        attempts: attempt,
+                    })?;
+                }
+                ResponseDisposition::Retryable(kind) | ResponseDisposition::Terminal(kind) => {
+                    return Err(UpstreamError::HttpStatus {
+                        operation,
+                        status: status.as_u16(),
+                        kind,
+                        attempts: attempt,
+                    });
+                }
+            }
+        }
+
+        Err(UpstreamError::DeadlineExceeded {
+            operation,
+            attempts: policy.max_retries.saturating_add(1),
+        })
+    }
 }
 
 fn is_retryable_pre_response_transport(kind: TransportFailureKind) -> bool {
@@ -639,6 +792,125 @@ impl BoundedResponse {
 
     pub fn attempts(&self) -> u8 {
         self.attempts
+    }
+}
+
+pub struct StreamingResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    response: Option<Response>,
+    operation: UpstreamOperation,
+    deadline: OperationDeadline,
+    max_response_bytes: usize,
+    bytes_read: usize,
+    attempts: u8,
+}
+
+impl fmt::Debug for StreamingResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamingResponse")
+            .field("status", &self.status)
+            .field("bytes_read", &self.bytes_read)
+            .field("attempts", &self.attempts)
+            .field("finished", &self.response.is_none())
+            .finish()
+    }
+}
+
+impl StreamingResponse {
+    fn new(
+        response: Response,
+        operation: UpstreamOperation,
+        deadline: OperationDeadline,
+        max_response_bytes: usize,
+        attempts: u8,
+    ) -> Result<Self, UpstreamError> {
+        let max_response_bytes_u64 = u64::try_from(max_response_bytes).unwrap_or(u64::MAX);
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_response_bytes_u64)
+        {
+            return Err(UpstreamError::ResponseTooLarge {
+                operation,
+                attempts,
+            });
+        }
+
+        Ok(Self {
+            status: response.status(),
+            headers: response.headers().clone(),
+            response: Some(response),
+            operation,
+            deadline,
+            max_response_bytes,
+            bytes_read: 0,
+            attempts,
+        })
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    pub fn attempts(&self) -> u8 {
+        self.attempts
+    }
+
+    pub fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    /// Read the next upstream body chunk under the original operation deadline.
+    ///
+    /// The returned `Vec` preserves the chunk boundary produced by reqwest.
+    /// Once this method returns an error, the owned response is dropped and
+    /// subsequent calls return end-of-stream.
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, UpstreamError> {
+        let Some(response) = self.response.as_mut() else {
+            return Ok(None);
+        };
+        let chunk = self.deadline.run(response.chunk()).await;
+        match chunk {
+            Ok(Ok(Some(chunk))) => {
+                let next_len = match self.bytes_read.checked_add(chunk.len()) {
+                    Some(next_len) if next_len <= self.max_response_bytes => next_len,
+                    _ => {
+                        self.response.take();
+                        return Err(UpstreamError::ResponseTooLarge {
+                            operation: self.operation,
+                            attempts: self.attempts,
+                        });
+                    }
+                };
+                self.bytes_read = next_len;
+                Ok(Some(chunk.to_vec()))
+            }
+            Ok(Ok(None)) => {
+                self.response.take();
+                Ok(None)
+            }
+            Ok(Err(error)) => {
+                let kind = classify_transport_error(&error);
+                self.response.take();
+                Err(UpstreamError::Transport {
+                    operation: self.operation,
+                    kind,
+                    attempts: self.attempts,
+                })
+            }
+            Err(_) => {
+                self.response.take();
+                Err(UpstreamError::DeadlineExceeded {
+                    operation: self.operation,
+                    attempts: self.attempts,
+                })
+            }
+        }
     }
 }
 
@@ -903,7 +1175,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
-        sync::{mpsc, Mutex},
+        sync::{mpsc, oneshot, Mutex},
     };
 
     use super::*;
@@ -1431,6 +1703,314 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stream_retries_retryable_status_before_accepting_success() {
+        let responses = vec![
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+        ];
+        let (url, requests) = spawn_server(responses).await;
+        let client = test_client();
+        let request_client = client.client();
+        let mut response = client
+            .execute_stream(
+                UpstreamOperation::LlmCompletion,
+                &OperationPolicy {
+                    deadline: Duration::from_secs(2),
+                    max_response_bytes: 1024,
+                    max_retries: 1,
+                    initial_backoff: Duration::ZERO,
+                    max_backoff: Duration::ZERO,
+                },
+                "stream-retry-request-id",
+                move |_| {
+                    let request = request_client.get(url.clone());
+                    async move { Ok(request) }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.attempts(), 2);
+        let mut body = Vec::new();
+        while let Some(chunk) = response.next_chunk().await.unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"hello world");
+        assert_eq!(response.bytes_read(), body.len());
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("x-client-request-id: stream-retry-request-id"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_does_not_retry_a_body_failure_after_success_headers() {
+        let responses =
+            vec!["HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\npartial"];
+        let (url, requests) = spawn_server(responses).await;
+        let client = test_client();
+        let request_client = client.client();
+        let mut response = client
+            .execute_stream(
+                UpstreamOperation::LlmCompletion,
+                &retrying_test_policy(),
+                "stream-body-failure-request-id",
+                move |_| {
+                    let request = request_client.get(url.clone());
+                    async move { Ok(request) }
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = loop {
+            match response.next_chunk().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("truncated successful response ended without an error"),
+                Err(error) => break error,
+            }
+        };
+        assert!(matches!(
+            error,
+            UpstreamError::Transport {
+                operation: UpstreamOperation::LlmCompletion,
+                attempts: 1,
+                ..
+            }
+        ));
+        assert!(response.next_chunk().await.unwrap().is_none());
+        assert_eq!(requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_enforces_the_cumulative_body_limit_without_retrying() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (continue_tx, continue_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request_headers(&mut stream).await;
+            request_tx.send(request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            continue_rx.await.unwrap();
+            stream.write_all(b"4\r\nefgh\r\n0\r\n\r\n").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let client = test_client();
+        let request_client = client.client();
+        let url = format!("http://{address}");
+        let mut response = client
+            .execute_stream(
+                UpstreamOperation::LlmCompletion,
+                &OperationPolicy {
+                    deadline: Duration::from_secs(2),
+                    max_response_bytes: 6,
+                    max_retries: 2,
+                    initial_backoff: Duration::ZERO,
+                    max_backoff: Duration::ZERO,
+                },
+                "stream-limit-request-id",
+                move |_| {
+                    let request = request_client.get(url.clone());
+                    async move { Ok(request) }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.next_chunk().await.unwrap(), Some(b"abcd".to_vec()));
+        assert_eq!(response.bytes_read(), 4);
+        continue_tx.send(()).unwrap();
+        assert_eq!(
+            response.next_chunk().await.unwrap_err(),
+            UpstreamError::ResponseTooLarge {
+                operation: UpstreamOperation::LlmCompletion,
+                attempts: 1,
+            }
+        );
+        assert_eq!(response.bytes_read(), 4);
+        assert!(response.next_chunk().await.unwrap().is_none());
+        assert!(String::from_utf8_lossy(&request_rx.recv().await.unwrap())
+            .to_ascii_lowercase()
+            .contains("x-client-request-id: stream-limit-request-id"));
+        assert!(request_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_body_uses_the_original_deadline_and_is_not_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request_headers(&mut stream).await;
+            request_tx.send(request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let client = test_client();
+        let request_client = client.client();
+        let url = format!("http://{address}");
+        let mut response = client
+            .execute_stream(
+                UpstreamOperation::LlmCompletion,
+                &OperationPolicy {
+                    deadline: Duration::from_millis(75),
+                    max_response_bytes: 1024,
+                    max_retries: 2,
+                    initial_backoff: Duration::ZERO,
+                    max_backoff: Duration::ZERO,
+                },
+                "stream-deadline-request-id",
+                move |_| {
+                    let request = request_client.get(url.clone());
+                    async move { Ok(request) }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            response.next_chunk().await.unwrap_err(),
+            UpstreamError::DeadlineExceeded {
+                operation: UpstreamOperation::LlmCompletion,
+                attempts: 1,
+            } | UpstreamError::Transport {
+                operation: UpstreamOperation::LlmCompletion,
+                kind: TransportFailureKind::Timeout,
+                attempts: 1,
+            }
+        ));
+        assert!(String::from_utf8_lossy(&request_rx.recv().await.unwrap())
+            .to_ascii_lowercase()
+            .contains("x-client-request-id: stream-deadline-request-id"));
+        assert!(request_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_streaming_response_cancels_its_unread_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed_tx, mut closed_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request_headers(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nopen\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            let mut byte = [0_u8; 1];
+            if stream.read(&mut byte).await.unwrap() == 0 {
+                closed_tx.send(()).await.unwrap();
+            }
+        });
+
+        let client = test_client();
+        let request_client = client.client();
+        let url = format!("http://{address}");
+        let mut response = client
+            .execute_stream(
+                UpstreamOperation::LlmCompletion,
+                &OperationPolicy::without_retries(Duration::from_secs(5), 1024),
+                "stream-drop-request-id",
+                move |_| {
+                    let request = request_client.get(url.clone());
+                    async move { Ok(request) }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.next_chunk().await.unwrap(), Some(b"open".to_vec()));
+
+        drop(response);
+        time::timeout(Duration::from_secs(1), closed_rx.recv())
+            .await
+            .expect("dropping the streaming response did not close the upstream connection")
+            .expect("upstream connection closed without a drop signal");
+    }
+
+    #[tokio::test]
+    async fn stream_reads_non_success_bodies_with_a_bound_for_classification() {
+        let quota =
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 39\r\nConnection: close\r\n\r\n{\"error\":{\"code\":\"insufficient_quota\"}}";
+        let (quota_url, quota_requests) = spawn_server(vec![quota]).await;
+        let client = test_client();
+        let request_client = client.client();
+        let error = client
+            .execute_stream(
+                UpstreamOperation::LlmCompletion,
+                &retrying_test_policy(),
+                "stream-quota-request-id",
+                move |_| {
+                    let request = request_client.get(quota_url.clone());
+                    async move { Ok(request) }
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            UpstreamError::HttpStatus {
+                operation: UpstreamOperation::LlmCompletion,
+                status: 429,
+                kind: HttpFailureKind::Quota,
+                attempts: 1,
+            }
+        );
+        assert_eq!(quota_requests.lock().await.len(), 1);
+
+        let oversized = "HTTP/1.1 503 Service Unavailable\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n";
+        let (oversized_url, oversized_requests) = spawn_server(vec![oversized]).await;
+        let request_client = client.client();
+        let error = client
+            .execute_stream(
+                UpstreamOperation::LlmCompletion,
+                &OperationPolicy {
+                    deadline: Duration::from_secs(2),
+                    max_response_bytes: 6,
+                    max_retries: 2,
+                    initial_backoff: Duration::ZERO,
+                    max_backoff: Duration::ZERO,
+                },
+                "stream-error-limit-request-id",
+                move |_| {
+                    let request = request_client.get(oversized_url.clone());
+                    async move { Ok(request) }
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            UpstreamError::ResponseTooLarge {
+                operation: UpstreamOperation::LlmCompletion,
+                attempts: 1,
+            }
+        );
+        assert_eq!(oversized_requests.lock().await.len(), 1);
+    }
+
     fn test_client() -> UpstreamHttpClient {
         UpstreamHttpClient::build(&ClientPolicy {
             connect_timeout: Duration::from_secs(1),
@@ -1483,5 +2063,20 @@ mod tests {
         });
         ready_rx.recv().await.unwrap();
         (format!("http://{address}"), requests)
+    }
+
+    async fn read_request_headers(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 1024];
+            let count = stream.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                return request;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return request;
+            }
+        }
     }
 }

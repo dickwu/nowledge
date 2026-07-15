@@ -243,6 +243,237 @@ pub fn mask_secret_boundary_fragments_preserving_chars(
     SecretMatcher::new(known_secrets).mask_boundaries(input, minimum_fragment_chars)
 }
 
+/// Incrementally projects provider text without allowing a secret to straddle
+/// two emitted chunks.
+///
+/// `push` may return an empty string while the trailing input can still grow
+/// into a configured secret or a credential-shaped value. Configured secrets
+/// shorter than the regular projection window are matched in full; longer
+/// secrets use the same eight-character windows as [`redact_egress_text`]. A
+/// credential-shaped value is held until its existing minimum length is met,
+/// then masked through the first non-credential delimiter.
+///
+/// Call [`Self::finish`] only after a successful end-of-stream. Dropping the
+/// value, or consuming it through [`Self::abort`], discards any un-emitted
+/// suffix.
+pub struct StreamingTextRedactor {
+    literal_patterns: HashSet<Vec<char>>,
+    literal_prefixes: HashSet<Vec<char>>,
+    maximum_literal_pattern_chars: usize,
+    pending: Vec<StreamingCharacter>,
+    preceding_projected_character: Option<char>,
+    suppressing_credential: bool,
+    mask_character: char,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum StreamingMask {
+    None,
+    Configured,
+    Credential,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StreamingCharacter {
+    character: char,
+    mask: StreamingMask,
+}
+
+impl StreamingCharacter {
+    fn projected(self, mask_character: char) -> char {
+        match self.mask {
+            StreamingMask::None => self.character,
+            StreamingMask::Configured if self.character.is_whitespace() => self.character,
+            StreamingMask::Configured | StreamingMask::Credential => mask_character,
+        }
+    }
+}
+
+impl StreamingTextRedactor {
+    pub fn new(known_secrets: &[String]) -> Self {
+        let matcher = SecretMatcher::new(known_secrets);
+        let mask_character = matcher.mask_character;
+        let mut literal_patterns = HashSet::new();
+
+        for secret in known_secrets.iter().filter(|secret| !secret.is_empty()) {
+            let characters = secret.chars().collect::<Vec<_>>();
+            if characters.len() <= SECRET_SUBSTRING_WINDOW_CHARS {
+                literal_patterns.insert(characters);
+            } else {
+                literal_patterns.extend(
+                    characters
+                        .windows(SECRET_SUBSTRING_WINDOW_CHARS)
+                        .map(<[char]>::to_vec),
+                );
+            }
+        }
+
+        let maximum_literal_pattern_chars =
+            literal_patterns.iter().map(Vec::len).max().unwrap_or(0);
+        let literal_prefixes = literal_patterns
+            .iter()
+            .flat_map(|pattern| (1..pattern.len()).map(|end| pattern[..end].to_vec()))
+            .collect();
+
+        Self {
+            literal_patterns,
+            literal_prefixes,
+            maximum_literal_pattern_chars,
+            pending: Vec::new(),
+            preceding_projected_character: None,
+            suppressing_credential: false,
+            mask_character,
+        }
+    }
+
+    /// Adds one provider delta and returns only text that is safe to emit now.
+    pub fn push(&mut self, delta: &str) -> String {
+        let mut output = String::with_capacity(delta.len());
+        for character in delta.chars() {
+            if self.suppressing_credential && is_credential_character(character) {
+                self.pending.push(StreamingCharacter {
+                    character,
+                    mask: StreamingMask::Credential,
+                });
+            } else {
+                self.suppressing_credential = false;
+                self.pending.push(StreamingCharacter {
+                    character,
+                    mask: StreamingMask::None,
+                });
+                self.mask_complete_configured_suffixes();
+                self.start_credential_suppression_if_complete();
+            }
+
+            let retained = self.longest_sensitive_suffix();
+            self.emit_prefix(self.pending.len() - retained, &mut output);
+        }
+        output
+    }
+
+    /// Flushes the final suffix after a successful provider end-of-stream.
+    pub fn finish(mut self) -> String {
+        let mut output = String::new();
+        self.emit_prefix(self.pending.len(), &mut output);
+        output
+    }
+
+    /// Discards the suffix retained for a stream that did not complete.
+    pub fn abort(mut self) {
+        self.pending.clear();
+    }
+
+    fn mask_complete_configured_suffixes(&mut self) {
+        let maximum = self.maximum_literal_pattern_chars.min(self.pending.len());
+        for length in 1..=maximum {
+            let start = self.pending.len() - length;
+            let candidate = self.pending[start..]
+                .iter()
+                .map(|character| character.character)
+                .collect::<Vec<_>>();
+            if self.literal_patterns.contains(&candidate) {
+                for character in &mut self.pending[start..] {
+                    character.mask = character.mask.max(StreamingMask::Configured);
+                }
+            }
+        }
+    }
+
+    fn start_credential_suppression_if_complete(&mut self) {
+        for (prefix, minimum_chars) in credential_shapes() {
+            if self.pending.len() < minimum_chars {
+                continue;
+            }
+            let start = self.pending.len() - minimum_chars;
+            if !self.has_credential_left_boundary(start) {
+                continue;
+            }
+            let candidate = self.pending[start..]
+                .iter()
+                .map(|character| character.projected(self.mask_character))
+                .collect::<Vec<_>>();
+            let prefix = prefix.chars().collect::<Vec<_>>();
+            if candidate.starts_with(&prefix)
+                && candidate[prefix.len()..]
+                    .iter()
+                    .all(|character| is_credential_character(*character))
+            {
+                for character in &mut self.pending[start..] {
+                    character.mask = StreamingMask::Credential;
+                }
+                self.suppressing_credential = true;
+                return;
+            }
+        }
+    }
+
+    fn longest_sensitive_suffix(&self) -> usize {
+        let configured = (1..=self
+            .maximum_literal_pattern_chars
+            .saturating_sub(1)
+            .min(self.pending.len()))
+            .rev()
+            .find(|length| {
+                let start = self.pending.len() - length;
+                let candidate = self.pending[start..]
+                    .iter()
+                    .map(|character| character.character)
+                    .collect::<Vec<_>>();
+                self.literal_prefixes.contains(&candidate)
+            })
+            .unwrap_or(0);
+
+        let credential = credential_shapes()
+            .into_iter()
+            .filter_map(|(prefix, minimum_chars)| {
+                let maximum = minimum_chars.saturating_sub(1).min(self.pending.len());
+                (1..=maximum).rev().find(|length| {
+                    let start = self.pending.len() - length;
+                    self.has_credential_left_boundary(start)
+                        && self.pending[start..]
+                            .iter()
+                            .map(|character| character.projected(self.mask_character))
+                            .eq(prefix.chars().take(*length))
+                        || self.has_credential_left_boundary(start)
+                            && *length >= prefix.chars().count()
+                            && self.pending[start..]
+                                .iter()
+                                .take(prefix.chars().count())
+                                .map(|character| character.projected(self.mask_character))
+                                .eq(prefix.chars())
+                            && self.pending[start + prefix.chars().count()..].iter().all(
+                                |character| {
+                                    is_credential_character(
+                                        character.projected(self.mask_character),
+                                    )
+                                },
+                            )
+                })
+            })
+            .max()
+            .unwrap_or(0);
+
+        configured.max(credential)
+    }
+
+    fn has_credential_left_boundary(&self, start: usize) -> bool {
+        let previous = if start == 0 {
+            self.preceding_projected_character
+        } else {
+            Some(self.pending[start - 1].projected(self.mask_character))
+        };
+        previous.is_none_or(|character| !is_credential_left_context_character(character))
+    }
+
+    fn emit_prefix(&mut self, length: usize, output: &mut String) {
+        for character in self.pending.drain(..length) {
+            let projected = character.projected(self.mask_character);
+            output.push(projected);
+            self.preceding_projected_character = Some(projected);
+        }
+    }
+}
+
 struct SecretMatcher<'a> {
     ordered: Vec<&'a str>,
     short_exact: Vec<&'a str>,
@@ -957,7 +1188,7 @@ mod redaction_tests {
     use super::{
         mask_secret_egress_projection_preserving_chars,
         mask_secret_fragment_projection_preserving_chars, mask_secrets_preserving_chars,
-        redact_egress_text, redact_secrets, redact_string, REDACTION_MARKER,
+        redact_egress_text, redact_secrets, redact_string, StreamingTextRedactor, REDACTION_MARKER,
     };
     use serde_json::json;
 
@@ -1458,5 +1689,165 @@ mod redaction_tests {
         assert!(!masked.contains(&configured));
         assert!(!masked.contains("sk-test-secret-123456"));
         assert!(masked.contains(' '));
+    }
+
+    fn stream_at_split(input: &str, secrets: &[String], split: usize) -> String {
+        let mut redactor = StreamingTextRedactor::new(secrets);
+        let mut output = redactor.push(&input[..split]);
+        output.push_str(&redactor.push(&input[split..]));
+        output.push_str(&redactor.finish());
+        output
+    }
+
+    fn character_boundaries(input: &str) -> Vec<usize> {
+        input
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(input.len()))
+            .collect()
+    }
+
+    #[test]
+    fn streaming_redactor_matches_configured_secrets_at_every_split_point() {
+        let secret = "秘密🔐-configured-private-token".to_string();
+        let input = format!("unicode before {secret} after ✅");
+        let expected =
+            mask_secret_egress_projection_preserving_chars(&input, std::slice::from_ref(&secret));
+
+        for split in character_boundaries(&input) {
+            let output = stream_at_split(&input, std::slice::from_ref(&secret), split);
+            assert_eq!(output, expected, "split at byte {split}");
+            assert!(!output.contains(&secret), "split at byte {split}: {output}");
+        }
+    }
+
+    #[test]
+    fn streaming_redactor_uses_bounded_windows_for_long_secret_projection() {
+        let secret = format!(
+            "{}middle-secret-window{}",
+            "前".repeat(128),
+            "後".repeat(128)
+        );
+        let exposed_window = "middle-secret-window";
+        let input = format!("provider returned {exposed_window} in otherwise safe text");
+        let expected =
+            mask_secret_egress_projection_preserving_chars(&input, std::slice::from_ref(&secret));
+        let mut redactor = StreamingTextRedactor::new(std::slice::from_ref(&secret));
+        let mut output = String::new();
+
+        for character in input.chars() {
+            output.push_str(&redactor.push(&character.to_string()));
+            assert!(!output.contains(exposed_window), "{output}");
+            assert!(redactor.pending.len() <= 7);
+        }
+        output.push_str(&redactor.finish());
+
+        assert_eq!(output, expected);
+        assert!(!output.contains(exposed_window));
+    }
+
+    #[test]
+    fn streaming_redactor_masks_overlapping_secrets_without_reconstruction() {
+        let secrets = vec![
+            "abcdefghi".to_string(),
+            "bcdefghij".to_string(),
+            "abcdefghi".to_string(),
+            String::new(),
+        ];
+        let input = "prefix abcdefghij suffix";
+        let mut redactor = StreamingTextRedactor::new(&secrets);
+        let mut output = String::new();
+
+        for character in input.chars() {
+            output.push_str(&redactor.push(&character.to_string()));
+            assert!(secrets
+                .iter()
+                .filter(|secret| !secret.is_empty())
+                .all(|secret| !output.contains(secret)));
+        }
+        output.push_str(&redactor.finish());
+
+        assert_eq!(output.chars().count(), input.chars().count());
+        assert_eq!(output, "prefix ********** suffix");
+        assert!(!output.contains("abcdefghi"));
+        assert!(!output.contains("bcdefghij"));
+    }
+
+    #[test]
+    fn streaming_redactor_masks_every_credential_shape_at_every_split_point() {
+        let credentials = [
+            "sk-123456789abcdef",
+            "sess-12345678901abcdef",
+            "codex-12345678901234abcdef",
+            "oaic-12345678901abcdef",
+            "Bearer abcdefghijklmnop",
+        ];
+        let input = credentials.join(" | ");
+        let expected = mask_secret_egress_projection_preserving_chars(&input, &[]);
+
+        for split in character_boundaries(&input) {
+            let output = stream_at_split(&input, &[], split);
+            assert_eq!(output, expected, "split at byte {split}");
+            for credential in credentials {
+                assert!(
+                    !output.contains(credential),
+                    "split at byte {split}: {output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_redactor_preserves_incomplete_and_non_boundary_credentials() {
+        let input = "sk-12345678 task-sk-123456789abcdef sess-short";
+        let mut redactor = StreamingTextRedactor::new(&[]);
+        assert_eq!(redactor.push("sk-"), "");
+        assert_eq!(redactor.push("12345678"), "");
+        let mut output = redactor.push(" task-sk-123456789abcdef sess-short");
+        output.push_str(&redactor.finish());
+
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn streaming_redactor_uses_collision_free_masks_for_markers_and_mask_runs() {
+        let secrets = vec![
+            "********".to_string(),
+            "[REDACTED]_2".to_string(),
+            "ACTED]_2".to_string(),
+            "REDA".to_string(),
+        ];
+        let input = "******** [REDACTED]_2 [REDACTED] credential sk-123456789abcdef";
+        let mut redactor = StreamingTextRedactor::new(&secrets);
+        let mut output = String::new();
+
+        for character in input.chars() {
+            output.push_str(&redactor.push(&character.to_string()));
+            for secret in &secrets {
+                assert!(!output.contains(secret), "{output}");
+            }
+            assert!(!output.contains("sk-123456789abcdef"), "{output}");
+        }
+        output.push_str(&redactor.finish());
+
+        for secret in &secrets {
+            assert!(!output.contains(secret), "{output}");
+        }
+        assert!(!output.contains("sk-123456789abcdef"), "{output}");
+    }
+
+    #[test]
+    fn streaming_redactor_retains_only_the_longest_completable_suffix() {
+        let secrets = vec!["secret-value".to_string()];
+        let mut redactor = StreamingTextRedactor::new(&secrets);
+
+        assert_eq!(redactor.push("ordinary sec"), "ordinary ");
+        assert_eq!(redactor.pending.len(), 3);
+        assert_eq!(redactor.push("ular "), "secular ");
+        assert!(redactor.pending.is_empty());
+
+        assert_eq!(redactor.push("Bearer "), "");
+        assert_eq!(redactor.pending.len(), 7);
+        redactor.abort();
     }
 }

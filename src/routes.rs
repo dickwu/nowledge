@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
+    convert::Infallible,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -14,12 +15,16 @@ use axum::{
         multipart::{Field, MultipartError},
         DefaultBodyLimit, Extension, MatchedPath, Multipart, Path, Query, Request, State,
     },
-    http::{header::CONTENT_LENGTH, header::CONTENT_TYPE, Method, StatusCode},
+    http::{
+        header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, LINK},
+        Method, StatusCode,
+    },
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, patch, post, put},
     Json, Router,
 };
+use futures_util::stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -44,7 +49,7 @@ use crate::{
     http_boundary::{self, HttpBoundaryState, RequestDeadline},
     llm::{
         LlmEvidence, LlmHealthProbe, LlmHealthProbeResult, LlmProfile, LlmProviderRegistry,
-        LlmRequest,
+        LlmRequest, LlmStreamEvent, LlmTextStream, LlmTokenUsage,
     },
     meili::MeiliAdmin,
     models::*,
@@ -54,9 +59,11 @@ use crate::{
     store::Store,
     util::{
         hmac_hex, redact_egress_text, redact_locator, redact_secrets, redact_string,
-        require_string, sanitize_slug, text_score, validate_meili_uid,
+        require_string, sanitize_slug, text_score, validate_meili_uid, StreamingTextRedactor,
     },
 };
+
+const RAG_STREAM_JSON_DEPRECATION_DATE: &str = "@1784073600"; // 2026-07-15T00:00:00Z
 
 #[derive(Clone)]
 pub struct IngestTaskManager {
@@ -905,14 +912,14 @@ pub fn build_router(state: AppState) -> Router {
             http_boundary::enforce_timeout,
         ))
         .layer(middleware::from_fn_with_state(
-            state.http_boundary.clone(),
-            http_boundary::load_shed,
-        ))
-        .layer(middleware::from_fn_with_state(
             state.config.clone(),
             redact_json_response,
         ))
         .layer(CompressionLayer::new())
+        .layer(middleware::from_fn_with_state(
+            state.http_boundary.clone(),
+            http_boundary::load_shed,
+        ))
         .layer(
             http_boundary::build_cors_layer(&state.config).expect("validated CORS configuration"),
         )
@@ -2688,12 +2695,298 @@ async fn rag_answer(
     Ok(Json(redact_for_state(&state, answer)))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RagStreamQuery {
+    format: Option<String>,
+}
+
 async fn rag_stream(
     user: UserGuard,
-    state: State<AppState>,
-    req: Json<RagAnswerRequest>,
-) -> Result<Json<Value>, ApiError> {
-    rag_answer(user, state, req).await
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(query): Query<RagStreamQuery>,
+    Json(mut req): Json<RagAnswerRequest>,
+) -> Result<Response, ApiError> {
+    match query.format.as_deref().unwrap_or("sse") {
+        "json" => {
+            let mut response = rag_answer(user, State(state), Json(req))
+                .await?
+                .into_response();
+            response.headers_mut().insert(
+                "deprecation",
+                HeaderValue::from_static(RAG_STREAM_JSON_DEPRECATION_DATE),
+            );
+            response.headers_mut().insert(
+                LINK,
+                HeaderValue::from_static("</v1/rag/answer>; rel=\"successor-version\""),
+            );
+            return Ok(response);
+        }
+        "sse" => {}
+        _ => {
+            return Err(ApiError::validation("format", "must be one of: sse, json"));
+        }
+    }
+
+    user.apply_owner_default(&mut req.owner_user_id)?;
+    let budget_key = provider_budget_key(&user.principal, &state);
+    let answer = state
+        .store
+        .answer_rag_async(state.tenant_id(), req.clone(), user.principal.is_admin())
+        .await?;
+    let status = state.llm_providers.status(LlmProfile::Primary).await;
+    let grounded = !answer.citations.is_empty();
+    let backend = state.store.backend_name().to_string();
+
+    // Opening the provider stream is intentionally a pre-header operation.
+    // Safe retries and upstream status classification can happen here; after
+    // this succeeds, body failures are terminal SSE `error` events.
+    let provider_stream = if state.config.llm_provider == "none" {
+        None
+    } else {
+        let security = state.config.provider_security_snapshot();
+        let request = build_rag_llm_request(
+            &req.question.unwrap_or_default(),
+            &answer.citations,
+            &security.secrets,
+            state.config.llm_max_output_tokens,
+        );
+        Some(
+            state
+                .llm_providers
+                .stream_text(LlmProfile::Primary, &budget_key, request)
+                .await?,
+        )
+    };
+
+    // Refresh after the provider has opened so a credential rotation performed
+    // during authentication is included in the route-level egress inventory.
+    let known_secrets = known_secrets_for_state(&state);
+    let provider = provider_stream
+        .as_ref()
+        .map(|stream| stream.provider.clone())
+        .unwrap_or(status.provider);
+    let model = provider_stream
+        .as_ref()
+        .map(|stream| stream.model.clone())
+        .unwrap_or(status.model);
+
+    let mut pending = VecDeque::new();
+    pending.push_back(sse_json_event(
+        "meta",
+        redact_secrets(
+            &json!({
+                "answer_id": answer.answer_id,
+                "trace_id": answer.trace_id,
+                "provider": provider,
+                "model": model,
+                "backend": backend,
+                "grounded": grounded
+            }),
+            &known_secrets,
+        ),
+    ));
+    for citation in &answer.citations {
+        let citation = serde_json::to_value(citation)
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        pending.push_back(sse_json_event(
+            "citation",
+            redact_secrets(&citation, &known_secrets),
+        ));
+    }
+
+    let mut stream_state = RagSseState {
+        pending,
+        provider_stream,
+        route_redactor: StreamingTextRedactor::new(&known_secrets),
+        known_secrets,
+        request_id: request_id.as_str().to_string(),
+        answer_id: answer.answer_id,
+        trace_id: answer.trace_id,
+        provider,
+        model,
+        backend,
+        grounded,
+        completed: false,
+    };
+
+    if stream_state.provider_stream.is_none() {
+        let delta = stream_state.route_redactor.push(&answer.answer);
+        if !delta.is_empty() {
+            stream_state
+                .pending
+                .push_back(sse_json_event("delta", json!({ "text": delta })));
+        }
+        let tail = std::mem::replace(
+            &mut stream_state.route_redactor,
+            StreamingTextRedactor::new(&[]),
+        )
+        .finish();
+        if !tail.is_empty() {
+            stream_state
+                .pending
+                .push_back(sse_json_event("delta", json!({ "text": tail })));
+        }
+        let usage = stream_usage(
+            answer.usage,
+            &stream_state.provider,
+            &stream_state.model,
+            &stream_state.backend,
+            stream_state.grounded,
+            None,
+            None,
+        );
+        stream_state.pending.push_back(sse_json_event(
+            "usage",
+            redact_secrets(&usage, &stream_state.known_secrets),
+        ));
+        stream_state.pending.push_back(sse_json_event(
+            "done",
+            json!({
+                "answer_id": stream_state.answer_id,
+                "trace_id": stream_state.trace_id
+            }),
+        ));
+        stream_state.completed = true;
+    }
+
+    let body = stream::unfold(stream_state, |mut state| async move {
+        state
+            .next_event()
+            .await
+            .map(|event| (Ok::<_, Infallible>(event), state))
+    });
+    Ok(Sse::new(body).into_response())
+}
+
+struct RagSseState {
+    pending: VecDeque<Event>,
+    provider_stream: Option<LlmTextStream>,
+    route_redactor: StreamingTextRedactor,
+    known_secrets: Vec<String>,
+    request_id: String,
+    answer_id: String,
+    trace_id: String,
+    provider: String,
+    model: String,
+    backend: String,
+    grounded: bool,
+    completed: bool,
+}
+
+impl RagSseState {
+    async fn next_event(&mut self) -> Option<Event> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Some(event);
+            }
+            if self.completed {
+                return None;
+            }
+
+            let next = match self.provider_stream.as_mut() {
+                Some(provider_stream) => provider_stream.next_event().await,
+                None => return None,
+            };
+            match next {
+                Ok(Some(LlmStreamEvent::Delta(delta))) => {
+                    let delta = self.route_redactor.push(&delta);
+                    if !delta.is_empty() {
+                        return Some(sse_json_event("delta", json!({ "text": delta })));
+                    }
+                }
+                Ok(Some(LlmStreamEvent::Completed { latency_ms, usage })) => {
+                    let redactor = std::mem::replace(
+                        &mut self.route_redactor,
+                        StreamingTextRedactor::new(&[]),
+                    );
+                    let tail = redactor.finish();
+                    if !tail.is_empty() {
+                        self.pending
+                            .push_back(sse_json_event("delta", json!({ "text": tail })));
+                    }
+                    let usage = stream_usage(
+                        json!({}),
+                        &self.provider,
+                        &self.model,
+                        &self.backend,
+                        self.grounded,
+                        Some(latency_ms),
+                        usage.as_ref(),
+                    );
+                    self.pending.push_back(sse_json_event(
+                        "usage",
+                        redact_secrets(&usage, &self.known_secrets),
+                    ));
+                    self.pending.push_back(sse_json_event(
+                        "done",
+                        json!({
+                            "answer_id": self.answer_id,
+                            "trace_id": self.trace_id
+                        }),
+                    ));
+                    self.provider_stream.take();
+                    self.completed = true;
+                }
+                Ok(None) => {
+                    self.queue_error(ApiError::Upstream(
+                        "LLM stream ended without a completion event".to_string(),
+                    ));
+                }
+                Err(error) => self.queue_error(error),
+            }
+        }
+    }
+
+    fn queue_error(&mut self, error: ApiError) {
+        let redactor = std::mem::replace(&mut self.route_redactor, StreamingTextRedactor::new(&[]));
+        redactor.abort();
+        self.provider_stream.take();
+        let envelope = serde_json::to_value(error.public_body(Some(&self.request_id)))
+            .unwrap_or_else(|_| {
+                json!({
+                    "error": {
+                        "code": "internal_error",
+                        "message": "internal server error",
+                        "details": { "status": 500, "request_id": self.request_id }
+                    }
+                })
+            });
+        self.pending.push_back(sse_json_event(
+            "error",
+            redact_secrets(&envelope, &self.known_secrets),
+        ));
+        self.completed = true;
+    }
+}
+
+fn sse_json_event(name: &'static str, value: Value) -> Event {
+    Event::default().event(name).data(value.to_string())
+}
+
+fn stream_usage(
+    mut usage: Value,
+    provider: &str,
+    model: &str,
+    backend: &str,
+    grounded: bool,
+    latency_ms: Option<u64>,
+    tokens: Option<&LlmTokenUsage>,
+) -> Value {
+    if !usage.is_object() {
+        usage = json!({});
+    }
+    usage["provider"] = json!(provider);
+    usage["model"] = json!(model);
+    usage["backend"] = json!(backend);
+    usage["grounded"] = json!(grounded);
+    if let Some(latency_ms) = latency_ms {
+        usage["latency_ms"] = json!(latency_ms);
+    }
+    if let Some(tokens) = tokens {
+        merge_token_usage(&mut usage, tokens);
+    }
+    usage
 }
 
 async fn rag_debug(

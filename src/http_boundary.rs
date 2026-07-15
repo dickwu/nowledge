@@ -1,14 +1,16 @@
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes, HttpBody},
     extract::{Request, State},
     http::{
-        header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
+        header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, LINK, RETRY_AFTER},
         HeaderName, HeaderValue, Method,
     },
     middleware::Next,
@@ -30,6 +32,7 @@ const READY_PATH: &str = "/readyz";
 const PUBLIC_READY_RATE_KEY: &str = "public-readiness";
 const SYNC_INGEST_PATHS: [&str; 2] = ["/v1/ingest/uploads:sync", "/v1/ingest/files:sync"];
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+const DEPRECATION: HeaderName = HeaderName::from_static("deprecation");
 
 #[derive(Clone, Copy, Debug)]
 pub struct RequestDeadline(TokioInstant);
@@ -227,9 +230,59 @@ pub async fn load_shed(
         None
     };
     let response = next.run(request).await;
-    drop(sync_ingest_permit);
-    drop(permit);
-    response
+    hold_capacity_until_body_completion(response, permit, sync_ingest_permit)
+}
+
+struct CapacityPermits {
+    _global: OwnedSemaphorePermit,
+    _sync_ingest: Option<OwnedSemaphorePermit>,
+}
+
+struct CapacityBody {
+    inner: Body,
+    permits: Option<CapacityPermits>,
+}
+
+impl HttpBody for CapacityBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let poll = Pin::new(&mut self.inner).poll_frame(context);
+        if matches!(&poll, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            self.permits.take();
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn hold_capacity_until_body_completion(
+    response: Response,
+    global: OwnedSemaphorePermit,
+    sync_ingest: Option<OwnedSemaphorePermit>,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::new(CapacityBody {
+            inner: body,
+            permits: Some(CapacityPermits {
+                _global: global,
+                _sync_ingest: sync_ingest,
+            }),
+        }),
+    )
 }
 
 pub async fn enforce_timeout(
@@ -304,7 +357,7 @@ pub fn build_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
             Method::OPTIONS,
         ])
         .allow_headers([ACCEPT, AUTHORIZATION, CONTENT_TYPE, X_REQUEST_ID])
-        .expose_headers([X_REQUEST_ID, RETRY_AFTER]);
+        .expose_headers([X_REQUEST_ID, RETRY_AFTER, DEPRECATION, LINK]);
 
     if config.cors_allowed_origins == ["*"] {
         Ok(layer.allow_origin(Any))
@@ -377,6 +430,66 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
         drop(permit);
+        assert!(state.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn capacity_is_held_until_response_body_eof_or_drop() {
+        let mut config = Config::test();
+        config.max_in_flight_requests = 1;
+        config.ingest_max_concurrent_tasks = 1;
+        let state = HttpBoundaryState::new(&config);
+
+        let response = hold_capacity_until_body_completion(
+            (StatusCode::OK, "chunk").into_response(),
+            state.try_acquire().unwrap(),
+            Some(state.try_acquire_sync_ingest().unwrap()),
+        );
+        let mut body = response.into_body();
+        assert!(state.try_acquire().is_err());
+        assert!(state.try_acquire_sync_ingest().is_err());
+
+        let frame = std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context))
+            .await
+            .expect("body data frame")
+            .expect("body frame succeeds");
+        assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"chunk"));
+        assert!(state.try_acquire().is_err());
+
+        let end = std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await;
+        assert!(end.is_none());
+        assert!(state.try_acquire().is_ok());
+        assert!(state.try_acquire_sync_ingest().is_ok());
+
+        let response = hold_capacity_until_body_completion(
+            StatusCode::NO_CONTENT.into_response(),
+            state.try_acquire().unwrap(),
+            None,
+        );
+        assert!(state.try_acquire().is_err());
+        drop(response);
+        assert!(state.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn capacity_is_released_when_the_response_body_errors() {
+        let mut config = Config::test();
+        config.max_in_flight_requests = 1;
+        let state = HttpBoundaryState::new(&config);
+        let error_stream = futures_util::stream::once(async {
+            Err::<Bytes, std::io::Error>(std::io::Error::other("body failed"))
+        });
+        let response = hold_capacity_until_body_completion(
+            Response::new(Body::from_stream(error_stream)),
+            state.try_acquire().unwrap(),
+            None,
+        );
+        let mut body = response.into_body();
+
+        let frame = std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context))
+            .await
+            .expect("body error frame");
+        assert!(frame.is_err());
         assert!(state.try_acquire().is_ok());
     }
 

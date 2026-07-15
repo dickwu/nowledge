@@ -159,15 +159,18 @@ impl ApiError {
             _ => None,
         }
     }
-}
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> axum::response::Response {
+    /// Build the stable public error envelope while retaining private causes
+    /// only in redacted, fingerprinted logs. Streaming responses pass their
+    /// captured request ID because the request task-local ends after headers.
+    pub fn public_body(&self, captured_request_id: Option<&str>) -> ErrorBody {
         let (status, code) = self.status_and_code();
         let request_id = self.private_cause().map(|cause| {
-            let request_id = crate::request_context::current_or_new_id();
+            let request_id = captured_request_id
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(crate::request_context::current_or_new_id);
             let diagnostic = safe_cause_diagnostic(cause);
-            match &self {
+            match self {
                 Self::Upstream(_) => tracing::warn!(
                     target: "nowledge::error",
                     %request_id,
@@ -188,7 +191,7 @@ impl IntoResponse for ApiError {
             }
             request_id
         });
-        let details = match (&self, request_id) {
+        let details = match (self, request_id) {
             (Self::Validation { field, .. }, Some(request_id)) => json!({
                 "status": status.as_u16(),
                 "field": field,
@@ -204,14 +207,21 @@ impl IntoResponse for ApiError {
             }),
             (_, None) => json!({ "status": status.as_u16() }),
         };
-        let retry_after_seconds = self.retry_after_seconds();
-        let body = ErrorBody {
+        ErrorBody {
             error: ErrorInfo {
                 code: code.to_string(),
                 message: self.public_message().to_string(),
                 details: Some(details),
             },
-        };
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, _) = self.status_and_code();
+        let retry_after_seconds = self.retry_after_seconds();
+        let body = self.public_body(None);
         let mut response = (status, Json(body)).into_response();
         if let Some(seconds) = retry_after_seconds {
             if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
@@ -309,6 +319,22 @@ mod tests {
         assert_eq!(body["error"]["code"], "validation_error");
         assert_eq!(body["error"]["details"]["status"], 400);
         assert_eq!(body["error"]["details"]["field"], "rows");
+    }
+
+    #[test]
+    fn streaming_error_envelopes_reuse_the_captured_request_id() {
+        let private = "provider body exposed secret-stream-material";
+        let body = ApiError::Upstream(private.to_string()).public_body(Some("captured-request-id"));
+        let body = serde_json::to_value(body).unwrap();
+
+        assert_eq!(body["error"]["code"], "upstream_error");
+        assert_eq!(body["error"]["message"], "upstream service unavailable");
+        assert_eq!(
+            body["error"]["details"]["request_id"],
+            "captured-request-id"
+        );
+        assert!(!body.to_string().contains(private));
+        assert!(!body.to_string().contains("secret-stream-material"));
     }
 
     #[test]
