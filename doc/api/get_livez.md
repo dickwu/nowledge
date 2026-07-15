@@ -24,7 +24,7 @@ Schema: `LivezResponse`
 | --- | --- | --- |
 | status | string | Always ok when the process can serve the request. |
 | version | string | Crate version baked in at compile time. |
-| git_rev | string | Short git revision of the build, `-dirty` suffix when built from a modified tree, `unknown` outside a git checkout. |
+| git_rev | string | Revision asserted through `NOWLEDGE_GIT_REVISION` against a clean Git `HEAD` when metadata is available; otherwise the short checkout revision, with `-dirty` for modified tracked files or `unknown` outside a checkout. |
 
 ## Errors and Access Rules
 - Public; no bearer token is required.

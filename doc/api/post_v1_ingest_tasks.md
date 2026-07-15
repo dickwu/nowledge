@@ -2,6 +2,12 @@
 
 Create an asynchronous ingest task. The handler creates an `IngestTask` in `queued` state and returns immediately; a background worker performs parsing, fragmenting, indexing, and result materialization.
 
+## Handler
+
+- Rust handler: `create_ingest_task`
+- Route registration: `src/routes.rs::build_router`
+- Authentication: UserGuard; owner write scope required
+
 ## Request
 
 JSON `IngestTaskRequest`.

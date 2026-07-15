@@ -253,6 +253,7 @@ impl Store {
             req.bytes.clone()
         };
 
+        let parsing_observation = self.metrics.begin_ingest_stage("parsing");
         self.transition_ingest_task_async(task_id, "parsing", None)
             .await?;
         let parser = match self.parser_registry.parser_for_config(&parser_config) {
@@ -316,6 +317,8 @@ impl Store {
 
         self.transition_ingest_task_async(task_id, "parsed", None)
             .await?;
+        parsing_observation.complete();
+        let fragmenting_observation = self.metrics.begin_ingest_stage("fragmenting");
         // The built-in parser already performs the single bounded staged-file read.
         // Reuse its markdown rather than materializing the upload a second time.
         let original_content_for_artifacts = if !original_content.is_empty() {
@@ -430,7 +433,9 @@ impl Store {
             },
         ))
         .await?;
+        fragmenting_observation.complete();
 
+        let indexing_observation = self.metrics.begin_ingest_stage("indexing");
         self.transition_ingest_task_async(task_id, "indexing", None)
             .await?;
 
@@ -484,6 +489,7 @@ impl Store {
             },
         ))
         .await?;
+        indexing_observation.complete();
         Ok(result)
     }
 

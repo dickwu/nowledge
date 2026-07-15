@@ -555,6 +555,9 @@ impl Store {
                 .insights
                 .get_mut(insight_id)
                 .ok_or_else(|| ApiError::not_found("insight not found"))?;
+            if insight.tenant_id != tenant_id {
+                return Err(ApiError::not_found("insight not found"));
+            }
             if let Some(statement) = req.statement {
                 insight.statement = statement;
             }
@@ -1022,7 +1025,7 @@ impl Store {
         insight_id: &str,
         req: InsightPatchRequest,
     ) -> Result<InsightResponse, ApiError> {
-        let owner = self.insight_owner(insight_id)?;
+        let owner = self.insight_owner(tenant_id, insight_id)?;
         let (response, _) = self
             .execute_staged_mutation(
                 tenant_id,

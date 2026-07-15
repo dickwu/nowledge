@@ -12,6 +12,8 @@ use crate::{
     config::{Config, WriteConsistency},
     error::{safe_cause_diagnostic, ApiError},
     fragmenter::{BlockAwareFragmenter, FragmentChunk},
+    meili::MeiliAdmin,
+    metrics::Metrics,
     models::*,
     mutation::{
         operation_list_item, operation_record_from_plan, operation_step_accepted,
@@ -23,8 +25,8 @@ use crate::{
         StagedUpload,
     },
     repository::{
-        repository_from_config, KnowledgeRepository, RepositoryContextSearchQuery,
-        RepositoryOperationListQuery,
+        repository_from_config, repository_from_meili_admins, KnowledgeRepository,
+        RepositoryContextSearchQuery, RepositoryOperationListQuery,
     },
     request_context::{self, RequestPrincipalScope},
     resolver::{EventIndexResolver, EVENT_INDEX_SCHEMA_VERSION, EVENT_SETTINGS_HASH},
@@ -78,6 +80,7 @@ pub struct Store {
     vector: Arc<Mutex<VectorMatcher>>,
     redaction_config: Arc<Config>,
     parser_registry: ParserRegistry,
+    metrics: Metrics,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -125,6 +128,7 @@ impl ParseArtifactKey {
 #[derive(Clone, Default)]
 struct StoreData {
     hydration_report: Option<HydrationReport>,
+    audit_records: HashMap<String, AuditRecord>,
     operations: HashMap<String, OperationRecord>,
     user_indexes: HashMap<(String, String), UserEventIndex>,
     events_by_index: HashMap<String, Vec<HistoryEvent>>,
@@ -163,6 +167,8 @@ struct StoreData {
     eval_case_results: HashMap<String, RagEvalCaseResult>,
     eval_overviews: HashMap<String, RagEvalOverview>,
 }
+
+const MAX_IN_MEMORY_AUDIT_RECORDS: usize = 10_000;
 
 #[derive(Default)]
 struct HydrationStage {
@@ -963,6 +969,27 @@ fn decode_operation_list_cursor(
 
 impl Store {
     pub fn new(config: &Config) -> Self {
+        Self::new_with_repository(config, repository_from_config(config), Metrics::new())
+    }
+
+    pub(crate) fn new_with_meili_admins_and_metrics(
+        config: &Config,
+        runtime: MeiliAdmin,
+        index_admin: MeiliAdmin,
+        metrics: Metrics,
+    ) -> Self {
+        Self::new_with_repository(
+            config,
+            repository_from_meili_admins(config, runtime, index_admin),
+            metrics,
+        )
+    }
+
+    fn new_with_repository(
+        config: &Config,
+        repository: Arc<dyn KnowledgeRepository>,
+        metrics: Metrics,
+    ) -> Self {
         // Capture the current dynamic Codex credential before any later
         // rotation so response and provider-boundary redaction retain it.
         let _ = config.refresh_configured_secret_values();
@@ -975,11 +1002,62 @@ impl Store {
             inner: Arc::new(RwLock::new(data)),
             mutation_gate: Arc::new(tokio::sync::Mutex::new(())),
             resolver: EventIndexResolver::new(config.index_hash_secret.clone()),
-            repository: repository_from_config(config),
+            repository,
             vector: Arc::new(Mutex::new(VectorMatcher::from_config(config))),
             redaction_config: Arc::new(config.clone()),
             parser_registry: ParserRegistry::new(config),
+            metrics,
         }
+    }
+
+    async fn wait_for_repository_tasks(
+        &self,
+        task_uids: &[String],
+        operation: &'static str,
+    ) -> Result<(), ApiError> {
+        let started_at = Instant::now();
+        let result = self.repository.wait_for_tasks(task_uids).await;
+        if self.repository.backend_name() == "meili" && !task_uids.is_empty() {
+            self.metrics.record_meili_task_wait(
+                operation,
+                started_at.elapsed().as_secs_f64(),
+                &result,
+            );
+        }
+        result
+    }
+
+    /// Persist a complete audit state before publishing it to the process
+    /// cache. The initial attempted state therefore fails closed, while a
+    /// rejected finalization leaves the previously accepted attempt intact.
+    pub(crate) async fn persist_audit_record(&self, record: &AuditRecord) -> Result<(), ApiError> {
+        record
+            .validate()
+            .map_err(|error| ApiError::Internal(format!("invalid audit record: {error}")))?;
+        let receipt = self.repository.upsert_audit_record(record).await?;
+        self.wait_for_repository_tasks(&receipt.task_uids, "durable_write")
+            .await?;
+        if self.backend_name() == "memory" {
+            let mut data = self.write()?;
+            if !data.audit_records.contains_key(&record.id)
+                && data.audit_records.len() >= MAX_IN_MEMORY_AUDIT_RECORDS
+            {
+                let oldest_id = data
+                    .audit_records
+                    .values()
+                    .min_by(|left, right| {
+                        left.occurred_at
+                            .cmp(&right.occurred_at)
+                            .then_with(|| left.id.cmp(&right.id))
+                    })
+                    .map(|oldest| oldest.id.clone());
+                if let Some(oldest_id) = oldest_id {
+                    data.audit_records.remove(&oldest_id);
+                }
+            }
+            data.audit_records.insert(record.id.clone(), record.clone());
+        }
+        Ok(())
     }
 
     /// Reuse the same pooled parser client used by ingestion for health checks.
@@ -1684,7 +1762,10 @@ impl Store {
 
     async fn persist_operation_checkpoint(&self, record: &OperationRecord) -> Result<(), ApiError> {
         let receipt = self.repository.upsert_operation(record).await?;
-        if let Err(error) = self.repository.wait_for_tasks(&receipt.task_uids).await {
+        if let Err(error) = self
+            .wait_for_repository_tasks(&receipt.task_uids, "durable_write")
+            .await
+        {
             // Preserve an already confirmed local checkpoint. In particular,
             // never publish a newly completed step locally when the journal
             // task that records that completion failed. If this is the first
@@ -1770,7 +1851,10 @@ impl Store {
             if !wait_for_index {
                 return Ok(record);
             }
-            if let Err(error) = self.repository.wait_for_tasks(&progress.task_uids).await {
+            if let Err(error) = self
+                .wait_for_repository_tasks(&progress.task_uids, "write")
+                .await
+            {
                 return self.record_operation_failure(record, step_id, error).await;
             }
             record = operation_step_completed(&record, step_id, now()).map_err(|error| {
@@ -1796,7 +1880,10 @@ impl Store {
         self.persist_operation_checkpoint(&record).await?;
 
         if wait_for_index && !receipt.task_uids.is_empty() {
-            if let Err(error) = self.repository.wait_for_tasks(&receipt.task_uids).await {
+            if let Err(error) = self
+                .wait_for_repository_tasks(&receipt.task_uids, "write")
+                .await
+            {
                 return self.record_operation_failure(record, step_id, error).await;
             }
             record = operation_step_completed(&record, step_id, now()).map_err(|error| {
@@ -3385,6 +3472,14 @@ impl Store {
             }
         };
         let report = completed_hydration_report(&self.redaction_config, tenant_id, &stage);
+        for (domain_name, domain) in &report.domains {
+            self.metrics
+                .record_hydration(domain_name, "loaded", domain.loaded);
+            self.metrics
+                .record_hydration(domain_name, "quarantined", domain.quarantined);
+            self.metrics
+                .record_hydration(domain_name, "recovered", domain.recovered);
+        }
         self.publish_hydration_stage(tenant_id, stage, report.clone())?;
         Ok(hydration_response(&report))
     }
@@ -3436,8 +3531,7 @@ impl Store {
         if !reconciliation_task_uids.is_empty() {
             hydration_result(
                 "user_event_indexes",
-                self.repository
-                    .wait_for_tasks(&reconciliation_task_uids)
+                self.wait_for_repository_tasks(&reconciliation_task_uids, "hydration")
                     .await,
             )?;
         }
@@ -3804,6 +3898,7 @@ impl Store {
             cause_fingerprint = %diagnostic.fingerprint,
             "mandatory repository hydration failed"
         );
+        self.metrics.record_hydration(failure.domain, "failure", 1);
         self.write()?.hydration_report = Some(report);
         Ok(())
     }
@@ -4438,13 +4533,25 @@ impl Store {
         let snapshot = self.get_snapshot_async(tenant_id, snapshot_id).await?;
         let already_loaded = self.read()?.rows_by_snapshot.contains_key(snapshot_id);
         if already_loaded {
+            self.metrics.record_cache_access("structured_rows", "hit");
             return Ok(snapshot);
         }
-        let rows = self
-            .repository
-            .list_rows(tenant_id, snapshot_id)
-            .await?
-            .unwrap_or_default();
+        self.metrics.record_cache_access("structured_rows", "miss");
+        let rows = match self.repository.list_rows(tenant_id, snapshot_id).await {
+            Ok(rows) => rows.unwrap_or_default(),
+            Err(error) => {
+                self.metrics
+                    .record_read_through("structured_rows", "failure", 1);
+                return Err(error);
+            }
+        };
+        if rows.is_empty() {
+            self.metrics
+                .record_read_through("structured_rows", "not_found", 1);
+        } else {
+            self.metrics
+                .record_read_through("structured_rows", "loaded", rows.len());
+        }
         let mut data = self.write()?;
         if !data.rows_by_snapshot.contains_key(snapshot_id) {
             for row_id in rows
@@ -4465,9 +4572,19 @@ impl Store {
         trace_id: &str,
     ) -> Result<TraceRecord, ApiError> {
         if let Ok(trace) = self.get_trace(tenant_id, trace_id) {
+            self.metrics.record_cache_access("trace", "hit");
             return Ok(trace);
         }
-        if let Some(trace) = self.repository.get_trace(tenant_id, trace_id).await? {
+        self.metrics.record_cache_access("trace", "miss");
+        let trace = match self.repository.get_trace(tenant_id, trace_id).await {
+            Ok(trace) => trace,
+            Err(error) => {
+                self.metrics.record_read_through("trace", "failure", 1);
+                return Err(error);
+            }
+        };
+        if let Some(trace) = trace {
+            self.metrics.record_read_through("trace", "loaded", 1);
             let mut data = self.write()?;
             if let Some(current) = data.traces.get(trace_id) {
                 return Ok(current.clone());
@@ -4475,6 +4592,7 @@ impl Store {
             data.traces.insert(trace.id.clone(), trace.clone());
             return Ok(trace);
         }
+        self.metrics.record_read_through("trace", "not_found", 1);
         Err(ApiError::not_found("trace not found"))
     }
 
@@ -4531,13 +4649,22 @@ impl Store {
 
         for (index_uid, owner_hash, expected_owner) in index_scopes {
             if self.read()?.personal_context_loaded.contains(&index_uid) {
+                self.metrics.record_cache_access("personal_context", "hit");
                 continue;
             }
-            let nodes = self
+            self.metrics.record_cache_access("personal_context", "miss");
+            let nodes = match self
                 .repository
                 .list_personal_context_nodes(tenant_id, &index_uid)
-                .await?
-                .unwrap_or_default();
+                .await
+            {
+                Ok(nodes) => nodes.unwrap_or_default(),
+                Err(error) => {
+                    self.metrics
+                        .record_read_through("personal_context", "failure", 1);
+                    return Err(error);
+                }
+            };
             let loaded_count = nodes.len();
             let nodes = nodes
                 .into_iter()
@@ -4555,6 +4682,16 @@ impl Store {
                 })
                 .collect::<Vec<_>>();
             let quarantined = loaded_count.saturating_sub(nodes.len());
+            if loaded_count == 0 {
+                self.metrics
+                    .record_read_through("personal_context", "not_found", 1);
+            } else {
+                self.metrics.record_read_through(
+                    "personal_context",
+                    "loaded",
+                    loaded_count.saturating_sub(quarantined),
+                );
+            }
             if quarantined > 0 {
                 tracing::warn!(
                     index_uid,
@@ -4568,6 +4705,8 @@ impl Store {
                 nodes,
             );
             data.personal_context_loaded.insert(index_uid);
+            self.metrics
+                .record_cache_access("personal_context", "stored");
         }
         Ok(())
     }
@@ -4832,15 +4971,30 @@ impl Store {
         self.ensure_personal_context_loaded(tenant_id, owner_user_id, include_all_private)
             .await?;
         match self.fs_read(tenant_id, uri, owner_user_id, include_all_private) {
-            Ok(node) => return Ok(self.sanitize_context_node_for_egress(node)),
-            Err(ApiError::NotFound(_)) => {}
+            Ok(node) => {
+                self.metrics.record_cache_access("context_node", "hit");
+                return Ok(self.sanitize_context_node_for_egress(node));
+            }
+            Err(ApiError::NotFound(_)) => {
+                self.metrics.record_cache_access("context_node", "miss");
+            }
             Err(error) => return Err(error),
         }
-        if let Some(node) = self
+        let repository_node = match self
             .repository
             .read_context_node(tenant_id, owner_user_id, uri, None, &self.resolver)
-            .await?
+            .await
         {
+            Ok(node) => node,
+            Err(error) => {
+                self.metrics
+                    .record_read_through("context_node", "failure", 1);
+                return Err(error);
+            }
+        };
+        if let Some(node) = repository_node {
+            self.metrics
+                .record_read_through("context_node", "loaded", 1);
             self.validate_repository_context_node(&node, tenant_id, owner_user_id)?;
             let node = self.cache_context_node(node)?;
             return Ok(self.sanitize_context_node_for_egress(node));
@@ -4858,10 +5012,16 @@ impl Store {
                 .await?
         };
         if let Some(source_document) = source_document {
+            self.metrics
+                .record_read_through("source_document", "loaded", 1);
             let source_document = self.cache_source_document(source_document)?;
             return Ok(self
                 .sanitize_context_node_for_egress(source_document_context_node(source_document)));
         }
+        self.metrics
+            .record_read_through("context_node", "not_found", 1);
+        self.metrics
+            .record_read_through("source_document", "not_found", 1);
         Err(ApiError::not_found("context uri not found"))
     }
 
@@ -4876,8 +5036,13 @@ impl Store {
         self.ensure_personal_context_loaded(tenant_id, owner_user_id, include_all_private)
             .await?;
         match self.fs_layer(tenant_id, uri, layer, owner_user_id, include_all_private) {
-            Ok(node) => return Ok(self.sanitize_context_node_for_egress(node)),
-            Err(ApiError::NotFound(_)) => {}
+            Ok(node) => {
+                self.metrics.record_cache_access("context_node", "hit");
+                return Ok(self.sanitize_context_node_for_egress(node));
+            }
+            Err(ApiError::NotFound(_)) => {
+                self.metrics.record_cache_access("context_node", "miss");
+            }
             Err(error) => return Err(error),
         }
         if let Some(node) = self
@@ -4885,10 +5050,14 @@ impl Store {
             .read_context_node(tenant_id, owner_user_id, uri, Some(layer), &self.resolver)
             .await?
         {
+            self.metrics
+                .record_read_through("context_node", "loaded", 1);
             self.validate_repository_context_node(&node, tenant_id, owner_user_id)?;
             let node = self.cache_context_node(node)?;
             return Ok(self.sanitize_context_node_for_egress(node));
         }
+        self.metrics
+            .record_read_through("context_node", "not_found", 1);
         Err(ApiError::not_found("context layer not found"))
     }
 
@@ -4985,6 +5154,7 @@ impl Store {
     }
 
     fn cache_context_node(&self, node: ContextNode) -> Result<ContextNode, ApiError> {
+        self.metrics.record_cache_access("context_node", "stored");
         let mut data = self.write()?;
         let nodes = if node.index_kind == "company" || node.index_uid == "rag_company_context" {
             &mut data.company_context
@@ -5050,6 +5220,8 @@ impl Store {
     }
 
     fn cache_source_document(&self, document: SourceDocument) -> Result<SourceDocument, ApiError> {
+        self.metrics
+            .record_cache_access("source_document", "stored");
         let mut data = self.write()?;
         let key = SourceDocumentKey::from_document(&document);
         if let Some(existing) = data.source_documents.get(&key) {
@@ -8571,6 +8743,143 @@ fn simple_slope(values: &[f64]) -> f64 {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[tokio::test]
+    async fn memory_audit_persistence_updates_one_record_in_place() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let occurred_at = now();
+        let mut record = AuditRecord {
+            id: new_id("audit"),
+            tenant_id: config.tenant_id.clone(),
+            request_id: uuid::Uuid::now_v7().to_string(),
+            principal_scope: AuditPrincipalScope::Admin,
+            principal_owner_user_id_hash: None,
+            resource_id_hash: format!("hmac:{}", "a".repeat(32)),
+            action: AuditAction::CompanyDocDelete,
+            reason_code: AuditReasonCode::AdminDelete,
+            reason_fingerprint: format!("hmac:{}", "b".repeat(32)),
+            outcome: AuditOutcome::Attempted,
+            error_kind: None,
+            operation_id: None,
+            occurred_at,
+            updated_at: occurred_at,
+        };
+
+        store.persist_audit_record(&record).await.unwrap();
+        record.outcome = AuditOutcome::Success;
+        record.updated_at = now();
+        store.persist_audit_record(&record).await.unwrap();
+
+        let data = store.read().unwrap();
+        assert_eq!(data.audit_records.len(), 1);
+        assert_eq!(
+            data.audit_records[&record.id].outcome,
+            AuditOutcome::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_audit_cache_evicts_the_oldest_record_at_its_fixed_ceiling() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let started = now() - chrono::Duration::days(1);
+        let mut oldest_id = None;
+        {
+            let mut data = store.write().unwrap();
+            for offset in 0..MAX_IN_MEMORY_AUDIT_RECORDS {
+                let occurred_at = started + chrono::Duration::milliseconds(offset as i64);
+                let id = new_id("audit");
+                if offset == 0 {
+                    oldest_id = Some(id.clone());
+                }
+                data.audit_records.insert(
+                    id.clone(),
+                    AuditRecord {
+                        id,
+                        tenant_id: config.tenant_id.clone(),
+                        request_id: uuid::Uuid::now_v7().to_string(),
+                        principal_scope: AuditPrincipalScope::Admin,
+                        principal_owner_user_id_hash: None,
+                        resource_id_hash: format!("hmac:{}", "a".repeat(32)),
+                        action: AuditAction::CompanyDocDelete,
+                        reason_code: AuditReasonCode::AdminDelete,
+                        reason_fingerprint: format!("hmac:{}", "b".repeat(32)),
+                        outcome: AuditOutcome::Attempted,
+                        error_kind: None,
+                        operation_id: None,
+                        occurred_at,
+                        updated_at: occurred_at,
+                    },
+                );
+            }
+        }
+
+        let occurred_at = now();
+        let newest = AuditRecord {
+            id: new_id("audit"),
+            tenant_id: config.tenant_id.clone(),
+            request_id: uuid::Uuid::now_v7().to_string(),
+            principal_scope: AuditPrincipalScope::Admin,
+            principal_owner_user_id_hash: None,
+            resource_id_hash: format!("hmac:{}", "c".repeat(32)),
+            action: AuditAction::CompanyDocDelete,
+            reason_code: AuditReasonCode::AdminDelete,
+            reason_fingerprint: format!("hmac:{}", "d".repeat(32)),
+            outcome: AuditOutcome::Attempted,
+            error_kind: None,
+            operation_id: None,
+            occurred_at,
+            updated_at: occurred_at,
+        };
+        store.persist_audit_record(&newest).await.unwrap();
+
+        let data = store.read().unwrap();
+        assert_eq!(data.audit_records.len(), MAX_IN_MEMORY_AUDIT_RECORDS);
+        assert!(!data
+            .audit_records
+            .contains_key(oldest_id.as_deref().expect("oldest audit id")));
+        assert!(data.audit_records.contains_key(&newest.id));
+    }
+
+    #[test]
+    fn direct_insight_patch_cannot_cross_tenants() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let created = store
+            .upsert_insight(
+                "tenant-a",
+                InsightUpsertRequest {
+                    owner_user_id: Some("owner-a".to_string()),
+                    insight_type: Some("isolation".to_string()),
+                    title: Some("Tenant-bound insight".to_string()),
+                    statement: Some("original statement".to_string()),
+                    ..InsightUpsertRequest::default()
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.patch_insight(
+                "tenant-b",
+                &created.insight.id,
+                InsightPatchRequest {
+                    statement: Some("foreign mutation".to_string()),
+                    ..InsightPatchRequest::default()
+                },
+            ),
+            Err(ApiError::NotFound(message)) if message == "insight not found"
+        ));
+
+        let stored = store
+            .search_insights(InsightSearchRequest {
+                owner_user_id: Some("owner-a".to_string()),
+                ..InsightSearchRequest::default()
+            })
+            .unwrap();
+        assert_eq!(stored.hits.len(), 1);
+        assert_eq!(stored.hits[0].statement, "original statement");
+    }
 
     #[test]
     fn local_event_idempotency_rejects_a_different_request_without_a_journal_record() {

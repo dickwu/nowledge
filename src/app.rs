@@ -14,11 +14,13 @@ use tokio::{
 };
 
 use crate::{
+    audit_service::AuditRecorder,
     config::Config,
     error::{safe_cause_diagnostic, safe_value_fingerprint, ApiError},
     http_boundary::{HttpBoundaryState, RequestDeadline},
     llm::{LlmHealthProbe, LlmProviderRegistry},
     meili::MeiliAdmin,
+    metrics::{IngestRuntimeMetrics, Metrics},
     models::{IngestTask, IngestTaskRequest, IngestTaskResult},
     parser::StagedUpload,
     runtime::RuntimeSupervisor,
@@ -184,6 +186,13 @@ impl IngestTaskManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
+    }
+
+    pub(crate) fn metrics(&self) -> IngestRuntimeMetrics {
+        IngestRuntimeMetrics {
+            queue_depth: self.queued_depth.load(Ordering::Acquire),
+            accepting: self.accepting.load(Ordering::Acquire),
+        }
     }
 }
 
@@ -351,10 +360,14 @@ pub(crate) fn log_ingest_failure(task_id: &str, err: &ApiError, message: &'stati
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: Store,
+    pub(crate) runtime_meili: MeiliAdmin,
     pub meili: MeiliAdmin,
     pub llm_health: LlmHealthProbe,
+    pub analysis_llm_health: LlmHealthProbe,
     pub llm_providers: LlmProviderRegistry,
     pub ingest_manager: IngestTaskManager,
+    pub(crate) metrics: Metrics,
+    pub(crate) audit_recorder: AuditRecorder,
     pub(crate) http_boundary: HttpBoundaryState,
     pub(crate) runtime: RuntimeSupervisor,
 }
@@ -363,6 +376,7 @@ pub struct AppState {
 pub(crate) struct AuthState {
     config: Arc<Config>,
     http_boundary: HttpBoundaryState,
+    audit_recorder: AuditRecorder,
 }
 
 impl AuthState {
@@ -370,12 +384,12 @@ impl AuthState {
         &self.config
     }
 
-    pub(crate) fn tenant_id(&self) -> &str {
-        &self.config.tenant_id
-    }
-
     pub(crate) fn http_boundary(&self) -> &HttpBoundaryState {
         &self.http_boundary
+    }
+
+    pub(crate) fn audit_recorder(&self) -> &AuditRecorder {
+        &self.audit_recorder
     }
 }
 
@@ -384,25 +398,43 @@ impl FromRef<AppState> for AuthState {
         Self {
             config: state.config.clone(),
             http_boundary: state.http_boundary.clone(),
+            audit_recorder: state.audit_recorder.clone(),
         }
     }
 }
 
 impl AppState {
     pub fn new(config: Arc<Config>) -> Self {
-        let store = Store::new(&config);
+        let (runtime_meili, index_admin) = MeiliAdmin::pair_from_config(&config);
+        let metrics = Metrics::new();
+        let store = Store::new_with_meili_admins_and_metrics(
+            &config,
+            runtime_meili.clone(),
+            index_admin.clone(),
+            metrics.clone(),
+        );
         let runtime = RuntimeSupervisor::new();
+        let audit_recorder = AuditRecorder::new(
+            config.clone(),
+            store.clone(),
+            runtime.clone(),
+            metrics.clone(),
+        );
         let http_boundary = HttpBoundaryState::new(&config);
-        let llm_providers = LlmProviderRegistry::new(config.clone());
+        let llm_providers = LlmProviderRegistry::new_with_metrics(config.clone(), metrics.clone());
         config.start_codex_secret_refresh_task();
         let ingest_manager = IngestTaskManager::new(store.clone(), config.clone(), runtime.clone());
         spawn_ingest_task_cleanup(store.clone(), &config, &runtime);
         Self {
             store,
-            meili: MeiliAdmin::from_config(&config),
+            runtime_meili,
+            meili: index_admin,
             llm_health: LlmHealthProbe::new(),
+            analysis_llm_health: LlmHealthProbe::new(),
             llm_providers,
             ingest_manager,
+            metrics,
+            audit_recorder,
             http_boundary,
             runtime,
             config,

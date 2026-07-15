@@ -3,17 +3,16 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
 
 use crate::{
     app::AppState,
     auth::UserGuard,
     error::ApiError,
     models::{
-        InsightPatchRequest, InsightResponse, InsightSearchRequest, InsightSearchResponse,
-        InsightUpsertRequest, LinkResponse, LinkSearchRequest, LinkSearchResponse,
-        LinkUpsertRequest, PatchStateFactRequest, StateItemResponse, StateSearchRequest,
-        StateSearchResponse, UpsertStateFactRequest,
+        default_limit, InsightEventsResponse, InsightPatchRequest, InsightResponse,
+        InsightSearchRequest, InsightSearchResponse, InsightUpsertRequest, LinkResponse,
+        LinkSearchRequest, LinkSearchResponse, LinkUpsertRequest, PatchStateFactRequest,
+        StateItemResponse, StateSearchRequest, StateSearchResponse, UpsertStateFactRequest,
     },
     request_validation::{validate_search_limit, validate_tags},
     state_service::StateService,
@@ -22,6 +21,12 @@ use crate::{
 #[derive(Debug, Deserialize)]
 pub(crate) struct OwnerQuery {
     owner_user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct InsightEventsQuery {
+    #[serde(default = "default_limit")]
+    limit: usize,
 }
 
 pub(crate) async fn upsert_state_fact(
@@ -132,10 +137,20 @@ pub(crate) async fn search_links(
 }
 
 pub(crate) async fn insight_events(
-    _user: UserGuard,
+    user: UserGuard,
+    State(state): State<AppState>,
     Path(insight_id): Path<String>,
-) -> Json<Value> {
-    Json(json!({ "insight_id": insight_id, "events": [] }))
+    Query(query): Query<InsightEventsQuery>,
+) -> Result<Json<InsightEventsResponse>, ApiError> {
+    let service = state_service(&state);
+    let owner = service.insight_owner(&insight_id)?;
+    user.require_owner_access(&owner)?;
+    validate_search_limit("limit", query.limit, &state.config)?;
+    Ok(Json(
+        service
+            .insight_events(&insight_id, &owner, query.limit)
+            .await?,
+    ))
 }
 
 fn state_service(state: &AppState) -> StateService {

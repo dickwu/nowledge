@@ -2,6 +2,12 @@
 
 Return current task metadata for an ingest task visible to the caller.
 
+## Handler
+
+- Rust handler: `get_ingest_task`
+- Route registration: `src/routes.rs::build_router`
+- Authentication: UserGuard; task owner scope enforced
+
 ## Query
 
 | Field | Type | Notes |

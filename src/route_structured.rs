@@ -110,5 +110,9 @@ pub(crate) async fn list_rows(
 }
 
 fn structured_service(state: &AppState) -> StructuredService {
-    StructuredService::new(state.config.clone(), state.store.clone())
+    StructuredService::new(
+        state.config.clone(),
+        state.store.clone(),
+        state.audit_recorder.clone(),
+    )
 }

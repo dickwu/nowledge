@@ -1,6 +1,8 @@
-target/
-.omx/
-.env
+/target/
+/.omx/
+/.omc/
+/.env
+/.env.*
+!/.env.example
 *.log
-scripts/
-.omc/*
+/scripts/

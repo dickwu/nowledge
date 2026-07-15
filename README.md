@@ -38,6 +38,18 @@ cargo run
 
 The default URL is `http://127.0.0.1:14242`.
 
+Nowledge requires Rust 1.88 or newer. For a safe local starting point, copy the
+checked-in example and explicitly load it into your shell; the binary does not
+load `.env` files itself:
+
+```sh
+cp .env.example .env
+set -a
+. ./.env
+set +a
+cargo run
+```
+
 Useful environment variables:
 
 ```sh
@@ -47,6 +59,7 @@ RAG_TENANT_ID=default
 RAG_INDEX_HASH_SECRET=
 RAG_ALLOW_LEGACY_WEAK_INDEX_HASH_SECRET=false
 RAG_STORE_BACKEND=memory
+RAG_ALLOW_EPHEMERAL_PRODUCTION=false
 RAG_BEARER_TOKEN=optional-user-token
 RAG_BEARER_TOKEN_SCOPE=owner
 RAG_BEARER_TOKEN_OWNER_USER_ID=owner-user-id
@@ -57,7 +70,11 @@ RAG_AUTH_USERS=owner-user-id:user-token:user,*:service-token:user,writer-owner:w
 RAG_RUN_MODE=development
 RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true
 RAG_MEILI_URL=http://127.0.0.1:7700
-RAG_MEILI_API_KEY=optional-meili-key
+RAG_MEILI_API_KEY=optional-runtime-document-search-key
+RAG_MEILI_ADMIN_API_KEY=optional-distinct-index-admin-key
+RAG_MEILI_ALLOW_INITIAL_PROVISION=false
+RAG_MEILI_OPERATIONS_INDEX_CREATED_AT=required-production-rfc3339-createdAt
+RAG_MEILI_AUDIT_INDEX_CREATED_AT=required-production-rfc3339-createdAt
 RAG_WRITE_CONSISTENCY=read_your_writes
 RAG_MEILI_SCAN_PAGE_SIZE=500
 RAG_MEILI_SCAN_MAX_DOCUMENTS=100000
@@ -183,16 +200,20 @@ cargo run --bin operations_v1 -- apply \
   --plan /secure/operations-v1-plan.json --dry-run
 cargo run --bin operations_v1 -- apply \
   --plan /secure/operations-v1-plan.json
+cargo run --bin operations_v1 -- plan \
+  --out /secure/operations-v1-verify-plan.json
 cargo run --bin operations_v1 -- verify \
-  --plan /secure/operations-v1-plan.json
+  --plan /secure/operations-v1-verify-plan.json
 ```
 
-Use the same `RAG_MEILI_URL` and, when required, `RAG_MEILI_API_KEY` as the
-service. `operations_v1` manages only `rag_operations`, waits for every task,
-requires the exact primary key `id`, is non-destructive and idempotent, and
+Use the same `RAG_MEILI_URL` and `RAG_MEILI_ADMIN_API_KEY` as the service.
+`operations_v1` manages only `rag_operations`, waits for every task,
+requires the exact primary key `id`, is non-destructive, and
 rejects a tampered plan. `verify` exits nonzero whenever the index, primary
-key, or managed settings are not ready, so deployment automation must treat
-that command as a hard gate. The previous
+key, managed settings, or exact Meilisearch `createdAt` generation are not
+ready, so deployment automation must treat that command as a hard gate. A
+missing-index plan creates the index but cannot know its future generation;
+always capture the fresh post-apply verification plan shown above. The previous
 application revision ignores this additional index, so rollback does not
 require deleting it. See
 [ADR 0006](doc/adr/0006-mutation-consistency.md) for consistency and recovery
@@ -203,6 +224,82 @@ Do not run active-active Nowledge writer replicas against the same tenant until
 a durable lease or compare-and-set protocol is introduced; the in-process
 mutation gate is not distributed consensus. Read replicas are outside this
 revision's supported deployment topology.
+
+### Durable shared-mutation audit rollout
+
+This revision also adds `rag_audit_records` for the five shared-knowledge
+mutation targets: company-document preflight, revision creation, revision
+activation, company-document deletion, and structured-dataset schema upsert.
+Authorization denials for those targets are recorded in the same index. There
+is deliberately no public audit-query route in this revision.
+
+Run the following non-destructive migration before starting the upgraded
+binary against an existing managed Meilisearch deployment. Use the exact
+application revision that will be deployed, back up Meilisearch first, stop or
+drain writers for the cutover, and provide the service's `RAG_MEILI_URL` plus
+`RAG_MEILI_ADMIN_API_KEY` when required:
+
+```sh
+cargo run --bin audit_records_v1 -- plan \
+  --out /secure/audit-records-v1-plan.json
+cargo run --bin audit_records_v1 -- apply \
+  --plan /secure/audit-records-v1-plan.json --dry-run
+cargo run --bin audit_records_v1 -- apply \
+  --plan /secure/audit-records-v1-plan.json
+cargo run --bin audit_records_v1 -- plan \
+  --out /secure/audit-records-v1-verify-plan.json
+cargo run --bin audit_records_v1 -- verify \
+  --plan /secure/audit-records-v1-verify-plan.json
+```
+
+Do not start the upgraded service unless `verify` exits successfully. Adding
+the index to `FIXED_INDEXES` intentionally makes an old managed index set
+incomplete, and startup refuses to recreate only the missing audit index.
+`audit_records_v1` manages only `rag_audit_records`, requires primary key `id`,
+waits for all creation/settings tasks, rejects incompatible or tampered plans,
+and refuses to recreate an index that disappeared after planning. The
+post-apply plan binds the exact `createdAt` generation; a plan
+that originally observed a missing index is intentionally not valid evidence
+for verifying the newly created generation. Plan, dry-run, and verify are
+mutation-free.
+
+For either fixed-index migration, a missing-index plan is not a generally
+idempotent artifact. If creation was accepted but the CLI then crashed or lost
+its response, do not retry that plan or silently adopt the UID. Stop, preserve
+and inspect Meilisearch task history for the exact UID, time, and result, then
+generate and review a fresh plan. An `already_present` plan may be verified;
+`settings_drift` must be dry-run/applied and then verified with that bound plan;
+`missing` starts a new full sequence only after a confirmed failed create task.
+Treat `primary_key_mismatch` or an unexplained generation as an incident/restore
+condition.
+
+Before each authorized shared mutation, the service persists an `attempted`
+record and fails closed if that record cannot be accepted. It then updates the
+same record to `success` or `failure` in a supervised background write; a
+finalization failure retains the attempt and emits only bounded, fingerprinted
+diagnostics. Recording an
+authorization denial is admitted to a bounded, supervised best-effort
+background write. Capacity, shutdown, or persistence failure never delays or
+replaces the original 401/403 response. Records contain trusted tenant/request
+correlation plus bounded enums and HMAC-derived owner/resource/reason
+identities; raw request content, identifiers, reasons, paths, queries, prompts,
+tokens, and provider bodies are not part of the schema.
+
+Audit evidence is retained indefinitely in this revision. There is no
+automatic age deletion. Operators must monitor Meilisearch capacity and
+`nowledge_audit_background_drops_total`, preserve legal holds, archive a
+verified off-host dump before any approved cleanup, and scope any cleanup by
+both tenant and occurrence time. The exact policy is recorded in ADR 0008.
+
+The previous application ignores the additional index, so rollback does not
+require deleting it. Preserve the index and migration artifact for a later
+retry or forward deployment. See
+[ADR 0008](doc/adr/0008-durable-shared-mutation-audit.md) for the persistence
+and failure semantics. Existing installations that also require the
+tenant-scope migration must follow the ordered
+[production upgrade runbook](doc/runbooks/production-upgrade.md): create and
+verify the operation and audit indexes before generating the final
+`tenant_scope_v1` plan.
 
 HTTP and ingest boundaries are typed startup configuration. Numeric limits
 must be positive, malformed values fail startup, and the synchronous ingest
@@ -249,9 +346,16 @@ browser origins. See
 ordering, overload semantics, upload staging, and rollout.
 
 Use `RAG_STORE_BACKEND=meili` with `RAG_MEILI_URL` to mirror core writes to
-Meilisearch and search per-user event indexes through Meilisearch. Production
-mode requires configured auth unless `RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true` is
-set explicitly.
+Meilisearch and search per-user event indexes through Meilisearch. Ordinary
+production mode requires this durable backend; an intentionally ephemeral
+production process must acknowledge restart data loss with
+`RAG_ALLOW_EPHEMERAL_PRODUCTION=true`. Production mode requires configured auth
+unless `RAG_ALLOW_UNSAFE_UNAUTHENTICATED=true` is set explicitly.
+
+`RAG_LLM_PROVIDER` and `RAG_ANALYSIS_LLM_PROVIDER` accept only `none`, `mock`,
+`openai_api_key`, or `codex_auth`; unknown values fail startup instead of
+silently selecting a disabled client. Required primary and analysis profiles
+both participate in readiness.
 
 Authentication data scope is explicit. A named owner in `RAG_AUTH_USERS` creates
 an owner-bound principal; the literal owner `*` creates a tenant-service
@@ -349,14 +453,32 @@ Health endpoints split process liveness from operational readiness:
   post-ingest credential rotation from sending split token halves to a provider
   or returning them in content-bearing JSON fields.
 
-Meilisearch startup is fail-closed. A fresh backend with none of Nowledge's
-managed fixed indexes is provisioned automatically, while a partial managed
-index set stops startup so missing durable data cannot be replaced by empty
-indexes. Existing registered per-user event and personal-context indexes are
-reconciled in place and are never recreated during hydration. Settings are
-updated only when the managed attributes differ, so ordinary restarts do not
-enqueue redundant Meilisearch mutations. Use the explicit administrative reset
-workflow only when destructive recreation is intended.
+Meilisearch startup is fail-closed. Production refuses both an all-missing and
+a partial managed index set so a lost data directory cannot be accepted as an
+empty installation. A first installation requires the one-time
+`RAG_MEILI_ALLOW_INITIAL_PROVISION=true` gate; use it only while observing a
+known-empty target, then capture the durable-index identity pins, remove the
+gate, and restart. Development and test retain automatic first provision.
+Existing registered per-user event and personal-context indexes are reconciled
+in place and are never recreated during hydration. Settings are updated only
+when the managed attributes differ, so ordinary restarts do not enqueue
+redundant Meilisearch mutations. Use the explicit administrative reset workflow
+only when destructive recreation is intended.
+
+Production also requires distinct Meilisearch credentials. The runtime
+`RAG_MEILI_API_KEY` performs document/search/task reads and must not have index
+create/delete permission. `RAG_MEILI_ADMIN_API_KEY` is used only by managed
+index/settings paths and maintenance binaries. Durable operation and audit
+writes compare the captured index generation and exact managed settings before
+the write and after its task succeeds; drift makes readiness unhealthy and the
+write fails closed. Normal production startup also pins the exact `createdAt`
+identities of `rag_operations` and `rag_audit_records` through
+`RAG_MEILI_OPERATIONS_INDEX_CREATED_AT` and
+`RAG_MEILI_AUDIT_INDEX_CREATED_AT`, so a restart cannot silently rebaseline to
+a different fully provisioned cluster. Capture these values only after the
+verified migrations or first-install provisioning, preserve them with the
+deployment configuration, and change them only during an operator-reviewed
+restore or replacement.
 
 Before restarting after a credential rotation, place any revoked value that
 can still occur in persisted documents in the comma-separated
@@ -458,10 +580,15 @@ Link and analysis surfaces:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo check
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo check --locked --all-targets
+cargo test --locked
+cargo package --locked
 ```
+
+CI also checks the same lockfile with Rust 1.88, runs the exact route-manifest
+contract test, audits RustSec advisories, and enforces the dependency license,
+source, ban, and advisory policy in `deny.toml`.
 
 Optional Meilisearch integration tests run when `RAG_TEST_MEILI_URL` is set.
 If the server requires a key, set `RAG_TEST_MEILI_API_KEY` too:

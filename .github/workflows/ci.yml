@@ -4,16 +4,68 @@ on:
   pull_request:
   push:
     branches: [main, master]
+  schedule:
+    - cron: "23 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
+  quality:
+    name: stable quality gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       # turbovec links OpenBLAS on Linux (Accelerate on macOS).
       - run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
-      - run: cargo package --allow-dirty --no-verify
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo check --locked --all-targets
+      - run: cargo test --locked --test route_manifest
+      - run: cargo test --locked
+      - run: cargo package --locked
+
+  msrv:
+    name: Rust 1.88 MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      - run: cargo check --locked --all-targets
+
+  audit:
+    name: RustSec audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2024-0436
+
+  deny:
+    name: dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

@@ -17,6 +17,7 @@ use axum::{
 use nowledge::{
     build_router,
     config::WriteConsistency,
+    meili::settings_for,
     models::{ActivateRevisionRequest, CreateRevisionRequest, LinkUpsertRequest},
     tenant_scope::tenant_document,
     AppState, Config,
@@ -197,13 +198,21 @@ async fn company_delete_meili(
     let path = request.uri().path().to_string();
 
     if method == Method::GET && path.ends_with("/settings") {
-        return (StatusCode::OK, Json(json!({}))).into_response();
+        let uid = path
+            .strip_prefix("/indexes/")
+            .and_then(|path| path.strip_suffix("/settings"))
+            .unwrap();
+        return (StatusCode::OK, Json(settings_for(uid))).into_response();
     }
     if method == Method::GET && path.starts_with("/indexes/") {
         let uid = path.trim_start_matches("/indexes/");
         return (
             StatusCode::OK,
-            Json(json!({ "uid": uid, "primaryKey": "id" })),
+            Json(json!({
+                "uid": uid,
+                "primaryKey": "id",
+                "createdAt": "2026-07-14T00:00:00Z"
+            })),
         )
             .into_response();
     }

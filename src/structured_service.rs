@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::{
+    audit_service::AuditRecorder,
     auth::Principal,
     config::Config,
     error::ApiError,
@@ -12,7 +13,7 @@ use crate::{
         CurrentStructuredStateResponse, DatasetSchemaResponse, DatasetSchemaUpsertRequest,
         StructuredSnapshot, StructuredSnapshotResponse,
     },
-    shared_audit::audit_shared_write,
+    shared_audit::{audit_shared_write, dataset_upsert_schema_target},
     store::Store,
 };
 
@@ -20,11 +21,16 @@ use crate::{
 pub(crate) struct StructuredService {
     config: Arc<Config>,
     store: Store,
+    audit_recorder: AuditRecorder,
 }
 
 impl StructuredService {
-    pub(crate) fn new(config: Arc<Config>, store: Store) -> Self {
-        Self { config, store }
+    pub(crate) fn new(config: Arc<Config>, store: Store, audit_recorder: AuditRecorder) -> Self {
+        Self {
+            config,
+            store,
+            audit_recorder,
+        }
     }
 
     pub(crate) async fn upsert_dataset(
@@ -33,19 +39,20 @@ impl StructuredService {
         dataset_key: &str,
         request: DatasetSchemaUpsertRequest,
     ) -> Result<DatasetSchemaResponse, ApiError> {
-        let result = self
-            .store
-            .upsert_dataset_async(&self.config.tenant_id, dataset_key, request)
-            .await;
+        let store = self.store.clone();
+        let tenant_id = self.config.tenant_id.clone();
         audit_shared_write(
-            result,
+            &self.audit_recorder,
             principal,
-            &self.config,
-            &self.config.tenant_id,
-            "dataset.upsert_schema",
-            dataset_key,
+            dataset_upsert_schema_target(dataset_key),
             "schema_upsert",
+            || async move {
+                store
+                    .upsert_dataset_async(&tenant_id, dataset_key, request)
+                    .await
+            },
         )
+        .await
     }
 
     pub(crate) async fn snapshot_owner(&self, snapshot_id: &str) -> Result<String, ApiError> {

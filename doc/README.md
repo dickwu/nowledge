@@ -2,8 +2,6 @@
 
 This directory contains one standalone English document for every HTTP API registered in `src/routes.rs::build_router`.
 
-Total documented APIs: 89.
-
 Each endpoint file includes request parameters, response fields, access rules, and a Mermaid internal logic call graph.
 
 ## Retrieval and Source Documents
@@ -71,6 +69,7 @@ by `RAG_INGEST_MAX_CONCURRENT_TASKS`. When full, both sync ingest routes return
 | `GET` | `/livez` | `livez` | [api/get_livez.md](api/get_livez.md) |
 | `GET` | `/readyz` | `readyz` | [api/get_readyz.md](api/get_readyz.md) |
 | `POST` | `/v1/admin/bootstrap` | `bootstrap` | [api/post_v1_admin_bootstrap.md](api/post_v1_admin_bootstrap.md) |
+| `GET` | `/v1/admin/metrics` | `metrics` | [api/get_v1_admin_metrics.md](api/get_v1_admin_metrics.md) |
 | `GET` | `/v1/admin/harness/components` | `list_harness_components` | [api/get_v1_admin_harness_components.md](api/get_v1_admin_harness_components.md) |
 | `GET` | `/v1/admin/harness/components/{component_id}` | `get_harness_component` | [api/get_v1_admin_harness_components_component_id.md](api/get_v1_admin_harness_components_component_id.md) |
 | `POST` | `/v1/admin/harness/components/{component_id}/revisions` | `create_harness_component_revision` | [api/post_v1_admin_harness_components_component_id_revisions.md](api/post_v1_admin_harness_components_component_id_revisions.md) |

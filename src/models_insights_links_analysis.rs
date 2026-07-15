@@ -46,6 +46,12 @@ pub struct InsightResponse {
     pub context_uri: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsightEventsResponse {
+    pub insight_id: String,
+    pub events: Vec<HistoryEvent>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InsightPatchRequest {
     pub statement: Option<String>,

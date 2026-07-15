@@ -1,10 +1,10 @@
 use crate::{
     error::ApiError,
     models::{
-        InsightPatchRequest, InsightResponse, InsightSearchRequest, InsightSearchResponse,
-        InsightUpsertRequest, LinkResponse, LinkSearchRequest, LinkSearchResponse,
-        LinkUpsertRequest, PatchStateFactRequest, StateItemResponse, StateSearchRequest,
-        StateSearchResponse, UpsertStateFactRequest,
+        HistorySearchRequest, InsightEventsResponse, InsightPatchRequest, InsightResponse,
+        InsightSearchRequest, InsightSearchResponse, InsightUpsertRequest, LinkResponse,
+        LinkSearchRequest, LinkSearchResponse, LinkUpsertRequest, PatchStateFactRequest,
+        StateItemResponse, StateSearchRequest, StateSearchResponse, UpsertStateFactRequest,
     },
     store::Store,
 };
@@ -66,7 +66,7 @@ impl StateService {
     }
 
     pub(crate) fn insight_owner(&self, insight_id: &str) -> Result<String, ApiError> {
-        self.store.insight_owner(insight_id)
+        self.store.insight_owner(&self.tenant_id, insight_id)
     }
 
     pub(crate) async fn patch_insight(
@@ -77,6 +77,41 @@ impl StateService {
         self.store
             .patch_insight_async(&self.tenant_id, insight_id, request)
             .await
+    }
+
+    pub(crate) async fn insight_events(
+        &self,
+        insight_id: &str,
+        owner_user_id: &str,
+        limit: usize,
+    ) -> Result<InsightEventsResponse, ApiError> {
+        let mut events = self
+            .store
+            .search_events_async(
+                &self.tenant_id,
+                Some(owner_user_id),
+                HistorySearchRequest {
+                    entity_type: Some("insight".to_string()),
+                    entity_id: Some(insight_id.to_string()),
+                    owner_user_id: Some(owner_user_id.to_string()),
+                    limit,
+                    ..HistorySearchRequest::default()
+                },
+            )
+            .await?
+            .hits;
+        events.sort_by(|left, right| {
+            right
+                .occurred_at
+                .cmp(&left.occurred_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        events.truncate(limit.max(1));
+
+        Ok(InsightEventsResponse {
+            insight_id: insight_id.to_string(),
+            events,
+        })
     }
 
     pub(crate) fn search_insights(

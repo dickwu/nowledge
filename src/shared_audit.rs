@@ -1,42 +1,81 @@
+use std::{fmt::Write, future::Future};
+
 use axum::http::Method;
 
 use crate::{
-    app::AuthState, auth::Principal, config::Config, error::ApiError, request_context,
-    util::hmac_hex,
+    app::AuthState,
+    audit_service::AuditRecorder,
+    auth::{Principal, PrincipalScope},
+    error::ApiError,
+    models::{AuditAction, AuditPrincipalScope},
 };
 
-pub(crate) fn audit_shared_write<T>(
-    result: Result<T, ApiError>,
-    principal: &Principal,
-    config: &Config,
-    tenant_id: &str,
-    action: &str,
-    resource_id: &str,
-    reason: &str,
-) -> Result<T, ApiError> {
-    match &result {
-        Ok(_) => emit_shared_mutation_audit(
-            Some(principal),
-            config,
-            tenant_id,
-            action,
-            resource_id,
-            reason,
-            "success",
-            None,
-        ),
-        Err(error) => emit_shared_mutation_audit(
-            Some(principal),
-            config,
-            tenant_id,
-            action,
-            resource_id,
-            reason,
-            "failure",
-            Some(api_error_kind(error)),
-        ),
+#[derive(Debug, Clone)]
+pub(crate) struct SharedMutationAuditTarget {
+    action: AuditAction,
+    resource_identity: String,
+}
+
+pub(crate) fn company_doc_preflight_target() -> SharedMutationAuditTarget {
+    SharedMutationAuditTarget {
+        action: AuditAction::CompanyDocPreflight,
+        resource_identity: length_prefixed_identity(&["company-doc", "preflight"]),
     }
-    result
+}
+
+pub(crate) fn company_doc_create_revision_target(source_id: &str) -> SharedMutationAuditTarget {
+    SharedMutationAuditTarget {
+        action: AuditAction::CompanyDocCreateRevision,
+        resource_identity: length_prefixed_identity(&[source_id]),
+    }
+}
+
+pub(crate) fn company_doc_activate_revision_target(
+    source_id: &str,
+    revision_id: &str,
+) -> SharedMutationAuditTarget {
+    SharedMutationAuditTarget {
+        action: AuditAction::CompanyDocActivateRevision,
+        resource_identity: length_prefixed_identity(&[source_id, revision_id]),
+    }
+}
+
+pub(crate) fn company_doc_delete_target(source_id: &str) -> SharedMutationAuditTarget {
+    SharedMutationAuditTarget {
+        action: AuditAction::CompanyDocDelete,
+        resource_identity: length_prefixed_identity(&[source_id]),
+    }
+}
+
+pub(crate) fn dataset_upsert_schema_target(dataset_key: &str) -> SharedMutationAuditTarget {
+    SharedMutationAuditTarget {
+        action: AuditAction::DatasetUpsertSchema,
+        resource_identity: length_prefixed_identity(&[dataset_key]),
+    }
+}
+
+pub(crate) async fn audit_shared_write<T, F, Fut>(
+    recorder: &AuditRecorder,
+    principal: &Principal,
+    target: SharedMutationAuditTarget,
+    reason: &str,
+    mutation: F,
+) -> Result<T, ApiError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, ApiError>>,
+{
+    recorder
+        .record_mutation(
+            principal_scope(Some(principal)),
+            principal.owner_user_id(),
+            target.action,
+            &target.resource_identity,
+            reason,
+            None,
+            mutation,
+        )
+        .await
 }
 
 pub(crate) fn audit_shared_write_denial(
@@ -47,142 +86,99 @@ pub(crate) fn audit_shared_write_denial(
     reason: &str,
     error: &ApiError,
 ) {
-    let Some((action, resource_id)) = shared_mutation_audit_target(method, path) else {
+    let Some(target) = shared_mutation_audit_target(method, path) else {
         return;
     };
-    emit_shared_mutation_audit(
-        principal,
-        state.config(),
-        state.tenant_id(),
-        action,
-        &resource_id,
+    let denial_identity = principal
+        .map(|principal| principal.denial_audit_identity(&state.config().index_hash_secret));
+    state.audit_recorder().record_denial(
+        principal_scope(principal),
+        denial_identity.as_ref(),
+        principal.and_then(Principal::owner_user_id),
+        target.action,
+        &target.resource_identity,
         reason,
-        "denied",
-        Some(api_error_kind(error)),
+        error,
     );
 }
 
-fn shared_mutation_audit_target(method: &Method, path: &str) -> Option<(&'static str, String)> {
+fn shared_mutation_audit_target(method: &Method, path: &str) -> Option<SharedMutationAuditTarget> {
     let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
     match (method, segments.as_slice()) {
         (&Method::POST, ["v1", "state", "company-docs", "preflight"]) => {
-            Some(("company_doc.preflight", "company-doc:preflight".to_string()))
+            Some(company_doc_preflight_target())
         }
         (&Method::POST, ["v1", "state", "company-docs", source_id, "revisions"]) => {
-            Some(("company_doc.create_revision", (*source_id).to_string()))
+            let source_id = percent_decode_path_segment(source_id);
+            Some(company_doc_create_revision_target(&source_id))
         }
         (
             &Method::POST,
             ["v1", "state", "company-docs", source_id, "revisions", revision_id, "activate"],
-        ) => Some((
-            "company_doc.activate_revision",
-            format!("{source_id}:{revision_id}"),
-        )),
+        ) => {
+            let source_id = percent_decode_path_segment(source_id);
+            let revision_id = percent_decode_path_segment(revision_id);
+            Some(company_doc_activate_revision_target(
+                &source_id,
+                &revision_id,
+            ))
+        }
         (&Method::PUT, ["v1", "state", "structured", "datasets", dataset_key]) => {
-            Some(("dataset.upsert_schema", (*dataset_key).to_string()))
+            let dataset_key = percent_decode_path_segment(dataset_key);
+            Some(dataset_upsert_schema_target(&dataset_key))
         }
         (&Method::DELETE, ["v1", "state", "company-docs", source_id]) => {
-            Some(("company_doc.delete", (*source_id).to_string()))
+            let source_id = percent_decode_path_segment(source_id);
+            Some(company_doc_delete_target(&source_id))
         }
         _ => None,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_shared_mutation_audit(
-    principal: Option<&Principal>,
-    config: &Config,
-    tenant_id: &str,
-    action: &str,
-    resource_id: &str,
-    reason: &str,
-    outcome: &str,
-    error_kind: Option<&str>,
-) {
-    let request_id = request_context::current_or_new_id();
-    let resource_id = audit_identifier(config, "resource", resource_id);
-    let tenant_id = audit_identifier(config, "tenant", tenant_id);
-    let principal_scope = principal
-        .map(Principal::scope_label)
-        .unwrap_or("unauthenticated");
-    let owner_user_id = principal
-        .and_then(Principal::owner_user_id)
-        .map(|owner| audit_identifier(config, "principal-owner", owner))
-        .unwrap_or_else(|| "none".to_string());
-    let (reason_code, reason_fingerprint) = audit_reason(config, reason);
-    if outcome == "success" {
-        tracing::info!(
-            target: "nowledge::audit",
-            %request_id,
-            %tenant_id,
-            principal_scope,
-            principal_owner_user_id = %owner_user_id,
-            action,
-            %resource_id,
-            reason = reason_code,
-            %reason_fingerprint,
-            outcome,
-            "shared knowledge mutation"
-        );
-    } else {
-        tracing::warn!(
-            target: "nowledge::audit",
-            %request_id,
-            %tenant_id,
-            principal_scope,
-            principal_owner_user_id = %owner_user_id,
-            action,
-            %resource_id,
-            reason = reason_code,
-            %reason_fingerprint,
-            outcome,
-            error_kind = error_kind.unwrap_or("unknown"),
-            "shared knowledge mutation"
-        );
+fn percent_decode_path_segment(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| segment.to_string())
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
-fn audit_identifier(config: &Config, namespace: &str, value: &str) -> String {
-    format!(
-        "hmac:{}",
-        hmac_hex(&config.index_hash_secret, namespace, value, 16)
-    )
-}
-
-fn audit_reason(config: &Config, reason: &str) -> (&'static str, String) {
-    let reason_code = match reason {
-        "authentication_failed" => "authentication_failed",
-        "company_writer_required" => "company_writer_required",
-        "admin_required" => "admin_required",
-        "preflight_requested" => "preflight_requested",
-        "revision_create_requested" => "revision_create_requested",
-        "activation_reason_unspecified" => "activation_reason_unspecified",
-        "admin_delete" => "admin_delete",
-        "schema_upsert" => "schema_upsert",
-        _ => "caller_supplied",
-    };
-    let reason_fingerprint = format!(
-        "hmac:{}",
-        hmac_hex(&config.index_hash_secret, "audit-reason", reason, 16)
-    );
-    (reason_code, reason_fingerprint)
-}
-
-fn api_error_kind(error: &ApiError) -> &'static str {
-    match error {
-        ApiError::BadRequest(_) => "bad_request",
-        ApiError::Validation { .. } => "validation_error",
-        ApiError::Unauthorized(_) => "unauthorized",
-        ApiError::Forbidden(_) => "forbidden",
-        ApiError::NotFound(_) => "not_found",
-        ApiError::Conflict(_) => "conflict",
-        ApiError::PayloadTooLarge => "payload_too_large",
-        ApiError::TooManyRequests(_) => "too_many_requests",
-        ApiError::ServiceUnavailable(_) => "service_unavailable",
-        ApiError::Timeout => "timeout",
-        ApiError::Upstream(_) => "upstream_error",
-        ApiError::Internal(_) => "internal_error",
+fn principal_scope(principal: Option<&Principal>) -> AuditPrincipalScope {
+    match principal.map(|principal| &principal.scope) {
+        None => AuditPrincipalScope::Unauthenticated,
+        Some(PrincipalScope::Owner { .. }) => AuditPrincipalScope::Owner,
+        Some(PrincipalScope::TenantService) => AuditPrincipalScope::TenantService,
+        Some(PrincipalScope::Admin) => AuditPrincipalScope::Admin,
     }
+}
+
+fn length_prefixed_identity(parts: &[&str]) -> String {
+    let mut identity = String::new();
+    for part in parts {
+        let _ = write!(&mut identity, "{}:{part}", part.len());
+    }
+    identity
 }
 
 #[cfg(test)]
@@ -190,20 +186,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn audit_identifiers_and_caller_reasons_are_never_logged_raw() {
-        let config = Config::test();
-        let raw_identifier = "tenant/private-owner/source-id";
-        let identifier = audit_identifier(&config, "resource", raw_identifier);
-        assert!(identifier.starts_with("hmac:"));
-        assert!(!identifier.contains(raw_identifier));
+    fn denial_mapping_is_exact_and_composite_ids_are_unambiguous() {
+        let target = shared_mutation_audit_target(
+            &Method::POST,
+            "/v1/state/company-docs/source/revisions/revision/activate",
+        )
+        .unwrap();
+        assert_eq!(target.action, AuditAction::CompanyDocActivateRevision);
+        assert_eq!(target.resource_identity, "6:source8:revision");
 
-        let raw_reason = "activate because /private/auth.json contains a provider token";
-        let (reason_code, reason_fingerprint) = audit_reason(&config, raw_reason);
-        assert_eq!(reason_code, "caller_supplied");
-        assert!(reason_fingerprint.starts_with("hmac:"));
-        assert!(!reason_fingerprint.contains(raw_reason));
+        assert!(shared_mutation_audit_target(
+            &Method::GET,
+            "/v1/state/company-docs/source/revisions/revision/activate"
+        )
+        .is_none());
+        assert_ne!(
+            length_prefixed_identity(&["a:b", "c"]),
+            length_prefixed_identity(&["a", "b:c"])
+        );
+    }
 
-        let (system_code, _) = audit_reason(&config, "company_writer_required");
-        assert_eq!(system_code, "company_writer_required");
+    #[test]
+    fn denial_targets_match_axum_decoded_path_identities() {
+        for (encoded, decoded) in [
+            ("source%41", "sourceA"),
+            ("%E7%9F%A5%E8%AF%86", "知识"),
+            ("source%2Fchild", "source/child"),
+        ] {
+            let target = shared_mutation_audit_target(
+                &Method::POST,
+                &format!("/v1/state/company-docs/{encoded}/revisions"),
+            )
+            .unwrap();
+            assert_eq!(
+                target.resource_identity,
+                company_doc_create_revision_target(decoded).resource_identity
+            );
+        }
     }
 }

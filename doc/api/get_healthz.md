@@ -30,7 +30,8 @@ Schema: `HealthResponse`
 | meilisearch | object | Meilisearch health payload. |
 | hydration | object | Tenant hydration status plus per-domain durability strategy, counts, recovery totals, and redacted failure diagnostics. |
 | parser | object | Parser health payload. |
-| llm | object | LLM health payload with provider, model, auth, quota, rate-limit, and stale status. |
+| llm | object | Primary LLM health payload with provider, model, auth, quota, rate-limit, and stale status. |
+| analysis_llm | object | Analysis-profile LLM health payload. A distinct analysis profile is probed independently and can make readiness unhealthy. |
 | usage | object | Compact usage summary. |
 
 ### `llm.rate_limits` Fields
@@ -50,7 +51,8 @@ says when it was last observed. For `codex_auth` the windows come from the
 | additional_limits | array? | Model-scoped buckets (`name`, `limit_name`, `primary`, `secondary`). |
 | remaining_requests / remaining_tokens / reset_requests / reset_tokens | string? | OpenAI API-style `x-ratelimit-*` values when the provider is `openai_api_key`. |
 
-`llm.rate_limit_state` is `ok`, `near_limit` (any window ≥ 90% used),
+The same fields are present under `analysis_llm.rate_limits`.
+`llm.rate_limit_state` and `analysis_llm.rate_limit_state` are `ok`, `near_limit` (any window ≥ 90% used),
 `limited` (any window ≥ 100% used or upstream 429), or `unknown`.
 `remaining_percent` is the "left available usage" for dashboards.
 
@@ -68,7 +70,7 @@ flowchart TD
   n2["healthz calls detailed operational health"]
   n3["Store builds compact usage summary"]
   n4["Hydration status, MeiliAdmin, and parser health are checked"]
-  n5["LlmHealthProbe checks configured provider"]
+  n5["LlmHealthProbe checks primary and analysis profiles"]
   n6["HTTP status is 200 when ready, 503 when unhealthy"]
   n0 --> n1
   n1 --> n2

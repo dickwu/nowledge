@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     config::Config,
     error::ApiError,
+    metrics::Metrics,
     upstream::{
         ClientPolicy, OperationPolicy, ProxyMode, RequestFactoryError, StreamingResponse,
         UpstreamError, UpstreamHttpClient, UpstreamOperation,
@@ -170,6 +171,13 @@ pub enum LlmProfile {
     Analysis,
 }
 
+fn profile_name(profile: LlmProfile) -> &'static str {
+    match profile {
+        LlmProfile::Primary => "primary",
+        LlmProfile::Analysis => "analysis",
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LlmAttemptBudget {
     budget: ProviderBudget,
@@ -273,6 +281,8 @@ impl ProviderBudget {
 pub struct LlmTextResponse {
     pub text: String,
     pub latency_ms: u64,
+    /// Number of upstream attempts used by the terminal response.
+    pub attempts: u8,
     /// Real token counts reported by the upstream provider, when available.
     pub usage: Option<LlmTokenUsage>,
 }
@@ -364,6 +374,15 @@ pub struct LlmTextStream {
     max_response_bytes: usize,
     emitted_bytes: usize,
     finished: bool,
+    attempts: u8,
+    metrics: Option<LlmStreamMetrics>,
+}
+
+struct LlmStreamMetrics {
+    metrics: Metrics,
+    profile: &'static str,
+    provider: String,
+    started_at: Instant,
 }
 
 impl fmt::Debug for LlmTextStream {
@@ -379,7 +398,12 @@ impl fmt::Debug for LlmTextStream {
 }
 
 impl LlmTextStream {
-    fn new(provider: String, model: String, source: impl LlmTextStreamSource + 'static) -> Self {
+    fn new(
+        provider: String,
+        model: String,
+        source: impl LlmTextStreamSource + 'static,
+        attempts: u8,
+    ) -> Self {
         Self {
             provider,
             model,
@@ -388,6 +412,8 @@ impl LlmTextStream {
             max_response_bytes: usize::MAX,
             emitted_bytes: 0,
             finished: false,
+            attempts,
+            metrics: None,
         }
     }
 
@@ -401,11 +427,14 @@ impl LlmTextStream {
             Ok(None) => {
                 self.source.abort();
                 self.finished = true;
-                return Err(invalid_llm_output());
+                let error = invalid_llm_output();
+                self.record_metrics_failure(&error);
+                return Err(error);
             }
             Err(error) => {
                 self.source.abort();
                 self.finished = true;
+                self.record_metrics_failure(&error);
                 return Err(error);
             }
         };
@@ -418,9 +447,11 @@ impl LlmTextStream {
                 else {
                     self.source.abort();
                     self.finished = true;
-                    return Err(ApiError::Upstream(
+                    let error = ApiError::Upstream(
                         "LLM response exceeded the configured size limit".to_string(),
-                    ));
+                    );
+                    self.record_metrics_failure(&error);
+                    return Err(error);
                 };
                 self.emitted_bytes = emitted_bytes;
                 Ok(Some(LlmStreamEvent::Delta(delta)))
@@ -430,10 +461,12 @@ impl LlmTextStream {
                     if let Err(error) = reconciliation.reconcile(usage) {
                         self.source.abort();
                         self.finished = true;
+                        self.record_metrics_failure(&error);
                         return Err(error);
                     }
                 }
                 self.finished = true;
+                self.record_metrics_success(latency_ms, usage.as_ref());
                 Ok(Some(LlmStreamEvent::Completed { latency_ms, usage }))
             }
         }
@@ -442,6 +475,63 @@ impl LlmTextStream {
     fn constrain(&mut self, max_response_bytes: usize, reconciliation: StreamBudgetReconciliation) {
         self.max_response_bytes = max_response_bytes;
         self.budget_reconciliation = Some(reconciliation);
+    }
+
+    fn attach_metrics(&mut self, metrics: Metrics, profile: &'static str) {
+        metrics.record_llm_retries(
+            profile,
+            &self.provider,
+            u64::from(self.attempts.saturating_sub(1)),
+        );
+        self.metrics = Some(LlmStreamMetrics {
+            metrics,
+            profile,
+            provider: self.provider.clone(),
+            started_at: Instant::now(),
+        });
+    }
+
+    fn record_metrics_success(&mut self, latency_ms: u64, usage: Option<&LlmTokenUsage>) {
+        let Some(observation) = self.metrics.take() else {
+            return;
+        };
+        let success: Result<(), &ApiError> = Ok(());
+        observation.metrics.record_llm_request(
+            observation.profile,
+            &observation.provider,
+            Duration::from_millis(latency_ms).as_secs_f64(),
+            &success,
+        );
+        if let Some(usage) = usage {
+            observation.metrics.record_llm_tokens(
+                observation.profile,
+                &observation.provider,
+                usage,
+            );
+        }
+    }
+
+    fn record_metrics_failure(&mut self, error: &ApiError) {
+        let Some(observation) = self.metrics.take() else {
+            return;
+        };
+        let failure = Err(error);
+        observation.metrics.record_llm_request(
+            observation.profile,
+            &observation.provider,
+            observation.started_at.elapsed().as_secs_f64(),
+            &failure,
+        );
+    }
+}
+
+impl Drop for LlmTextStream {
+    fn drop(&mut self) {
+        if self.metrics.is_none() {
+            return;
+        }
+        let error = ApiError::Upstream("LLM stream cancelled before completion".to_string());
+        self.record_metrics_failure(&error);
     }
 }
 
@@ -585,6 +675,7 @@ struct CachedLlmProbe {
 #[derive(Debug, Clone, Default)]
 pub struct LlmHealthProbe {
     cache: Arc<RwLock<Option<CachedLlmProbe>>>,
+    refresh_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[async_trait]
@@ -623,6 +714,7 @@ fn synthetic_text_stream(provider: &str, model: &str, response: LlmTextResponse)
                 },
             ]),
         },
+        response.attempts,
     )
 }
 
@@ -655,6 +747,7 @@ impl LlmClient for NoneLlmClient {
                     .collect::<String>()
             ),
             latency_ms: started.elapsed().as_millis() as u64,
+            attempts: 1,
             usage: None,
         })
     }
@@ -706,6 +799,7 @@ impl LlmClient for MockLlmClient {
         Ok(LlmTextResponse {
             text,
             latency_ms: started.elapsed().as_millis() as u64,
+            attempts: 1,
             usage: Some(LlmTokenUsage {
                 input_tokens: Some(input_tokens),
                 cached_input_tokens: Some(0),
@@ -794,7 +888,7 @@ impl LlmClient for OpenAiResponsesClient {
         let request = request.redact_for_provider(&secrets);
         request.charge_attempt()?;
         let started = Instant::now();
-        let body = complete_openai_responses(
+        let (body, attempts) = complete_openai_responses(
             &self.upstream,
             &self.operation_policy,
             &self.model,
@@ -811,6 +905,7 @@ impl LlmClient for OpenAiResponsesClient {
         Ok(LlmTextResponse {
             text,
             latency_ms: started.elapsed().as_millis() as u64,
+            attempts,
             usage: token_usage_from_value(body.get("usage")),
         })
     }
@@ -866,7 +961,7 @@ impl LlmClient for CodexResponsesClient {
 
         if credentials.token_kind == CodexAuthTokenKind::OpenAiApiKey {
             let started = Instant::now();
-            let body = complete_openai_responses(
+            let (body, attempts) = complete_openai_responses(
                 &self.upstream,
                 &self.operation_policy,
                 &self.model,
@@ -883,6 +978,7 @@ impl LlmClient for CodexResponsesClient {
             return Ok(LlmTextResponse {
                 text,
                 latency_ms: started.elapsed().as_millis() as u64,
+                attempts,
                 usage: token_usage_from_value(body.get("usage")),
             });
         }
@@ -920,6 +1016,7 @@ impl LlmClient for CodexResponsesClient {
             .map_err(map_upstream_error)?;
         self.latest_rate_limits
             .record("codex_auth", &rate_limits_from_headers(response.headers()));
+        let attempts = response.attempts();
         let body = String::from_utf8(response.into_body())
             .map_err(|_| ApiError::Upstream("LLM response was not valid UTF-8".to_string()))?;
         let text = redact_string(&extract_codex_sse_text(&body)?, &secrets);
@@ -927,6 +1024,7 @@ impl LlmClient for CodexResponsesClient {
         Ok(LlmTextResponse {
             text,
             latency_ms: started.elapsed().as_millis() as u64,
+            attempts,
             usage: extract_codex_sse_usage(&body),
         })
     }
@@ -1012,11 +1110,13 @@ async fn start_responses_stream(
         &rate_limits_from_headers(response.headers()),
     );
     require_event_stream_content_type(response.headers())?;
+    let attempts = response.attempts();
 
     Ok(LlmTextStream::new(
         stream_request.provider.to_string(),
         stream_request.model.to_string(),
         ProviderLlmStreamSource::new(response, stream_request.secrets, started),
+        attempts,
     ))
 }
 
@@ -1028,7 +1128,7 @@ async fn complete_openai_responses(
     api_key: &str,
     request: &LlmRequest,
     rate_limit_sink: ProviderRateLimitSink<'_>,
-) -> Result<Value, ApiError> {
+) -> Result<(Value, u8), ApiError> {
     let payload = responses_payload(model, request, reasoning_effort, false);
     let client = upstream.client();
     let api_key = api_key.to_string();
@@ -1048,7 +1148,9 @@ async fn complete_openai_responses(
         .await
         .map_err(map_upstream_error)?;
     rate_limit_sink.record(response.headers());
-    decode_openai_response_body(response.body())
+    let attempts = response.attempts();
+    let body = decode_openai_response_body(response.body())?;
+    Ok((body, attempts))
 }
 
 fn require_event_stream_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
@@ -1802,10 +1904,15 @@ pub struct LlmProviderRegistry {
     upstream: UpstreamHttpClient,
     budget: ProviderBudget,
     latest_rate_limits: LatestRateLimits,
+    metrics: Metrics,
 }
 
 impl LlmProviderRegistry {
     pub fn new(config: Arc<Config>) -> Self {
+        Self::new_with_metrics(config, Metrics::new())
+    }
+
+    pub(crate) fn new_with_metrics(config: Arc<Config>, metrics: Metrics) -> Self {
         let upstream = build_llm_upstream(&config)
             .expect("validated provider HTTP configuration must build a client");
         let operation_policy = llm_operation_policy(&config);
@@ -1835,6 +1942,7 @@ impl LlmProviderRegistry {
             analysis,
             upstream,
             latest_rate_limits,
+            metrics,
         }
     }
 
@@ -1843,6 +1951,45 @@ impl LlmProviderRegistry {
     }
 
     pub async fn complete_text(
+        &self,
+        profile: LlmProfile,
+        principal_key: &str,
+        request: LlmRequest,
+    ) -> Result<LlmTextResponse, ApiError> {
+        let started_at = Instant::now();
+        let provider = self.configured_provider(profile).to_string();
+        let result = self
+            .complete_text_inner(profile, principal_key, request)
+            .await;
+        if let Ok(response) = &result {
+            self.metrics.record_llm_retries(
+                profile_name(profile),
+                &provider,
+                u64::from(response.attempts.saturating_sub(1)),
+            );
+            if let Some(usage) = response.usage.as_ref() {
+                self.metrics
+                    .record_llm_tokens(profile_name(profile), &provider, usage);
+            }
+        } else if let Err(error) = &result {
+            self.metrics.record_llm_retries(
+                profile_name(profile),
+                &provider,
+                observed_retries_from_error(error),
+            );
+        }
+        let metric_result = result.as_ref().map(|_| ());
+        self.metrics.record_llm_request(
+            profile_name(profile),
+            &provider,
+            started_at.elapsed().as_secs_f64(),
+            &metric_result,
+        );
+        self.update_llm_rate_limit_metric(profile, &provider, result.as_ref().err());
+        result
+    }
+
+    async fn complete_text_inner(
         &self,
         profile: LlmProfile,
         principal_key: &str,
@@ -1889,6 +2036,42 @@ impl LlmProviderRegistry {
         &self,
         profile: LlmProfile,
         principal_key: &str,
+        request: LlmRequest,
+    ) -> Result<LlmTextStream, ApiError> {
+        let started_at = Instant::now();
+        let provider = self.configured_provider(profile).to_string();
+        let result = self
+            .stream_text_inner(profile, principal_key, request)
+            .await;
+        match result {
+            Ok(mut stream) => {
+                stream.attach_metrics(self.metrics.clone(), profile_name(profile));
+                self.update_llm_rate_limit_metric(profile, &provider, None);
+                Ok(stream)
+            }
+            Err(error) => {
+                self.metrics.record_llm_retries(
+                    profile_name(profile),
+                    &provider,
+                    observed_retries_from_error(&error),
+                );
+                let metric_result = Err(&error);
+                self.metrics.record_llm_request(
+                    profile_name(profile),
+                    &provider,
+                    started_at.elapsed().as_secs_f64(),
+                    &metric_result,
+                );
+                self.update_llm_rate_limit_metric(profile, &provider, Some(&error));
+                Err(error)
+            }
+        }
+    }
+
+    async fn stream_text_inner(
+        &self,
+        profile: LlmProfile,
+        principal_key: &str,
         mut request: LlmRequest,
     ) -> Result<LlmTextStream, ApiError> {
         self.validate_request(&request)?;
@@ -1915,6 +2098,34 @@ impl LlmProviderRegistry {
             },
         );
         Ok(stream)
+    }
+
+    fn configured_provider(&self, profile: LlmProfile) -> &str {
+        match profile {
+            LlmProfile::Primary => &self.config.llm_provider,
+            LlmProfile::Analysis => &self.config.analysis_llm_provider,
+        }
+    }
+
+    fn update_llm_rate_limit_metric(
+        &self,
+        profile: LlmProfile,
+        provider: &str,
+        error: Option<&ApiError>,
+    ) {
+        let state = if matches!(error, Some(ApiError::TooManyRequests(_)))
+            || matches!(error, Some(ApiError::Upstream(message)) if message.contains("category=rate_limited"))
+        {
+            "limited"
+        } else if let Some(snapshot) = self.latest_rate_limits.latest(provider) {
+            codex_rate_limit_state(&snapshot).unwrap_or("ok")
+        } else if matches!(provider, "none" | "mock") {
+            "ok"
+        } else {
+            "unknown"
+        };
+        self.metrics
+            .set_llm_rate_limit_state(profile_name(profile), provider, state);
     }
 
     pub(crate) fn upstream(&self) -> UpstreamHttpClient {
@@ -2035,6 +2246,20 @@ impl LlmProviderRegistry {
     }
 }
 
+fn observed_retries_from_error(error: &ApiError) -> u64 {
+    let ApiError::Upstream(message) = error else {
+        return 0;
+    };
+    let Some(attempts) = message
+        .split_once("attempts=")
+        .and_then(|(_, attempts)| attempts.split_whitespace().next())
+        .and_then(|attempts| attempts.parse::<u64>().ok())
+    else {
+        return 0;
+    };
+    attempts.saturating_sub(1)
+}
+
 fn llm_client_from_profile(
     profile: &Config,
     credential_config: Arc<Config>,
@@ -2149,6 +2374,17 @@ impl LlmHealthProbe {
             return with_reasoning_effort(disabled_probe(config), config);
         }
 
+        if let Ok(cache) = self.cache.read() {
+            if let Some(cached) = cache.as_ref() {
+                if cached.checked_instant.elapsed()
+                    < Duration::from_secs(config.health_llm_probe_interval_seconds)
+                {
+                    return self.cached_with_age(cached, config);
+                }
+            }
+        }
+
+        let _refresh_guard = self.refresh_gate.lock().await;
         if let Ok(cache) = self.cache.read() {
             if let Some(cached) = cache.as_ref() {
                 if cached.checked_instant.elapsed()
@@ -3825,6 +4061,75 @@ mod tests {
         assert!(!valid_health_probe_text(""));
     }
 
+    #[tokio::test]
+    async fn concurrent_health_probe_cache_misses_are_single_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let handler_requests = requests.clone();
+        let app = axum::Router::new().route(
+            "/backend-api/codex/responses",
+            axum::routing::post(move || {
+                let requests = handler_requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        terminal_sse("ok", None),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let auth_path = std::env::temp_dir().join(format!(
+            "nowledge-health-single-flight-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(
+            &auth_path,
+            json!({ "access_token": "header.payload.signature" }).to_string(),
+        )
+        .unwrap();
+        let mut config = Config::test();
+        config.llm_provider = "codex_auth".to_string();
+        config.llm_model = Some("health-single-flight-model".to_string());
+        config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
+        config.codex_base_url = format!("http://{address}/backend-api/codex");
+        config.health_llm_probe_interval_seconds = 60;
+        config.health_llm_timeout_ms = 2_000;
+        config.refresh_configured_secret_values();
+        let config = Arc::new(config);
+        let registry = LlmProviderRegistry::new(config.clone());
+        let probe = LlmHealthProbe::new();
+        let barrier = Arc::new(tokio::sync::Barrier::new(33));
+        let mut checks = Vec::new();
+        for _ in 0..32 {
+            let barrier = barrier.clone();
+            let config = config.clone();
+            let registry = registry.clone();
+            let probe = probe.clone();
+            checks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                probe.check_with_registry(&config, &registry).await
+            }));
+        }
+        barrier.wait().await;
+        for check in checks {
+            let result = check.await.unwrap();
+            assert_eq!(result.status, "ok", "{result:?}");
+        }
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+        let _ = std::fs::remove_file(auth_path);
+    }
+
     #[test]
     fn codex_auth_credentials_include_account_id_and_oauth_kind() {
         let path = std::env::temp_dir().join(format!(
@@ -4224,6 +4529,7 @@ mod tests {
             kind: crate::upstream::HttpFailureKind::Server,
             attempts: 3,
         });
+        assert_eq!(observed_retries_from_error(&mapped), 2);
         match mapped {
             ApiError::Upstream(message) => {
                 assert_eq!(
