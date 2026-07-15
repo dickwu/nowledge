@@ -503,7 +503,7 @@ impl UpstreamHttpClient {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => {
                     let kind = classify_transport_error(&error);
-                    if is_retryable_transport(kind) && attempt <= policy.max_retries {
+                    if is_retryable_pre_response_transport(kind) && attempt <= policy.max_retries {
                         wait_for_retry(&deadline, policy, attempt, None, request_id.as_bytes())
                             .await
                             .map_err(|_| UpstreamError::DeadlineExceeded {
@@ -543,17 +543,6 @@ impl UpstreamHttpClient {
                             operation,
                             attempts: attempt,
                         });
-                    }
-                    Err(BoundedReadError::Transport(kind))
-                        if is_retryable_transport(kind) && attempt <= policy.max_retries =>
-                    {
-                        wait_for_retry(&deadline, policy, attempt, None, request_id.as_bytes())
-                            .await
-                            .map_err(|_| UpstreamError::DeadlineExceeded {
-                                operation,
-                                attempts: attempt,
-                            })?;
-                        continue;
                     }
                     Err(BoundedReadError::Transport(kind)) => {
                         return Err(UpstreamError::Transport {
@@ -605,11 +594,12 @@ impl UpstreamHttpClient {
     }
 }
 
-fn is_retryable_transport(kind: TransportFailureKind) -> bool {
-    matches!(
-        kind,
-        TransportFailureKind::Connection | TransportFailureKind::Timeout
-    )
+fn is_retryable_pre_response_transport(kind: TransportFailureKind) -> bool {
+    // Reqwest's generic timeout classification spans connect, request-body,
+    // response-header, and response-body phases. Only `is_connect()` proves
+    // that the request was not accepted by the upstream, so every other
+    // transport failure is terminal to avoid duplicating POST side effects.
+    kind == TransportFailureKind::Connection
 }
 
 pub struct BoundedResponse {
@@ -1187,49 +1177,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_a_body_read_timeout_with_a_rebuilt_request() {
+    async fn does_not_retry_a_timeout_after_a_post_body_is_sent() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (request_tx, mut request_rx) = mpsc::channel(2);
+        let expected_body = b"provider-side-effect";
         tokio::spawn(async move {
-            for attempt in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut buffer = [0_u8; 1024];
-                    let count = stream.read(&mut buffer).await.unwrap();
-                    if count == 0 {
-                        return;
-                    }
-                    request.extend_from_slice(&buffer[..count]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request
+                .windows(expected_body.len())
+                .any(|window| window == expected_body)
+            {
+                let mut buffer = [0_u8; 1024];
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    return;
                 }
-                request_tx.send(request).await.unwrap();
-                if attempt == 0 {
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n",
-                        )
-                        .await
-                        .unwrap();
-                    stream.flush().await.unwrap();
-                    tokio::spawn(async move {
-                        time::sleep(Duration::from_millis(120)).await;
-                        let _ = stream.shutdown().await;
-                    });
-                    continue;
-                } else {
-                    stream
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
-                        )
-                        .await
-                        .unwrap();
-                }
-                let _ = stream.shutdown().await;
+                request.extend_from_slice(&buffer[..count]);
             }
+            request_tx.send(request).await.unwrap();
+            std::future::pending::<()>().await;
         });
 
         let client = UpstreamHttpClient::build(&ClientPolicy {
@@ -1241,7 +1209,81 @@ mod tests {
         .unwrap();
         let request_client = client.client();
         let url = format!("http://{address}");
-        let response = client
+        let error = client
+            .execute(
+                UpstreamOperation::LlmCompletion,
+                &OperationPolicy {
+                    deadline: Duration::from_secs(1),
+                    max_response_bytes: 1024,
+                    max_retries: 1,
+                    initial_backoff: Duration::ZERO,
+                    max_backoff: Duration::ZERO,
+                },
+                "post-timeout-request-id",
+                move |_| {
+                    let request = request_client
+                        .post(url.clone())
+                        .body(expected_body.as_slice());
+                    async move { Ok(request) }
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            UpstreamError::Transport {
+                operation: UpstreamOperation::LlmCompletion,
+                kind: TransportFailureKind::Timeout,
+                attempts: 1,
+            }
+        );
+        let request = request_rx.recv().await.unwrap();
+        assert!(request
+            .windows(expected_body.len())
+            .any(|window| window == expected_body));
+        assert!(request_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_a_body_read_timeout_after_response_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::channel(2);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0_u8; 1024];
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx.send(request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            time::sleep(Duration::from_millis(120)).await;
+            let _ = stream.shutdown().await;
+        });
+
+        let client = UpstreamHttpClient::build(&ClientPolicy {
+            connect_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(1),
+            read_timeout: Duration::from_millis(40),
+            proxy_mode: ProxyMode::Direct,
+        })
+        .unwrap();
+        let request_client = client.client();
+        let url = format!("http://{address}");
+        let error = client
             .execute(
                 UpstreamOperation::ParserUpload,
                 &OperationPolicy {
@@ -1258,19 +1300,21 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(response.attempts(), 2);
-        assert_eq!(response.body(), b"{\"ok\":true}");
-        let requests = [
-            request_rx.recv().await.unwrap(),
-            request_rx.recv().await.unwrap(),
-        ];
-        for request in requests {
-            assert!(String::from_utf8_lossy(&request)
-                .to_ascii_lowercase()
-                .contains("x-client-request-id: read-timeout-request-id"));
-        }
+        assert_eq!(
+            error,
+            UpstreamError::Transport {
+                operation: UpstreamOperation::ParserUpload,
+                kind: TransportFailureKind::Timeout,
+                attempts: 1,
+            }
+        );
+        let request = request_rx.recv().await.unwrap();
+        assert!(String::from_utf8_lossy(&request)
+            .to_ascii_lowercase()
+            .contains("x-client-request-id: read-timeout-request-id"));
+        assert!(request_rx.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -320,9 +320,11 @@ Health endpoints split process liveness from operational readiness:
   persistence/materialization, and response serialization. Analysis parses the
   provider JSON before redaction, validates proposed link locators against the
   prompt's authorized context/seed locator set, deduplicates exact persisted
-  link/insight identities, and then sanitizes free text. Accepted analysis
-  candidates are written as one owner-bound durable operation and returned only
-  after every Meilisearch task is confirmed.
+  link/insight identities, and then sanitizes free text. Active exact-identity
+  matches are reused unchanged, while inactive matches conflict instead of
+  being overwritten or reactivated. New accepted analysis candidates are
+  written as one owner-bound durable operation and returned only after every
+  Meilisearch task is confirmed; all-reuse batches require no write.
 - `GET /v1/usage` returns only the selected owner's usage counters to owner and
   tenant-service principals. Global counters and service-wide Meilisearch,
   parser, and LLM provider diagnostics are admin-only.

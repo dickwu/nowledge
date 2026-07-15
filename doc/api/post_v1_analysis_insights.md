@@ -19,7 +19,7 @@ Schema: `AnalysisInsightRequest`
 
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| owner_user_id | string | optional normally; required when history_event_id is supplied | Owner scope for search, link creation, and insight upsert. |
+| owner_user_id | string | required after authentication defaults | Owner scope for search, link creation, and insight upsert. An owner-scoped credential may omit it because the authenticated owner default is applied first. |
 | history_event_id | string | optional | When supplied, analysis is constrained to the selected event and other events from the same owner event index. |
 | query | string | required by handler | Analysis question or topic. |
 | seed_uris | string[] | optional, default [] | Extra seed context URIs used when not running in history_event_id mode. |
@@ -42,8 +42,8 @@ Schema: `AnalysisInsightResponse`
 | existing_links | KnowledgeLink[] | Existing links included in the analysis prompt. |
 | link_candidates | LinkCandidate[] | Proposed links from deterministic or LLM analysis. |
 | insight_candidates | InsightCandidate[] | Proposed insights from deterministic or LLM analysis. |
-| created_links | KnowledgeLink[] | Links persisted when create_links is true. |
-| insights | InsightRecord[] | Insights persisted when upsert_insights is true. |
+| created_links | KnowledgeLink[] | Newly persisted links plus unchanged active links reused by exact natural identity when create_links is true. |
+| insights | InsightRecord[] | Newly persisted insights plus unchanged active insights reused by exact context identity when upsert_insights is true. |
 | persistence | PersistenceMetadata? | Durable operation ID, completed operation/indexing states, and confirmed Meilisearch task UIDs when candidates were materialized. Omitted when no write was needed. |
 | usage | object | Provider/model/backend metadata; includes history_scope same_index for history_event_id mode. Admin debug includes only safe candidate rejection codes. |
 | prompt | string? | Configured-secret-redacted prompt included only when debug is true. |
@@ -57,7 +57,8 @@ Schema: `AnalysisInsightResponse`
 - Configured secrets are redacted from the complete response. Provider previews
   are redacted before they are truncated.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
-- history_event_id analysis requires owner_user_id after auth defaults are applied.
+- An exact link or insight identity that already exists with a non-active status returns 409 instead of being overwritten or reactivated by model output.
+- All analysis requires owner_user_id after auth defaults are applied.
 - Non-history context evidence uses the same default fragment-only context search as /v1/context/search.
 
 ## Internal Logic Call Graph
@@ -73,8 +74,8 @@ flowchart TD
   n7["build_analysis_prompt constructs grounded prompt"]
   n8["analysis_llm_config selects analysis-specific provider/model"]
   n9["deterministic or LLM draft yields link and insight candidates"]
-  n10["Store.materialize_analysis_async stages accepted candidates as one owner-bound operation"]
-  n11["Journal every typed resource, confirm every Meilisearch task, then publish the cache atomically"]
+  n10["Store.materialize_analysis_async reuses active exact identities unchanged, rejects inactive identities, and stages only new candidates"]
+  n11["When new resources exist, journal every typed resource, confirm every Meilisearch task, then publish the cache atomically"]
   n12["Return persistence confirmation and redacted AnalysisInsightResponse; prompt only for admin debug"]
   n0 --> n1
   n1 --> n2
@@ -96,5 +97,9 @@ flowchart TD
   membership, relation/score/field bounds, and first-valid-wins deduplication
   before any durable write.
 - Link, insight, history, and ContextFS projection writes are committed through
-  one HMAC owner-bound `analysis.materialize` operation. The response is not
-  returned until every accepted Meilisearch task has completed successfully.
+  one HMAC owner-bound `analysis.materialize` operation. Active exact existing
+  link or insight identities are returned unchanged and cannot be overwritten
+  by model output; inactive identities conflict rather than being reactivated.
+  An all-reuse batch is a no-op with no persistence record. When a write is
+  needed, the response is not returned until every accepted Meilisearch task
+  has completed successfully.

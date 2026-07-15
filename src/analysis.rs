@@ -9,7 +9,7 @@ use std::{collections::HashSet, error::Error, fmt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::util::sanitize_slug;
+use crate::util::{redact_egress_text, redact_string, sanitize_slug};
 
 pub const MAX_ANALYSIS_RESPONSE_BYTES: usize = 256 * 1024;
 pub const MAX_LINK_CANDIDATES: usize = 32;
@@ -318,6 +318,73 @@ pub fn validate_analysis_output(
     Ok(output)
 }
 
+/// Remove configured credential material from validated provider fields before
+/// they can influence durable identities, operation plans, or persisted data.
+///
+/// URI authorization intentionally happens before this pass and authorized
+/// locators are left unchanged. Redaction can collapse otherwise distinct
+/// provider values, so tags and insight identities are deduplicated again with
+/// a deterministic first-candidate-wins policy.
+pub fn redact_validated_analysis_output(
+    mut output: ValidatedAnalysisOutput,
+    known_secrets: &[String],
+) -> ValidatedAnalysisOutput {
+    for link in &mut output.links {
+        link.rationale = link
+            .rationale
+            .take()
+            .map(|value| redact_egress_text(&value, known_secrets))
+            .and_then(|value| {
+                normalize_optional_field(Some(value), MAX_RATIONALE_BYTES)
+                    .ok()
+                    .flatten()
+            });
+        link.tags = redact_analysis_tags(std::mem::take(&mut link.tags), known_secrets);
+    }
+
+    let mut seen_insights = HashSet::new();
+    output.insights = output
+        .insights
+        .into_iter()
+        .filter_map(|mut insight| {
+            insight.insight_type = normalize_required_field(
+                redact_string(&insight.insight_type, known_secrets),
+                MAX_INSIGHT_TYPE_BYTES,
+            )
+            .ok()?;
+            insight.title = normalize_required_field(
+                redact_egress_text(&insight.title, known_secrets),
+                MAX_TITLE_BYTES,
+            )
+            .ok()?;
+            insight.statement = normalize_required_field(
+                redact_egress_text(&insight.statement, known_secrets),
+                MAX_STATEMENT_BYTES,
+            )
+            .ok()?;
+            insight.tags = redact_analysis_tags(std::mem::take(&mut insight.tags), known_secrets);
+            let identity = analysis_insight_context_uri(&insight.insight_type, &insight.title);
+            seen_insights.insert(identity).then_some(insight)
+        })
+        .collect();
+    output
+}
+
+fn redact_analysis_tags(tags: Vec<String>, known_secrets: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    tags.into_iter()
+        .filter_map(|tag| {
+            let tag = redact_string(&tag, known_secrets);
+            let tag = tag.trim();
+            (!tag.is_empty()
+                && tag.len() <= MAX_TAG_BYTES
+                && !tag.chars().any(char::is_control)
+                && seen.insert(tag.to_string()))
+            .then(|| tag.to_string())
+        })
+        .collect()
+}
+
 /// Applies the same layer-suffix equivalence already used by ContextFS reads
 /// and link persistence, then validates the bounded `ctx://` locator shape.
 pub fn canonicalize_analysis_uri(uri: &str) -> Option<String> {
@@ -465,6 +532,9 @@ fn normalize_required_field(
     if value.len() > max_bytes {
         return Err(CandidateRejectionCode::FieldTooLong);
     }
+    if value.chars().any(char::is_control) {
+        return Err(CandidateRejectionCode::InvalidCandidateSchema);
+    }
     Ok(value.to_string())
 }
 
@@ -481,6 +551,9 @@ fn normalize_optional_field(
     }
     if value.len() > max_bytes {
         return Err(CandidateRejectionCode::FieldTooLong);
+    }
+    if value.chars().any(char::is_control) {
+        return Err(CandidateRejectionCode::InvalidCandidateSchema);
     }
     Ok(Some(value.to_string()))
 }
@@ -666,6 +739,31 @@ mod tests {
     }
 
     #[test]
+    fn control_characters_are_rejected_from_persistable_text_fields() {
+        let mut link = valid_link();
+        link["rationale"] = json!("unsafe\nline");
+        let mut insight = valid_insight();
+        insight["statement"] = json!("unsafe\u{0000}statement");
+
+        let output =
+            validate_analysis_output(&response(vec![link], vec![insight]), &allowlist()).unwrap();
+
+        assert!(output.links.is_empty());
+        assert!(output.insights.is_empty());
+        assert_eq!(
+            output
+                .rejections
+                .iter()
+                .map(|rejection| rejection.code)
+                .collect::<Vec<_>>(),
+            vec![
+                CandidateRejectionCode::InvalidCandidateSchema,
+                CandidateRejectionCode::InvalidCandidateSchema,
+            ]
+        );
+    }
+
+    #[test]
     fn duplicate_links_are_first_valid_candidate_wins_and_directional() {
         let mut duplicate = valid_link();
         duplicate["rationale"] = json!("Second proposal");
@@ -797,6 +895,42 @@ mod tests {
                 CandidateRejectionCode::TooManyTags,
             ]
         );
+    }
+
+    #[test]
+    fn provider_fields_are_redacted_and_rededuplicated_before_persistence() {
+        let secret = "credential-token-for-analysis".to_string();
+        let mut link = valid_link();
+        link["rationale"] = json!(format!("Grounded with {secret}"));
+        link["tags"] = json!([secret, secret]);
+        let first = json!({
+            "insight_type": "analysis",
+            "title": format!("Finding {secret}"),
+            "statement": format!("Statement contains {secret}"),
+            "confidence": 0.8,
+            "salience": 0.6,
+            "source_uris": ["ctx://tenant/a"],
+            "tags": [secret]
+        });
+        let collision = json!({
+            "insight_type": "analysis",
+            "title": "Finding [REDACTED]",
+            "statement": "Second statement",
+            "confidence": 0.7,
+            "salience": 0.5,
+            "source_uris": ["ctx://tenant/a"]
+        });
+        let validated =
+            validate_analysis_output(&response(vec![link], vec![first, collision]), &allowlist())
+                .unwrap();
+
+        let redacted = redact_validated_analysis_output(validated, std::slice::from_ref(&secret));
+
+        assert_eq!(redacted.insights.len(), 1);
+        assert_eq!(redacted.links[0].tags, vec!["[REDACTED]"]);
+        let serialized = format!("{redacted:?}");
+        assert!(!serialized.contains(&secret));
+        assert!(serialized.contains("[REDACTED]"));
     }
 
     #[test]

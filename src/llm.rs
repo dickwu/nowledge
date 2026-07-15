@@ -18,6 +18,7 @@ use crate::{
         ClientPolicy, OperationPolicy, ProxyMode, RequestFactoryError, UpstreamError,
         UpstreamHttpClient, UpstreamOperation,
     },
+    util::{redact_egress_text, redact_string},
 };
 
 const PROVIDER_BUDGET_WINDOW: Duration = Duration::from_secs(60);
@@ -147,6 +148,17 @@ impl LlmRequest {
             input.push_str(&evidence.content);
         }
         input
+    }
+
+    fn redact_for_provider(mut self, known_secrets: &[String]) -> Self {
+        self.system = redact_egress_text(&self.system, known_secrets);
+        self.user = redact_egress_text(&self.user, known_secrets);
+        for evidence in &mut self.evidence {
+            evidence.id = redact_egress_text(&evidence.id, known_secrets);
+            evidence.content = redact_egress_text(&evidence.content, known_secrets);
+        }
+        self.metadata.request_id = redact_egress_text(&self.metadata.request_id, known_secrets);
+        self
     }
 }
 
@@ -553,11 +565,29 @@ pub struct CodexResponsesClient {
 }
 
 impl CodexResponsesClient {
-    fn current_credentials(&self) -> Option<CodexAuthCredentials> {
-        self.credential_config
+    fn current_security_snapshot(&self) -> (Option<CodexAuthCredentials>, Vec<String>) {
+        if let Some(config) = self.credential_config.as_ref() {
+            let snapshot = config.provider_security_snapshot();
+            return (snapshot.credentials, snapshot.secrets);
+        }
+        let credentials = self.credentials.clone();
+        let secrets = credentials
             .as_ref()
-            .and_then(|config| config.provider_security_snapshot().credentials)
-            .or_else(|| self.credentials.clone())
+            .map(|credentials| vec![credentials.token.clone()])
+            .unwrap_or_default();
+        (credentials, secrets)
+    }
+
+    fn secure_request(
+        &self,
+        request: LlmRequest,
+    ) -> Result<(CodexAuthCredentials, LlmRequest, Vec<String>), ApiError> {
+        let (credentials, secrets) = self.current_security_snapshot();
+        let credentials = credentials.ok_or_else(|| {
+            ApiError::Unauthorized("Codex auth token is not configured".to_string())
+        })?;
+        let request = request.redact_for_provider(&secrets);
+        Ok((credentials, request, secrets))
     }
 }
 
@@ -575,8 +605,10 @@ impl LlmClient for OpenAiResponsesClient {
     async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, ApiError> {
         let api_key = self
             .api_key
-            .as_deref()
+            .clone()
             .ok_or_else(|| ApiError::Unauthorized("LLM API key is not configured".to_string()))?;
+        let secrets = vec![api_key.clone()];
+        let request = request.redact_for_provider(&secrets);
         request.charge_attempt()?;
         let started = Instant::now();
         let body = complete_openai_responses(
@@ -584,7 +616,7 @@ impl LlmClient for OpenAiResponsesClient {
             &self.operation_policy,
             &self.model,
             self.reasoning_effort.as_deref(),
-            api_key,
+            &api_key,
             &request,
             ProviderRateLimitSink {
                 provider: &self.provider,
@@ -592,7 +624,7 @@ impl LlmClient for OpenAiResponsesClient {
             },
         )
         .await?;
-        let text = require_response_text(&body)?;
+        let text = redact_string(&require_response_text(&body)?, &secrets);
         Ok(LlmTextResponse {
             text,
             latency_ms: started.elapsed().as_millis() as u64,
@@ -604,7 +636,7 @@ impl LlmClient for OpenAiResponsesClient {
 #[async_trait]
 impl LlmClient for CodexResponsesClient {
     async fn status(&self) -> LlmRuntimeStatus {
-        let credentials = self.current_credentials();
+        let (credentials, _) = self.current_security_snapshot();
         LlmRuntimeStatus {
             provider: "codex_auth".to_string(),
             model: self.model.clone(),
@@ -618,9 +650,11 @@ impl LlmClient for CodexResponsesClient {
     }
 
     async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, ApiError> {
-        let credentials = self.current_credentials().ok_or_else(|| {
-            ApiError::Unauthorized("Codex auth token is not configured".to_string())
-        })?;
+        // Use one atomic credential/redaction snapshot. A rotation between a
+        // route's initial prompt construction and this last-mile boundary must
+        // never authenticate with a newly published token while leaving that
+        // same token unredacted in the outbound prompt.
+        let (credentials, request, secrets) = self.secure_request(request)?;
         request.charge_attempt()?;
 
         if credentials.token_kind == CodexAuthTokenKind::OpenAiApiKey {
@@ -638,7 +672,7 @@ impl LlmClient for CodexResponsesClient {
                 },
             )
             .await?;
-            let text = require_response_text(&body)?;
+            let text = redact_string(&require_response_text(&body)?, &secrets);
             return Ok(LlmTextResponse {
                 text,
                 latency_ms: started.elapsed().as_millis() as u64,
@@ -681,7 +715,7 @@ impl LlmClient for CodexResponsesClient {
             .record("codex_auth", &rate_limits_from_headers(response.headers()));
         let body = String::from_utf8(response.into_body())
             .map_err(|_| ApiError::Upstream("LLM response was not valid UTF-8".to_string()))?;
-        let text = extract_codex_sse_text(&body)?;
+        let text = redact_string(&extract_codex_sse_text(&body)?, &secrets);
 
         Ok(LlmTextResponse {
             text,
@@ -2297,6 +2331,60 @@ mod tests {
         assert_eq!(credentials.token, "header.payload.signature");
         assert_eq!(credentials.account_id.as_deref(), Some("acct-test"));
         assert_eq!(credentials.token_kind, CodexAuthTokenKind::CodexOauth);
+    }
+
+    #[test]
+    fn codex_completion_uses_one_rotation_snapshot_for_auth_and_redaction() {
+        let auth_path = std::env::temp_dir().join(format!(
+            "nowledge-codex-request-snapshot-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        let old_token = "codex-old-request-snapshot-token";
+        let new_token = "codex-new-request-snapshot-token";
+        std::fs::write(&auth_path, json!({ "access_token": old_token }).to_string()).unwrap();
+
+        let mut config = Config::test();
+        config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
+        config.refresh_configured_secret_values();
+        let config = Arc::new(config);
+        let client = CodexResponsesClient {
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: None,
+            auth_source: "codex_file".to_string(),
+            credentials: None,
+            credential_config: Some(config.clone()),
+            base_url: config.codex_base_url.clone(),
+            upstream: build_llm_upstream(&config).unwrap(),
+            operation_policy: llm_operation_policy(&config),
+            latest_rate_limits: LatestRateLimits::default(),
+        };
+        let mut request = LlmRequest::text(
+            format!("trusted policy {new_token}"),
+            format!("user supplied {new_token}"),
+            128,
+            "rag.answer",
+        )
+        .with_evidence(vec![LlmEvidence {
+            id: format!("evidence-{new_token}"),
+            content: format!("provider evidence {new_token}"),
+        }]);
+        request.metadata.request_id = new_token.to_string();
+
+        std::fs::write(&auth_path, json!({ "access_token": new_token }).to_string()).unwrap();
+        config.refresh_configured_secret_values();
+
+        let (credentials, secured, secrets) = client.secure_request(request).unwrap();
+        let _ = std::fs::remove_file(auth_path);
+        assert_eq!(credentials.token, new_token);
+        assert!(secrets.iter().any(|secret| secret == new_token));
+        assert!(!secured.system.contains(new_token));
+        assert!(!secured.user.contains(new_token));
+        assert!(!secured.evidence[0].id.contains(new_token));
+        assert!(!secured.evidence[0].content.contains(new_token));
+        assert!(!secured.metadata.request_id.contains(new_token));
+        assert!(!responses_payload("gpt-5.5", &secured, None, true)
+            .to_string()
+            .contains(new_token));
     }
 
     #[test]

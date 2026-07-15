@@ -35,7 +35,10 @@ use tower_http::{
 };
 
 use crate::{
-    analysis::{validate_analysis_output, AnalysisUriAllowlist, ValidatedAnalysisOutput},
+    analysis::{
+        redact_validated_analysis_output, validate_analysis_output, AnalysisUriAllowlist,
+        ValidatedAnalysisOutput,
+    },
     auth::{AdminGuard, CompanyWriterGuard, Principal, UserGuard},
     config::Config,
     error::{safe_cause_diagnostic, safe_value_fingerprint, ApiError},
@@ -3198,7 +3201,7 @@ async fn run_analysis_insights(
 
     let analysis_config = state.config.analysis_llm_config();
     let security = state.config.provider_security_snapshot();
-    let known_secrets = security.secrets;
+    let mut known_secrets = security.secrets;
     let llm_request = build_analysis_llm_request(
         &query,
         &context_hits,
@@ -3253,6 +3256,13 @@ async fn run_analysis_insights(
             merge_token_usage(&mut usage, tokens);
         }
     }
+    // Refresh the inventory after the provider call so the credential used by
+    // a concurrently rotated client, plus both sides of that rotation, also
+    // protects provider fields and context titles before durable writes.
+    known_secrets.extend(state.config.provider_security_snapshot().secrets);
+    known_secrets.sort_unstable();
+    known_secrets.dedup();
+    validated = redact_validated_analysis_output(validated, &known_secrets);
     if req.debug {
         usage["candidate_rejections"] =
             serde_json::to_value(&validated.rejections).unwrap_or_else(|_| json!([]));
@@ -3261,8 +3271,15 @@ async fn run_analysis_insights(
     let title_by_uri = context_hits
         .iter()
         .filter_map(|hit| {
-            crate::analysis::canonicalize_analysis_uri(&hit.uri)
-                .map(|uri| (uri, redact_egress_text(&hit.title, &known_secrets)))
+            crate::analysis::canonicalize_analysis_uri(&hit.uri).map(|uri| {
+                (
+                    uri,
+                    truncate_utf8_bytes(
+                        &redact_egress_text(&hit.title, &known_secrets),
+                        crate::analysis::MAX_TITLE_BYTES,
+                    ),
+                )
+            })
         })
         .collect::<std::collections::HashMap<_, _>>();
     let link_candidates = validated
