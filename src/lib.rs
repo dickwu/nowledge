@@ -1,6 +1,7 @@
 pub mod analysis;
 mod analysis_service;
 mod app;
+mod audit_service;
 pub mod auth;
 mod company_docs_service;
 pub mod config;

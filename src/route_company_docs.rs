@@ -20,7 +20,9 @@ pub(crate) async fn preflight_doc(
 ) -> Result<Json<CompanyDocPreflightResponse>, ApiError> {
     validate_tags("tags", &request.tags, &state.config)?;
     Ok(Json(
-        company_docs_service(&state).preflight(&user.principal, request)?,
+        company_docs_service(&state)
+            .preflight(&user.principal, request)
+            .await?,
     ))
 }
 
@@ -88,5 +90,9 @@ pub(crate) async fn list_revisions(
 }
 
 fn company_docs_service(state: &AppState) -> CompanyDocsService {
-    CompanyDocsService::new(state.config.clone(), state.store.clone())
+    CompanyDocsService::new(
+        state.config.clone(),
+        state.store.clone(),
+        state.audit_recorder.clone(),
+    )
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::{
+    audit_service::AuditRecorder,
     auth::Principal,
     config::Config,
     error::ApiError,
@@ -10,7 +11,11 @@ use crate::{
         ActivateRevisionRequest, ActivateRevisionResponse, CompanyDocPreflightRequest,
         CompanyDocPreflightResponse, CreateRevisionRequest, CreateRevisionResponse,
     },
-    shared_audit::audit_shared_write,
+    shared_audit::{
+        audit_shared_write, company_doc_activate_revision_target,
+        company_doc_create_revision_target, company_doc_delete_target,
+        company_doc_preflight_target,
+    },
     store::Store,
 };
 
@@ -18,27 +23,32 @@ use crate::{
 pub(crate) struct CompanyDocsService {
     config: Arc<Config>,
     store: Store,
+    audit_recorder: AuditRecorder,
 }
 
 impl CompanyDocsService {
-    pub(crate) fn new(config: Arc<Config>, store: Store) -> Self {
-        Self { config, store }
+    pub(crate) fn new(config: Arc<Config>, store: Store, audit_recorder: AuditRecorder) -> Self {
+        Self {
+            config,
+            store,
+            audit_recorder,
+        }
     }
 
-    pub(crate) fn preflight(
+    pub(crate) async fn preflight(
         &self,
         principal: &Principal,
         request: CompanyDocPreflightRequest,
     ) -> Result<CompanyDocPreflightResponse, ApiError> {
+        let store = self.store.clone();
         audit_shared_write(
-            self.store.preflight_company_doc(request),
+            &self.audit_recorder,
             principal,
-            &self.config,
-            &self.config.tenant_id,
-            "company_doc.preflight",
-            "company-doc:preflight",
+            company_doc_preflight_target(),
             "preflight_requested",
+            || async move { store.preflight_company_doc(request) },
         )
+        .await
     }
 
     pub(crate) async fn create_revision(
@@ -47,19 +57,20 @@ impl CompanyDocsService {
         source_id: &str,
         request: CreateRevisionRequest,
     ) -> Result<CreateRevisionResponse, ApiError> {
-        let result = self
-            .store
-            .create_revision_async(&self.config.tenant_id, source_id, request)
-            .await;
+        let store = self.store.clone();
+        let tenant_id = self.config.tenant_id.clone();
         audit_shared_write(
-            result,
+            &self.audit_recorder,
             principal,
-            &self.config,
-            &self.config.tenant_id,
-            "company_doc.create_revision",
-            source_id,
+            company_doc_create_revision_target(source_id),
             "revision_create_requested",
+            || async move {
+                store
+                    .create_revision_async(&tenant_id, source_id, request)
+                    .await
+            },
         )
+        .await
     }
 
     pub(crate) async fn activate_revision(
@@ -74,19 +85,20 @@ impl CompanyDocsService {
             .as_deref()
             .unwrap_or("activation_reason_unspecified")
             .to_string();
-        let result = self
-            .store
-            .activate_revision_async(&self.config.tenant_id, source_id, revision_id, request)
-            .await;
+        let store = self.store.clone();
+        let tenant_id = self.config.tenant_id.clone();
         audit_shared_write(
-            result,
+            &self.audit_recorder,
             principal,
-            &self.config,
-            &self.config.tenant_id,
-            "company_doc.activate_revision",
-            &format!("{source_id}:{revision_id}"),
+            company_doc_activate_revision_target(source_id, revision_id),
             &audit_reason,
+            || async move {
+                store
+                    .activate_revision_async(&tenant_id, source_id, revision_id, request)
+                    .await
+            },
         )
+        .await
     }
 
     pub(crate) fn list(&self) -> Result<Value, ApiError> {
@@ -102,19 +114,16 @@ impl CompanyDocsService {
         principal: &Principal,
         source_id: &str,
     ) -> Result<Value, ApiError> {
-        let result = self
-            .store
-            .delete_company_doc(&self.config.tenant_id, source_id)
-            .await;
+        let store = self.store.clone();
+        let tenant_id = self.config.tenant_id.clone();
         audit_shared_write(
-            result,
+            &self.audit_recorder,
             principal,
-            &self.config,
-            &self.config.tenant_id,
-            "company_doc.delete",
-            source_id,
+            company_doc_delete_target(source_id),
             "admin_delete",
+            || async move { store.delete_company_doc(&tenant_id, source_id).await },
         )
+        .await
     }
 
     pub(crate) fn list_revisions(&self, source_id: &str) -> Result<Value, ApiError> {

@@ -55,6 +55,17 @@ struct DurabilityDomain {
 
 const DURABILITY_MATRIX: &[DurabilityDomain] = &[
     DurabilityDomain {
+        name: "shared_mutation_audit",
+        store_fields: &["audit_records"],
+        durability: DurabilityClass::DurableCanonical,
+        strategy: RestartStrategy::NotRequired,
+        repository_writes: &["upsert_audit_record"],
+        repository_reads: &[],
+        startup_methods: &[],
+        report_domains: &[],
+        evidence: "the durable repository is canonical while the cache only retains in-flight attempt state and has no query surface",
+    },
+    DurabilityDomain {
         name: "operation_journal",
         store_fields: &["operations"],
         durability: DurabilityClass::DurableCanonical,

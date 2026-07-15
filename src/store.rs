@@ -125,6 +125,7 @@ impl ParseArtifactKey {
 #[derive(Clone, Default)]
 struct StoreData {
     hydration_report: Option<HydrationReport>,
+    audit_records: HashMap<String, AuditRecord>,
     operations: HashMap<String, OperationRecord>,
     user_indexes: HashMap<(String, String), UserEventIndex>,
     events_by_index: HashMap<String, Vec<HistoryEvent>>,
@@ -980,6 +981,21 @@ impl Store {
             redaction_config: Arc::new(config.clone()),
             parser_registry: ParserRegistry::new(config),
         }
+    }
+
+    /// Persist a complete audit state before publishing it to the process
+    /// cache. The initial attempted state therefore fails closed, while a
+    /// rejected finalization leaves the previously accepted attempt intact.
+    pub(crate) async fn persist_audit_record(&self, record: &AuditRecord) -> Result<(), ApiError> {
+        record
+            .validate()
+            .map_err(|error| ApiError::Internal(format!("invalid audit record: {error}")))?;
+        let receipt = self.repository.upsert_audit_record(record).await?;
+        self.repository.wait_for_tasks(&receipt.task_uids).await?;
+        self.write()?
+            .audit_records
+            .insert(record.id.clone(), record.clone());
+        Ok(())
     }
 
     /// Reuse the same pooled parser client used by ingestion for health checks.
@@ -8571,6 +8587,41 @@ fn simple_slope(values: &[f64]) -> f64 {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[tokio::test]
+    async fn memory_audit_persistence_updates_one_record_in_place() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let occurred_at = now();
+        let mut record = AuditRecord {
+            id: new_id("audit"),
+            tenant_id: config.tenant_id.clone(),
+            request_id: uuid::Uuid::now_v7().to_string(),
+            principal_scope: AuditPrincipalScope::Admin,
+            principal_owner_user_id_hash: None,
+            resource_id_hash: format!("hmac:{}", "a".repeat(32)),
+            action: AuditAction::CompanyDocDelete,
+            reason_code: AuditReasonCode::AdminDelete,
+            reason_fingerprint: format!("hmac:{}", "b".repeat(32)),
+            outcome: AuditOutcome::Attempted,
+            error_kind: None,
+            operation_id: None,
+            occurred_at,
+            updated_at: occurred_at,
+        };
+
+        store.persist_audit_record(&record).await.unwrap();
+        record.outcome = AuditOutcome::Success;
+        record.updated_at = now();
+        store.persist_audit_record(&record).await.unwrap();
+
+        let data = store.read().unwrap();
+        assert_eq!(data.audit_records.len(), 1);
+        assert_eq!(
+            data.audit_records[&record.id].outcome,
+            AuditOutcome::Success
+        );
+    }
 
     #[test]
     fn direct_insight_patch_cannot_cross_tenants() {

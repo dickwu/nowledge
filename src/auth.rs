@@ -183,7 +183,8 @@ where
                     parts.uri.path(),
                     "authentication_failed",
                     &error,
-                );
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -197,7 +198,8 @@ where
                     parts.uri.path(),
                     "company_writer_required",
                     &error,
-                );
+                )
+                .await;
                 return Err(error);
             }
         }
@@ -225,7 +227,8 @@ where
                     parts.uri.path(),
                     "authentication_failed",
                     &error,
-                );
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -238,7 +241,8 @@ where
                 parts.uri.path(),
                 "admin_required",
                 &error,
-            );
+            )
+            .await;
             return Err(error);
         }
         record_request_principal(&principal, &auth_state);

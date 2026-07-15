@@ -12,6 +12,7 @@ pub const FIXED_INDEXES: &[&str] = &[
     "rag_state_items",
     "rag_user_event_indexes",
     "rag_operations",
+    "rag_audit_records",
     "rag_sources",
     "rag_source_revisions",
     "rag_source_documents",
@@ -101,7 +102,7 @@ impl MeiliAdmin {
             let mut missing = Vec::new();
             for uid in FIXED_INDEXES {
                 if self.index_exists(uid).await? {
-                    if *uid == "rag_operations" {
+                    if matches!(*uid, "rag_operations" | "rag_audit_records") {
                         self.require_index_primary_key(uid, "id").await?;
                     }
                     existing.push(*uid);
@@ -869,7 +870,13 @@ fn required_task_uid(value: &Value, action: &str) -> Result<String, ApiError> {
 }
 
 pub fn settings_for(uid: &str) -> Value {
-    let mut settings = if uid == "rag_operations" {
+    let mut settings = if uid == "rag_audit_records" {
+        json!({
+            "searchableAttributes": ["action", "reason_code", "error_kind"],
+            "filterableAttributes": ["id", "logical_id", "tenant_id", "request_id", "principal_scope", "principal_owner_user_id_hash", "resource_id_hash", "action", "reason_code", "outcome", "error_kind", "operation_id"],
+            "sortableAttributes": ["occurred_at", "updated_at", "id"]
+        })
+    } else if uid == "rag_operations" {
         json!({
             "searchableAttributes": ["operation_kind", "idempotency_key_hash", "last_error_category", "last_error_fingerprint"],
             "filterableAttributes": ["id", "tenant_id", "operation_kind", "actor_scope", "status", "indexing_state", "idempotency_key_hash"],
@@ -1152,6 +1159,36 @@ mod tests {
             .as_array()
             .expect("sortable attributes");
         for required in ["created_at", "updated_at", "completed_at", "id"] {
+            assert!(sortable.iter().any(|value| value == required));
+        }
+    }
+
+    #[test]
+    fn audit_records_support_bounded_operational_filters_and_timeline_ordering() {
+        let settings = settings_for("rag_audit_records");
+        let filterable = settings["filterableAttributes"]
+            .as_array()
+            .expect("filterable attributes");
+        for required in [
+            "tenant_id",
+            "request_id",
+            "principal_scope",
+            "resource_id_hash",
+            "action",
+            "reason_code",
+            "outcome",
+            "error_kind",
+            "operation_id",
+        ] {
+            assert!(
+                filterable.iter().any(|value| value == required),
+                "rag_audit_records is missing {required}"
+            );
+        }
+        let sortable = settings["sortableAttributes"]
+            .as_array()
+            .expect("sortable attributes");
+        for required in ["occurred_at", "updated_at", "id"] {
             assert!(sortable.iter().any(|value| value == required));
         }
     }

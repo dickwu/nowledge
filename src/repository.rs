@@ -101,6 +101,11 @@ pub trait KnowledgeRepository: Send + Sync {
         operation: &OperationRecord,
     ) -> Result<RepositoryWriteReceipt, ApiError>;
 
+    async fn upsert_audit_record(
+        &self,
+        record: &AuditRecord,
+    ) -> Result<RepositoryWriteReceipt, ApiError>;
+
     async fn get_operation(
         &self,
         tenant_id: &str,
@@ -674,6 +679,16 @@ impl KnowledgeRepository for MemoryRepository {
         validate_operation_record(operation).map_err(|error| {
             ApiError::Internal(format!("invalid operation journal record: {error}"))
         })?;
+        Ok(RepositoryWriteReceipt::empty())
+    }
+
+    async fn upsert_audit_record(
+        &self,
+        record: &AuditRecord,
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        record
+            .validate()
+            .map_err(|error| ApiError::Internal(format!("invalid audit record: {error}")))?;
         Ok(RepositoryWriteReceipt::empty())
     }
 
@@ -1764,6 +1779,19 @@ impl KnowledgeRepository for MeiliRepository {
         )?;
         Ok(RepositoryWriteReceipt::from_task_uid(
             self.upsert_values("rag_operations", &[document]).await?,
+        ))
+    }
+
+    async fn upsert_audit_record(
+        &self,
+        record: &AuditRecord,
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        record
+            .validate()
+            .map_err(|error| ApiError::Internal(format!("invalid audit record: {error}")))?;
+        let document = tenant_document(&record.tenant_id, "rag_audit_records", &record.id, record)?;
+        Ok(RepositoryWriteReceipt::from_task_uid(
+            self.upsert_values("rag_audit_records", &[document]).await?,
         ))
     }
 

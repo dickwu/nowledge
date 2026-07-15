@@ -423,7 +423,10 @@ async fn existing_then_missing_meili_stub(
     if method == Method::GET && path.starts_with("/indexes/") {
         let mut checks = recorder.index_checks.lock().unwrap();
         let count = checks.entry(path.clone()).or_default();
-        let allowed_checks = if path == "/indexes/rag_operations" {
+        let allowed_checks = if matches!(
+            path.as_str(),
+            "/indexes/rag_operations" | "/indexes/rag_audit_records"
+        ) {
             2
         } else {
             1

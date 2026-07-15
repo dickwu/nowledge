@@ -10,6 +10,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[path = "models_audit.rs"]
+mod audit;
 #[path = "models_common.rs"]
 mod common;
 #[path = "models_company_docs.rs"]
@@ -35,6 +37,7 @@ mod state;
 #[path = "models_structured.rs"]
 mod structured;
 
+pub use audit::*;
 pub use common::*;
 pub use company_docs::*;
 pub use context_rag_llm::*;

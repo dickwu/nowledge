@@ -14,6 +14,7 @@ use tokio::{
 };
 
 use crate::{
+    audit_service::AuditRecorder,
     config::Config,
     error::{safe_cause_diagnostic, safe_value_fingerprint, ApiError},
     http_boundary::{HttpBoundaryState, RequestDeadline},
@@ -364,6 +365,7 @@ pub struct AppState {
     pub llm_providers: LlmProviderRegistry,
     pub ingest_manager: IngestTaskManager,
     pub(crate) metrics: Metrics,
+    pub(crate) audit_recorder: AuditRecorder,
     pub(crate) http_boundary: HttpBoundaryState,
     pub(crate) runtime: RuntimeSupervisor,
 }
@@ -372,6 +374,7 @@ pub struct AppState {
 pub(crate) struct AuthState {
     config: Arc<Config>,
     http_boundary: HttpBoundaryState,
+    audit_recorder: AuditRecorder,
 }
 
 impl AuthState {
@@ -379,12 +382,12 @@ impl AuthState {
         &self.config
     }
 
-    pub(crate) fn tenant_id(&self) -> &str {
-        &self.config.tenant_id
-    }
-
     pub(crate) fn http_boundary(&self) -> &HttpBoundaryState {
         &self.http_boundary
+    }
+
+    pub(crate) fn audit_recorder(&self) -> &AuditRecorder {
+        &self.audit_recorder
     }
 }
 
@@ -393,6 +396,7 @@ impl FromRef<AppState> for AuthState {
         Self {
             config: state.config.clone(),
             http_boundary: state.http_boundary.clone(),
+            audit_recorder: state.audit_recorder.clone(),
         }
     }
 }
@@ -400,6 +404,7 @@ impl FromRef<AppState> for AuthState {
 impl AppState {
     pub fn new(config: Arc<Config>) -> Self {
         let store = Store::new(&config);
+        let audit_recorder = AuditRecorder::new(config.clone(), store.clone());
         let runtime = RuntimeSupervisor::new();
         let http_boundary = HttpBoundaryState::new(&config);
         let llm_providers = LlmProviderRegistry::new(config.clone());
@@ -414,6 +419,7 @@ impl AppState {
             llm_providers,
             ingest_manager,
             metrics,
+            audit_recorder,
             http_boundary,
             runtime,
             config,

@@ -26,7 +26,7 @@ use nowledge::{
     repository::{KnowledgeRepository, MeiliRepository},
     tenant_scope::{
         owner_scoped_storage_identity, tenant_document, tenant_document_with_storage_identity,
-        tenant_structured_row_document,
+        tenant_structured_row_document, TenantFilter,
     },
     tenant_scope_v1::{
         apply_plan, create_plan, create_rollback_plan, verify_plan, FileCheckpointStore,
@@ -36,6 +36,10 @@ use nowledge::{
 };
 use serde_json::{json, Value};
 use tower::ServiceExt;
+
+#[path = "../src/audit_records_v1.rs"]
+#[allow(dead_code)]
+mod audit_records_v1;
 
 static LIVE_MEILI_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 type AuxiliaryInventory = (&'static str, Vec<Value>, Vec<Value>);
@@ -108,6 +112,36 @@ async fn bootstrapped_meili_admin(config: &Config) -> MeiliAdmin {
         .await
         .expect("Meilisearch bootstrap should succeed");
     admin
+}
+
+async fn prepare_audit_records_index(config: &Config) -> Result<(), String> {
+    let admin = MeiliAdmin::from_config(config);
+    match admin.bootstrap(false).await {
+        Ok(_) => return Ok(()),
+        Err(error) if error.to_string().contains("rag_audit_records") => {}
+        Err(error) => return Err(format!("managed-index bootstrap failed: {error}")),
+    }
+
+    let plan = audit_records_v1::create_plan(&admin)
+        .await
+        .map_err(|error| format!("audit migration planning failed: {error}"))?;
+    audit_records_v1::apply_plan(&admin, &plan, false)
+        .await
+        .map_err(|error| format!("audit migration apply failed: {error}"))?;
+    let verification = audit_records_v1::verify_plan(&admin, &plan)
+        .await
+        .map_err(|error| format!("audit migration verify failed: {error}"))?;
+    if !verification.ready {
+        return Err(format!(
+            "audit migration did not verify: {}",
+            verification.failures.join("; ")
+        ));
+    }
+    admin
+        .bootstrap(false)
+        .await
+        .map_err(|error| format!("post-migration bootstrap failed: {error}"))?;
+    Ok(())
 }
 
 async fn start_meili_app(config: &Config) -> (AppState, Value, Router) {
@@ -642,6 +676,146 @@ async fn try_call_with_token(
         serde_json::from_slice(&bytes).map_err(|error| format!("response JSON failed: {error}"))?
     };
     Ok((status, value))
+}
+
+#[tokio::test]
+async fn meili_persists_final_shared_mutation_and_auth_denial_audits_without_raw_inputs() {
+    let _guard = live_meili_test_guard().await;
+    let tenant_id = format!("test-tenant-audit-{}", uuid::Uuid::now_v7());
+    let Some(mut config) = meili_config_with_tenant(tenant_id.clone()).await else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    let writer_token = format!("audit-writer-token-{}", uuid::Uuid::now_v7());
+    let raw_owner_id = format!("raw-audit-owner-{}", uuid::Uuid::now_v7());
+    let raw_source_id = format!("raw-audit-source-{}", uuid::Uuid::now_v7());
+    let raw_body_marker = format!("raw-audit-body-{}", uuid::Uuid::now_v7());
+    config.allow_unsafe_unauthenticated = false;
+    config.auth_users = vec![AuthUserConfig {
+        token: writer_token.clone(),
+        scope: AuthUserScope::Owner {
+            owner_user_id: raw_owner_id.clone(),
+        },
+        roles: vec!["user".to_string(), "company_writer".to_string()],
+    }];
+
+    prepare_audit_records_index(&config)
+        .await
+        .expect("audit migration prerequisite should converge");
+    let (state, _, app) = start_meili_app(&config).await;
+    let admin = state.meili.clone();
+
+    let exercise = async {
+        let (success_status, success_body) = try_call_with_token(
+            app.clone(),
+            Method::POST,
+            "/v1/state/company-docs/preflight",
+            json!({
+                "title": raw_body_marker.clone(),
+                "text_preview": "shared audit persistence integration",
+                "checksum": "audit-persistence-checksum"
+            }),
+            &writer_token,
+        )
+        .await?;
+        if success_status != StatusCode::OK {
+            return Err(format!("audited mutation failed: {success_body}"));
+        }
+
+        let (denied_status, denied_body) = try_call(
+            app.clone(),
+            Method::POST,
+            &format!("/v1/state/company-docs/{raw_source_id}/revisions"),
+            json!({ "content": raw_body_marker.clone(), "ingest": false }),
+        )
+        .await?;
+        if denied_status != StatusCode::UNAUTHORIZED {
+            return Err(format!(
+                "unauthenticated mutation returned {denied_status}: {denied_body}"
+            ));
+        }
+
+        let response: nowledge::meili::SearchResponse<Value> = admin
+            .search(
+                "rag_audit_records",
+                json!({
+                    "q": "",
+                    "limit": 10,
+                    "filter": TenantFilter::new(&tenant_id)
+                        .map_err(|error| format!("audit tenant filter failed: {error}"))?
+                        .finish(),
+                    "sort": ["occurred_at:asc", "id:asc"]
+                }),
+            )
+            .await
+            .map_err(|error| format!("audit search failed: {error}"))?;
+        if response.hits.len() != 2 {
+            return Err(format!(
+                "expected one finalized mutation and one denial, got {:?}",
+                response.hits
+            ));
+        }
+
+        let success = response
+            .hits
+            .iter()
+            .find(|hit| hit["outcome"] == "success")
+            .ok_or_else(|| format!("missing success audit: {:?}", response.hits))?;
+        let denial = response
+            .hits
+            .iter()
+            .find(|hit| hit["outcome"] == "denied")
+            .ok_or_else(|| format!("missing denial audit: {:?}", response.hits))?;
+        if success["action"] != "company_doc.preflight"
+            || success["principal_scope"] != "owner"
+            || !success["principal_owner_user_id_hash"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("hmac:"))
+        {
+            return Err(format!("unexpected success audit: {success}"));
+        }
+        if denial["action"] != "company_doc.create_revision"
+            || denial["principal_scope"] != "unauthenticated"
+            || denial["reason_code"] != "authentication_failed"
+            || denial["error_kind"] != "unauthorized"
+        {
+            return Err(format!("unexpected denial audit: {denial}"));
+        }
+        for hit in &response.hits {
+            if hit["outcome"] == "attempted"
+                || !hit["logical_id"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("audit_"))
+                || uuid::Uuid::parse_str(hit["request_id"].as_str().unwrap_or_default()).is_err()
+                || !hit["resource_id_hash"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("hmac:"))
+            {
+                return Err(format!("invalid persisted audit record: {hit}"));
+            }
+        }
+        let encoded = serde_json::to_string(&response.hits)
+            .map_err(|error| format!("audit serialization failed: {error}"))?;
+        for forbidden in [
+            raw_owner_id.as_str(),
+            raw_source_id.as_str(),
+            raw_body_marker.as_str(),
+            writer_token.as_str(),
+            "/v1/state/company-docs/",
+        ] {
+            if encoded.contains(forbidden) {
+                return Err(format!(
+                    "raw audit input leaked into durable records: {forbidden}"
+                ));
+            }
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+
+    let cleanup = delete_tenant_rows_and_wait(&admin, &tenant_id, &["rag_audit_records"]).await;
+    assert_cleanup_results(vec![("durable audit records", cleanup)]);
+    exercise.expect("durable shared-mutation audit integration should pass");
 }
 
 #[tokio::test]

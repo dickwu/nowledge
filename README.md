@@ -204,6 +204,55 @@ a durable lease or compare-and-set protocol is introduced; the in-process
 mutation gate is not distributed consensus. Read replicas are outside this
 revision's supported deployment topology.
 
+### Durable shared-mutation audit rollout
+
+This revision also adds `rag_audit_records` for the five shared-knowledge
+mutation targets: company-document preflight, revision creation, revision
+activation, company-document deletion, and structured-dataset schema upsert.
+Authorization denials for those targets are recorded in the same index. There
+is deliberately no public audit-query route in this revision.
+
+Run the following non-destructive migration before starting the upgraded
+binary against an existing managed Meilisearch deployment. Use the exact
+application revision that will be deployed, back up Meilisearch first, stop or
+drain writers for the cutover, and provide the service's `RAG_MEILI_URL` plus
+`RAG_MEILI_API_KEY` when required:
+
+```sh
+cargo run --bin audit_records_v1 -- plan \
+  --out /secure/audit-records-v1-plan.json
+cargo run --bin audit_records_v1 -- apply \
+  --plan /secure/audit-records-v1-plan.json --dry-run
+cargo run --bin audit_records_v1 -- apply \
+  --plan /secure/audit-records-v1-plan.json
+cargo run --bin audit_records_v1 -- verify \
+  --plan /secure/audit-records-v1-plan.json
+```
+
+Do not start the upgraded service unless `verify` exits successfully. Adding
+the index to `FIXED_INDEXES` intentionally makes an old managed index set
+incomplete, and startup refuses to recreate only the missing audit index.
+`audit_records_v1` manages only `rag_audit_records`, requires primary key `id`,
+waits for all creation/settings tasks, rejects incompatible or tampered plans,
+refuses to recreate an index that disappeared after planning, and is
+idempotent. Plan, dry-run, and verify are mutation-free.
+
+Before each authorized shared mutation, the service persists an `attempted`
+record and fails closed if that record cannot be accepted. It then updates the
+same record to `success` or `failure`; a finalization failure retains the
+attempt and emits only bounded, fingerprinted diagnostics. Audit persistence
+failure while recording an authorization denial never replaces the original
+401/403 response. Records contain trusted tenant/request correlation plus
+bounded enums and HMAC-derived owner/resource/reason identities; raw request
+content, identifiers, reasons, paths, queries, prompts, tokens, and provider
+bodies are not part of the schema.
+
+The previous application ignores the additional index, so rollback does not
+require deleting it. Preserve the index and migration artifact for a later
+retry or forward deployment. See
+[ADR 0007](doc/adr/0007-durable-shared-mutation-audit.md) for the persistence
+and failure semantics.
+
 HTTP and ingest boundaries are typed startup configuration. Numeric limits
 must be positive, malformed values fail startup, and the synchronous ingest
 timeout must be at least the ordinary request timeout. Request, sync-ingest,
