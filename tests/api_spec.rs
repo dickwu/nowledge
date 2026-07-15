@@ -316,7 +316,7 @@ async fn spawn_codex_analysis_stub(token: &str) -> (String, Arc<RwLock<String>>)
     async fn responses(
         State(state): State<CodexAnalysisStub>,
         headers: HeaderMap,
-        Json(_request): Json<Value>,
+        Json(request): Json<Value>,
     ) -> impl IntoResponse {
         let expected_authorization = format!("Bearer {}", state.token);
         assert_eq!(
@@ -325,6 +325,8 @@ async fn spawn_codex_analysis_stub(token: &str) -> (String, Arc<RwLock<String>>)
                 .and_then(|value| value.to_str().ok()),
             Some(expected_authorization.as_str())
         );
+        assert!(request.get("max_output_tokens").is_none());
+        assert!(request.get("metadata").is_none());
         let output = state
             .output
             .read()
@@ -383,6 +385,8 @@ async fn spawn_counting_codex_health_stub(
                 .and_then(|value| value.to_str().ok()),
             Some(expected_authorization.as_str())
         );
+        assert!(request.get("max_output_tokens").is_none());
+        assert!(request.get("metadata").is_none());
         let model = request["model"]
             .as_str()
             .expect("health probe request should include a model")
