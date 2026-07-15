@@ -1,18 +1,15 @@
 use axum::http::Method;
 
 use crate::{
-    app::{AppState, AuthState},
-    auth::Principal,
-    config::Config,
-    error::ApiError,
-    request_context,
+    app::AuthState, auth::Principal, config::Config, error::ApiError, request_context,
     util::hmac_hex,
 };
 
 pub(crate) fn audit_shared_write<T>(
     result: Result<T, ApiError>,
     principal: &Principal,
-    state: &AppState,
+    config: &Config,
+    tenant_id: &str,
     action: &str,
     resource_id: &str,
     reason: &str,
@@ -20,8 +17,8 @@ pub(crate) fn audit_shared_write<T>(
     match &result {
         Ok(_) => emit_shared_mutation_audit(
             Some(principal),
-            &state.config,
-            state.tenant_id(),
+            config,
+            tenant_id,
             action,
             resource_id,
             reason,
@@ -30,8 +27,8 @@ pub(crate) fn audit_shared_write<T>(
         ),
         Err(error) => emit_shared_mutation_audit(
             Some(principal),
-            &state.config,
-            state.tenant_id(),
+            config,
+            tenant_id,
             action,
             resource_id,
             reason,
