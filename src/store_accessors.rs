@@ -106,10 +106,11 @@ impl Store {
         Ok(json!({ "index_uid": index_uid, "hits": hits }))
     }
 
-    pub fn insight_owner(&self, insight_id: &str) -> Result<String, ApiError> {
+    pub fn insight_owner(&self, tenant_id: &str, insight_id: &str) -> Result<String, ApiError> {
         let data = self.read()?;
         data.insights
             .get(insight_id)
+            .filter(|insight| insight.tenant_id == tenant_id)
             .map(|insight| insight.owner_user_id.clone())
             .ok_or_else(|| ApiError::not_found("insight not found"))
     }

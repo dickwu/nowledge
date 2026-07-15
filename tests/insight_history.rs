@@ -13,6 +13,7 @@ use nowledge::{
     build_router,
     config::{AuthUserConfig, AuthUserScope},
     meili::{task_uid, MeiliAdmin},
+    models::InsightUpsertRequest,
     AppState, Config,
 };
 use serde_json::{json, Value};
@@ -266,6 +267,52 @@ async fn insight_history_enforces_owner_scope_and_tenant_service_path_scope() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
     assert_eq!(missing["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn insight_history_never_resolves_an_insight_from_another_tenant() {
+    let state = AppState::new(Arc::new(authenticated_config()));
+    let foreign = state
+        .store
+        .upsert_insight_async(
+            "foreign-tenant",
+            InsightUpsertRequest {
+                owner_user_id: Some("u1".to_string()),
+                insight_type: Some("isolation".to_string()),
+                title: Some("Foreign insight".to_string()),
+                statement: Some("This belongs to another tenant".to_string()),
+                evidence_text: Some("Cross-tenant owner lookup must fail".to_string()),
+                ..InsightUpsertRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    let app = build_router(state);
+
+    let (status, missing) = call(
+        app.clone(),
+        Method::GET,
+        &format!("/v1/history/insights/{}/events", foreign.insight.id),
+        Value::Null,
+        OWNER_U1_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    assert_eq!(missing["error"]["code"], "not_found");
+
+    let (status, patch_missing) = call(
+        app,
+        Method::PATCH,
+        &format!("/v1/state/insights/{}", foreign.insight.id),
+        json!({
+            "statement": "A tenant-local caller must not patch this insight",
+            "patch_reason": "cross-tenant isolation regression"
+        }),
+        OWNER_U1_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{patch_missing}");
+    assert_eq!(patch_missing["error"]["code"], "not_found");
 }
 
 #[tokio::test]

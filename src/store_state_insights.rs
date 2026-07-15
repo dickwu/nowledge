@@ -1022,7 +1022,7 @@ impl Store {
         insight_id: &str,
         req: InsightPatchRequest,
     ) -> Result<InsightResponse, ApiError> {
-        let owner = self.insight_owner(insight_id)?;
+        let owner = self.insight_owner(tenant_id, insight_id)?;
         let (response, _) = self
             .execute_staged_mutation(
                 tenant_id,

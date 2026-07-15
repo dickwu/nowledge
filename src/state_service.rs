@@ -66,7 +66,7 @@ impl StateService {
     }
 
     pub(crate) fn insight_owner(&self, insight_id: &str) -> Result<String, ApiError> {
-        self.store.insight_owner(insight_id)
+        self.store.insight_owner(&self.tenant_id, insight_id)
     }
 
     pub(crate) async fn patch_insight(
