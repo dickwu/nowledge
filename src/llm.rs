@@ -1121,13 +1121,18 @@ async fn start_responses_stream(
         stream_request.provider,
         &rate_limits_from_headers(response.headers()),
     );
-    require_event_stream_content_type(response.headers())?;
+    require_event_stream_content_type(response.headers(), stream_request.codex_oauth)?;
     let attempts = response.attempts();
 
     Ok(LlmTextStream::new(
         stream_request.provider.to_string(),
         stream_request.model.to_string(),
-        ProviderLlmStreamSource::new(response, stream_request.secrets, started),
+        ProviderLlmStreamSource::new(
+            response,
+            stream_request.secrets,
+            started,
+            stream_request.codex_oauth,
+        ),
         attempts,
     ))
 }
@@ -1165,10 +1170,30 @@ async fn complete_openai_responses(
     Ok((body, attempts))
 }
 
-fn require_event_stream_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
-    let is_event_stream = headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
+fn require_event_stream_content_type(
+    headers: &HeaderMap,
+    allow_missing_for_codex_oauth: bool,
+) -> Result<(), ApiError> {
+    let mut content_types = headers.get_all(CONTENT_TYPE).iter();
+    let Some(content_type) = content_types.next() else {
+        if allow_missing_for_codex_oauth {
+            // The ChatGPT Codex backend currently omits Content-Type while
+            // still returning a valid SSE body. The incremental decoder
+            // remains the fail-closed protocol boundary.
+            return Ok(());
+        }
+        return Err(ApiError::Upstream(
+            "LLM streaming response did not use text/event-stream".to_string(),
+        ));
+    };
+    if content_types.next().is_some() {
+        return Err(ApiError::Upstream(
+            "LLM streaming response did not use text/event-stream".to_string(),
+        ));
+    }
+    let is_event_stream = content_type
+        .to_str()
+        .ok()
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
     if is_event_stream {
@@ -1272,7 +1297,7 @@ struct ValidatedProviderTerminal {
 
 #[derive(Debug)]
 struct PendingProviderTerminal {
-    text: String,
+    fallback_text: Option<String>,
     usage: Option<LlmTokenUsage>,
 }
 
@@ -1334,10 +1359,19 @@ struct ResponsesSseDecoder {
     output_item_ids: BTreeMap<u64, String>,
     last_text_part: Option<TextPartKey>,
     saw_delta: bool,
+    saw_non_whitespace_delta: bool,
+    allow_empty_terminal_output: bool,
     completed: Option<PendingProviderTerminal>,
 }
 
 impl ResponsesSseDecoder {
+    fn for_codex_oauth() -> Self {
+        Self {
+            allow_empty_terminal_output: true,
+            ..Self::default()
+        }
+    }
+
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<DecodedProviderEvent>, ApiError> {
         let messages = self.sse.push(chunk)?;
         let mut events = Vec::new();
@@ -1356,7 +1390,7 @@ impl ResponsesSseDecoder {
         if message.data == "[DONE]" {
             return Err(invalid_llm_output());
         }
-        if self.completed_text().is_some() {
+        if self.completed.is_some() {
             return Err(invalid_llm_output());
         }
 
@@ -1395,6 +1429,8 @@ impl ResponsesSseDecoder {
                 part.delta_hasher.update(delta.as_bytes());
                 part.saw_delta = true;
                 self.saw_delta = true;
+                self.saw_non_whitespace_delta |=
+                    delta.chars().any(|character| !character.is_whitespace());
                 Ok((!delta.is_empty()).then(|| DecodedProviderEvent::Delta(delta.to_string())))
             }
             "response.output_text.done" => {
@@ -1420,9 +1456,14 @@ impl ResponsesSseDecoder {
                     .get("response")
                     .filter(|response| response.is_object())
                     .ok_or_else(invalid_llm_output)?;
-                let text = self.validate_completed_parts(response)?;
+                let completed_text = self.validate_completed_parts(response)?;
+                let fallback_text = if self.saw_delta {
+                    None
+                } else {
+                    Some(completed_text.ok_or_else(invalid_llm_output)?)
+                };
                 self.completed = Some(PendingProviderTerminal {
-                    text,
+                    fallback_text,
                     usage: token_usage_from_value(response.get("usage")),
                 });
                 Ok(None)
@@ -1502,9 +1543,32 @@ impl ResponsesSseDecoder {
         Ok(())
     }
 
-    fn validate_completed_parts(&self, response: &Value) -> Result<String, ApiError> {
+    fn validate_completed_parts(&self, response: &Value) -> Result<Option<String>, ApiError> {
         if response.get("status").and_then(Value::as_str) != Some("completed") {
             return Err(invalid_llm_output());
+        }
+        let output = response
+            .get("output")
+            .and_then(Value::as_array)
+            .ok_or_else(invalid_llm_output)?;
+        if output.is_empty() {
+            // The ChatGPT Codex backend can omit terminal output content even
+            // after emitting authoritative delta + done pairs. Accept only
+            // that observed dialect: every streamed part must have both forms,
+            // so completion cannot bless missing, partial, or mismatched text.
+            if !self.allow_empty_terminal_output
+                || self.mode != TextPartMode::Indexed
+                || self.parts.len() != 1
+                || !self.saw_delta
+                || !self.saw_non_whitespace_delta
+                || self
+                    .parts
+                    .values()
+                    .any(|part| !part.saw_delta || part.done.is_none())
+            {
+                return Err(invalid_llm_output());
+            }
+            return Ok(None);
         }
         let final_parts = final_response_text_parts(response)?;
         let mut text = String::new();
@@ -1536,7 +1600,7 @@ impl ResponsesSseDecoder {
         if text.trim().is_empty() {
             return Err(invalid_llm_output());
         }
-        Ok(text)
+        Ok(Some(text))
     }
 
     fn validate_final_part(
@@ -1564,12 +1628,6 @@ impl ResponsesSseDecoder {
         Ok(())
     }
 
-    fn completed_text(&self) -> Option<&str> {
-        self.completed
-            .as_ref()
-            .map(|terminal| terminal.text.as_str())
-    }
-
     fn finish(&mut self) -> Result<ValidatedProviderTerminal, ApiError> {
         self.sse.finish()?;
         let terminal = self.completed.take().ok_or_else(invalid_llm_output)?;
@@ -1577,7 +1635,7 @@ impl ResponsesSseDecoder {
             return Err(invalid_llm_output());
         }
         Ok(ValidatedProviderTerminal {
-            fallback_text: (!self.saw_delta).then_some(terminal.text),
+            fallback_text: terminal.fallback_text,
             usage: terminal.usage,
         })
     }
@@ -1642,10 +1700,19 @@ impl fmt::Debug for ProviderLlmStreamSource {
 }
 
 impl ProviderLlmStreamSource {
-    fn new(response: StreamingResponse, secrets: &[String], started: Instant) -> Self {
+    fn new(
+        response: StreamingResponse,
+        secrets: &[String],
+        started: Instant,
+        allow_empty_terminal_output: bool,
+    ) -> Self {
         Self {
             response: Some(response),
-            decoder: ResponsesSseDecoder::default(),
+            decoder: if allow_empty_terminal_output {
+                ResponsesSseDecoder::for_codex_oauth()
+            } else {
+                ResponsesSseDecoder::default()
+            },
             redactor: Some(StreamingTextRedactor::new(secrets)),
             pending: VecDeque::new(),
             started,
@@ -3286,9 +3353,14 @@ fn require_response_text(value: &Value) -> Result<String, ApiError> {
 }
 
 fn extract_codex_sse_text(body: &str) -> Result<String, ApiError> {
+    enum TerminalText {
+        Embedded(String),
+        StreamedOnly,
+    }
+
     let mut deltas = String::new();
     let mut done_text: Option<String> = None;
-    let mut completed_text: Option<String> = None;
+    let mut terminal: Option<TerminalText> = None;
 
     for line in body.lines() {
         let Some(data) = line.strip_prefix("data:") else {
@@ -3319,14 +3391,25 @@ fn extract_codex_sse_text(body: &str) -> Result<String, ApiError> {
                 done_text = Some(text.to_string());
             }
             "response.completed" => {
-                if completed_text.is_some() {
+                if terminal.is_some() {
                     return Err(invalid_llm_output());
                 }
                 let response = value
                     .get("response")
                     .filter(|response| response.is_object())
                     .ok_or_else(invalid_llm_output)?;
-                completed_text = Some(require_response_text(response)?);
+                let output = response
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .ok_or_else(invalid_llm_output)?;
+                terminal = Some(if output.is_empty() {
+                    if response.get("status").and_then(Value::as_str) != Some("completed") {
+                        return Err(invalid_llm_output());
+                    }
+                    TerminalText::StreamedOnly
+                } else {
+                    TerminalText::Embedded(require_response_text(response)?)
+                });
             }
             "response.failed" | "response.incomplete" | "error" => {
                 return Err(invalid_llm_output());
@@ -3335,15 +3418,31 @@ fn extract_codex_sse_text(body: &str) -> Result<String, ApiError> {
         }
     }
 
-    let completed_text = completed_text.ok_or_else(invalid_llm_output)?;
-    if done_text
-        .as_deref()
-        .is_some_and(|done_text| done_text != completed_text)
-        || (!deltas.is_empty() && deltas != completed_text)
-    {
-        return Err(invalid_llm_output());
+    match terminal.ok_or_else(invalid_llm_output)? {
+        TerminalText::Embedded(completed_text) => {
+            if done_text
+                .as_deref()
+                .is_some_and(|done_text| done_text != completed_text)
+                || (!deltas.is_empty() && deltas != completed_text)
+            {
+                return Err(invalid_llm_output());
+            }
+            Ok(completed_text)
+        }
+        TerminalText::StreamedOnly => {
+            let mut decoder = ResponsesSseDecoder::for_codex_oauth();
+            let mut text = String::new();
+            for event in decoder.push(body.as_bytes())? {
+                match event {
+                    DecodedProviderEvent::Delta(delta) => text.push_str(&delta),
+                }
+            }
+            if decoder.finish()?.fallback_text.is_some() || text.trim().is_empty() {
+                return Err(invalid_llm_output());
+            }
+            Ok(text)
+        }
     }
-    Ok(completed_text)
 }
 
 /// Pull real token counts out of the terminal `response.completed` SSE event.
@@ -3381,7 +3480,7 @@ mod tests {
 
     async fn spawn_sse_server(
         chunks: Vec<Vec<u8>>,
-        content_type: &'static str,
+        content_type: Option<&'static str>,
     ) -> (String, oneshot::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3418,10 +3517,13 @@ mod tests {
             }
             let _ = request_tx.send(String::from_utf8(request).unwrap());
 
+            let content_type = content_type
+                .map(|value| format!("content-type: {value}\r\n"))
+                .unwrap_or_default();
             socket
                 .write_all(
                     format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                        "HTTP/1.1 200 OK\r\n{content_type}transfer-encoding: chunked\r\nconnection: close\r\n\r\n"
                     )
                     .as_bytes(),
                 )
@@ -3453,6 +3555,17 @@ mod tests {
             json!({"type": "response.output_text.done", "text": text}),
             json!({"type": "response.completed", "response": response})
         )
+    }
+
+    fn terminal_sse_without_output(usage: Option<Value>) -> String {
+        let mut response = json!({"status": "completed", "output": []});
+        if let Some(usage) = usage {
+            response["usage"] = usage;
+        }
+        sse_json(json!({
+            "type": "response.completed",
+            "response": response
+        }))
     }
 
     fn collect_decoded_deltas(events: Vec<DecodedProviderEvent>, output: &mut String) {
@@ -3538,6 +3651,174 @@ mod tests {
                 ..LlmTokenUsage::default()
             })
         );
+    }
+
+    #[test]
+    fn codex_empty_terminal_output_accepts_only_verified_streamed_text() {
+        let body = format!(
+            "{}{}{}",
+            indexed_text_event(
+                "response.output_text.delta",
+                1,
+                0,
+                Some("msg-live"),
+                "delta",
+                "ok"
+            ),
+            indexed_text_event(
+                "response.output_text.done",
+                1,
+                0,
+                Some("msg-live"),
+                "text",
+                "ok"
+            ),
+            terminal_sse_without_output(Some(json!({
+                "input_tokens": 5,
+                "output_tokens": 1,
+                "total_tokens": 6
+            })))
+        );
+
+        let mut strict_openai_decoder = ResponsesSseDecoder::default();
+        assert_invalid_llm_output(strict_openai_decoder.push(body.as_bytes()).unwrap_err());
+
+        let mut decoder = ResponsesSseDecoder::for_codex_oauth();
+        let mut output = String::new();
+        for chunk in body.as_bytes().chunks(2) {
+            collect_decoded_deltas(decoder.push(chunk).unwrap(), &mut output);
+        }
+        assert_eq!(output, "ok");
+        let terminal = decoder.finish().unwrap();
+        assert_eq!(terminal.fallback_text, None);
+        assert_eq!(
+            terminal.usage,
+            Some(LlmTokenUsage {
+                input_tokens: Some(5),
+                output_tokens: Some(1),
+                total_tokens: Some(6),
+                ..LlmTokenUsage::default()
+            })
+        );
+        assert_eq!(extract_codex_sse_text(&body).unwrap(), "ok");
+
+        let done_without_delta = format!(
+            "{}{}",
+            indexed_text_event(
+                "response.output_text.done",
+                1,
+                0,
+                Some("msg-live"),
+                "text",
+                "ok"
+            ),
+            terminal_sse_without_output(None)
+        );
+        let mut rejected = ResponsesSseDecoder::for_codex_oauth();
+        assert_invalid_llm_output(rejected.push(done_without_delta.as_bytes()).unwrap_err());
+        assert_invalid_llm_output(extract_codex_sse_text(&done_without_delta).unwrap_err());
+
+        let delta_without_done = format!(
+            "{}{}",
+            indexed_text_event(
+                "response.output_text.delta",
+                1,
+                0,
+                Some("msg-live"),
+                "delta",
+                "ok"
+            ),
+            terminal_sse_without_output(None)
+        );
+        let mut rejected = ResponsesSseDecoder::for_codex_oauth();
+        assert_invalid_llm_output(rejected.push(delta_without_done.as_bytes()).unwrap_err());
+        assert_invalid_llm_output(extract_codex_sse_text(&delta_without_done).unwrap_err());
+
+        let legacy_without_terminal_echo = format!(
+            "{}{}{}",
+            sse_json(json!({
+                "type": "response.output_text.delta",
+                "delta": "ok"
+            })),
+            sse_json(json!({
+                "type": "response.output_text.done",
+                "text": "ok"
+            })),
+            terminal_sse_without_output(None)
+        );
+        let mut rejected = ResponsesSseDecoder::for_codex_oauth();
+        assert_invalid_llm_output(
+            rejected
+                .push(legacy_without_terminal_echo.as_bytes())
+                .unwrap_err(),
+        );
+        assert_invalid_llm_output(
+            extract_codex_sse_text(&legacy_without_terminal_echo).unwrap_err(),
+        );
+
+        let blank_indexed = format!(
+            "{}{}{}",
+            indexed_text_event(
+                "response.output_text.delta",
+                1,
+                0,
+                Some("msg-live"),
+                "delta",
+                " \n"
+            ),
+            indexed_text_event(
+                "response.output_text.done",
+                1,
+                0,
+                Some("msg-live"),
+                "text",
+                " \n"
+            ),
+            terminal_sse_without_output(None)
+        );
+        let mut rejected = ResponsesSseDecoder::for_codex_oauth();
+        assert_invalid_llm_output(rejected.push(blank_indexed.as_bytes()).unwrap_err());
+        assert_invalid_llm_output(extract_codex_sse_text(&blank_indexed).unwrap_err());
+
+        let multipart = format!(
+            "{}{}{}{}{}",
+            indexed_text_event(
+                "response.output_text.delta",
+                1,
+                0,
+                Some("msg-live"),
+                "delta",
+                "one"
+            ),
+            indexed_text_event(
+                "response.output_text.done",
+                1,
+                0,
+                Some("msg-live"),
+                "text",
+                "one"
+            ),
+            indexed_text_event(
+                "response.output_text.delta",
+                1,
+                1,
+                Some("msg-live"),
+                "delta",
+                "two"
+            ),
+            indexed_text_event(
+                "response.output_text.done",
+                1,
+                1,
+                Some("msg-live"),
+                "text",
+                "two"
+            ),
+            terminal_sse_without_output(None)
+        );
+        let mut rejected = ResponsesSseDecoder::for_codex_oauth();
+        assert_invalid_llm_output(rejected.push(multipart.as_bytes()).unwrap_err());
+        assert_invalid_llm_output(extract_codex_sse_text(&multipart).unwrap_err());
     }
 
     #[test]
@@ -3859,14 +4140,30 @@ mod tests {
             CONTENT_TYPE,
             HeaderValue::from_static("Text/Event-Stream; charset=utf-8"),
         );
-        require_event_stream_content_type(&headers).unwrap();
+        require_event_stream_content_type(&headers, false).unwrap();
+
+        headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        for allow_missing_for_codex_oauth in [false, true] {
+            match require_event_stream_content_type(&headers, allow_missing_for_codex_oauth)
+                .unwrap_err()
+            {
+                ApiError::Upstream(message) => assert_eq!(
+                    message,
+                    "LLM streaming response did not use text/event-stream"
+                ),
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        let headers = HeaderMap::new();
+        require_event_stream_content_type(&headers, true).unwrap();
 
         for value in [None, Some("application/json"), Some("text/plain")] {
             let mut headers = HeaderMap::new();
             if let Some(value) = value {
                 headers.insert(CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
             }
-            match require_event_stream_content_type(&headers).unwrap_err() {
+            match require_event_stream_content_type(&headers, false).unwrap_err() {
                 ApiError::Upstream(message) => {
                     assert_eq!(
                         message,
@@ -3874,6 +4171,15 @@ mod tests {
                     );
                 }
                 other => panic!("unexpected error: {other:?}"),
+            }
+            if value.is_some() {
+                match require_event_stream_content_type(&headers, true).unwrap_err() {
+                    ApiError::Upstream(message) => assert_eq!(
+                        message,
+                        "LLM streaming response did not use text/event-stream"
+                    ),
+                    other => panic!("unexpected error: {other:?}"),
+                }
             }
         }
     }
@@ -3885,27 +4191,43 @@ mod tests {
         let second = "secret and safe suffix";
         let text = format!("{first}{second}");
         let chunks = vec![
-            format!(
-                "event: response.output_text.delta\r\ndata: {}\r\n\r\n",
-                json!({"type": "response.output_text.delta", "delta": first})
+            indexed_text_event(
+                "response.output_text.delta",
+                1,
+                0,
+                Some("msg-live"),
+                "delta",
+                first,
+            )
+            .into_bytes(),
+            indexed_text_event(
+                "response.output_text.delta",
+                1,
+                0,
+                Some("msg-live"),
+                "delta",
+                second,
             )
             .into_bytes(),
             format!(
-                "event: response.output_text.delta\r\ndata: {}\r\n\r\n",
-                json!({"type": "response.output_text.delta", "delta": second})
-            )
-            .into_bytes(),
-            terminal_sse(
-                &text,
-                Some(json!({
+                "{}{}",
+                indexed_text_event(
+                    "response.output_text.done",
+                    1,
+                    0,
+                    Some("msg-live"),
+                    "text",
+                    &text,
+                ),
+                terminal_sse_without_output(Some(json!({
                     "input_tokens": 11,
                     "output_tokens": 9,
                     "total_tokens": 20
-                })),
+                })))
             )
             .into_bytes(),
         ];
-        let (base_url, request_rx) = spawn_sse_server(chunks, "text/event-stream").await;
+        let (base_url, request_rx) = spawn_sse_server(chunks, None).await;
         let config = Config::test();
         let client = CodexResponsesClient {
             model: "gpt-stream-test".to_string(),
