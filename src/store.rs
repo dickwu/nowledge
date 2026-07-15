@@ -8573,6 +8573,45 @@ mod tests {
     use crate::config::Config;
 
     #[test]
+    fn direct_insight_patch_cannot_cross_tenants() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let created = store
+            .upsert_insight(
+                "tenant-a",
+                InsightUpsertRequest {
+                    owner_user_id: Some("owner-a".to_string()),
+                    insight_type: Some("isolation".to_string()),
+                    title: Some("Tenant-bound insight".to_string()),
+                    statement: Some("original statement".to_string()),
+                    ..InsightUpsertRequest::default()
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.patch_insight(
+                "tenant-b",
+                &created.insight.id,
+                InsightPatchRequest {
+                    statement: Some("foreign mutation".to_string()),
+                    ..InsightPatchRequest::default()
+                },
+            ),
+            Err(ApiError::NotFound(message)) if message == "insight not found"
+        ));
+
+        let stored = store
+            .search_insights(InsightSearchRequest {
+                owner_user_id: Some("owner-a".to_string()),
+                ..InsightSearchRequest::default()
+            })
+            .unwrap();
+        assert_eq!(stored.hits.len(), 1);
+        assert_eq!(stored.hits[0].statement, "original statement");
+    }
+
+    #[test]
     fn local_event_idempotency_rejects_a_different_request_without_a_journal_record() {
         let config = Config::test();
         let store = Store::new(&config);

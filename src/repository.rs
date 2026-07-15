@@ -2900,7 +2900,7 @@ impl KnowledgeRepository for MeiliRepository {
                     "q": req.query.clone().unwrap_or_default(),
                     "limit": req.limit.max(1),
                     "filter": filters.join(" AND "),
-                    "sort": ["occurred_at:desc"]
+                    "sort": ["occurred_at:desc", "id:desc"]
                 }),
             )
             .await?;

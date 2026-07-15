@@ -555,6 +555,9 @@ impl Store {
                 .insights
                 .get_mut(insight_id)
                 .ok_or_else(|| ApiError::not_found("insight not found"))?;
+            if insight.tenant_id != tenant_id {
+                return Err(ApiError::not_found("insight not found"));
+            }
             if let Some(statement) = req.statement {
                 insight.statement = statement;
             }

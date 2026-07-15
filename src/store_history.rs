@@ -454,7 +454,12 @@ impl Store {
             })
             .collect();
 
-        hits.sort_by_key(|event| Reverse(event.occurred_at));
+        hits.sort_by(|left, right| {
+            right
+                .occurred_at
+                .cmp(&left.occurred_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
         hits.truncate(req.limit.max(1));
 
         Ok(HistorySearchResponse { hits, routing })

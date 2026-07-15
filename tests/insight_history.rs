@@ -224,6 +224,47 @@ async fn insight_history_returns_exact_newest_first_events_with_bounded_limit() 
 }
 
 #[tokio::test]
+async fn insight_history_applies_the_id_tie_breaker_before_limiting() {
+    let app = app();
+    let (insight_id, _, _) = create_and_patch_insight(&app).await;
+    let mut tied_ids = Vec::new();
+    for source_id in ["tie-a", "tie-b"] {
+        let (status, event) = call(
+            app.clone(),
+            Method::POST,
+            "/v1/history/events",
+            json!({
+                "event_type": "insight.reviewed",
+                "entity_type": "insight",
+                "entity_id": insight_id,
+                "occurred_at": "2099-07-15T12:00:00Z",
+                "observed_at": "2099-07-15T12:00:01Z",
+                "source_kind": "test",
+                "source_ref": { "kind": "test", "id": source_id },
+                "text": "Tie-break ordering regression"
+            }),
+            OWNER_U1_TOKEN,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{event}");
+        tied_ids.push(event["event"]["id"].as_str().unwrap().to_string());
+    }
+
+    tied_ids.sort();
+    let expected = tied_ids.last().unwrap();
+    let (status, limited) = call(
+        app,
+        Method::GET,
+        &format!("/v1/history/insights/{insight_id}/events?limit=1"),
+        Value::Null,
+        OWNER_U1_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{limited}");
+    assert_eq!(limited["events"][0]["id"], expected.as_str());
+}
+
+#[tokio::test]
 async fn insight_history_enforces_owner_scope_and_tenant_service_path_scope() {
     let app = app();
     let (insight_id, _, _) = create_and_patch_insight(&app).await;
