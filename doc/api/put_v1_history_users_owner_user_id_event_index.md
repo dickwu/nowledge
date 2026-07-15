@@ -22,8 +22,8 @@ Schema: `EnsureUserEventIndexRequest`
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
 | force_reapply_settings | boolean | optional, default false | Reapply index settings even when the stored settings hash matches. |
-| create_personal_context_index | boolean | optional, default true | Create the companion personal context index for the same owner. |
-| schema_version | integer | optional | Override the event index schema version to use for the owner. |
+| create_personal_context_index | boolean | optional, default true | Must remain true; the companion personal context index is a required routing invariant. |
+| schema_version | integer | optional | When supplied, must equal the server's current event-index schema version. |
 
 ## Response
 Schema: `UserEventIndexResponse`
@@ -36,6 +36,8 @@ Schema: `UserEventIndexResponse`
 
 ## Errors and Access Rules
 - Malformed JSON or missing required runtime fields returns 400.
+- Setting `create_personal_context_index=false` or requesting a non-current
+  `schema_version` returns 400 before any index mutation.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 

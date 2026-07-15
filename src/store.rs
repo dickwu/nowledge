@@ -5,15 +5,25 @@ use std::{
     time::Instant,
 };
 
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
-    config::Config,
+    config::{Config, WriteConsistency},
     error::{safe_cause_diagnostic, ApiError},
     fragmenter::{BlockAwareFragmenter, FragmentChunk},
     models::*,
+    mutation::{
+        operation_list_item, operation_record_from_plan, operation_step_accepted,
+        operation_step_completed, operation_step_failed, operation_summary, persistence_metadata,
+        validate_operation_record, OPERATION_PLAN_SCHEMA_VERSION,
+    },
     parser::{parser_from_config, ParserInput, ParserOutput, StagedUpload},
-    repository::{repository_from_config, KnowledgeRepository, RepositoryContextSearchQuery},
+    repository::{
+        repository_from_config, KnowledgeRepository, RepositoryContextSearchQuery,
+        RepositoryOperationListQuery,
+    },
+    request_context::{self, RequestPrincipalScope},
     resolver::{EventIndexResolver, EVENT_INDEX_SCHEMA_VERSION, EVENT_SETTINGS_HASH},
     util::{
         ancestor_uris, hmac_hex, mask_secret_egress_projection_preserving_chars,
@@ -27,10 +37,20 @@ const INGEST_ERROR_PARSER_FAILED: &str = "parser_failed";
 const INGEST_ERROR_INDEXING_FAILED: &str = "indexing_failed";
 const INGEST_ERROR_FAILED: &str = "ingest_failed";
 const INGEST_ERROR_INTERRUPTED: &str = "ingest_interrupted";
+const OPERATION_LIST_CURSOR_PREFIX: &str = "op1";
+const OPERATION_LIST_CURSOR_MAX_BYTES: usize = 4_096;
+const OPERATION_STARTUP_RECONCILE_BATCH_SIZE: usize = 250;
+
+#[derive(Debug, Clone)]
+struct OperationListCursor {
+    offset: usize,
+    previous_operation_id: String,
+}
 
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<RwLock<StoreData>>,
+    mutation_gate: Arc<tokio::sync::Mutex<()>>,
     resolver: EventIndexResolver,
     repository: Arc<dyn KnowledgeRepository>,
     vector: Arc<Mutex<VectorMatcher>>,
@@ -79,9 +99,10 @@ impl ParseArtifactKey {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StoreData {
     hydration_report: Option<HydrationReport>,
+    operations: HashMap<String, OperationRecord>,
     user_indexes: HashMap<(String, String), UserEventIndex>,
     events_by_index: HashMap<String, Vec<HistoryEvent>>,
     event_by_id: HashMap<String, HistoryEvent>,
@@ -122,6 +143,7 @@ struct StoreData {
 
 #[derive(Default)]
 struct HydrationStage {
+    operations: Vec<OperationRecord>,
     user_indexes: Vec<UserEventIndex>,
     company_context: Vec<ContextNode>,
     state_items: Vec<StateItem>,
@@ -214,6 +236,7 @@ fn durability_contract() -> BTreeMap<&'static str, (DurabilityClass, HydrationSt
     };
 
     [
+        ("operations", (DurableCanonical, Startup, true)),
         ("user_event_indexes", (DurableCanonical, Startup, true)),
         ("user_events", (DurableCanonical, ReadThrough, false)),
         ("personal_context", (DerivedDurable, ReadThrough, false)),
@@ -324,6 +347,29 @@ fn hydration_result<T>(
     result.map_err(|error| HydrationFailure { domain, error })
 }
 
+fn failed_ingest_recovery_domain(record: &OperationRecord) -> Option<&'static str> {
+    std::iter::once(&record.plan.primary)
+        .chain(record.plan.side_effects.iter())
+        .find_map(|step| {
+            let failed = record
+                .progress
+                .steps
+                .get(&step.id)
+                .is_some_and(|progress| progress.status == OperationStepStatus::Failed);
+            if !failed {
+                return None;
+            }
+            match &step.resource {
+                OperationResource::IngestTask { .. } | OperationResource::IngestTasks { .. } => {
+                    Some("ingest_tasks")
+                }
+                OperationResource::ParseArtifacts { .. } => Some("parse_artifacts"),
+                OperationResource::IngestResult { .. } => Some("ingest_results"),
+                _ => None,
+            }
+        })
+}
+
 fn completed_hydration_report(
     config: &Config,
     tenant_id: &str,
@@ -336,6 +382,7 @@ fn completed_hydration_report(
     report.completed_at = Some(now());
 
     let counts = [
+        ("operations", stage.operations.len(), 0),
         ("user_event_indexes", stage.user_indexes.len(), 0),
         ("company_context_nodes", stage.company_context.len(), 0),
         ("state_items", stage.state_items.len(), 0),
@@ -401,18 +448,486 @@ fn hydration_response(report: &HydrationReport) -> Value {
     Value::Object(response)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextSearchOutcome {
     pub response: ContextSearchResponse,
     pub trace: TraceRecord,
     pub nodes: Vec<ContextNode>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DocumentIngestResult {
     source_id: String,
     source_document_uri: String,
     fragment_uris: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum MutationPrimary {
+    UserIndex,
+    HistoryEvents,
+    StateItem,
+    Insight,
+    Links,
+    DeleteCompanySource,
+    SourceRevision,
+    SourceDocuments,
+    ParseArtifacts,
+    StructuredSnapshot,
+    Dataset,
+    StructuredRows,
+    StructuredSummary,
+    Session,
+    Trace,
+    HarnessComponents,
+    HarnessChanges,
+    HarnessVerdicts,
+    IngestTask,
+    DeleteIngestTasks,
+    IngestResult,
+    EvalCase,
+    EvalRun,
+}
+
+struct MutationPlanInput<'a> {
+    tenant_id: &'a str,
+    operation_kind: &'a str,
+    owner_user_id: Option<&'a str>,
+    idempotency_key: Option<&'a str>,
+    primary_kind: MutationPrimary,
+    resources: Vec<OperationResource>,
+    response_snapshot: Value,
+    request_fingerprint: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+struct MutationIdempotency<'a> {
+    key: Option<&'a str>,
+    request_fingerprint: Option<&'a str>,
+}
+
+impl MutationPrimary {
+    fn matches(self, resource: &OperationResource) -> bool {
+        matches!(
+            (self, resource),
+            (
+                Self::UserIndex,
+                OperationResource::EnsureUserEventIndex { .. }
+            ) | (Self::HistoryEvents, OperationResource::HistoryEvents { .. })
+                | (Self::StateItem, OperationResource::StateItem { .. })
+                | (Self::Insight, OperationResource::Insight { .. })
+                | (Self::Links, OperationResource::Links { .. })
+                | (
+                    Self::DeleteCompanySource,
+                    OperationResource::DeleteCompanySourceIndex {
+                        target: CompanySourceDeleteTarget::Fragments,
+                        ..
+                    }
+                )
+                | (
+                    Self::SourceRevision,
+                    OperationResource::SourceRevision { .. }
+                )
+                | (
+                    Self::SourceDocuments,
+                    OperationResource::SourceDocuments { .. }
+                )
+                | (
+                    Self::ParseArtifacts,
+                    OperationResource::ParseArtifacts { .. }
+                )
+                | (
+                    Self::StructuredSnapshot,
+                    OperationResource::StructuredSnapshot { .. }
+                )
+                | (Self::Dataset, OperationResource::Dataset { .. })
+                | (
+                    Self::StructuredRows,
+                    OperationResource::StructuredRows { .. }
+                )
+                | (
+                    Self::StructuredSummary,
+                    OperationResource::StructuredSummary { .. }
+                )
+                | (Self::Session, OperationResource::Session { .. })
+                | (Self::Trace, OperationResource::Trace { .. })
+                | (
+                    Self::HarnessComponents,
+                    OperationResource::HarnessComponents { .. }
+                )
+                | (
+                    Self::HarnessChanges,
+                    OperationResource::HarnessChanges { .. }
+                )
+                | (
+                    Self::HarnessVerdicts,
+                    OperationResource::HarnessVerdicts { .. }
+                )
+                | (
+                    Self::IngestTask,
+                    OperationResource::IngestTask { .. } | OperationResource::IngestTasks { .. }
+                )
+                | (
+                    Self::DeleteIngestTasks,
+                    OperationResource::DeleteIngestTasks { .. }
+                )
+                | (Self::IngestResult, OperationResource::IngestResult { .. })
+                | (Self::EvalCase, OperationResource::EvalCase { .. })
+                | (Self::EvalRun, OperationResource::EvalRun { .. })
+        )
+    }
+
+    const fn exposes_partial_persistence(self) -> bool {
+        matches!(self, Self::HistoryEvents | Self::DeleteCompanySource)
+    }
+
+    const fn requires_index_confirmation(self) -> bool {
+        matches!(
+            self,
+            Self::UserIndex | Self::DeleteCompanySource | Self::DeleteIngestTasks
+        )
+    }
+}
+
+fn serialized_changed<T: Serialize>(before: Option<&T>, after: &T) -> bool {
+    before
+        .is_none_or(|before| serde_json::to_value(before).ok() != serde_json::to_value(after).ok())
+}
+
+fn context_node_identity(node: &ContextNode) -> (&str, u8) {
+    (&node.uri, node.layer)
+}
+
+fn changed_context_nodes(
+    before: impl Iterator<Item = ContextNode>,
+    after: impl Iterator<Item = ContextNode>,
+) -> Vec<ContextNode> {
+    let before = before
+        .map(|node| ((node.uri.clone(), node.layer), node))
+        .collect::<HashMap<_, _>>();
+    let mut changed = after
+        .filter(|node| serialized_changed(before.get(&(node.uri.clone(), node.layer)), node))
+        .collect::<Vec<_>>();
+    changed.sort_by(|left, right| context_node_identity(left).cmp(&context_node_identity(right)));
+    changed
+}
+
+fn company_source_related_uris(
+    data: &StoreData,
+    tenant_id: &str,
+    source_id: &str,
+) -> HashSet<String> {
+    let mut uris = data
+        .source_documents
+        .values()
+        .filter(|document| {
+            document.tenant_id == tenant_id
+                && document.owner_user_id.is_none()
+                && document.source_id == source_id
+        })
+        .map(|document| document.uri.clone())
+        .collect::<HashSet<_>>();
+    uris.extend(
+        data.source_revisions
+            .get(source_id)
+            .into_iter()
+            .flatten()
+            .filter(|revision| revision.tenant_id == tenant_id)
+            .map(|revision| company_revision_source_document_uri(source_id, &revision.id)),
+    );
+    uris.extend(
+        data.company_context
+            .iter()
+            .filter(|node| {
+                node.tenant_id == tenant_id && node.source_id.as_deref() == Some(source_id)
+            })
+            .flat_map(|node| {
+                std::iter::once(node.uri.clone()).chain(node.source_document_uri.clone())
+            }),
+    );
+    uris.extend(
+        data.parse_artifacts
+            .values()
+            .filter(|artifact| {
+                artifact.tenant_id == tenant_id
+                    && artifact.owner_user_id.is_none()
+                    && artifact.source_id == source_id
+            })
+            .flat_map(|artifact| {
+                [artifact.source_document_uri.clone(), artifact.uri.clone()].into_iter()
+            }),
+    );
+    uris.extend(
+        data.ingest_tasks
+            .values()
+            .filter(|task| {
+                task.tenant_id == tenant_id
+                    && task.owner_user_id.is_none()
+                    && task.source_id == source_id
+            })
+            .filter_map(|task| task.source_document_uri.clone()),
+    );
+    uris.extend(
+        data.ingest_results
+            .values()
+            .filter(|result| {
+                result.task.tenant_id == tenant_id
+                    && result.task.owner_user_id.is_none()
+                    && result.source_id == source_id
+            })
+            .map(|result| result.source_document_uri.clone()),
+    );
+    uris
+}
+
+fn unfinished_company_source_delete(data: &StoreData, tenant_id: &str, source_id: &str) -> bool {
+    data.operations.values().any(|operation| {
+        operation.tenant_id == tenant_id
+            && operation.operation_kind == "company_doc.delete"
+            && !(operation.status == OperationStatus::Completed
+                && operation.indexing_state == OperationIndexingState::Completed)
+            && std::iter::once(&operation.plan.primary)
+                .chain(operation.plan.side_effects.iter())
+                .any(|step| {
+                    matches!(
+                        &step.resource,
+                        OperationResource::DeleteCompanySourceIndex {
+                            source_id: deleting_source_id,
+                            ..
+                        } if deleting_source_id == source_id
+                    )
+                })
+    })
+}
+
+fn ensure_company_source_not_deleting(
+    data: &StoreData,
+    tenant_id: &str,
+    source_id: &str,
+) -> Result<(), ApiError> {
+    if unfinished_company_source_delete(data, tenant_id, source_id) {
+        return Err(ApiError::conflict(
+            "company source deletion is incomplete; reconcile it before recreating or updating the source",
+        ));
+    }
+    Ok(())
+}
+
+fn operation_resource_targets_company_source(
+    resource: &OperationResource,
+    tenant_id: &str,
+    source_id: &str,
+    related_uris: &HashSet<String>,
+) -> bool {
+    match resource {
+        OperationResource::CompanySource { source } => {
+            source.tenant_id == tenant_id && source.id == source_id
+        }
+        OperationResource::SourceRevision { revision } => {
+            revision.tenant_id == tenant_id && revision.source_id == source_id
+        }
+        OperationResource::ContextNodes { nodes, .. } => nodes.iter().any(|node| {
+            node.tenant_id == tenant_id
+                && node.owner_user_id.is_none()
+                && node.source_id.as_deref() == Some(source_id)
+        }),
+        OperationResource::SourceDocuments { documents } => documents.iter().any(|document| {
+            document.tenant_id == tenant_id
+                && document.owner_user_id.is_none()
+                && document.source_id == source_id
+        }),
+        OperationResource::ParseArtifacts { artifacts } => artifacts.iter().any(|artifact| {
+            artifact.tenant_id == tenant_id
+                && artifact.owner_user_id.is_none()
+                && artifact.source_id == source_id
+        }),
+        OperationResource::IngestTask { task } => {
+            task.tenant_id == tenant_id
+                && task.owner_user_id.is_none()
+                && task.source_id == source_id
+        }
+        OperationResource::IngestTasks { tasks } => tasks.iter().any(|task| {
+            task.tenant_id == tenant_id
+                && task.owner_user_id.is_none()
+                && task.source_id == source_id
+        }),
+        OperationResource::IngestResult { result } => {
+            result.task.tenant_id == tenant_id
+                && result.task.owner_user_id.is_none()
+                && result.source_id == source_id
+        }
+        OperationResource::Links { links } => links.iter().any(|link| {
+            link.tenant_id == tenant_id
+                && (related_uris.contains(&link.source_uri)
+                    || related_uris.contains(&link.target_uri))
+        }),
+        OperationResource::DeleteCompanySourceIndex {
+            source_id: deleting_source_id,
+            ..
+        } => deleting_source_id == source_id,
+        _ => false,
+    }
+}
+
+fn ensure_company_source_mutations_reconciled_before_delete(
+    data: &StoreData,
+    tenant_id: &str,
+    source_id: &str,
+    related_uris: &HashSet<String>,
+) -> Result<(), ApiError> {
+    let unfinished_predecessor = data.operations.values().any(|operation| {
+        operation.tenant_id == tenant_id
+            && operation.operation_kind != "company_doc.delete"
+            && !(operation.status == OperationStatus::Completed
+                && operation.indexing_state == OperationIndexingState::Completed)
+            && std::iter::once(&operation.plan.primary)
+                .chain(operation.plan.side_effects.iter())
+                .any(|step| {
+                    operation_resource_targets_company_source(
+                        &step.resource,
+                        tenant_id,
+                        source_id,
+                        related_uris,
+                    )
+                })
+    });
+    if unfinished_predecessor {
+        return Err(ApiError::conflict(
+            "a previous company source mutation must be reconciled before deleting the source",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_link_not_pending_company_source_delete(
+    data: &StoreData,
+    tenant_id: &str,
+    link_id: Option<&str>,
+    source_uri: &str,
+    target_uri: &str,
+) -> Result<(), ApiError> {
+    let pending_delete_targets_link = data.operations.values().any(|operation| {
+        operation.tenant_id == tenant_id
+            && operation.operation_kind == "company_doc.delete"
+            && !(operation.status == OperationStatus::Completed
+                && operation.indexing_state == OperationIndexingState::Completed)
+            && std::iter::once(&operation.plan.primary)
+                .chain(operation.plan.side_effects.iter())
+                .any(|step| {
+                    matches!(
+                        &step.resource,
+                        OperationResource::DeleteCompanySourceIndex {
+                            target: CompanySourceDeleteTarget::Links {
+                                link_ids,
+                                related_uris,
+                            },
+                            ..
+                        } if link_id.is_some_and(|link_id| {
+                                link_ids.iter().any(|deleting_link_id| deleting_link_id == link_id)
+                            })
+                            || related_uris.iter().any(|uri| {
+                                uri == source_uri || uri == target_uri
+                            })
+                    )
+                })
+    });
+    if pending_delete_targets_link {
+        return Err(ApiError::conflict(
+            "link belongs to an incomplete company source deletion; reconcile it before updating the link",
+        ));
+    }
+    Ok(())
+}
+
+fn operation_list_cursor_scope(
+    tenant_id: &str,
+    statuses: &[OperationStatus],
+    operation_kinds: &[String],
+) -> Result<String, ApiError> {
+    let mut statuses = statuses
+        .iter()
+        .map(|status| status.as_str().to_string())
+        .collect::<Vec<_>>();
+    statuses.sort();
+    statuses.dedup();
+    let mut operation_kinds = operation_kinds.to_vec();
+    operation_kinds.sort();
+    operation_kinds.dedup();
+    serde_json::to_string(&(tenant_id, statuses, operation_kinds))
+        .map_err(|error| ApiError::Internal(error.to_string()))
+}
+
+fn encode_operation_list_cursor(
+    secret: &[u8],
+    tenant_id: &str,
+    statuses: &[OperationStatus],
+    operation_kinds: &[String],
+    offset: usize,
+    previous_operation_id: &str,
+) -> Result<String, ApiError> {
+    if offset == 0 || previous_operation_id.trim().is_empty() {
+        return Err(ApiError::Internal(
+            "operation cursor requires a non-empty prior page".to_string(),
+        ));
+    }
+    let scope = operation_list_cursor_scope(tenant_id, statuses, operation_kinds)?;
+    let payload = hex::encode(format!("{offset}\0{previous_operation_id}"));
+    let signature = hmac_hex(
+        secret,
+        "operation-list-cursor",
+        &format!("{scope}\0{payload}"),
+        32,
+    );
+    Ok(format!(
+        "{OPERATION_LIST_CURSOR_PREFIX}.{payload}.{signature}"
+    ))
+}
+
+fn decode_operation_list_cursor(
+    secret: &[u8],
+    tenant_id: &str,
+    statuses: &[OperationStatus],
+    operation_kinds: &[String],
+    cursor: Option<&str>,
+) -> Result<Option<OperationListCursor>, ApiError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let invalid = || ApiError::bad_request("cursor is invalid or stale");
+    if cursor.len() > OPERATION_LIST_CURSOR_MAX_BYTES {
+        return Err(invalid());
+    }
+    let mut parts = cursor.split('.');
+    let prefix = parts.next().ok_or_else(&invalid)?;
+    let payload = parts.next().ok_or_else(&invalid)?;
+    let signature = parts.next().ok_or_else(&invalid)?;
+    if prefix != OPERATION_LIST_CURSOR_PREFIX || parts.next().is_some() {
+        return Err(invalid());
+    }
+    let scope = operation_list_cursor_scope(tenant_id, statuses, operation_kinds)?;
+    let expected_signature = hmac_hex(
+        secret,
+        "operation-list-cursor",
+        &format!("{scope}\0{payload}"),
+        32,
+    );
+    if signature != expected_signature {
+        return Err(invalid());
+    }
+    let decoded = hex::decode(payload).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(decoded).map_err(|_| invalid())?;
+    let (offset, previous_operation_id) = decoded.split_once('\0').ok_or_else(&invalid)?;
+    let offset = offset.parse::<usize>().map_err(|_| invalid())?;
+    if offset == 0
+        || previous_operation_id.trim().is_empty()
+        || previous_operation_id.contains('\0')
+    {
+        return Err(invalid());
+    }
+    Ok(Some(OperationListCursor {
+        offset,
+        previous_operation_id: previous_operation_id.to_string(),
+    }))
 }
 
 impl Store {
@@ -427,11 +942,1602 @@ impl Store {
         data.seed_harness_components(&config.tenant_id);
         Self {
             inner: Arc::new(RwLock::new(data)),
+            mutation_gate: Arc::new(tokio::sync::Mutex::new(())),
             resolver: EventIndexResolver::new(config.index_hash_secret.clone()),
             repository: repository_from_config(config),
             vector: Arc::new(Mutex::new(VectorMatcher::from_config(config))),
             redaction_config: Arc::new(config.clone()),
         }
+    }
+
+    /// Build an isolated copy used to validate and plan a mutation without
+    /// publishing any cache changes before the durable primary write is
+    /// accepted. The repository and immutable helpers are shared; only the
+    /// mutable StoreData snapshot and mutation gate are private to the stage.
+    fn staged_copy(&self) -> Result<Self, ApiError> {
+        let mut staged = self.clone();
+        staged.inner = Arc::new(RwLock::new(self.read()?.clone()));
+        staged.mutation_gate = Arc::new(tokio::sync::Mutex::new(()));
+        // Vector warming is an optional performance projection. A staged
+        // mutation must not share it with the live store because a rejected
+        // primary write must have no live side effects.
+        staged.vector = Arc::new(Mutex::new(VectorMatcher::from_config(
+            &self.redaction_config,
+        )));
+        Ok(staged)
+    }
+
+    fn mutation_resources(
+        &self,
+        tenant_id: &str,
+        before: &StoreData,
+        after: &StoreData,
+    ) -> Vec<OperationResource> {
+        let mut resources = Vec::new();
+
+        let mut indexes = after
+            .user_indexes
+            .values()
+            .filter(|index| index.tenant_id == tenant_id)
+            .filter(|index| {
+                serialized_changed(
+                    before
+                        .user_indexes
+                        .get(&(index.tenant_id.clone(), index.owner_user_id_hash.clone())),
+                    *index,
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        indexes.sort_by(|left, right| left.id.cmp(&right.id));
+        resources.extend(
+            indexes
+                .into_iter()
+                .map(|index| OperationResource::EnsureUserEventIndex { index }),
+        );
+
+        let mut events_by_index = BTreeMap::<String, Vec<HistoryEvent>>::new();
+        for event in after
+            .event_by_id
+            .values()
+            .filter(|event| event.tenant_id == tenant_id)
+            .filter(|event| serialized_changed(before.event_by_id.get(&event.id), *event))
+        {
+            events_by_index
+                .entry(event.event_index_uid.clone())
+                .or_default()
+                .push(event.clone());
+        }
+        for events in events_by_index.values_mut() {
+            events.sort_by(|left, right| left.id.cmp(&right.id));
+        }
+        resources.extend(
+            events_by_index
+                .into_values()
+                .map(|events| OperationResource::HistoryEvents { events }),
+        );
+
+        let changed_company_nodes = changed_context_nodes(
+            before
+                .company_context
+                .iter()
+                .filter(|node| node.tenant_id == tenant_id)
+                .cloned(),
+            after
+                .company_context
+                .iter()
+                .filter(|node| node.tenant_id == tenant_id)
+                .cloned(),
+        );
+        if !changed_company_nodes.is_empty() {
+            resources.push(OperationResource::ContextNodes {
+                index_uid: "rag_company_context".to_string(),
+                nodes: changed_company_nodes,
+            });
+        }
+        let mut personal_index_uids = after
+            .personal_context
+            .keys()
+            .chain(before.personal_context.keys())
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        personal_index_uids.sort();
+        for index_uid in personal_index_uids {
+            let changed = changed_context_nodes(
+                before
+                    .personal_context
+                    .get(&index_uid)
+                    .into_iter()
+                    .flatten()
+                    .filter(|node| node.tenant_id == tenant_id)
+                    .cloned(),
+                after
+                    .personal_context
+                    .get(&index_uid)
+                    .into_iter()
+                    .flatten()
+                    .filter(|node| node.tenant_id == tenant_id)
+                    .cloned(),
+            );
+            if !changed.is_empty() {
+                resources.push(OperationResource::ContextNodes {
+                    index_uid,
+                    nodes: changed,
+                });
+            }
+        }
+
+        let mut state_items = after
+            .state_items
+            .values()
+            .filter(|item| item.tenant_id == tenant_id)
+            .filter(|item| {
+                serialized_changed(
+                    before.state_items.get(&(
+                        item.tenant_id.clone(),
+                        item.owner_user_id.clone(),
+                        item.natural_key.clone(),
+                    )),
+                    *item,
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        state_items.sort_by(|left, right| left.id.cmp(&right.id));
+        resources.extend(
+            state_items
+                .into_iter()
+                .map(|item| OperationResource::StateItem { item }),
+        );
+
+        let mut insights = after
+            .insights
+            .values()
+            .filter(|insight| insight.tenant_id == tenant_id)
+            .filter(|insight| serialized_changed(before.insights.get(&insight.id), *insight))
+            .cloned()
+            .collect::<Vec<_>>();
+        insights.sort_by(|left, right| left.id.cmp(&right.id));
+        resources.extend(
+            insights
+                .into_iter()
+                .map(|insight| OperationResource::Insight { insight }),
+        );
+
+        let mut sources = after
+            .sources
+            .values()
+            .filter(|source| source.tenant_id == tenant_id)
+            .filter(|source| serialized_changed(before.sources.get(&source.id), *source))
+            .cloned()
+            .collect::<Vec<_>>();
+        sources.sort_by(|left, right| left.id.cmp(&right.id));
+        resources.extend(
+            sources
+                .into_iter()
+                .map(|source| OperationResource::CompanySource { source }),
+        );
+        let mut deleted_sources = before
+            .sources
+            .values()
+            .filter(|source| source.tenant_id == tenant_id)
+            .filter(|source| !after.sources.contains_key(&source.id))
+            .map(|source| {
+                let mut source_document_uris =
+                    company_source_related_uris(before, tenant_id, &source.id)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                source_document_uris.sort();
+                source_document_uris.dedup();
+                let source_document_uri_set = source_document_uris.iter().collect::<HashSet<_>>();
+                let mut link_ids = before
+                    .links
+                    .values()
+                    .filter(|link| {
+                        link.tenant_id == tenant_id
+                            && (source_document_uri_set.contains(&link.source_uri)
+                                || source_document_uri_set.contains(&link.target_uri))
+                    })
+                    .map(|link| link.id.clone())
+                    .collect::<Vec<_>>();
+                link_ids.sort();
+                link_ids.dedup();
+                (source.id.clone(), link_ids, source_document_uris)
+            })
+            .collect::<Vec<_>>();
+        deleted_sources.sort_by(|left, right| left.0.cmp(&right.0));
+        for (source_id, link_ids, related_uris) in deleted_sources {
+            resources.extend(
+                [
+                    CompanySourceDeleteTarget::Fragments,
+                    CompanySourceDeleteTarget::Revisions,
+                    CompanySourceDeleteTarget::Source,
+                    CompanySourceDeleteTarget::SourceDocuments,
+                    CompanySourceDeleteTarget::ParseArtifacts,
+                    CompanySourceDeleteTarget::IngestTasks,
+                    CompanySourceDeleteTarget::IngestResults,
+                ]
+                .into_iter()
+                .map(|target| OperationResource::DeleteCompanySourceIndex {
+                    source_id: source_id.clone(),
+                    target,
+                }),
+            );
+            resources.push(OperationResource::DeleteCompanySourceIndex {
+                source_id,
+                target: CompanySourceDeleteTarget::Links {
+                    link_ids,
+                    related_uris,
+                },
+            });
+        }
+
+        let before_revisions = before
+            .source_revisions
+            .values()
+            .flatten()
+            .filter(|revision| revision.tenant_id == tenant_id)
+            .map(|revision| (revision.id.clone(), revision))
+            .collect::<HashMap<_, _>>();
+        let mut revisions = after
+            .source_revisions
+            .values()
+            .flatten()
+            .filter(|revision| revision.tenant_id == tenant_id)
+            .filter(|revision| {
+                serialized_changed(before_revisions.get(&revision.id).copied(), *revision)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        revisions.sort_by(|left, right| left.id.cmp(&right.id));
+        resources.extend(
+            revisions
+                .into_iter()
+                .map(|revision| OperationResource::SourceRevision { revision }),
+        );
+
+        let mut documents = after
+            .source_documents
+            .iter()
+            .filter(|(_, document)| document.tenant_id == tenant_id)
+            .filter(|(key, document)| {
+                serialized_changed(before.source_documents.get(*key), *document)
+            })
+            .map(|(_, document)| document.clone())
+            .collect::<Vec<_>>();
+        documents.sort_by(|left, right| left.uri.cmp(&right.uri));
+        if !documents.is_empty() {
+            resources.push(OperationResource::SourceDocuments { documents });
+        }
+
+        let mut artifacts = after
+            .parse_artifacts
+            .iter()
+            .filter(|(_, artifact)| artifact.tenant_id == tenant_id)
+            .filter(|(key, artifact)| {
+                serialized_changed(before.parse_artifacts.get(*key), *artifact)
+            })
+            .map(|(_, artifact)| artifact.clone())
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| left.id.cmp(&right.id));
+        if !artifacts.is_empty() {
+            resources.push(OperationResource::ParseArtifacts { artifacts });
+        }
+
+        self.structured_mutation_resources(tenant_id, before, after, &mut resources);
+        self.session_and_link_mutation_resources(tenant_id, before, after, &mut resources);
+        self.operational_mutation_resources(tenant_id, before, after, &mut resources);
+        resources
+    }
+
+    fn structured_mutation_resources(
+        &self,
+        tenant_id: &str,
+        before: &StoreData,
+        after: &StoreData,
+        resources: &mut Vec<OperationResource>,
+    ) {
+        let mut datasets = after
+            .datasets
+            .values()
+            .filter(|dataset| dataset.tenant_id == tenant_id)
+            .filter(|dataset| {
+                serialized_changed(before.datasets.get(&dataset.dataset_key), *dataset)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        datasets.sort_by(|left, right| left.dataset_key.cmp(&right.dataset_key));
+        resources.extend(
+            datasets
+                .into_iter()
+                .map(|dataset| OperationResource::Dataset { dataset }),
+        );
+
+        let mut snapshots = after
+            .snapshots
+            .values()
+            .filter(|snapshot| snapshot.tenant_id == tenant_id)
+            .filter(|snapshot| serialized_changed(before.snapshots.get(&snapshot.id), *snapshot))
+            .cloned()
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| left.id.cmp(&right.id));
+        resources.extend(
+            snapshots
+                .into_iter()
+                .map(|snapshot| OperationResource::StructuredSnapshot { snapshot }),
+        );
+
+        let mut snapshot_ids = after
+            .snapshots
+            .values()
+            .filter(|snapshot| snapshot.tenant_id == tenant_id)
+            .map(|snapshot| snapshot.id.clone())
+            .collect::<Vec<_>>();
+        snapshot_ids.sort();
+        for snapshot_id in snapshot_ids {
+            let Some(rows) = after.rows_by_snapshot.get(&snapshot_id) else {
+                continue;
+            };
+            if !rows.is_empty()
+                && serialized_changed(before.rows_by_snapshot.get(&snapshot_id), rows)
+            {
+                resources.push(OperationResource::StructuredRows { rows: rows.clone() });
+            }
+        }
+
+        let mut summaries = after
+            .structured_summaries
+            .iter()
+            .filter(|(_, summary)| {
+                summary.get("tenant_id").and_then(Value::as_str) == Some(tenant_id)
+            })
+            .filter(|(id, summary)| {
+                serialized_changed(before.structured_summaries.get(*id), *summary)
+            })
+            .map(|(id, summary)| (id.clone(), summary.clone()))
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| left.0.cmp(&right.0));
+        resources.extend(
+            summaries
+                .into_iter()
+                .map(|(_, summary)| OperationResource::StructuredSummary { summary }),
+        );
+    }
+
+    fn session_and_link_mutation_resources(
+        &self,
+        tenant_id: &str,
+        before: &StoreData,
+        after: &StoreData,
+        resources: &mut Vec<OperationResource>,
+    ) {
+        let mut sessions = after
+            .sessions
+            .values()
+            .filter(|session| session.tenant_id == tenant_id)
+            .filter(|session| serialized_changed(before.sessions.get(&session.id), *session))
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.id.cmp(&right.id));
+        resources.extend(
+            sessions
+                .into_iter()
+                .map(|session| OperationResource::Session { session }),
+        );
+
+        let mut traces = after
+            .traces
+            .values()
+            .filter(|trace| trace.tenant_id == tenant_id)
+            .filter(|trace| serialized_changed(before.traces.get(&trace.id), *trace))
+            .cloned()
+            .collect::<Vec<_>>();
+        traces.sort_by(|left, right| left.id.cmp(&right.id));
+        resources.extend(
+            traces
+                .into_iter()
+                .map(|trace| OperationResource::Trace { trace }),
+        );
+
+        let mut links = after
+            .links
+            .values()
+            .filter(|link| link.tenant_id == tenant_id)
+            .filter(|link| serialized_changed(before.links.get(&link.id), *link))
+            .cloned()
+            .collect::<Vec<_>>();
+        links.sort_by(|left, right| left.id.cmp(&right.id));
+        if !links.is_empty() {
+            resources.push(OperationResource::Links { links });
+        }
+    }
+
+    fn operational_mutation_resources(
+        &self,
+        tenant_id: &str,
+        before: &StoreData,
+        after: &StoreData,
+        resources: &mut Vec<OperationResource>,
+    ) {
+        let mut components = after
+            .harness_components
+            .values()
+            .filter(|component| component.tenant_id == tenant_id)
+            .filter(|component| {
+                serialized_changed(before.harness_components.get(&component.id), *component)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        components.sort_by(|left, right| left.id.cmp(&right.id));
+        let before_revisions = before
+            .harness_revisions
+            .values()
+            .flatten()
+            .filter(|revision| revision.tenant_id == tenant_id)
+            .map(|revision| (revision.id.clone(), revision))
+            .collect::<HashMap<_, _>>();
+        let mut revisions = after
+            .harness_revisions
+            .values()
+            .flatten()
+            .filter(|revision| revision.tenant_id == tenant_id)
+            .filter(|revision| {
+                serialized_changed(before_revisions.get(&revision.id).copied(), *revision)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        revisions.sort_by(|left, right| left.id.cmp(&right.id));
+        if !components.is_empty() || !revisions.is_empty() {
+            resources.push(OperationResource::HarnessComponents {
+                components,
+                revisions,
+            });
+        }
+
+        let mut changes = after
+            .harness_changes
+            .values()
+            .filter(|change| change.tenant_id == tenant_id)
+            .filter(|change| serialized_changed(before.harness_changes.get(&change.id), *change))
+            .cloned()
+            .collect::<Vec<_>>();
+        changes.sort_by(|left, right| left.id.cmp(&right.id));
+        if !changes.is_empty() {
+            resources.push(OperationResource::HarnessChanges { changes });
+        }
+
+        let mut verdicts = after
+            .harness_verdicts
+            .values()
+            .filter(|verdict| verdict.tenant_id == tenant_id)
+            .filter(|verdict| {
+                serialized_changed(before.harness_verdicts.get(&verdict.id), *verdict)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        verdicts.sort_by(|left, right| left.id.cmp(&right.id));
+        if !verdicts.is_empty() {
+            resources.push(OperationResource::HarnessVerdicts { verdicts });
+        }
+
+        let mut tasks = after
+            .ingest_tasks
+            .values()
+            .filter(|task| task.tenant_id == tenant_id)
+            .filter(|task| serialized_changed(before.ingest_tasks.get(&task.task_id), *task))
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        if !tasks.is_empty() {
+            resources.push(OperationResource::IngestTasks { tasks });
+        }
+        let mut deleted_task_ids = before
+            .ingest_tasks
+            .values()
+            .filter(|task| task.tenant_id == tenant_id)
+            .filter(|task| !after.ingest_tasks.contains_key(&task.task_id))
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>();
+        deleted_task_ids.sort();
+        if !deleted_task_ids.is_empty() {
+            resources.push(OperationResource::DeleteIngestTasks {
+                task_ids: deleted_task_ids,
+            });
+        }
+        let mut results = after
+            .ingest_results
+            .values()
+            .filter(|result| result.task.tenant_id == tenant_id)
+            .filter(|result| {
+                serialized_changed(before.ingest_results.get(&result.task.task_id), *result)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        results.sort_by(|left, right| left.task.task_id.cmp(&right.task.task_id));
+        resources.extend(
+            results
+                .into_iter()
+                .map(|result| OperationResource::IngestResult { result }),
+        );
+
+        self.eval_mutation_resources(tenant_id, before, after, resources);
+    }
+
+    fn eval_mutation_resources(
+        &self,
+        tenant_id: &str,
+        before: &StoreData,
+        after: &StoreData,
+        resources: &mut Vec<OperationResource>,
+    ) {
+        let mut cases = after
+            .eval_cases
+            .values()
+            .filter(|case| case.tenant_id == tenant_id)
+            .filter(|case| serialized_changed(before.eval_cases.get(&case.id), *case))
+            .cloned()
+            .collect::<Vec<_>>();
+        cases.sort_by(|left, right| left.id.cmp(&right.id));
+        resources.extend(
+            cases
+                .into_iter()
+                .map(|case| OperationResource::EvalCase { case }),
+        );
+
+        let mut runs = after
+            .eval_runs
+            .values()
+            .filter(|run| run.tenant_id == tenant_id)
+            .filter(|run| serialized_changed(before.eval_runs.get(&run.id), *run))
+            .cloned()
+            .collect::<Vec<_>>();
+        runs.sort_by(|left, right| left.id.cmp(&right.id));
+        resources.extend(
+            runs.into_iter()
+                .map(|run| OperationResource::EvalRun { run }),
+        );
+
+        let mut results = after
+            .eval_case_results
+            .values()
+            .filter(|result| result.tenant_id == tenant_id)
+            .filter(|result| serialized_changed(before.eval_case_results.get(&result.id), *result))
+            .cloned()
+            .collect::<Vec<_>>();
+        results.sort_by(|left, right| left.id.cmp(&right.id));
+        if !results.is_empty() {
+            resources.push(OperationResource::EvalCaseResults { results });
+        }
+
+        let mut overviews = after
+            .eval_overviews
+            .values()
+            .filter(|overview| overview.tenant_id == tenant_id)
+            .filter(|overview| {
+                serialized_changed(before.eval_overviews.get(&overview.run_id), *overview)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        overviews.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        resources.extend(
+            overviews
+                .into_iter()
+                .map(|overview| OperationResource::EvalOverview { overview }),
+        );
+    }
+
+    fn mutation_plan(&self, input: MutationPlanInput<'_>) -> Result<OperationPlan, ApiError> {
+        let MutationPlanInput {
+            tenant_id,
+            operation_kind,
+            owner_user_id,
+            idempotency_key,
+            primary_kind,
+            mut resources,
+            response_snapshot,
+            request_fingerprint,
+        } = input;
+        let resource_count = resources.len();
+        let primary_index = resources
+            .iter()
+            .position(|resource| primary_kind.matches(resource))
+            .ok_or_else(|| {
+                ApiError::Internal(format!(
+                    "mutation {operation_kind} did not produce its declared primary resource"
+                ))
+            })?;
+        let primary_resource = resources.remove(primary_index);
+        let idempotency_key_hash = idempotency_key.map(|key| self.resolver.idempotency_hash(key));
+        let target_owner_user_id_hash = owner_user_id.map(|owner| self.resolver.user_hash(owner));
+        let operation_id = idempotency_key_hash.as_deref().map_or_else(
+            || new_id("op"),
+            |hash| {
+                self.idempotent_operation_id(
+                    tenant_id,
+                    operation_kind,
+                    target_owner_user_id_hash.as_deref(),
+                    hash,
+                )
+            },
+        );
+        let actor = match request_context::current_principal() {
+            Some(principal) => {
+                let (scope, owner_user_id_hash) = match principal.scope {
+                    RequestPrincipalScope::Owner { owner_user_id_hash } => {
+                        (OperationActorScope::Owner, Some(owner_user_id_hash))
+                    }
+                    RequestPrincipalScope::TenantService => {
+                        (OperationActorScope::TenantService, None)
+                    }
+                    RequestPrincipalScope::Admin => (OperationActorScope::Admin, None),
+                };
+                OperationActor {
+                    scope,
+                    owner_user_id_hash,
+                    roles: principal.roles,
+                    request_id: request_context::current_id(),
+                }
+            }
+            None => OperationActor {
+                scope: OperationActorScope::System,
+                owner_user_id_hash: None,
+                roles: Vec::new(),
+                request_id: request_context::current_id(),
+            },
+        };
+        let created_at = now();
+        let wait_for_index = self.redaction_config.write_consistency
+            == WriteConsistency::WaitForIndex
+            || primary_kind.requires_index_confirmation();
+        Ok(OperationPlan {
+            schema_version: OPERATION_PLAN_SCHEMA_VERSION,
+            id: operation_id,
+            tenant_id: tenant_id.to_string(),
+            operation_kind: operation_kind.to_string(),
+            actor,
+            idempotency_key_hash,
+            primary: OperationStep {
+                id: "primary".to_string(),
+                role: OperationStepRole::Primary,
+                resource: primary_resource,
+            },
+            side_effects: resources
+                .into_iter()
+                .enumerate()
+                .map(|(index, resource)| OperationStep {
+                    id: format!("effect-{:04}", index + 1),
+                    role: OperationStepRole::SideEffect,
+                    resource,
+                })
+                .collect(),
+            redacted_metadata: json!({
+                "resource_count": resource_count,
+                "write_consistency": self.redaction_config.write_consistency.as_str(),
+                "wait_for_index": wait_for_index,
+                "request_fingerprint": request_fingerprint
+            }),
+            response_snapshot,
+            created_at,
+        })
+    }
+
+    fn idempotent_operation_id(
+        &self,
+        tenant_id: &str,
+        operation_kind: &str,
+        owner_user_id_hash: Option<&str>,
+        idempotency_key_hash: &str,
+    ) -> String {
+        let actor_scope = owner_user_id_hash
+            .map(|owner_hash| format!("owner\0{owner_hash}"))
+            .unwrap_or_else(|| "tenant_service".to_string());
+        format!(
+            "op_{}",
+            hmac_hex(
+                &self.redaction_config.index_hash_secret,
+                "operation-id-v1",
+                &format!("{tenant_id}\0{operation_kind}\0{actor_scope}\0{idempotency_key_hash}"),
+                32,
+            )
+        )
+    }
+
+    async fn persist_operation_checkpoint(&self, record: &OperationRecord) -> Result<(), ApiError> {
+        let receipt = self.repository.upsert_operation(record).await?;
+        if let Err(error) = self.repository.wait_for_tasks(&receipt.task_uids).await {
+            // Preserve an already confirmed local checkpoint. In particular,
+            // never publish a newly completed step locally when the journal
+            // task that records that completion failed. If this is the first
+            // checkpoint, retaining the pending immutable plan prevents a
+            // same-process retry from constructing a different plan under the
+            // deterministic operation ID without overstating durability.
+            self.write()?
+                .operations
+                .entry(record.id.clone())
+                .or_insert_with(|| record.clone());
+            return Err(error);
+        }
+        self.write()?
+            .operations
+            .insert(record.id.clone(), record.clone());
+        Ok(())
+    }
+
+    async fn record_operation_failure(
+        &self,
+        record: OperationRecord,
+        step_id: &str,
+        error: ApiError,
+    ) -> Result<OperationRecord, ApiError> {
+        let diagnostic = safe_cause_diagnostic(&error);
+        let failed = operation_step_failed(
+            &record,
+            step_id,
+            diagnostic.category,
+            diagnostic.fingerprint,
+            now(),
+        )
+        .map_err(|transition| {
+            ApiError::Internal(format!(
+                "invalid operation failure transition: {transition}"
+            ))
+        })?;
+        if let Err(checkpoint_error) = self.persist_operation_checkpoint(&failed).await {
+            let checkpoint_diagnostic = safe_cause_diagnostic(&checkpoint_error);
+            tracing::error!(
+                step_id,
+                cause_category = checkpoint_diagnostic.category,
+                cause_fingerprint = %checkpoint_diagnostic.fingerprint,
+                "failed to persist operation failure checkpoint"
+            );
+            // Preserve the explicit failure locally even when the journal
+            // checkpoint itself is unavailable, so the accepted primary is
+            // never reported back as an unqualified generic error.
+            self.write()?
+                .operations
+                .insert(failed.id.clone(), failed.clone());
+        }
+        Err(error)
+    }
+
+    async fn apply_operation_step_record(
+        &self,
+        mut record: OperationRecord,
+        step_id: &str,
+        wait_for_index: bool,
+        dynamic_registry: Option<&HashMap<String, UserEventIndex>>,
+    ) -> Result<OperationRecord, ApiError> {
+        self.validate_operation_routing(&record)?;
+        self.validate_operation_step_dynamic_membership(&record, step_id, dynamic_registry)?;
+        let step = std::iter::once(&record.plan.primary)
+            .chain(record.plan.side_effects.iter())
+            .find(|step| step.id == step_id)
+            .cloned()
+            .ok_or_else(|| ApiError::Internal(format!("operation step {step_id} is missing")))?;
+        let wait_for_index = wait_for_index
+            || matches!(
+                &step.resource,
+                OperationResource::EnsureUserEventIndex { .. }
+            );
+        let progress =
+            record.progress.steps.get(step_id).cloned().ok_or_else(|| {
+                ApiError::Internal(format!("operation step {step_id} is missing"))
+            })?;
+        if progress.status == OperationStepStatus::Completed {
+            return Ok(record);
+        }
+        if progress.status == OperationStepStatus::Submitted {
+            if !wait_for_index {
+                return Ok(record);
+            }
+            if let Err(error) = self.repository.wait_for_tasks(&progress.task_uids).await {
+                return self.record_operation_failure(record, step_id, error).await;
+            }
+            record = operation_step_completed(&record, step_id, now()).map_err(|error| {
+                ApiError::Internal(format!("invalid operation completion: {error}"))
+            })?;
+            self.persist_operation_checkpoint(&record).await?;
+            return Ok(record);
+        }
+        let receipt = match self
+            .repository
+            .apply_operation_step(&record.tenant_id, &step)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => return self.record_operation_failure(record, step_id, error).await,
+        };
+        record = if receipt.task_uids.is_empty() {
+            operation_step_completed(&record, step_id, now())
+        } else {
+            operation_step_accepted(&record, step_id, receipt.task_uids.clone(), now())
+        }
+        .map_err(|error| ApiError::Internal(format!("invalid operation transition: {error}")))?;
+        self.persist_operation_checkpoint(&record).await?;
+
+        if wait_for_index && !receipt.task_uids.is_empty() {
+            if let Err(error) = self.repository.wait_for_tasks(&receipt.task_uids).await {
+                return self.record_operation_failure(record, step_id, error).await;
+            }
+            record = operation_step_completed(&record, step_id, now()).map_err(|error| {
+                ApiError::Internal(format!("invalid operation completion: {error}"))
+            })?;
+            self.persist_operation_checkpoint(&record).await?;
+        }
+        Ok(record)
+    }
+
+    fn publish_operation_step_cache(
+        &self,
+        staged: &StoreData,
+        record: &OperationRecord,
+        step_id: &str,
+    ) -> Result<(), ApiError> {
+        let step = std::iter::once(&record.plan.primary)
+            .chain(record.plan.side_effects.iter())
+            .find(|step| step.id == step_id)
+            .ok_or_else(|| ApiError::Internal(format!("operation step {step_id} is missing")))?;
+        let mut current = self.write()?;
+        Self::publish_resource_cache(&mut current, staged, &record.tenant_id, &step.resource);
+        current.operations.insert(record.id.clone(), record.clone());
+        Ok(())
+    }
+
+    fn publish_operation_cache(
+        &self,
+        staged: &StoreData,
+        record: &OperationRecord,
+    ) -> Result<(), ApiError> {
+        let mut current = self.write()?;
+        for step in std::iter::once(&record.plan.primary).chain(record.plan.side_effects.iter()) {
+            Self::publish_resource_cache(&mut current, staged, &record.tenant_id, &step.resource);
+        }
+        current.operations.insert(record.id.clone(), record.clone());
+        Ok(())
+    }
+
+    /// Project one durably accepted operation resource into the live cache.
+    ///
+    /// The staged store is a planning snapshot and may be stale by the time a
+    /// repository write returns. Publishing the complete snapshot would both
+    /// erase concurrent read-through fills and expose side effects whose own
+    /// writes were never accepted. Each arm below therefore owns only the
+    /// cache keys represented by that operation resource.
+    fn publish_resource_cache(
+        current: &mut StoreData,
+        staged: &StoreData,
+        tenant_id: &str,
+        resource: &OperationResource,
+    ) {
+        match resource {
+            OperationResource::EnsureUserEventIndex { index } => {
+                current.user_indexes.insert(
+                    (index.tenant_id.clone(), index.owner_user_id_hash.clone()),
+                    index.clone(),
+                );
+                current
+                    .events_by_index
+                    .entry(index.event_index_uid.clone())
+                    .or_default();
+                current
+                    .personal_context
+                    .entry(index.personal_context_index_uid.clone())
+                    .or_default();
+            }
+            OperationResource::HistoryEvents { events } => {
+                let event_ids = events
+                    .iter()
+                    .map(|event| event.id.clone())
+                    .collect::<HashSet<_>>();
+                copy_idempotency_entries(
+                    &mut current.event_idempotency,
+                    &staged.event_idempotency,
+                    &event_ids,
+                );
+                for event in events {
+                    if let Some(hash) = &event.idempotency_key_hash {
+                        current.event_idempotency.insert(
+                            (event.event_index_uid.clone(), hash.clone()),
+                            event.id.clone(),
+                        );
+                    }
+                    let index_events = current
+                        .events_by_index
+                        .entry(event.event_index_uid.clone())
+                        .or_default();
+                    if let Some(existing) = index_events
+                        .iter_mut()
+                        .find(|existing| existing.id == event.id)
+                    {
+                        *existing = event.clone();
+                    } else {
+                        index_events.push(event.clone());
+                    }
+                    current.event_by_id.insert(event.id.clone(), event.clone());
+                }
+            }
+            OperationResource::ContextNodes { index_uid, nodes } => {
+                if index_uid == "rag_company_context" {
+                    upsert_context_nodes(&mut current.company_context, nodes.clone());
+                } else {
+                    upsert_context_nodes(
+                        current
+                            .personal_context
+                            .entry(index_uid.clone())
+                            .or_default(),
+                        nodes.clone(),
+                    );
+                }
+            }
+            OperationResource::StateItem { item } => {
+                let key = (
+                    item.tenant_id.clone(),
+                    item.owner_user_id.clone(),
+                    item.natural_key.clone(),
+                );
+                if current
+                    .state_items
+                    .get(&key)
+                    .is_none_or(|existing| existing.updated_at <= item.updated_at)
+                {
+                    current.state_items.insert(key, item.clone());
+                }
+            }
+            OperationResource::Insight { insight } => {
+                let insight_ids = HashSet::from([insight.id.clone()]);
+                copy_idempotency_entries(
+                    &mut current.insight_idempotency,
+                    &staged.insight_idempotency,
+                    &insight_ids,
+                );
+                if current
+                    .insights
+                    .get(&insight.id)
+                    .is_none_or(|existing| existing.updated_at <= insight.updated_at)
+                {
+                    current.insights.insert(insight.id.clone(), insight.clone());
+                }
+            }
+            OperationResource::CompanySource { source } => {
+                current.sources.insert(source.id.clone(), source.clone());
+            }
+            OperationResource::SourceRevision { revision } => {
+                let revisions = current
+                    .source_revisions
+                    .entry(revision.source_id.clone())
+                    .or_default();
+                if let Some(existing) = revisions
+                    .iter_mut()
+                    .find(|existing| existing.id == revision.id)
+                {
+                    *existing = revision.clone();
+                } else {
+                    revisions.push(revision.clone());
+                }
+                revisions.sort_by_key(|revision| revision.created_at);
+            }
+            OperationResource::DeleteCompanySourceIndex { source_id, target } => match target {
+                CompanySourceDeleteTarget::Fragments => {
+                    current.company_context.retain(|node| {
+                        node.tenant_id != tenant_id || node.source_id.as_deref() != Some(source_id)
+                    });
+                }
+                CompanySourceDeleteTarget::Revisions => {
+                    let remove_entry =
+                        if let Some(revisions) = current.source_revisions.get_mut(source_id) {
+                            revisions.retain(|revision| revision.tenant_id != tenant_id);
+                            revisions.is_empty()
+                        } else {
+                            false
+                        };
+                    if remove_entry {
+                        current.source_revisions.remove(source_id);
+                    }
+                }
+                CompanySourceDeleteTarget::Source => {
+                    if current
+                        .sources
+                        .get(source_id)
+                        .is_some_and(|source| source.tenant_id == tenant_id)
+                    {
+                        current.sources.remove(source_id);
+                    }
+                }
+                CompanySourceDeleteTarget::SourceDocuments => {
+                    let removed_document_uris = current
+                        .source_documents
+                        .values()
+                        .filter(|document| {
+                            document.tenant_id == tenant_id
+                                && document.owner_user_id.is_none()
+                                && document.source_id == *source_id
+                        })
+                        .map(|document| document.uri.clone())
+                        .collect::<HashSet<_>>();
+                    current.source_documents.retain(|_, document| {
+                        document.tenant_id != tenant_id
+                            || document.owner_user_id.is_some()
+                            || document.source_id != *source_id
+                    });
+                    current.parsed_blocks.retain(|key, _| {
+                        key.tenant_id != tenant_id
+                            || key.owner_user_id.is_some()
+                            || !removed_document_uris.contains(&key.uri)
+                    });
+                }
+                CompanySourceDeleteTarget::ParseArtifacts => {
+                    current.parse_artifacts.retain(|_, artifact| {
+                        artifact.tenant_id != tenant_id
+                            || artifact.owner_user_id.is_some()
+                            || artifact.source_id != *source_id
+                    });
+                }
+                CompanySourceDeleteTarget::IngestTasks => {
+                    current.ingest_tasks.retain(|_, task| {
+                        task.tenant_id != tenant_id
+                            || task.owner_user_id.is_some()
+                            || task.source_id != *source_id
+                    });
+                }
+                CompanySourceDeleteTarget::IngestResults => {
+                    current.ingest_results.retain(|_, result| {
+                        result.task.tenant_id != tenant_id
+                            || result.task.owner_user_id.is_some()
+                            || result.source_id != *source_id
+                    });
+                }
+                CompanySourceDeleteTarget::Links { link_ids, .. } => {
+                    let link_ids = link_ids.iter().collect::<HashSet<_>>();
+                    current.links.retain(|link_id, link| {
+                        link.tenant_id != tenant_id || !link_ids.contains(link_id)
+                    });
+                    current
+                        .link_idempotency
+                        .retain(|_, link_id| !link_ids.contains(link_id));
+                }
+            },
+            OperationResource::SourceDocuments { documents } => {
+                for document in documents {
+                    upsert_source_document_cache(current, document.clone());
+                }
+            }
+            OperationResource::ParseArtifacts { artifacts } => {
+                for artifact in artifacts {
+                    current
+                        .parse_artifacts
+                        .insert(ParseArtifactKey::from_artifact(artifact), artifact.clone());
+                }
+            }
+            OperationResource::StructuredSnapshot { snapshot } => {
+                let snapshot_ids = HashSet::from([snapshot.id.clone()]);
+                copy_idempotency_entries(
+                    &mut current.snapshot_idempotency,
+                    &staged.snapshot_idempotency,
+                    &snapshot_ids,
+                );
+                current
+                    .snapshots
+                    .insert(snapshot.id.clone(), snapshot.clone());
+            }
+            OperationResource::Dataset { dataset } => {
+                current
+                    .datasets
+                    .insert(dataset.dataset_key.clone(), dataset.clone());
+            }
+            OperationResource::StructuredRows { rows } => {
+                for row in rows {
+                    let Some(snapshot_id) = row.get("snapshot_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let row_id = row.get("id").and_then(Value::as_str);
+                    let cached_rows = current
+                        .rows_by_snapshot
+                        .entry(snapshot_id.to_string())
+                        .or_default();
+                    if let Some(row_id) = row_id {
+                        if let Some(existing) = cached_rows.iter_mut().find(|existing| {
+                            existing.get("id").and_then(Value::as_str) == Some(row_id)
+                        }) {
+                            *existing = row.clone();
+                        } else {
+                            cached_rows.push(row.clone());
+                        }
+                        current
+                            .row_idempotency
+                            .insert((snapshot_id.to_string(), row_id.to_string()));
+                    } else if !cached_rows.contains(row) {
+                        cached_rows.push(row.clone());
+                    }
+                }
+            }
+            OperationResource::StructuredSummary { summary } => {
+                if let Some(id) = summary.get("id").and_then(Value::as_str) {
+                    current
+                        .structured_summaries
+                        .insert(id.to_string(), summary.clone());
+                }
+            }
+            OperationResource::Session { session } => {
+                current.sessions.insert(session.id.clone(), session.clone());
+            }
+            OperationResource::Trace { trace } => {
+                current
+                    .traces
+                    .entry(trace.id.clone())
+                    .or_insert_with(|| trace.clone());
+            }
+            OperationResource::Links { links } => {
+                let link_ids = links
+                    .iter()
+                    .map(|link| link.id.clone())
+                    .collect::<HashSet<_>>();
+                copy_idempotency_entries(
+                    &mut current.link_idempotency,
+                    &staged.link_idempotency,
+                    &link_ids,
+                );
+                for link in links {
+                    if current
+                        .links
+                        .get(&link.id)
+                        .is_none_or(|existing| existing.updated_at <= link.updated_at)
+                    {
+                        current.links.insert(link.id.clone(), link.clone());
+                    }
+                }
+            }
+            OperationResource::HarnessComponents {
+                components,
+                revisions,
+            } => {
+                current.harness_components.extend(
+                    components
+                        .iter()
+                        .cloned()
+                        .map(|component| (component.id.clone(), component)),
+                );
+                for revision in revisions {
+                    let component_revisions = current
+                        .harness_revisions
+                        .entry(revision.component_id.clone())
+                        .or_default();
+                    if let Some(existing) = component_revisions
+                        .iter_mut()
+                        .find(|existing| existing.id == revision.id)
+                    {
+                        *existing = revision.clone();
+                    } else {
+                        component_revisions.push(revision.clone());
+                    }
+                    component_revisions.sort_by_key(|revision| revision.iteration);
+                }
+            }
+            OperationResource::HarnessChanges { changes } => {
+                current.harness_changes.extend(
+                    changes
+                        .iter()
+                        .cloned()
+                        .map(|change| (change.id.clone(), change)),
+                );
+            }
+            OperationResource::HarnessVerdicts { verdicts } => {
+                current.harness_verdicts.extend(
+                    verdicts
+                        .iter()
+                        .cloned()
+                        .map(|verdict| (verdict.id.clone(), verdict)),
+                );
+            }
+            OperationResource::IngestTask { task } => {
+                upsert_ingest_task_cache(current, task.clone());
+            }
+            OperationResource::IngestTasks { tasks } => {
+                for task in tasks {
+                    upsert_ingest_task_cache(current, task.clone());
+                }
+            }
+            OperationResource::DeleteIngestTasks { task_ids } => {
+                for task_id in task_ids {
+                    current.ingest_tasks.remove(task_id);
+                    if let Some(result) = current.ingest_results.remove(task_id) {
+                        current.parsed_blocks.remove(&SourceDocumentKey::new(
+                            &result.task.tenant_id,
+                            result.task.owner_user_id.as_deref(),
+                            &result.source_document_uri,
+                        ));
+                    }
+                }
+            }
+            OperationResource::IngestResult { result } => {
+                let should_replace = current
+                    .ingest_results
+                    .get(&result.task.task_id)
+                    .is_none_or(|existing| existing.task.updated_at <= result.task.updated_at);
+                if should_replace {
+                    current.parsed_blocks.insert(
+                        SourceDocumentKey::new(
+                            &result.task.tenant_id,
+                            result.task.owner_user_id.as_deref(),
+                            &result.source_document_uri,
+                        ),
+                        result.parsed_blocks.clone(),
+                    );
+                    current
+                        .ingest_results
+                        .insert(result.task.task_id.clone(), result.clone());
+                }
+            }
+            OperationResource::EvalCase { case } => {
+                current.eval_cases.insert(case.id.clone(), case.clone());
+            }
+            OperationResource::EvalRun { run } => {
+                current.eval_runs.insert(run.id.clone(), run.clone());
+            }
+            OperationResource::EvalCaseResults { results } => {
+                current.eval_case_results.extend(
+                    results
+                        .iter()
+                        .cloned()
+                        .map(|result| (result.id.clone(), result)),
+                );
+            }
+            OperationResource::EvalOverview { overview } => {
+                current
+                    .eval_overviews
+                    .insert(overview.run_id.clone(), overview.clone());
+            }
+        }
+    }
+
+    fn operation_primary_was_accepted(record: &OperationRecord) -> bool {
+        record
+            .progress
+            .steps
+            .get(&record.plan.primary.id)
+            .is_some_and(|progress| {
+                matches!(
+                    progress.status,
+                    OperationStepStatus::Submitted | OperationStepStatus::Completed
+                )
+            })
+    }
+
+    fn operation_primary_response_was_exposed(record: &OperationRecord) -> bool {
+        record
+            .plan
+            .redacted_metadata
+            .get("wait_for_index")
+            .and_then(Value::as_bool)
+            == Some(false)
+            && record
+                .progress
+                .steps
+                .get(&record.plan.primary.id)
+                .is_some_and(|progress| {
+                    !progress.task_uids.is_empty()
+                        || progress.status == OperationStepStatus::Completed
+                })
+    }
+
+    fn replay_operation_response<R>(record: &OperationRecord) -> Result<R, ApiError>
+    where
+        R: DeserializeOwned,
+    {
+        if record.plan.response_snapshot.is_null() {
+            return Err(ApiError::conflict(
+                "the existing operation predates idempotent response replay",
+            ));
+        }
+        let mut snapshot = record.plan.response_snapshot.clone();
+        if let Value::Object(fields) = &mut snapshot {
+            if fields.contains_key("duplicate") {
+                fields.insert("duplicate".to_string(), Value::Bool(true));
+            }
+        }
+        serde_json::from_value(snapshot).map_err(|error| {
+            ApiError::Internal(format!(
+                "operation {} contains an invalid response snapshot: {error}",
+                record.id
+            ))
+        })
+    }
+
+    async fn replay_existing_operation<R>(
+        &self,
+        operation: OperationRecord,
+        expose_partial_persistence: bool,
+    ) -> Result<(R, Option<PersistenceMetadata>), ApiError>
+    where
+        R: DeserializeOwned,
+    {
+        let operation_id = operation.id.clone();
+        // A RYW response may already have been returned while its accepted
+        // backend task was still pending. Preserve that historical commit
+        // boundary even if confirmation now transitions the step to failed.
+        let primary_response_was_exposed = Self::operation_primary_response_was_exposed(&operation);
+        let operation = match self.reconcile_operation_record(operation).await {
+            Ok(operation) => operation,
+            Err(error) => {
+                let latest = self.read()?.operations.get(&operation_id).cloned();
+                match latest {
+                    Some(latest)
+                        if expose_partial_persistence
+                            && (primary_response_was_exposed
+                                || Self::operation_primary_response_was_exposed(&latest)
+                                || Self::operation_primary_was_accepted(&latest)) =>
+                    {
+                        latest
+                    }
+                    _ => return Err(error),
+                }
+            }
+        };
+        let response = Self::replay_operation_response(&operation)?;
+        Ok((response, Some(persistence_metadata(&operation))))
+    }
+
+    async fn execute_staged_mutation<R, F>(
+        &self,
+        tenant_id: &str,
+        operation_kind: &str,
+        owner_user_id: Option<&str>,
+        idempotency_key: Option<&str>,
+        primary_kind: MutationPrimary,
+        mutate: F,
+    ) -> Result<(R, Option<PersistenceMetadata>), ApiError>
+    where
+        R: Serialize + DeserializeOwned,
+        F: FnOnce(&Store) -> Result<R, ApiError>,
+    {
+        self.execute_staged_mutation_with_idempotency(
+            tenant_id,
+            operation_kind,
+            owner_user_id,
+            MutationIdempotency {
+                key: idempotency_key,
+                request_fingerprint: None,
+            },
+            primary_kind,
+            mutate,
+        )
+        .await
+    }
+
+    async fn execute_staged_mutation_with_idempotency<R, F>(
+        &self,
+        tenant_id: &str,
+        operation_kind: &str,
+        owner_user_id: Option<&str>,
+        idempotency: MutationIdempotency<'_>,
+        primary_kind: MutationPrimary,
+        mutate: F,
+    ) -> Result<(R, Option<PersistenceMetadata>), ApiError>
+    where
+        R: Serialize + DeserializeOwned,
+        F: FnOnce(&Store) -> Result<R, ApiError>,
+    {
+        let _mutation_guard = self.mutation_gate.lock().await;
+        self.execute_staged_mutation_guarded(
+            tenant_id,
+            operation_kind,
+            owner_user_id,
+            idempotency,
+            primary_kind,
+            mutate,
+        )
+        .await
+    }
+
+    fn ensure_operation_request_matches(
+        operation: &OperationRecord,
+        expected_fingerprint: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let Some(expected_fingerprint) = expected_fingerprint else {
+            return Ok(());
+        };
+        let actual_fingerprint = operation
+            .plan
+            .redacted_metadata
+            .get("request_fingerprint")
+            .and_then(Value::as_str);
+        if actual_fingerprint != Some(expected_fingerprint) {
+            return Err(ApiError::conflict(
+                "idempotency key was already used for a different request",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn execute_staged_mutation_guarded<R, F>(
+        &self,
+        tenant_id: &str,
+        operation_kind: &str,
+        owner_user_id: Option<&str>,
+        idempotency: MutationIdempotency<'_>,
+        primary_kind: MutationPrimary,
+        mutate: F,
+    ) -> Result<(R, Option<PersistenceMetadata>), ApiError>
+    where
+        R: Serialize + DeserializeOwned,
+        F: FnOnce(&Store) -> Result<R, ApiError>,
+    {
+        let MutationIdempotency {
+            key: idempotency_key,
+            request_fingerprint,
+        } = idempotency;
+        if let Some(idempotency_key) = idempotency_key {
+            let idempotency_key_hash = self.resolver.idempotency_hash(idempotency_key);
+            let owner_user_id_hash = owner_user_id.map(|owner| self.resolver.user_hash(owner));
+            let operation_id = self.idempotent_operation_id(
+                tenant_id,
+                operation_kind,
+                owner_user_id_hash.as_deref(),
+                &idempotency_key_hash,
+            );
+            let existing_local = { self.read()?.operations.get(&operation_id).cloned() };
+            let existing = match existing_local {
+                Some(existing) => Some(existing),
+                None => {
+                    self.repository
+                        .get_operation(tenant_id, &operation_id)
+                        .await?
+                }
+            };
+            if let Some(existing) = existing {
+                Self::ensure_operation_request_matches(&existing, request_fingerprint)?;
+                return self
+                    .replay_existing_operation(existing, primary_kind.exposes_partial_persistence())
+                    .await;
+            }
+        }
+
+        let staged = self.staged_copy()?;
+        let before = staged.read()?.clone();
+        let response = mutate(&staged)?;
+        let after = staged.read()?.clone();
+        let resources = self.mutation_resources(tenant_id, &before, &after);
+        if resources.is_empty() {
+            return Ok((response, None));
+        }
+
+        let response_snapshot = match idempotency_key {
+            Some(_) => serde_json::to_value(&response).map_err(|error| {
+                ApiError::Internal(format!("failed to snapshot mutation response: {error}"))
+            })?,
+            None => Value::Null,
+        };
+        let plan = self.mutation_plan(MutationPlanInput {
+            tenant_id,
+            operation_kind,
+            owner_user_id,
+            idempotency_key,
+            primary_kind,
+            resources,
+            response_snapshot,
+            request_fingerprint,
+        })?;
+        let existing_local = { self.read()?.operations.get(&plan.id).cloned() };
+        let existing = if existing_local.is_some() {
+            existing_local
+        } else {
+            self.repository.get_operation(tenant_id, &plan.id).await?
+        };
+        if let Some(existing) = existing {
+            Self::ensure_operation_request_matches(&existing, request_fingerprint)?;
+            return self
+                .replay_existing_operation(existing, primary_kind.exposes_partial_persistence())
+                .await;
+        }
+
+        let mut record = operation_record_from_plan(plan)
+            .map_err(|error| ApiError::Internal(format!("invalid mutation plan: {error}")))?;
+        self.persist_operation_checkpoint(&record).await?;
+        let wait_for_index = self.redaction_config.write_consistency
+            == WriteConsistency::WaitForIndex
+            || primary_kind.requires_index_confirmation();
+        let buffer_publication =
+            wait_for_index && !matches!(primary_kind, MutationPrimary::DeleteCompanySource);
+        let mut dynamic_registry = self.current_user_index_registry(tenant_id)?;
+        let primary_step_id = record.plan.primary.id.clone();
+        record = match self
+            .apply_operation_step_record(
+                record.clone(),
+                &primary_step_id,
+                wait_for_index,
+                Some(&dynamic_registry),
+            )
+            .await
+        {
+            Ok(record) => record,
+            Err(error) => return Err(error),
+        };
+        Self::record_completed_registry_step(&record, &primary_step_id, &mut dynamic_registry)?;
+        if !buffer_publication {
+            self.publish_operation_step_cache(&after, &record, &primary_step_id)?;
+        }
+
+        let side_effect_ids = record
+            .plan
+            .side_effects
+            .iter()
+            .map(|step| step.id.clone())
+            .collect::<Vec<_>>();
+        for step_id in side_effect_ids {
+            match self
+                .apply_operation_step_record(
+                    record.clone(),
+                    &step_id,
+                    wait_for_index,
+                    Some(&dynamic_registry),
+                )
+                .await
+            {
+                Ok(updated) => {
+                    record = updated;
+                    Self::record_completed_registry_step(&record, &step_id, &mut dynamic_registry)?;
+                    if !buffer_publication {
+                        self.publish_operation_step_cache(&after, &record, &step_id)?;
+                    }
+                }
+                Err(error) => {
+                    let latest = self
+                        .read()?
+                        .operations
+                        .get(&record.id)
+                        .cloned()
+                        .unwrap_or_else(|| record.clone());
+                    if primary_kind.exposes_partial_persistence()
+                        && Self::operation_primary_was_accepted(&latest)
+                    {
+                        return Ok((response, Some(persistence_metadata(&latest))));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if buffer_publication {
+            self.publish_operation_cache(&after, &record)?;
+        }
+        Ok((response, Some(persistence_metadata(&record))))
+    }
+
+    /// Journal a repository write whose desired resource already matches the
+    /// cache, such as an explicit settings reapplication. These writes have
+    /// no staged StoreData delta, but they still require the same durable
+    /// operation record and task tracking as ordinary mutations.
+    async fn execute_explicit_resource_operation(
+        &self,
+        tenant_id: &str,
+        operation_kind: &str,
+        owner_user_id: Option<&str>,
+        primary_kind: MutationPrimary,
+        resource: OperationResource,
+    ) -> Result<PersistenceMetadata, ApiError> {
+        let _mutation_guard = self.mutation_gate.lock().await;
+        let cache_projection = self.read()?.clone();
+        let plan = self.mutation_plan(MutationPlanInput {
+            tenant_id,
+            operation_kind,
+            owner_user_id,
+            idempotency_key: None,
+            primary_kind,
+            resources: vec![resource],
+            response_snapshot: Value::Null,
+            request_fingerprint: None,
+        })?;
+        let mut record = operation_record_from_plan(plan)
+            .map_err(|error| ApiError::Internal(format!("invalid mutation plan: {error}")))?;
+        self.persist_operation_checkpoint(&record).await?;
+        let primary_step_id = record.plan.primary.id.clone();
+        let wait_for_index =
+            self.redaction_config.write_consistency == WriteConsistency::WaitForIndex;
+        record = self
+            .apply_operation_step_record(record, &primary_step_id, wait_for_index, None)
+            .await?;
+        self.publish_operation_step_cache(&cache_projection, &record, &primary_step_id)?;
+        Ok(persistence_metadata(&record))
     }
 
     /// Acquire the vector matcher.
@@ -496,6 +2602,644 @@ impl Store {
             .unwrap_or(false)
     }
 
+    fn validate_operation_routing(&self, record: &OperationRecord) -> Result<(), ApiError> {
+        validate_operation_record(record).map_err(|error| {
+            ApiError::Internal(format!("invalid persisted operation record: {error}"))
+        })?;
+        let tenant_hash = self.resolver.tenant_hash(&record.tenant_id);
+        for step in std::iter::once(&record.plan.primary).chain(record.plan.side_effects.iter()) {
+            match &step.resource {
+                OperationResource::EnsureUserEventIndex { index } => {
+                    let expected_id = user_event_index_id(&tenant_hash, &index.owner_user_id_hash);
+                    let expected_event_uid = format!(
+                        "rag_events__t_{tenant_hash}__u_{}",
+                        index.owner_user_id_hash
+                    );
+                    let expected_context_uid = format!(
+                        "rag_context__t_{tenant_hash}__u_{}",
+                        index.owner_user_id_hash
+                    );
+                    if index.tenant_id != record.tenant_id
+                        || index.tenant_hash != tenant_hash
+                        || index.id != expected_id
+                        || index.event_index_uid != expected_event_uid
+                        || index.personal_context_index_uid != expected_context_uid
+                        || index.schema_version != EVENT_INDEX_SCHEMA_VERSION
+                        || index.settings_hash != EVENT_SETTINGS_HASH
+                        || index.status != "active"
+                    {
+                        return Err(ApiError::Internal(
+                            "persisted operation contains an invalid user-index route".to_string(),
+                        ));
+                    }
+                }
+                OperationResource::HistoryEvents { events } => {
+                    for event in events {
+                        let routing = self.resolver.resolve(
+                            &record.tenant_id,
+                            &event.owner_user_id,
+                            false,
+                            true,
+                        )?;
+                        if event.tenant_id != record.tenant_id
+                            || event.owner_user_id_hash != routing.owner_user_id_hash
+                            || event.event_index_uid != routing.event_index_uid
+                            || event.event_index_schema_version != EVENT_INDEX_SCHEMA_VERSION
+                        {
+                            return Err(ApiError::Internal(
+                                "persisted operation contains an invalid history-event route"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                OperationResource::ContextNodes { index_uid, nodes } => {
+                    for node in nodes {
+                        if node.tenant_id != record.tenant_id || node.index_uid != *index_uid {
+                            return Err(ApiError::Internal(
+                                "persisted operation contains an invalid context route".to_string(),
+                            ));
+                        }
+                        match node.owner_user_id.as_deref() {
+                            Some(owner) => {
+                                let routing =
+                                    self.resolver
+                                        .resolve(&record.tenant_id, owner, false, true)?;
+                                if *index_uid != routing.personal_context_index_uid
+                                    || node.index_kind != "personal"
+                                    || node.privacy != "private"
+                                {
+                                    return Err(ApiError::Internal(
+                                        "persisted operation contains an invalid personal-context route"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                            None => {
+                                if index_uid != "rag_company_context"
+                                    || node.index_kind != "company"
+                                    || node.privacy != "company"
+                                {
+                                    return Err(ApiError::Internal(
+                                        "persisted operation contains an invalid company-context route"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_operation_step_dynamic_membership(
+        &self,
+        record: &OperationRecord,
+        step_id: &str,
+        dynamic_registry: Option<&HashMap<String, UserEventIndex>>,
+    ) -> Result<(), ApiError> {
+        let step = std::iter::once(&record.plan.primary)
+            .chain(record.plan.side_effects.iter())
+            .find(|step| step.id == step_id)
+            .ok_or_else(|| ApiError::Internal(format!("operation step {step_id} is missing")))?;
+        let mut requirements = Vec::new();
+        match &step.resource {
+            OperationResource::EnsureUserEventIndex { index } => {
+                let progress = record.progress.steps.get(step_id).ok_or_else(|| {
+                    ApiError::Internal(format!("operation step {step_id} is missing"))
+                })?;
+                if progress.status != OperationStepStatus::Completed {
+                    return Ok(());
+                }
+                requirements.push((
+                    index.owner_user_id_hash.clone(),
+                    Some(index.event_index_uid.clone()),
+                    Some(index.personal_context_index_uid.clone()),
+                    Some(index),
+                ));
+            }
+            OperationResource::HistoryEvents { events } => {
+                for event in events {
+                    requirements.push((
+                        event.owner_user_id_hash.clone(),
+                        Some(event.event_index_uid.clone()),
+                        None,
+                        None,
+                    ));
+                }
+            }
+            OperationResource::ContextNodes { index_uid, nodes } => {
+                for node in nodes {
+                    if let Some(owner_user_id) = node.owner_user_id.as_deref() {
+                        let owner_hash = self.resolver.user_hash(owner_user_id);
+                        requirements.push((owner_hash, None, Some(index_uid.clone()), None));
+                    }
+                }
+            }
+            _ => return Ok(()),
+        }
+        if requirements.is_empty() {
+            return Ok(());
+        }
+
+        let live_registry = if dynamic_registry.is_none() {
+            Some(self.read()?)
+        } else {
+            None
+        };
+        for (owner_hash, event_uid, context_uid, exact_index) in requirements {
+            let index = match dynamic_registry {
+                Some(registry) => registry.get(&owner_hash),
+                None => live_registry.as_ref().and_then(|data| {
+                    data.user_indexes
+                        .get(&(record.tenant_id.clone(), owner_hash.clone()))
+                }),
+            };
+            let Some(index) = index else {
+                return Err(ApiError::Internal(
+                    "persisted operation references an unregistered dynamic index".to_string(),
+                ));
+            };
+            if index.tenant_id != record.tenant_id
+                || index.owner_user_id_hash != owner_hash
+                || index.status != "active"
+                || index.schema_version != EVENT_INDEX_SCHEMA_VERSION
+                || index.settings_hash != EVENT_SETTINGS_HASH
+                || event_uid
+                    .as_deref()
+                    .is_some_and(|uid| index.event_index_uid != uid)
+                || context_uid
+                    .as_deref()
+                    .is_some_and(|uid| index.personal_context_index_uid != uid)
+                || exact_index
+                    .is_some_and(|expected| !Self::same_user_index_identity(index, expected))
+            {
+                return Err(ApiError::Internal(
+                    "persisted operation dynamic index is not in the reconciled registry"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn current_user_index_registry(
+        &self,
+        tenant_id: &str,
+    ) -> Result<HashMap<String, UserEventIndex>, ApiError> {
+        Ok(self
+            .read()?
+            .user_indexes
+            .values()
+            .filter(|index| index.tenant_id == tenant_id)
+            .cloned()
+            .map(|index| (index.owner_user_id_hash.clone(), index))
+            .collect())
+    }
+
+    async fn reconcile_operation_record(
+        &self,
+        record: OperationRecord,
+    ) -> Result<OperationRecord, ApiError> {
+        let mut registry = self.current_user_index_registry(&record.tenant_id)?;
+        self.reconcile_operation_record_with_startup_registry(record, Some(&mut registry))
+            .await
+    }
+
+    async fn reconcile_operation_record_with_startup_registry(
+        &self,
+        mut record: OperationRecord,
+        mut startup_registry: Option<&mut HashMap<String, UserEventIndex>>,
+    ) -> Result<OperationRecord, ApiError> {
+        let cache_projection = self.read()?.clone();
+        let buffer_publication = record
+            .plan
+            .redacted_metadata
+            .get("wait_for_index")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && !matches!(
+                &record.plan.primary.resource,
+                OperationResource::DeleteCompanySourceIndex { .. }
+            );
+        let primary_id = record.plan.primary.id.clone();
+        record = self
+            .apply_operation_step_record(record, &primary_id, true, startup_registry.as_deref())
+            .await?;
+        if let Some(registry) = startup_registry.as_deref_mut() {
+            Self::record_completed_registry_step(&record, &primary_id, registry)?;
+        }
+        if !buffer_publication {
+            self.publish_operation_step_cache(&cache_projection, &record, &primary_id)?;
+        }
+        let side_effect_ids = record
+            .plan
+            .side_effects
+            .iter()
+            .map(|step| step.id.clone())
+            .collect::<Vec<_>>();
+        for step_id in side_effect_ids {
+            record = self
+                .apply_operation_step_record(record, &step_id, true, startup_registry.as_deref())
+                .await?;
+            if let Some(registry) = startup_registry.as_deref_mut() {
+                Self::record_completed_registry_step(&record, &step_id, registry)?;
+            }
+            if !buffer_publication {
+                self.publish_operation_step_cache(&cache_projection, &record, &step_id)?;
+            }
+        }
+        if buffer_publication {
+            self.publish_operation_cache(&cache_projection, &record)?;
+        }
+        Ok(record)
+    }
+
+    fn record_completed_registry_step(
+        record: &OperationRecord,
+        step_id: &str,
+        registry: &mut HashMap<String, UserEventIndex>,
+    ) -> Result<(), ApiError> {
+        let progress =
+            record.progress.steps.get(step_id).ok_or_else(|| {
+                ApiError::Internal(format!("operation step {step_id} is missing"))
+            })?;
+        if progress.status != OperationStepStatus::Completed {
+            return Ok(());
+        }
+        let step = std::iter::once(&record.plan.primary)
+            .chain(record.plan.side_effects.iter())
+            .find(|step| step.id == step_id)
+            .ok_or_else(|| ApiError::Internal(format!("operation step {step_id} is missing")))?;
+        if let OperationResource::EnsureUserEventIndex { index } = &step.resource {
+            registry.insert(index.owner_user_id_hash.clone(), index.clone());
+        }
+        Ok(())
+    }
+
+    async fn reconcile_repository_operations_startup(
+        &self,
+        tenant_id: &str,
+        startup_registry: &mut HashMap<String, UserEventIndex>,
+    ) -> Result<(), ApiError> {
+        loop {
+            let mut operations = self
+                .repository
+                .list_oldest_reconcilable_operations(
+                    tenant_id,
+                    &[],
+                    OPERATION_STARTUP_RECONCILE_BATCH_SIZE,
+                )
+                .await?
+                .ok_or_else(|| {
+                    ApiError::Internal(
+                        "operation journal is unavailable for the configured backend".to_string(),
+                    )
+                })?;
+            if operations.is_empty() {
+                return Ok(());
+            }
+            if operations.len() > OPERATION_STARTUP_RECONCILE_BATCH_SIZE {
+                return Err(ApiError::Internal(
+                    "operation journal returned more startup candidates than requested".to_string(),
+                ));
+            }
+            operations.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            for operation in operations {
+                if operation.tenant_id != tenant_id {
+                    return Err(ApiError::Internal(
+                        "operation journal returned a cross-tenant record".to_string(),
+                    ));
+                }
+                validate_operation_record(&operation).map_err(|error| {
+                    ApiError::Internal(format!(
+                        "operation journal returned an invalid record: {error}"
+                    ))
+                })?;
+                if operation.status == OperationStatus::Completed
+                    && operation.indexing_state == OperationIndexingState::Completed
+                {
+                    return Err(ApiError::Internal(
+                        "operation journal returned a completed startup candidate".to_string(),
+                    ));
+                }
+                self.reconcile_operation_record_with_startup_registry(
+                    operation,
+                    Some(&mut *startup_registry),
+                )
+                .await?;
+            }
+        }
+    }
+
+    pub async fn list_operations(
+        &self,
+        tenant_id: &str,
+        req: OperationListRequest,
+    ) -> Result<OperationListResponse, ApiError> {
+        if req.limit == 0 || req.limit > 500 {
+            return Err(ApiError::bad_request("limit must be between 1 and 500"));
+        }
+        let cursor = decode_operation_list_cursor(
+            &self.redaction_config.index_hash_secret,
+            tenant_id,
+            &req.statuses,
+            &req.operation_kinds,
+            req.cursor.as_deref(),
+        )?;
+        let offset = cursor.as_ref().map_or(0, |cursor| cursor.offset);
+        let previous_operation_id = cursor
+            .as_ref()
+            .map(|cursor| cursor.previous_operation_id.as_str());
+
+        if let Some(page) = self
+            .repository
+            .list_operation_page(RepositoryOperationListQuery {
+                tenant_id,
+                statuses: &req.statuses,
+                operation_kinds: &req.operation_kinds,
+                offset,
+                previous_operation_id,
+                limit: req.limit,
+                include_plan: req.include_plan,
+            })
+            .await?
+        {
+            if page.operations.iter().any(|operation| {
+                operation.summary.tenant_id != tenant_id
+                    || (!req.statuses.is_empty()
+                        && !req.statuses.contains(&operation.summary.status))
+                    || (!req.operation_kinds.is_empty()
+                        && !req
+                            .operation_kinds
+                            .contains(&operation.summary.operation_kind))
+                    || operation.plan.is_some() != req.include_plan
+            }) {
+                return Err(ApiError::Internal(
+                    "operation repository returned a record outside the requested page scope"
+                        .to_string(),
+                ));
+            }
+            let next_cursor = if page.has_more {
+                let last = page.operations.last().ok_or_else(|| {
+                    ApiError::Internal(
+                        "operation repository returned an empty page with more results".to_string(),
+                    )
+                })?;
+                let next_offset = offset
+                    .checked_add(page.operations.len())
+                    .ok_or_else(|| ApiError::bad_request("cursor is invalid or stale"))?;
+                Some(encode_operation_list_cursor(
+                    &self.redaction_config.index_hash_secret,
+                    tenant_id,
+                    &req.statuses,
+                    &req.operation_kinds,
+                    next_offset,
+                    &last.summary.id,
+                )?)
+            } else {
+                None
+            };
+            return Ok(OperationListResponse {
+                operations: page.operations,
+                next_cursor,
+            });
+        }
+
+        let repository_operations = self
+            .repository
+            .list_operations(tenant_id, &req.statuses)
+            .await?;
+        let mut operations = match repository_operations {
+            Some(operations) => operations,
+            None => self.read()?.operations.values().cloned().collect(),
+        };
+        operations.retain(|operation| operation.tenant_id == tenant_id);
+        operations.retain(|operation| {
+            req.statuses.is_empty() || req.statuses.contains(&operation.status)
+        });
+        operations.retain(|operation| {
+            req.operation_kinds.is_empty()
+                || req.operation_kinds.contains(&operation.operation_kind)
+        });
+        operations.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        if let Some(cursor) = &cursor {
+            if cursor.offset > operations.len()
+                || operations
+                    .get(cursor.offset - 1)
+                    .is_none_or(|operation| operation.id != cursor.previous_operation_id)
+            {
+                return Err(ApiError::bad_request("cursor is invalid or stale"));
+            }
+            operations.drain(..cursor.offset);
+        }
+        let has_more = operations.len() > req.limit;
+        operations.truncate(req.limit);
+        let next_cursor = if has_more {
+            let last = operations.last().ok_or_else(|| {
+                ApiError::Internal(
+                    "operation journal returned an empty page with more results".to_string(),
+                )
+            })?;
+            let next_offset = offset
+                .checked_add(operations.len())
+                .ok_or_else(|| ApiError::bad_request("cursor is invalid or stale"))?;
+            Some(encode_operation_list_cursor(
+                &self.redaction_config.index_hash_secret,
+                tenant_id,
+                &req.statuses,
+                &req.operation_kinds,
+                next_offset,
+                &last.id,
+            )?)
+        } else {
+            None
+        };
+        Ok(OperationListResponse {
+            operations: operations
+                .iter()
+                .map(|operation| operation_list_item(operation, req.include_plan))
+                .collect(),
+            next_cursor,
+        })
+    }
+
+    pub async fn reconcile_operations_async(
+        &self,
+        tenant_id: &str,
+        req: ReconcileOperationsRequest,
+    ) -> Result<ReconcileOperationsResponse, ApiError> {
+        if req.limit == 0 || req.limit > 1_000 {
+            return Err(ApiError::bad_request("limit must be between 1 and 1000"));
+        }
+        let mut requested_operation_ids = Vec::new();
+        let mut seen_operation_ids = HashSet::new();
+        for operation_id in &req.operation_ids {
+            let operation_id = operation_id.trim();
+            if operation_id.is_empty() {
+                return Err(ApiError::bad_request(
+                    "operation_ids must not contain empty values",
+                ));
+            }
+            if seen_operation_ids.insert(operation_id.to_string()) {
+                requested_operation_ids.push(operation_id.to_string());
+            }
+        }
+        if requested_operation_ids.len() > 1_000 {
+            return Err(ApiError::bad_request(
+                "operation_ids must contain at most 1000 unique values",
+            ));
+        }
+
+        let _mutation_guard = self.mutation_gate.lock().await;
+        let mut candidates = if requested_operation_ids.is_empty() {
+            match self
+                .repository
+                .list_oldest_reconcilable_operations(tenant_id, &req.statuses, req.limit)
+                .await?
+            {
+                Some(candidates) => candidates,
+                None => {
+                    let data = self.read()?;
+                    let mut candidates = data
+                        .operations
+                        .values()
+                        .filter(|operation| operation.tenant_id == tenant_id)
+                        .filter(|operation| {
+                            operation.status != OperationStatus::Completed
+                                || operation.indexing_state != OperationIndexingState::Completed
+                        })
+                        .filter(|operation| {
+                            req.statuses.is_empty() || req.statuses.contains(&operation.status)
+                        })
+                        .collect::<Vec<_>>();
+                    candidates.sort_by(|left, right| {
+                        left.created_at
+                            .cmp(&right.created_at)
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    candidates.into_iter().take(req.limit).cloned().collect()
+                }
+            }
+        } else {
+            match self
+                .repository
+                .list_operations_by_ids(
+                    tenant_id,
+                    &requested_operation_ids,
+                    &req.statuses,
+                    req.limit,
+                )
+                .await?
+            {
+                Some(candidates) => candidates,
+                None => {
+                    let data = self.read()?;
+                    requested_operation_ids
+                        .iter()
+                        .filter_map(|operation_id| data.operations.get(operation_id))
+                        .filter(|operation| operation.tenant_id == tenant_id)
+                        .filter(|operation| {
+                            req.statuses.is_empty() || req.statuses.contains(&operation.status)
+                        })
+                        .cloned()
+                        .collect()
+                }
+            }
+        };
+        if candidates.iter().any(|operation| {
+            operation.tenant_id != tenant_id
+                || (!requested_operation_ids.is_empty()
+                    && !seen_operation_ids.contains(&operation.id))
+        }) {
+            return Err(ApiError::Internal(
+                "operation repository returned a record outside the requested reconcile scope"
+                    .to_string(),
+            ));
+        }
+        for operation in &candidates {
+            validate_operation_record(operation).map_err(|error| {
+                ApiError::Internal(format!(
+                    "operation repository returned an invalid record: {error}"
+                ))
+            })?;
+        }
+        candidates.retain(|operation| {
+            req.statuses.is_empty() || req.statuses.contains(&operation.status)
+        });
+        candidates.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        candidates.truncate(req.limit);
+
+        let checked = candidates.len();
+        let mut reconciled = 0;
+        let mut completed = 0;
+        let mut failed = 0;
+        let mut skipped = 0;
+        let mut errors = Vec::new();
+        let mut operations = Vec::new();
+        for candidate in candidates {
+            let already_complete = candidate.status == OperationStatus::Completed
+                && candidate.indexing_state == OperationIndexingState::Completed;
+            if req.dry_run || already_complete {
+                skipped += 1;
+                operations.push(operation_summary(&candidate));
+                continue;
+            }
+            reconciled += 1;
+            match self.reconcile_operation_record(candidate.clone()).await {
+                Ok(operation) => {
+                    if operation.status == OperationStatus::Completed
+                        && operation.indexing_state == OperationIndexingState::Completed
+                    {
+                        completed += 1;
+                    }
+                    operations.push(operation_summary(&operation));
+                }
+                Err(error) => {
+                    failed += 1;
+                    let diagnostic = safe_cause_diagnostic(&error);
+                    errors.push(OperationReconcileError {
+                        operation_id: candidate.id.clone(),
+                        category: diagnostic.category.to_string(),
+                        fingerprint: diagnostic.fingerprint,
+                    });
+                    let latest = self
+                        .read()?
+                        .operations
+                        .get(&candidate.id)
+                        .cloned()
+                        .unwrap_or(candidate);
+                    operations.push(operation_summary(&latest));
+                }
+            }
+        }
+        Ok(ReconcileOperationsResponse {
+            checked,
+            reconciled,
+            completed,
+            failed,
+            skipped,
+            errors,
+            operations,
+        })
+    }
+
     pub async fn hydrate_from_repository(&self, tenant_id: &str) -> Result<Value, ApiError> {
         let mut pending = initial_hydration_report(&self.redaction_config);
         pending.tenant_id = tenant_id.to_string();
@@ -510,7 +3254,48 @@ impl Store {
             return Ok(hydration_response(&pending));
         }
 
-        let stage = match self.load_hydration_stage(tenant_id).await {
+        let initial_user_indexes = match self.load_reconciled_user_indexes(tenant_id).await {
+            Ok(indexes) => indexes,
+            Err(failure) => {
+                self.publish_hydration_failure(tenant_id, &failure)?;
+                return Err(failure.error);
+            }
+        };
+        let mut startup_registry = match Self::startup_registry(&initial_user_indexes) {
+            Ok(registry) => registry,
+            Err(failure) => {
+                self.publish_hydration_failure(tenant_id, &failure)?;
+                return Err(failure.error);
+            }
+        };
+
+        if let Err(error) = self
+            .reconcile_repository_operations_startup(tenant_id, &mut startup_registry)
+            .await
+        {
+            let failure = HydrationFailure {
+                domain: "operations",
+                error,
+            };
+            self.publish_hydration_failure(tenant_id, &failure)?;
+            return Err(failure.error);
+        }
+
+        let user_indexes = match self.load_reconciled_user_indexes(tenant_id).await {
+            Ok(indexes) => indexes,
+            Err(failure) => {
+                self.publish_hydration_failure(tenant_id, &failure)?;
+                return Err(failure.error);
+            }
+        };
+        if let Err(failure) =
+            Self::verify_refreshed_startup_registry(tenant_id, &startup_registry, &user_indexes)
+        {
+            self.publish_hydration_failure(tenant_id, &failure)?;
+            return Err(failure.error);
+        }
+
+        let stage = match self.load_hydration_stage(tenant_id, user_indexes).await {
             Ok(stage) => stage,
             Err(failure) => {
                 self.publish_hydration_failure(tenant_id, &failure)?;
@@ -522,10 +3307,10 @@ impl Store {
         Ok(hydration_response(&report))
     }
 
-    async fn load_hydration_stage(
+    async fn load_reconciled_user_indexes(
         &self,
         tenant_id: &str,
-    ) -> Result<HydrationStage, HydrationFailure> {
+    ) -> Result<Vec<UserEventIndex>, HydrationFailure> {
         let mut user_indexes = required_hydration_rows(
             "user_event_indexes",
             self.repository.list_user_event_indexes(tenant_id).await,
@@ -575,7 +3360,78 @@ impl Store {
             )?;
         }
 
+        Ok(user_indexes)
+    }
+
+    fn startup_registry(
+        user_indexes: &[UserEventIndex],
+    ) -> Result<HashMap<String, UserEventIndex>, HydrationFailure> {
+        let mut registry = HashMap::new();
+        for index in user_indexes {
+            if registry
+                .insert(index.owner_user_id_hash.clone(), index.clone())
+                .is_some()
+            {
+                return Err(HydrationFailure {
+                    domain: "user_event_indexes",
+                    error: ApiError::Internal(
+                        "duplicate owner hash in user event-index registry".to_string(),
+                    ),
+                });
+            }
+        }
+        Ok(registry)
+    }
+
+    fn same_user_index_identity(left: &UserEventIndex, right: &UserEventIndex) -> bool {
+        left.id == right.id
+            && left.tenant_id == right.tenant_id
+            && left.tenant_hash == right.tenant_hash
+            && left.owner_user_id_hash == right.owner_user_id_hash
+            && left.event_index_uid == right.event_index_uid
+            && left.personal_context_index_uid == right.personal_context_index_uid
+            && left.schema_version == right.schema_version
+            && left.settings_hash == right.settings_hash
+            && left.status == right.status
+    }
+
+    fn verify_refreshed_startup_registry(
+        tenant_id: &str,
+        replay_registry: &HashMap<String, UserEventIndex>,
+        refreshed_indexes: &[UserEventIndex],
+    ) -> Result<(), HydrationFailure> {
+        let refreshed = Self::startup_registry(refreshed_indexes)?;
+        for (owner_hash, expected) in replay_registry {
+            let Some(actual) = refreshed.get(owner_hash) else {
+                return Err(HydrationFailure {
+                    domain: "user_event_indexes",
+                    error: ApiError::Internal(
+                        "replayed user event-index registry row is not durably visible".to_string(),
+                    ),
+                });
+            };
+            if actual.tenant_id != tenant_id || !Self::same_user_index_identity(actual, expected) {
+                return Err(HydrationFailure {
+                    domain: "user_event_indexes",
+                    error: ApiError::Internal(
+                        "replayed user event-index registry row changed identity".to_string(),
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn load_hydration_stage(
+        &self,
+        tenant_id: &str,
+        user_indexes: Vec<UserEventIndex>,
+    ) -> Result<HydrationStage, HydrationFailure> {
         let mut stage = HydrationStage {
+            // Startup reconciliation drains the bounded active set before
+            // loading the remaining mandatory domains. Completed history is
+            // intentionally read through by the admin journal endpoints.
+            operations: Vec::new(),
             user_indexes,
             company_context: required_hydration_rows(
                 "company_context_nodes",
@@ -742,55 +3598,103 @@ impl Store {
                 .then_with(|| left.id.cmp(&right.id))
                 .then_with(|| left.owner_user_id.cmp(&right.owner_user_id))
         });
-        if !recovered_artifacts.is_empty() {
-            let task_uid = hydration_result(
-                "parse_artifacts",
-                self.repository
-                    .upsert_parse_artifacts(&recovered_artifacts)
-                    .await,
-            )?;
-            if let Some(task_uid) = task_uid {
-                hydration_result(
-                    "parse_artifacts",
-                    self.repository.wait_for_tasks(&[task_uid]).await,
-                )?;
-            }
-        }
-
         let recovered_tasks = stage
             .ingest_tasks
             .iter()
             .filter(|task| recovered_ids.contains(&task.task_id))
             .cloned()
             .collect::<Vec<_>>();
-        if !recovered_tasks.is_empty() {
-            let task_uids = hydration_result(
-                "ingest_tasks",
-                self.repository.upsert_ingest_tasks(&recovered_tasks).await,
-            )?;
-            hydration_result(
-                "ingest_tasks",
-                self.repository.wait_for_tasks(&task_uids).await,
-            )?;
-        }
-        let mut result_task_uids = Vec::new();
-        for result in stage
+        let corrected_results = stage
             .ingest_results
             .iter()
             .filter(|result| corrected_result_ids.contains(&result.task.task_id))
-        {
-            if let Some(task_uid) = hydration_result(
-                "ingest_results",
-                self.repository.upsert_ingest_result(result).await,
-            )? {
-                result_task_uids.push(task_uid);
-            }
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // Recovery changes are durable mutations too. Journal the immutable
+        // repair intent before submitting any corrected domain row so a crash
+        // during hydration leaves an observable, replayable operation rather
+        // than an unknown prefix of direct writes.
+        let mut recovery_resources = Vec::new();
+        if !recovered_tasks.is_empty() {
+            recovery_resources.push(OperationResource::IngestTasks {
+                tasks: recovered_tasks,
+            });
         }
-        if !result_task_uids.is_empty() {
-            hydration_result(
-                "ingest_results",
-                self.repository.wait_for_tasks(&result_task_uids).await,
+        if !recovered_artifacts.is_empty() {
+            recovery_resources.push(OperationResource::ParseArtifacts {
+                artifacts: recovered_artifacts,
+            });
+        }
+        recovery_resources.extend(
+            corrected_results
+                .into_iter()
+                .map(|result| OperationResource::IngestResult { result }),
+        );
+        if !recovery_resources.is_empty() {
+            let (primary_kind, recovery_domain) = match recovery_resources.first() {
+                Some(OperationResource::IngestTasks { .. }) => {
+                    (MutationPrimary::IngestTask, "ingest_tasks")
+                }
+                Some(OperationResource::ParseArtifacts { .. }) => {
+                    (MutationPrimary::ParseArtifacts, "parse_artifacts")
+                }
+                Some(OperationResource::IngestResult { .. }) => {
+                    (MutationPrimary::IngestResult, "ingest_results")
+                }
+                _ => {
+                    return Err(HydrationFailure {
+                        domain: "operations",
+                        error: ApiError::Internal(
+                            "startup ingest recovery produced an invalid primary resource"
+                                .to_string(),
+                        ),
+                    });
+                }
+            };
+            let plan = hydration_result(
+                recovery_domain,
+                self.mutation_plan(MutationPlanInput {
+                    tenant_id,
+                    operation_kind: "startup.ingest_recovery",
+                    owner_user_id: None,
+                    idempotency_key: None,
+                    primary_kind,
+                    resources: recovery_resources,
+                    response_snapshot: Value::Null,
+                    request_fingerprint: None,
+                }),
             )?;
+            let record = hydration_result(
+                recovery_domain,
+                operation_record_from_plan(plan).map_err(|error| {
+                    ApiError::Internal(format!("invalid startup ingest-recovery plan: {error}"))
+                }),
+            )?;
+            hydration_result(
+                recovery_domain,
+                self.persist_operation_checkpoint(&record).await,
+            )?;
+            let operation_id = record.id.clone();
+            let record = match self.reconcile_operation_record(record).await {
+                Ok(record) => record,
+                Err(error) => {
+                    let failure_domain = self
+                        .read()
+                        .ok()
+                        .and_then(|data| {
+                            data.operations
+                                .get(&operation_id)
+                                .and_then(failed_ingest_recovery_domain)
+                        })
+                        .unwrap_or(recovery_domain);
+                    return Err(HydrationFailure {
+                        domain: failure_domain,
+                        error,
+                    });
+                }
+            };
+            stage.operations.push(record);
         }
 
         Ok(stage)
@@ -829,6 +3733,7 @@ impl Store {
         report: HydrationReport,
     ) -> Result<(), ApiError> {
         let HydrationStage {
+            operations,
             user_indexes,
             company_context,
             state_items,
@@ -880,6 +3785,13 @@ impl Store {
         }
 
         let mut data = self.write()?;
+        data.operations
+            .retain(|_, operation| operation.tenant_id != tenant_id);
+        data.operations.extend(
+            operations
+                .into_iter()
+                .map(|operation| (operation.id.clone(), operation)),
+        );
         let stale_event_index_uids = data
             .user_indexes
             .values()
@@ -1165,7 +4077,7 @@ impl Store {
         })
     }
 
-    pub async fn create_harness_change_async(
+    fn create_harness_change(
         &self,
         tenant_id: &str,
         req: CreateHarnessChangeManifestRequest,
@@ -1217,9 +4129,23 @@ impl Store {
             data.harness_changes
                 .insert(change.id.clone(), change.clone());
         }
-        let _ = self
-            .repository
-            .upsert_harness_changes(std::slice::from_ref(&change))
+        Ok(change)
+    }
+
+    pub async fn create_harness_change_async(
+        &self,
+        tenant_id: &str,
+        req: CreateHarnessChangeManifestRequest,
+    ) -> Result<HarnessChangeManifest, ApiError> {
+        let (change, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "harness_change.create",
+                None,
+                None,
+                MutationPrimary::HarnessChanges,
+                |staged| staged.create_harness_change(tenant_id, req),
+            )
             .await?;
         Ok(change)
     }
@@ -1239,7 +4165,7 @@ impl Store {
             .ok_or_else(|| ApiError::not_found("harness change not found"))
     }
 
-    pub async fn create_harness_component_revision_async(
+    fn create_harness_component_revision(
         &self,
         tenant_id: &str,
         component_id: &str,
@@ -1311,18 +4237,30 @@ impl Store {
             let change = change.clone();
             (component, revisions, change, revision)
         };
-        let _ = self
-            .repository
-            .upsert_harness_components(std::slice::from_ref(&component), &revisions)
-            .await?;
-        let _ = self
-            .repository
-            .upsert_harness_changes(std::slice::from_ref(&change))
+        let _ = (component, revisions, change);
+        Ok(revision)
+    }
+
+    pub async fn create_harness_component_revision_async(
+        &self,
+        tenant_id: &str,
+        component_id: &str,
+        req: CreateHarnessComponentRevisionRequest,
+    ) -> Result<HarnessComponentRevision, ApiError> {
+        let (revision, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "harness_component.revise",
+                None,
+                None,
+                MutationPrimary::HarnessComponents,
+                |staged| staged.create_harness_component_revision(tenant_id, component_id, req),
+            )
             .await?;
         Ok(revision)
     }
 
-    pub async fn rollback_harness_component_async(
+    fn rollback_harness_component(
         &self,
         tenant_id: &str,
         component_id: &str,
@@ -1404,17 +4342,7 @@ impl Store {
                 "scope": "harness_only"
             }),
         )?;
-        let _ = self.persist_history_event_by_id(&history.event.id).await?;
-        let _ = self
-            .repository
-            .upsert_harness_components(std::slice::from_ref(&component), &revisions)
-            .await?;
-        if let Some(manifest) = &manifest {
-            let _ = self
-                .repository
-                .upsert_harness_changes(std::slice::from_ref(manifest))
-                .await?;
-        }
+        let _ = (revisions, manifest);
         Ok(HarnessRollbackResponse {
             component,
             active_revision,
@@ -1422,7 +4350,26 @@ impl Store {
         })
     }
 
-    pub async fn create_harness_verdict_async(
+    pub async fn rollback_harness_component_async(
+        &self,
+        tenant_id: &str,
+        component_id: &str,
+        req: RollbackHarnessComponentRequest,
+    ) -> Result<HarnessRollbackResponse, ApiError> {
+        let (response, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "harness_component.rollback",
+                None,
+                None,
+                MutationPrimary::HarnessComponents,
+                |staged| staged.rollback_harness_component(tenant_id, component_id, req),
+            )
+            .await?;
+        Ok(response)
+    }
+
+    fn create_harness_verdict(
         &self,
         tenant_id: &str,
         change_id: &str,
@@ -1550,11 +4497,26 @@ impl Store {
             data.harness_verdicts
                 .insert(verdict_record.id.clone(), verdict_record.clone());
         }
-        let _ = self
-            .repository
-            .upsert_harness_verdicts(std::slice::from_ref(&verdict_record))
-            .await?;
         Ok(verdict_record)
+    }
+
+    pub async fn create_harness_verdict_async(
+        &self,
+        tenant_id: &str,
+        change_id: &str,
+        req: CreateHarnessChangeVerdictRequest,
+    ) -> Result<HarnessChangeVerdict, ApiError> {
+        let (verdict, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "harness_verdict.create",
+                None,
+                None,
+                MutationPrimary::HarnessVerdicts,
+                |staged| staged.create_harness_verdict(tenant_id, change_id, req),
+            )
+            .await?;
+        Ok(verdict)
     }
 
     pub fn compare_harness_change(
@@ -1675,8 +4637,16 @@ impl Store {
         tenant_id: &str,
         req: CreateRagEvalCaseRequest,
     ) -> Result<RagEvalCase, ApiError> {
-        let case = self.create_eval_case(tenant_id, req)?;
-        let _ = self.repository.upsert_eval_case(&case).await?;
+        let (case, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "eval_case.create",
+                None,
+                None,
+                MutationPrimary::EvalCase,
+                |staged| staged.create_eval_case(tenant_id, req),
+            )
+            .await?;
         Ok(case)
     }
 
@@ -1763,7 +4733,7 @@ impl Store {
             "passed"
         }
         .to_string();
-        let mut run = RagEvalRun {
+        let run = RagEvalRun {
             id: run_id.clone(),
             tenant_id: tenant_id.to_string(),
             change_id: req.change_id.clone(),
@@ -1779,42 +4749,39 @@ impl Store {
             created_at: now(),
             completed_at: Some(now()),
         };
-        let mut overview = build_eval_overview(&run, &results);
-        {
-            let mut data = self.write()?;
-            self.write_eval_reports_locked(&mut data, tenant_id, &mut run, &mut overview, &results);
-            for result in &results {
-                data.eval_case_results
-                    .insert(result.id.clone(), result.clone());
-            }
-            data.eval_overviews.insert(run.id.clone(), overview);
-            data.eval_runs.insert(run.id.clone(), run.clone());
-        }
-        let source_documents = self.source_documents_for_scope(tenant_id, None)?;
-        let _ = self
-            .repository
-            .upsert_source_documents(&source_documents)
+        let overview = build_eval_overview(&run, &results);
+        let run_for_stage = run.clone();
+        let overview_for_stage = overview.clone();
+        let results_for_stage = results.clone();
+        let (persisted_run, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "eval_run.create",
+                None,
+                None,
+                MutationPrimary::EvalRun,
+                move |staged| {
+                    let mut run = run_for_stage;
+                    let mut overview = overview_for_stage;
+                    let mut data = staged.write()?;
+                    staged.write_eval_reports_locked(
+                        &mut data,
+                        tenant_id,
+                        &mut run,
+                        &mut overview,
+                        &results_for_stage,
+                    );
+                    for result in &results_for_stage {
+                        data.eval_case_results
+                            .insert(result.id.clone(), result.clone());
+                    }
+                    data.eval_overviews.insert(run.id.clone(), overview);
+                    data.eval_runs.insert(run.id.clone(), run.clone());
+                    Ok(run)
+                },
+            )
             .await?;
-        let company_nodes = self.context_nodes_for_index("rag_company_context")?;
-        let _ = self
-            .repository
-            .upsert_context_nodes("rag_company_context", &company_nodes)
-            .await?;
-        let _ = self.repository.upsert_eval_run(&run).await?;
-        let report = self.eval_run_report(&run.id)?;
-        if let Some(results) = report.get("case_results").and_then(Value::as_array) {
-            let results = results
-                .iter()
-                .cloned()
-                .map(serde_json::from_value)
-                .collect::<Result<Vec<RagEvalCaseResult>, _>>()
-                .map_err(|err| ApiError::Internal(err.to_string()))?;
-            let _ = self.repository.upsert_eval_case_results(&results).await?;
-        }
-        if let Ok(overview) = self.eval_overview(&run.id) {
-            let _ = self.repository.upsert_eval_overview(&overview).await?;
-        }
-        Ok(run)
+        Ok(persisted_run)
     }
 
     pub fn get_eval_run(&self, run_id: &str) -> Result<RagEvalRun, ApiError> {
@@ -2100,12 +5067,33 @@ impl Store {
         owner_user_id: &str,
         req: EnsureUserEventIndexRequest,
     ) -> Result<UserEventIndexResponse, ApiError> {
-        let mut response = self.ensure_user_index(tenant_id, owner_user_id, req)?;
-        let task_uids = self
-            .repository
-            .ensure_user_event_index(&response.index)
+        let force_reapply = req.force_reapply_settings;
+        let (mut response, persistence) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "user_event_index.ensure",
+                Some(owner_user_id),
+                None,
+                MutationPrimary::UserIndex,
+                |staged| staged.ensure_user_index(tenant_id, owner_user_id, req),
+            )
             .await?;
-        response.meili_task_uids.extend(task_uids);
+        if let Some(persistence) = persistence {
+            response.meili_task_uids = persistence.task_uids;
+        } else if force_reapply {
+            let persistence = self
+                .execute_explicit_resource_operation(
+                    tenant_id,
+                    "user_event_index.settings_reapply",
+                    Some(owner_user_id),
+                    MutationPrimary::UserIndex,
+                    OperationResource::EnsureUserEventIndex {
+                        index: response.index.clone(),
+                    },
+                )
+                .await?;
+            response.meili_task_uids = persistence.primary_task_uids;
+        }
         Ok(response)
     }
 
@@ -2115,56 +5103,39 @@ impl Store {
         path_owner_user_id: Option<&str>,
         req: AppendHistoryEventRequest,
     ) -> Result<HistoryEventResponse, ApiError> {
-        let mut response = self.append_event(tenant_id, path_owner_user_id, req)?;
-        if !response.duplicate {
-            response.meili_task_uid = self.persist_event_to_repository(&response.event).await?;
+        let owner = self.validate_append_event_request(path_owner_user_id, &req)?;
+        // A history event is the primary aggregate, but its dynamic physical
+        // indexes are infrastructure prerequisites. Provision and confirm
+        // them in their own journaled operation before submitting the event;
+        // otherwise Meilisearch may auto-create an unconfigured index.
+        self.ensure_user_index_async(tenant_id, &owner, EnsureUserEventIndexRequest::default())
+            .await?;
+        let idempotency_key = req.idempotency_key.clone();
+        let mut canonical_request = req.clone();
+        canonical_request.owner_user_id = Some(owner.clone());
+        let request_fingerprint = self.mutation_request_fingerprint(
+            tenant_id,
+            "history_event.append",
+            &canonical_request,
+        )?;
+        let (mut response, persistence) = self
+            .execute_staged_mutation_with_idempotency(
+                tenant_id,
+                "history_event.append",
+                Some(&owner),
+                MutationIdempotency {
+                    key: idempotency_key.as_deref(),
+                    request_fingerprint: Some(&request_fingerprint),
+                },
+                MutationPrimary::HistoryEvents,
+                |staged| staged.append_event(tenant_id, path_owner_user_id, req),
+            )
+            .await?;
+        if let Some(persistence) = persistence {
+            response.meili_task_uid = persistence.primary_task_uids.last().cloned();
+            response.persistence = Some(persistence);
         }
         Ok(response)
-    }
-
-    async fn persist_event_to_repository(
-        &self,
-        event: &HistoryEvent,
-    ) -> Result<Option<String>, ApiError> {
-        self.ensure_user_indexes_for_owner(&event.tenant_id, &event.owner_user_id)
-            .await?;
-        let task_uid = self.repository.append_event(event).await?;
-        let routing = self
-            .resolver
-            .resolve(&event.tenant_id, &event.owner_user_id, false, true)?;
-        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
-        let _ = self
-            .repository
-            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
-            .await?;
-        Ok(task_uid)
-    }
-
-    async fn ensure_user_indexes_for_owner(
-        &self,
-        tenant_id: &str,
-        owner_user_id: &str,
-    ) -> Result<(), ApiError> {
-        let index = self.get_user_index(tenant_id, owner_user_id)?;
-        let _ = self
-            .repository
-            .ensure_user_event_index(&index.index)
-            .await?;
-        Ok(())
-    }
-
-    async fn persist_history_event_by_id(
-        &self,
-        event_id: &str,
-    ) -> Result<Option<String>, ApiError> {
-        let event = {
-            let data = self.read()?;
-            data.event_by_id
-                .get(event_id)
-                .cloned()
-                .ok_or_else(|| ApiError::not_found("history event not found"))?
-        };
-        self.persist_event_to_repository(&event).await
     }
 
     pub async fn append_bulk_events_async(
@@ -2176,47 +5147,55 @@ impl Store {
         if req.events.is_empty() {
             return Err(ApiError::bad_request("events must not be empty"));
         }
-
+        if req.events.len() > 500 {
+            return Err(ApiError::bad_request(
+                "events must contain at most 500 entries",
+            ));
+        }
+        if req
+            .events
+            .iter()
+            .any(|event| event.idempotency_key.is_some())
+        {
+            return Err(ApiError::bad_request(
+                "events[].idempotency_key is not supported; use the batch idempotency_key",
+            ));
+        }
         let owner = self
             .owner_from_path_or_body(path_owner_user_id, req.events[0].owner_user_id.as_deref())?;
-        let mut inserted = 0;
-        let mut duplicates = 0;
-        let mut event_ids = Vec::new();
-        let mut routing = None;
-        let mut last_task = None;
-
-        for mut event in req.events {
-            if event
-                .owner_user_id
-                .as_deref()
-                .is_some_and(|body_owner| body_owner != owner)
-            {
-                return Err(ApiError::bad_request(
-                    "all bulk events must match the path owner_user_id",
-                ));
-            }
-            event.owner_user_id = Some(owner.clone());
-            let response = self
-                .append_event_async(tenant_id, Some(&owner), event)
-                .await?;
-            if response.duplicate {
-                duplicates += 1;
-            } else {
-                inserted += 1;
-            }
-            event_ids.push(response.event.id);
-            routing = Some(response.routing);
-            last_task = response.meili_task_uid;
+        for event in &req.events {
+            self.validate_append_event_request(Some(&owner), event)?;
         }
-
-        Ok(BulkHistoryEventsResponse {
-            inserted,
-            duplicates,
-            event_ids,
-            materialization_job_ids: Vec::new(),
-            routing: routing.expect("bulk events are non-empty"),
-            meili_task_uid: last_task,
-        })
+        self.ensure_user_index_async(tenant_id, &owner, EnsureUserEventIndexRequest::default())
+            .await?;
+        let idempotency_key = req.idempotency_key.clone();
+        let mut canonical_request = req.clone();
+        for event in &mut canonical_request.events {
+            event.owner_user_id = Some(owner.clone());
+        }
+        let request_fingerprint = self.mutation_request_fingerprint(
+            tenant_id,
+            "history_event.append_bulk",
+            &canonical_request,
+        )?;
+        let (mut response, persistence) = self
+            .execute_staged_mutation_with_idempotency(
+                tenant_id,
+                "history_event.append_bulk",
+                Some(&owner),
+                MutationIdempotency {
+                    key: idempotency_key.as_deref(),
+                    request_fingerprint: Some(&request_fingerprint),
+                },
+                MutationPrimary::HistoryEvents,
+                |staged| staged.append_bulk_events(tenant_id, Some(&owner), req),
+            )
+            .await?;
+        if let Some(persistence) = persistence {
+            response.meili_task_uid = persistence.primary_task_uids.last().cloned();
+            response.persistence = Some(persistence);
+        }
+        Ok(response)
     }
 
     pub async fn search_events_async(
@@ -2230,7 +5209,27 @@ impl Store {
         let routing = self
             .resolver
             .resolve(tenant_id, &owner_user_id, false, true)?;
-        if let Some(hits) = self.repository.search_user_events(&routing, &req).await? {
+        if let Some(mut hits) = self.repository.search_user_events(&routing, &req).await? {
+            if self.redaction_config.write_consistency == WriteConsistency::ReadYourWrites {
+                let local = self
+                    .search_events(tenant_id, path_owner_user_id, req.clone())?
+                    .hits;
+                let mut merged = hits
+                    .drain(..)
+                    .map(|event| (event.id.clone(), event))
+                    .collect::<HashMap<_, _>>();
+                for event in local {
+                    merged.insert(event.id.clone(), event);
+                }
+                hits = merged.into_values().collect();
+                hits.sort_by(|left, right| {
+                    right
+                        .occurred_at
+                        .cmp(&left.occurred_at)
+                        .then_with(|| right.id.cmp(&left.id))
+                });
+                hits.truncate(req.limit.max(1));
+            }
             return Ok(HistorySearchResponse { hits, routing });
         }
         self.search_events(tenant_id, path_owner_user_id, req)
@@ -2265,28 +5264,45 @@ impl Store {
         fact_key: &str,
         req: UpsertStateFactRequest,
     ) -> Result<StateItemResponse, ApiError> {
-        let response = self.upsert_state_fact(tenant_id, fact_key, req)?;
-        let _ = self.repository.upsert_state_item(&response.item).await?;
-        let routing =
-            self.resolver
-                .resolve(tenant_id, &response.item.owner_user_id, false, true)?;
-        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
-        self.ensure_user_indexes_for_owner(tenant_id, &response.item.owner_user_id)
+        let owner = require_string(req.owner_user_id.clone(), "owner_user_id")?;
+        let state_type = require_string(req.state_type.clone(), "state_type")?;
+        let idempotency_key = req.idempotency_key.clone();
+        let request_fingerprint =
+            self.mutation_request_fingerprint(tenant_id, "state_fact.upsert", &(fact_key, &req))?;
+        let _mutation_guard = self.mutation_gate.lock().await;
+        self.ensure_state_aggregate_identity_available(tenant_id, &owner, &state_type, fact_key)?;
+        let current_operation_id = idempotency_key.as_deref().map(|key| {
+            let idempotency_key_hash = self.resolver.idempotency_hash(key);
+            let owner_user_id_hash = self.resolver.user_hash(&owner);
+            self.idempotent_operation_id(
+                tenant_id,
+                "state_fact.upsert",
+                Some(&owner_user_id_hash),
+                &idempotency_key_hash,
+            )
+        });
+        self.ensure_state_operation_generation_ready(
+            tenant_id,
+            &owner,
+            &state_type,
+            fact_key,
+            current_operation_id.as_deref(),
+        )
+        .await?;
+        self.ensure_state_document_aggregate_loaded(tenant_id, &owner, &state_type, fact_key)
             .await?;
-        let _ = self
-            .repository
-            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
-            .await?;
-        let source_documents =
-            self.source_documents_for_scope(tenant_id, Some(&response.item.owner_user_id))?;
-        let _ = self
-            .repository
-            .upsert_source_documents(&source_documents)
-            .await?;
-        let links = self.links_for_tenant(tenant_id)?;
-        let _ = self.repository.upsert_links(&links).await?;
-        let _ = self
-            .persist_history_event_by_id(&response.history_event_id)
+        let (response, _) = self
+            .execute_staged_mutation_guarded(
+                tenant_id,
+                "state_fact.upsert",
+                Some(&owner),
+                MutationIdempotency {
+                    key: idempotency_key.as_deref(),
+                    request_fingerprint: Some(&request_fingerprint),
+                },
+                MutationPrimary::StateItem,
+                |staged| staged.upsert_state_fact(tenant_id, fact_key, req),
+            )
             .await?;
         Ok(response)
     }
@@ -2297,20 +5313,39 @@ impl Store {
         fact_key: &str,
         req: PatchStateFactRequest,
     ) -> Result<StateItemResponse, ApiError> {
-        let response = self.patch_state_fact(tenant_id, fact_key, req)?;
-        let _ = self.repository.upsert_state_item(&response.item).await?;
-        let routing =
-            self.resolver
-                .resolve(tenant_id, &response.item.owner_user_id, false, true)?;
-        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
-        self.ensure_user_indexes_for_owner(tenant_id, &response.item.owner_user_id)
+        let _mutation_guard = self.mutation_gate.lock().await;
+        let state_key =
+            self.resolve_state_key(tenant_id, fact_key, req.owner_user_id.as_deref())?;
+        let owner = state_key.1.clone();
+        let state_type = self
+            .read()?
+            .state_items
+            .get(&state_key)
+            .map(|item| item.state_type.clone())
+            .ok_or_else(|| ApiError::not_found("state item not found"))?;
+        self.ensure_state_aggregate_identity_available(tenant_id, &owner, &state_type, fact_key)?;
+        self.ensure_state_operation_generation_ready(
+            tenant_id,
+            &owner,
+            &state_type,
+            fact_key,
+            None,
+        )
+        .await?;
+        self.ensure_state_document_aggregate_loaded(tenant_id, &owner, &state_type, fact_key)
             .await?;
-        let _ = self
-            .repository
-            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
-            .await?;
-        let _ = self
-            .persist_history_event_by_id(&response.history_event_id)
+        let (response, _) = self
+            .execute_staged_mutation_guarded(
+                tenant_id,
+                "state_fact.patch",
+                Some(&owner),
+                MutationIdempotency {
+                    key: None,
+                    request_fingerprint: None,
+                },
+                MutationPrimary::StateItem,
+                |staged| staged.patch_state_fact(tenant_id, fact_key, req),
+            )
             .await?;
         Ok(response)
     }
@@ -2320,20 +5355,22 @@ impl Store {
         tenant_id: &str,
         req: InsightUpsertRequest,
     ) -> Result<InsightResponse, ApiError> {
-        let response = self.upsert_insight(tenant_id, req)?;
-        let _ = self.repository.upsert_insight(&response.insight).await?;
-        let routing =
-            self.resolver
-                .resolve(tenant_id, &response.insight.owner_user_id, false, true)?;
-        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
-        self.ensure_user_indexes_for_owner(tenant_id, &response.insight.owner_user_id)
-            .await?;
-        let _ = self
-            .repository
-            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
-            .await?;
-        let _ = self
-            .persist_history_event_by_id(&response.history_event_id)
+        let owner = require_string(req.owner_user_id.clone(), "owner_user_id")?;
+        let idempotency_key = req.idempotency_key.clone();
+        let request_fingerprint =
+            self.mutation_request_fingerprint(tenant_id, "insight.upsert", &req)?;
+        let (response, _) = self
+            .execute_staged_mutation_with_idempotency(
+                tenant_id,
+                "insight.upsert",
+                Some(&owner),
+                MutationIdempotency {
+                    key: idempotency_key.as_deref(),
+                    request_fingerprint: Some(&request_fingerprint),
+                },
+                MutationPrimary::Insight,
+                |staged| staged.upsert_insight(tenant_id, req),
+            )
             .await?;
         Ok(response)
     }
@@ -2344,20 +5381,16 @@ impl Store {
         insight_id: &str,
         req: InsightPatchRequest,
     ) -> Result<InsightResponse, ApiError> {
-        let response = self.patch_insight(tenant_id, insight_id, req)?;
-        let _ = self.repository.upsert_insight(&response.insight).await?;
-        let routing =
-            self.resolver
-                .resolve(tenant_id, &response.insight.owner_user_id, false, true)?;
-        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
-        self.ensure_user_indexes_for_owner(tenant_id, &response.insight.owner_user_id)
-            .await?;
-        let _ = self
-            .repository
-            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
-            .await?;
-        let _ = self
-            .persist_history_event_by_id(&response.history_event_id)
+        let owner = self.insight_owner(insight_id)?;
+        let (response, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "insight.patch",
+                Some(&owner),
+                None,
+                MutationPrimary::Insight,
+                |staged| staged.patch_insight(tenant_id, insight_id, req),
+            )
             .await?;
         Ok(response)
     }
@@ -2367,14 +5400,23 @@ impl Store {
         tenant_id: &str,
         req: LinkUpsertRequest,
     ) -> Result<LinkResponse, ApiError> {
-        let response = self.upsert_link(tenant_id, req)?;
-        let _ = self
-            .repository
-            .upsert_links(std::slice::from_ref(&response.link))
+        let owner = req.owner_user_id.clone();
+        let idempotency_key = req.idempotency_key.clone();
+        let request_fingerprint =
+            self.mutation_request_fingerprint(tenant_id, "link.upsert", &req)?;
+        let (response, _) = self
+            .execute_staged_mutation_with_idempotency(
+                tenant_id,
+                "link.upsert",
+                owner.as_deref(),
+                MutationIdempotency {
+                    key: idempotency_key.as_deref(),
+                    request_fingerprint: Some(&request_fingerprint),
+                },
+                MutationPrimary::Links,
+                |staged| staged.upsert_link(tenant_id, req),
+            )
             .await?;
-        if let Some(history_event_id) = &response.history_event_id {
-            let _ = self.persist_history_event_by_id(history_event_id).await?;
-        }
         Ok(response)
     }
 
@@ -2384,16 +5426,25 @@ impl Store {
         source_id: &str,
         req: CreateRevisionRequest,
     ) -> Result<CreateRevisionResponse, ApiError> {
-        let response = self.create_revision(tenant_id, source_id, req)?;
-        if let Some(source) = self.company_source(source_id)? {
-            let _ = self.repository.upsert_company_source(&source).await?;
-        }
-        if let Some(revision) = self.source_revision(source_id, &response.revision_id)? {
-            let _ = self.repository.upsert_source_revision(&revision).await?;
-        }
-        if let Some(history_event_id) = &response.history_event_id {
-            let _ = self.persist_history_event_by_id(history_event_id).await?;
-        }
+        let idempotency_key = req.idempotency_key.clone();
+        let request_fingerprint = self.mutation_request_fingerprint(
+            tenant_id,
+            "company_revision.create",
+            &(source_id, &req),
+        )?;
+        let (response, _) = self
+            .execute_staged_mutation_with_idempotency(
+                tenant_id,
+                "company_revision.create",
+                None,
+                MutationIdempotency {
+                    key: idempotency_key.as_deref(),
+                    request_fingerprint: Some(&request_fingerprint),
+                },
+                MutationPrimary::SourceRevision,
+                |staged| staged.create_revision(tenant_id, source_id, req),
+            )
+            .await?;
         Ok(response)
     }
 
@@ -2404,28 +5455,16 @@ impl Store {
         revision_id: &str,
         req: ActivateRevisionRequest,
     ) -> Result<ActivateRevisionResponse, ApiError> {
-        let response = self.activate_revision(tenant_id, source_id, revision_id, req)?;
-        if let Some(source) = self.company_source(source_id)? {
-            let _ = self.repository.upsert_company_source(&source).await?;
-        }
-        if let Some(revision) = self.source_revision(source_id, revision_id)? {
-            let _ = self.repository.upsert_source_revision(&revision).await?;
-        }
-        let nodes = self.context_nodes_for_index("rag_company_context")?;
-        let _ = self
-            .repository
-            .upsert_context_nodes("rag_company_context", &nodes)
+        let (response, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "company_revision.activate",
+                None,
+                None,
+                MutationPrimary::SourceRevision,
+                |staged| staged.activate_revision(tenant_id, source_id, revision_id, req),
+            )
             .await?;
-        let source_documents = self.source_documents_for_scope(tenant_id, None)?;
-        let _ = self
-            .repository
-            .upsert_source_documents(&source_documents)
-            .await?;
-        let links = self.links_for_tenant(tenant_id)?;
-        let _ = self.repository.upsert_links(&links).await?;
-        if let Some(history_event_id) = &response.history_event_id {
-            let _ = self.persist_history_event_by_id(history_event_id).await?;
-        }
         Ok(response)
     }
 
@@ -2469,21 +5508,29 @@ impl Store {
         if expired.is_empty() {
             return Ok(expired);
         }
-        {
-            let mut data = self.write()?;
-            for task_id in &expired {
-                data.ingest_tasks.remove(task_id);
-                if let Some(result) = data.ingest_results.remove(task_id) {
-                    data.parsed_blocks.remove(&SourceDocumentKey::new(
-                        &result.task.tenant_id,
-                        result.task.owner_user_id.as_deref(),
-                        &result.source_document_uri,
-                    ));
-                }
-            }
-        }
-        self.repository
-            .delete_ingest_tasks(tenant_id, &expired)
+        let expired_for_stage = expired.clone();
+        let (_, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "ingest_tasks.cleanup",
+                None,
+                None,
+                MutationPrimary::DeleteIngestTasks,
+                move |staged| {
+                    let mut data = staged.write()?;
+                    for task_id in &expired_for_stage {
+                        data.ingest_tasks.remove(task_id);
+                        if let Some(result) = data.ingest_results.remove(task_id) {
+                            data.parsed_blocks.remove(&SourceDocumentKey::new(
+                                &result.task.tenant_id,
+                                result.task.owner_user_id.as_deref(),
+                                &result.source_document_uri,
+                            ));
+                        }
+                    }
+                    Ok(())
+                },
+            )
             .await?;
         Ok(expired)
     }
@@ -2516,6 +5563,11 @@ impl Store {
         has_staged_upload: bool,
         queued_ahead: usize,
     ) -> Result<IngestTask, ApiError> {
+        if req.idempotency_key.is_some() {
+            return Err(ApiError::bad_request(
+                "idempotency_key is not supported for ingest tasks",
+            ));
+        }
         let mut parser_config = config.clone();
         if let Some(provider) = req.parser_provider.as_deref() {
             parser_config.parser_provider = provider.to_string();
@@ -2600,11 +5652,30 @@ impl Store {
             result_url: Some(format!("/v1/ingest/tasks/{task_id}/result")),
             queued_ahead: Some(queued_ahead),
         };
-        let _ = self.repository.upsert_ingest_task(&task).await?;
-        {
-            let mut data = self.write()?;
-            data.ingest_tasks.insert(task.task_id.clone(), task.clone());
-        }
+        let owner = task.owner_user_id.clone();
+        let task_for_stage = task.clone();
+        let (task, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "ingest_task.create",
+                owner.as_deref(),
+                None,
+                MutationPrimary::IngestTask,
+                move |staged| {
+                    let mut data = staged.write()?;
+                    if task_for_stage.owner_user_id.is_none() {
+                        ensure_company_source_not_deleting(
+                            &data,
+                            tenant_id,
+                            &task_for_stage.source_id,
+                        )?;
+                    }
+                    data.ingest_tasks
+                        .insert(task_for_stage.task_id.clone(), task_for_stage.clone());
+                    Ok(task_for_stage)
+                },
+            )
+            .await?;
         Ok(task)
     }
 
@@ -2751,50 +5822,66 @@ impl Store {
         } else {
             ("company".to_string(), "rag_company_context".to_string())
         };
-        let ingest = {
-            let mut data = self.write()?;
-            for artifact in artifacts.iter().cloned() {
-                data.parse_artifacts
-                    .insert(ParseArtifactKey::from_artifact(&artifact), artifact);
-            }
-            self.write_source_document_fragments_locked(
-                &mut data,
+        let owner = req.owner_user_id.clone();
+        let artifacts_for_stage = artifacts.clone();
+        let blocks_for_stage = parsed.blocks.clone();
+        let artifact_refs_for_stage = artifact_refs.clone();
+        let source_id = task.source_id.clone();
+        let revision_id = task.revision_id.clone();
+        let source_document_uri = task.source_document_uri.clone().unwrap_or_default();
+        let title = req
+            .title
+            .clone()
+            .or_else(|| req.file_name.clone())
+            .or_else(|| req.source_uri.clone())
+            .unwrap_or_else(|| "Parsed document".to_string());
+        let fragment_policy = req.fragment_policy.clone();
+        let (ingest, _) = self
+            .execute_staged_mutation(
                 tenant_id,
-                req.owner_user_id.clone(),
-                "parsed_doc",
-                &task.source_id,
-                &task.revision_id,
-                task.source_document_uri.as_deref().unwrap_or_default(),
-                &req.title
-                    .clone()
-                    .or_else(|| req.file_name.clone())
-                    .or_else(|| req.source_uri.clone())
-                    .unwrap_or_else(|| "Parsed document".to_string()),
-                &document_content,
-                &checksum,
-                &index_kind,
-                &index_uid,
-                req.fragment_policy.as_ref(),
-                &parsed.blocks,
-                &artifact_refs,
+                "ingest.outputs.persist",
+                owner.as_deref(),
+                None,
+                MutationPrimary::SourceDocuments,
+                |staged| {
+                    let mut data = staged.write()?;
+                    if let Some(owner_user_id) = owner.as_deref() {
+                        staged.ensure_user_index_locked(
+                            &mut data,
+                            tenant_id,
+                            owner_user_id,
+                            EVENT_INDEX_SCHEMA_VERSION,
+                        )?;
+                    } else {
+                        ensure_company_source_not_deleting(&data, tenant_id, &source_id)?;
+                    }
+                    for artifact in artifacts_for_stage.iter().cloned() {
+                        data.parse_artifacts
+                            .insert(ParseArtifactKey::from_artifact(&artifact), artifact);
+                    }
+                    Ok(staged.write_source_document_fragments_locked(
+                        &mut data,
+                        tenant_id,
+                        owner.clone(),
+                        "parsed_doc",
+                        &source_id,
+                        &revision_id,
+                        &source_document_uri,
+                        &title,
+                        &document_content,
+                        &checksum,
+                        &index_kind,
+                        &index_uid,
+                        fragment_policy.as_ref(),
+                        &blocks_for_stage,
+                        &artifact_refs_for_stage,
+                    ))
+                },
             )
-        };
+            .await?;
 
         self.transition_ingest_task_async(task_id, "indexing", None)
             .await?;
-        if let Err(err) = self
-            .persist_ingest_outputs(tenant_id, req.owner_user_id.as_deref())
-            .await
-        {
-            let _ = self
-                .transition_ingest_task_async(
-                    task_id,
-                    "failed",
-                    Some(INGEST_ERROR_INDEXING_FAILED.to_string()),
-                )
-                .await;
-            return Err(err);
-        }
 
         let mut task = self.ingest_task_for_run(task_id)?;
         apply_ingest_task_transition(&mut task, "completed", None);
@@ -2808,23 +5895,45 @@ impl Store {
             context_uris: ingest.fragment_uris.clone(),
             fragment_uris: ingest.fragment_uris,
         };
-        let _ = self.repository.upsert_ingest_result(&result).await?;
-        let _ = self.repository.upsert_ingest_task(&task).await?;
-        {
-            let mut data = self.write()?;
-            let current = data
-                .ingest_tasks
-                .get(task_id)
-                .ok_or_else(|| ApiError::not_found("ingest task not found"))?;
-            if !is_nonterminal_ingest_state(&current.state) {
-                return Err(ApiError::conflict(
-                    "ingest task was terminalized before completion",
-                ));
-            }
-            data.ingest_tasks.insert(task.task_id.clone(), task.clone());
-            data.ingest_results
-                .insert(task.task_id.clone(), result.clone());
-        }
+        let owner = task.owner_user_id.clone();
+        let result_for_stage = result.clone();
+        let (result, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "ingest.complete",
+                owner.as_deref(),
+                None,
+                MutationPrimary::IngestResult,
+                move |staged| {
+                    let mut data = staged.write()?;
+                    if result_for_stage.task.owner_user_id.is_none() {
+                        ensure_company_source_not_deleting(
+                            &data,
+                            tenant_id,
+                            &result_for_stage.source_id,
+                        )?;
+                    }
+                    let current = data
+                        .ingest_tasks
+                        .get(task_id)
+                        .ok_or_else(|| ApiError::not_found("ingest task not found"))?;
+                    if !is_nonterminal_ingest_state(&current.state) {
+                        return Err(ApiError::conflict(
+                            "ingest task was terminalized before completion",
+                        ));
+                    }
+                    data.ingest_tasks.insert(
+                        result_for_stage.task.task_id.clone(),
+                        result_for_stage.task.clone(),
+                    );
+                    data.ingest_results.insert(
+                        result_for_stage.task.task_id.clone(),
+                        result_for_stage.clone(),
+                    );
+                    Ok(result_for_stage)
+                },
+            )
+            .await?;
         Ok(result)
     }
 
@@ -2884,13 +5993,22 @@ impl Store {
         tenant_id: &str,
         req: CreateStructuredSnapshotRequest,
     ) -> Result<StructuredSnapshotResponse, ApiError> {
-        let response = self.create_snapshot(tenant_id, req)?;
-        let _ = self
-            .repository
-            .upsert_structured_snapshot(&response.snapshot)
-            .await?;
-        let _ = self
-            .persist_history_event_by_id(&response.history_event_id)
+        let owner = require_string(req.owner_user_id.clone(), "owner_user_id")?;
+        let idempotency_key = req.idempotency_key.clone();
+        let request_fingerprint =
+            self.mutation_request_fingerprint(tenant_id, "structured_snapshot.create", &req)?;
+        let (response, _) = self
+            .execute_staged_mutation_with_idempotency(
+                tenant_id,
+                "structured_snapshot.create",
+                Some(&owner),
+                MutationIdempotency {
+                    key: idempotency_key.as_deref(),
+                    request_fingerprint: Some(&request_fingerprint),
+                },
+                MutationPrimary::StructuredSnapshot,
+                |staged| staged.create_snapshot(tenant_id, req),
+            )
             .await?;
         Ok(response)
     }
@@ -2901,8 +6019,22 @@ impl Store {
         dataset_key: &str,
         req: DatasetSchemaUpsertRequest,
     ) -> Result<DatasetSchemaResponse, ApiError> {
-        let response = self.upsert_dataset(tenant_id, dataset_key, req)?;
-        let _ = self.repository.upsert_dataset(&response.dataset).await?;
+        let idempotency_key = req.idempotency_key.clone();
+        let request_fingerprint =
+            self.mutation_request_fingerprint(tenant_id, "dataset.upsert", &(dataset_key, &req))?;
+        let (response, _) = self
+            .execute_staged_mutation_with_idempotency(
+                tenant_id,
+                "dataset.upsert",
+                None,
+                MutationIdempotency {
+                    key: idempotency_key.as_deref(),
+                    request_fingerprint: Some(&request_fingerprint),
+                },
+                MutationPrimary::Dataset,
+                |staged| staged.upsert_dataset(tenant_id, dataset_key, req),
+            )
+            .await?;
         Ok(response)
     }
 
@@ -2912,22 +6044,28 @@ impl Store {
         snapshot_id: &str,
         req: BulkStructuredRowsRequest,
     ) -> Result<BulkStructuredRowsResponse, ApiError> {
-        self.ensure_snapshot_rows_loaded(tenant_id, snapshot_id)
+        let snapshot = self
+            .ensure_snapshot_rows_loaded(tenant_id, snapshot_id)
             .await?;
-        let response = self.bulk_rows(tenant_id, snapshot_id, req)?;
-        let rows = self.snapshot_rows(snapshot_id)?;
-        let _ = self
-            .repository
-            .upsert_structured_rows(tenant_id, &rows)
-            .await?;
-        if let Some(snapshot) = self.snapshot(snapshot_id)? {
-            let _ = self
-                .repository
-                .upsert_structured_snapshot(&snapshot)
-                .await?;
-        }
-        let _ = self
-            .persist_history_event_by_id(&response.history_event_id)
+        let owner = snapshot.owner_user_id;
+        let idempotency_key = req.idempotency_key.clone();
+        let request_fingerprint = self.mutation_request_fingerprint(
+            tenant_id,
+            "structured_rows.bulk",
+            &(snapshot_id, &req),
+        )?;
+        let (response, _) = self
+            .execute_staged_mutation_with_idempotency(
+                tenant_id,
+                "structured_rows.bulk",
+                Some(&owner),
+                MutationIdempotency {
+                    key: idempotency_key.as_deref(),
+                    request_fingerprint: Some(&request_fingerprint),
+                },
+                MutationPrimary::StructuredRows,
+                |staged| staged.bulk_rows(tenant_id, snapshot_id, req),
+            )
             .await?;
         Ok(response)
     }
@@ -2970,34 +6108,26 @@ impl Store {
             self.ensure_snapshot_rows_loaded(tenant_id, &prior_snapshot_id)
                 .await?;
         }
-        let response = self.apply_snapshot(tenant_id, dataset_key, req)?;
-        for summary in self.structured_summaries(&response.summary_ids)? {
-            let _ = self
-                .repository
-                .upsert_structured_summary(tenant_id, &summary)
-                .await?;
-        }
-        let snapshot = self
-            .snapshot(&response.snapshot_id)?
-            .ok_or_else(|| ApiError::not_found("snapshot not found"))?;
-        let routing = self
-            .resolver
-            .resolve(tenant_id, &snapshot.owner_user_id, false, true)?;
-        let nodes = self.context_nodes_for_index(&routing.personal_context_index_uid)?;
-        self.ensure_user_indexes_for_owner(tenant_id, &snapshot.owner_user_id)
+        let owner = snapshot.owner_user_id.clone();
+        let idempotency_key = req.idempotency_key.clone();
+        let request_fingerprint = self.mutation_request_fingerprint(
+            tenant_id,
+            "structured_snapshot.apply",
+            &(dataset_key, &req),
+        )?;
+        let (response, _) = self
+            .execute_staged_mutation_with_idempotency(
+                tenant_id,
+                "structured_snapshot.apply",
+                Some(&owner),
+                MutationIdempotency {
+                    key: idempotency_key.as_deref(),
+                    request_fingerprint: Some(&request_fingerprint),
+                },
+                MutationPrimary::StructuredSummary,
+                |staged| staged.apply_snapshot(tenant_id, dataset_key, req),
+            )
             .await?;
-        let _ = self
-            .repository
-            .upsert_context_nodes(&routing.personal_context_index_uid, &nodes)
-            .await?;
-        if let Some(event_id) = self.latest_event_id_for_entity(
-            &snapshot.owner_user_id,
-            "structured.snapshot.applied",
-            "structured_snapshot",
-            &response.snapshot_id,
-        )? {
-            let _ = self.persist_history_event_by_id(&event_id).await?;
-        }
         Ok(response)
     }
 
@@ -3030,27 +6160,40 @@ impl Store {
                 self.validate_repository_context_node(node, tenant_id, owner_user_id.as_deref())
                     .is_ok()
             });
-            // Hybrid re-rank of the repository's candidates: Meilisearch
-            // decided membership, the blended text+vector score decides the
-            // final order. Repository matches are never dropped here — a
-            // node below the vector threshold keeps its text score.
+            if self.redaction_config.write_consistency == WriteConsistency::ReadYourWrites {
+                let local_scope = {
+                    let data = self.read()?;
+                    self.context_scope_locked(&data, tenant_id, owner_user_id.as_deref())?
+                };
+                let mut local_by_uri = HashMap::new();
+                for node in local_scope {
+                    local_by_uri.insert((node.uri.clone(), node.layer), node);
+                }
+                result
+                    .nodes
+                    .retain(|node| !local_by_uri.contains_key(&(node.uri.clone(), node.layer)));
+                result
+                    .nodes
+                    .extend(local_by_uri.into_values().filter(|node| {
+                        retrieval_candidate(node) && structured_filters.matches_node(node)
+                    }));
+            }
+            // Use the same hybrid ranker as the memory path after merging
+            // repository and local RYW candidates. This retains vector-only
+            // local matches without admitting unrelated zero-score rows.
             let doc_candidates = {
                 let data = self.read()?;
                 doc_candidates_locked(&data, &result.nodes)
             };
             let vector_scores = self.vector_score_map(&query, &result.nodes);
             let doc_scores = self.vector_doc_score_map(&query, doc_candidates);
-            let mut scored_nodes: Vec<(ContextNode, f32)> = result
-                .nodes
-                .into_iter()
-                .map(|node| {
-                    let text = text_score(&node_match_text(&node), &query);
-                    let score = hybrid_node_score(&node, &query, &vector_scores, &doc_scores)
-                        .unwrap_or(text);
-                    (node, score)
-                })
-                .collect();
-            scored_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let scored_nodes = rank_nodes(
+                result.nodes.into_iter(),
+                &query,
+                limit,
+                &vector_scores,
+                &doc_scores,
+            );
             let nodes: Vec<ContextNode> =
                 scored_nodes.iter().map(|(node, _)| node.clone()).collect();
             let redaction_secrets = self.redaction_config.configured_secret_values();
@@ -3082,7 +6225,7 @@ impl Store {
             let trace = TraceRecord {
                 id: new_id("trace"),
                 tenant_id: tenant_id.to_string(),
-                owner_user_id,
+                owner_user_id: owner_user_id.clone(),
                 query,
                 mode: req.mode,
                 stages: stages.clone(),
@@ -3095,15 +6238,39 @@ impl Store {
                 groups,
                 stages,
             };
-            self.insert_trace(trace.clone())?;
-            let _ = self.repository.upsert_trace(&trace).await?;
-            return Ok(ContextSearchOutcome {
+            let outcome = ContextSearchOutcome {
                 response,
                 trace,
                 nodes,
-            });
+            };
+            let outcome_for_stage = outcome.clone();
+            let (outcome, _) = self
+                .execute_staged_mutation(
+                    tenant_id,
+                    "trace.create",
+                    owner_user_id.as_deref(),
+                    None,
+                    MutationPrimary::Trace,
+                    move |staged| {
+                        staged.insert_trace(outcome_for_stage.trace.clone())?;
+                        Ok(outcome_for_stage)
+                    },
+                )
+                .await?;
+            return Ok(outcome);
         }
-        self.search_context(tenant_id, req, is_admin)
+        let owner = owner_user_id;
+        let (outcome, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "trace.create",
+                owner.as_deref(),
+                None,
+                MutationPrimary::Trace,
+                |staged| staged.search_context(tenant_id, req, is_admin),
+            )
+            .await?;
+        Ok(outcome)
     }
 
     pub async fn answer_rag_async(
@@ -3162,23 +6329,17 @@ impl Store {
         session_id: &str,
         req: SessionCommitRequest,
     ) -> Result<SessionCommitResponse, ApiError> {
-        let response = self.commit_session(tenant_id, session_id, req)?;
-        let session = self.session_record(session_id)?;
-        let _ = self.repository.upsert_session(&session).await?;
-        if let Some(uri) = &response.archive_uri {
-            let owner = self.session_owner_id(session_id)?;
-            let node = self.fs_read(tenant_id, uri, Some(&owner), false)?;
-            let index_uid = node.index_uid.clone();
-            self.ensure_user_indexes_for_owner(tenant_id, &owner)
-                .await?;
-            let _ = self
-                .repository
-                .upsert_context_nodes(&index_uid, &[node])
-                .await?;
-        }
-        for event_id in &response.history_event_ids {
-            let _ = self.persist_history_event_by_id(event_id).await?;
-        }
+        let owner = self.session_owner_id(session_id)?;
+        let (response, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "session.commit",
+                Some(&owner),
+                None,
+                MutationPrimary::Session,
+                |staged| staged.commit_session(tenant_id, session_id, req),
+            )
+            .await?;
         Ok(response)
     }
 
@@ -3188,16 +6349,17 @@ impl Store {
         session_id: &str,
         req: SessionMessageRequest,
     ) -> Result<Value, ApiError> {
-        let response = self.add_session_message(tenant_id, session_id, req)?;
-        let session = self.session_record(session_id)?;
-        let _ = self.repository.upsert_session(&session).await?;
-        if let Some(event_id) = response
-            .get("history_event_id")
-            .and_then(Value::as_str)
-            .filter(|event_id| !event_id.is_empty())
-        {
-            let _ = self.persist_history_event_by_id(event_id).await?;
-        }
+        let owner = self.session_owner_id(session_id)?;
+        let (response, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "session.message.add",
+                Some(&owner),
+                None,
+                MutationPrimary::Session,
+                |staged| staged.add_session_message(tenant_id, session_id, req),
+            )
+            .await?;
         Ok(response)
     }
 
@@ -3206,9 +6368,17 @@ impl Store {
         tenant_id: &str,
         req: SessionCreateRequest,
     ) -> Result<SessionResponse, ApiError> {
-        let response = self.create_session(tenant_id, req)?;
-        let session = self.session_record(&response.session_id)?;
-        let _ = self.repository.upsert_session(&session).await?;
+        let owner = require_string(req.owner_user_id.clone(), "owner_user_id")?;
+        let (response, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "session.create",
+                Some(&owner),
+                None,
+                MutationPrimary::Session,
+                |staged| staged.create_session(tenant_id, req),
+            )
+            .await?;
         Ok(response)
     }
 
@@ -3255,9 +6425,11 @@ impl Store {
             return Ok(snapshot);
         }
         if let Some(snapshot) = self.repository.get_snapshot(tenant_id, snapshot_id).await? {
-            self.write()?
-                .snapshots
-                .insert(snapshot.id.clone(), snapshot.clone());
+            let mut data = self.write()?;
+            if let Some(current) = data.snapshots.get(snapshot_id) {
+                return Ok(current.clone());
+            }
+            data.snapshots.insert(snapshot.id.clone(), snapshot.clone());
             return Ok(snapshot);
         }
         Err(ApiError::not_found("snapshot not found"))
@@ -3328,7 +6500,11 @@ impl Store {
             return Ok(trace);
         }
         if let Some(trace) = self.repository.get_trace(tenant_id, trace_id).await? {
-            self.write()?.traces.insert(trace.id.clone(), trace.clone());
+            let mut data = self.write()?;
+            if let Some(current) = data.traces.get(trace_id) {
+                return Ok(current.clone());
+            }
+            data.traces.insert(trace.id.clone(), trace.clone());
             return Ok(trace);
         }
         Err(ApiError::not_found("trace not found"))
@@ -3428,6 +6604,231 @@ impl Store {
         Ok(())
     }
 
+    async fn ensure_state_document_aggregate_loaded(
+        &self,
+        tenant_id: &str,
+        owner_user_id: &str,
+        state_type: &str,
+        fact_key: &str,
+    ) -> Result<(), ApiError> {
+        self.ensure_personal_context_loaded(tenant_id, Some(owner_user_id), false)
+            .await?;
+
+        let source_id = state_document_source_id(owner_user_id, state_type, fact_key);
+        let source_document_uris = {
+            let data = self.read()?;
+            let routing = self
+                .resolver
+                .resolve(tenant_id, owner_user_id, false, true)?;
+            data.personal_context
+                .get(&routing.personal_context_index_uid)
+                .into_iter()
+                .flatten()
+                .filter(|node| {
+                    node.tenant_id == tenant_id
+                        && node.owner_user_id.as_deref() == Some(owner_user_id)
+                        && node.source_id.as_deref() == Some(source_id.as_str())
+                })
+                .filter_map(|node| node.source_document_uri.clone())
+                .collect::<HashSet<_>>()
+        };
+
+        for uri in source_document_uris {
+            let key = SourceDocumentKey::new(tenant_id, Some(owner_user_id), &uri);
+            if self.read()?.source_documents.contains_key(&key) {
+                continue;
+            }
+            let Some(document) = self
+                .repository
+                .read_source_document(tenant_id, Some(owner_user_id), &uri)
+                .await?
+            else {
+                continue;
+            };
+            if document.tenant_id != tenant_id
+                || document.owner_user_id.as_deref() != Some(owner_user_id)
+                || document.source_id != source_id
+            {
+                return Err(ApiError::Internal(
+                    "repository state source document does not match its requested aggregate"
+                        .to_string(),
+                ));
+            }
+            self.cache_source_document(document)?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_company_source_documents_loaded(
+        &self,
+        tenant_id: &str,
+        source_id: &str,
+    ) -> Result<(), ApiError> {
+        let documents = self
+            .repository
+            .list_company_source_documents(tenant_id, source_id)
+            .await?
+            .unwrap_or_default();
+        for document in documents {
+            if document.tenant_id != tenant_id
+                || document.owner_user_id.is_some()
+                || document.source_id != source_id
+            {
+                return Err(ApiError::Internal(
+                    "repository company source document does not match its requested aggregate"
+                        .to_string(),
+                ));
+            }
+            self.cache_source_document(document)?;
+        }
+        Ok(())
+    }
+
+    fn mutation_request_fingerprint<T: Serialize>(
+        &self,
+        tenant_id: &str,
+        operation_kind: &str,
+        request: &T,
+    ) -> Result<String, ApiError> {
+        let canonical =
+            serde_json::to_string(&(tenant_id, operation_kind, request)).map_err(|error| {
+                ApiError::Internal(format!("failed to fingerprint mutation request: {error}"))
+            })?;
+        Ok(hmac_hex(
+            &self.redaction_config.index_hash_secret,
+            "mutation-request-v1",
+            &canonical,
+            32,
+        ))
+    }
+
+    fn ensure_state_aggregate_identity_available(
+        &self,
+        tenant_id: &str,
+        owner_user_id: &str,
+        state_type: &str,
+        fact_key: &str,
+    ) -> Result<(), ApiError> {
+        let requested_state_type = sanitize_slug(state_type);
+        let requested_fact_key = sanitize_slug(fact_key);
+        let data = self.read()?;
+        for item in data
+            .state_items
+            .values()
+            .filter(|item| item.tenant_id == tenant_id && item.owner_user_id == owner_user_id)
+        {
+            if item.natural_key == fact_key && item.state_type != state_type {
+                return Err(ApiError::conflict(
+                    "state_type is immutable for an existing state fact",
+                ));
+            }
+            if sanitize_slug(&item.state_type) == requested_state_type
+                && sanitize_slug(&item.natural_key) == requested_fact_key
+                && (item.state_type != state_type || item.natural_key != fact_key)
+            {
+                return Err(ApiError::conflict(
+                    "state fact identity collides with an existing canonical state path",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn ensure_state_operation_generation_ready(
+        &self,
+        tenant_id: &str,
+        owner_user_id: &str,
+        state_type: &str,
+        fact_key: &str,
+        current_operation_id: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let state_type_slug = sanitize_slug(state_type);
+        let fact_key_slug = sanitize_slug(fact_key);
+        let (current_version, mut prior_operations) = {
+            let data = self.read()?;
+            let current_version = data
+                .state_items
+                .values()
+                .filter(|item| {
+                    item.tenant_id == tenant_id
+                        && item.owner_user_id == owner_user_id
+                        && sanitize_slug(&item.state_type) == state_type_slug
+                        && sanitize_slug(&item.natural_key) == fact_key_slug
+                })
+                .map(|item| item.current_version)
+                .max();
+            let prior_operations = data
+                .operations
+                .values()
+                .filter(|operation| operation.tenant_id == tenant_id)
+                .filter(|operation| Some(operation.id.as_str()) != current_operation_id)
+                .filter(|operation| {
+                    matches!(
+                        &operation.plan.primary.resource,
+                        OperationResource::StateItem { item }
+                            if item.owner_user_id == owner_user_id
+                                && (item.natural_key == fact_key
+                                    || (sanitize_slug(&item.state_type) == state_type_slug
+                                        && sanitize_slug(&item.natural_key) == fact_key_slug))
+                    )
+                })
+                .filter(|operation| {
+                    operation.status != OperationStatus::Completed
+                        || operation.indexing_state != OperationIndexingState::Completed
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (current_version, prior_operations)
+        };
+        prior_operations.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        for operation in prior_operations {
+            let operation_item = match &operation.plan.primary.resource {
+                OperationResource::StateItem { item } => item,
+                _ => unreachable!("state generation candidates have a state-item primary"),
+            };
+            if operation_item.natural_key == fact_key && operation_item.state_type != state_type {
+                return Err(ApiError::conflict(
+                    "state_type is immutable for an existing state fact",
+                ));
+            }
+            if sanitize_slug(&operation_item.state_type) == state_type_slug
+                && sanitize_slug(&operation_item.natural_key) == fact_key_slug
+                && (operation_item.state_type != state_type
+                    || operation_item.natural_key != fact_key)
+            {
+                return Err(ApiError::conflict(
+                    "state fact identity collides with an existing canonical state path",
+                ));
+            }
+            let operation_version = operation_item.current_version;
+            if current_version.is_some_and(|version| version > operation_version) {
+                return Err(ApiError::conflict(
+                    "a previous update for this state fact must be reconciled before a newer update",
+                ));
+            }
+            if operation.status == OperationStatus::Completed
+                && operation.indexing_state == OperationIndexingState::Pending
+            {
+                let reconciled = self.reconcile_operation_record(operation).await;
+                if reconciled.as_ref().is_ok_and(|record| {
+                    record.status == OperationStatus::Completed
+                        && record.indexing_state == OperationIndexingState::Completed
+                }) {
+                    continue;
+                }
+            }
+            return Err(ApiError::conflict(
+                "a previous update for this state fact must be reconciled before a newer update",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn fs_ls_async(
         &self,
         tenant_id: &str,
@@ -3473,7 +6874,7 @@ impl Store {
             .await?
         {
             self.validate_repository_context_node(&node, tenant_id, owner_user_id)?;
-            self.cache_context_node(node.clone())?;
+            let node = self.cache_context_node(node)?;
             return Ok(self.sanitize_context_node_for_egress(node));
         }
         let source_document = if owner_user_id.is_none() && include_all_private {
@@ -3489,7 +6890,7 @@ impl Store {
                 .await?
         };
         if let Some(source_document) = source_document {
-            self.cache_source_document(source_document.clone())?;
+            let source_document = self.cache_source_document(source_document)?;
             return Ok(self
                 .sanitize_context_node_for_egress(source_document_context_node(source_document)));
         }
@@ -3517,7 +6918,7 @@ impl Store {
             .await?
         {
             self.validate_repository_context_node(&node, tenant_id, owner_user_id)?;
-            self.cache_context_node(node.clone())?;
+            let node = self.cache_context_node(node)?;
             return Ok(self.sanitize_context_node_for_egress(node));
         }
         Err(ApiError::not_found("context layer not found"))
@@ -3615,7 +7016,7 @@ impl Store {
         })
     }
 
-    fn cache_context_node(&self, node: ContextNode) -> Result<(), ApiError> {
+    fn cache_context_node(&self, node: ContextNode) -> Result<ContextNode, ApiError> {
         let mut data = self.write()?;
         let nodes = if node.index_kind == "company" || node.index_uid == "rag_company_context" {
             &mut data.company_context
@@ -3624,15 +7025,19 @@ impl Store {
                 .entry(node.index_uid.clone())
                 .or_default()
         };
-        if let Some(existing) = nodes
-            .iter_mut()
-            .find(|existing| existing.tenant_id == node.tenant_id && existing.uri == node.uri)
-        {
-            *existing = node;
+        if let Some(existing) = nodes.iter_mut().find(|existing| {
+            existing.tenant_id == node.tenant_id
+                && existing.uri == node.uri
+                && existing.layer == node.layer
+        }) {
+            if existing.updated_at <= node.updated_at {
+                *existing = node;
+            }
+            Ok(existing.clone())
         } else {
-            nodes.push(node);
+            nodes.push(node.clone());
+            Ok(node)
         }
-        Ok(())
     }
 
     fn validate_repository_context_node(
@@ -3676,10 +7081,16 @@ impl Store {
         ))
     }
 
-    fn cache_source_document(&self, document: SourceDocument) -> Result<(), ApiError> {
+    fn cache_source_document(&self, document: SourceDocument) -> Result<SourceDocument, ApiError> {
+        let mut data = self.write()?;
         let key = SourceDocumentKey::from_document(&document);
-        self.write()?.source_documents.insert(key, document);
-        Ok(())
+        if let Some(existing) = data.source_documents.get(&key) {
+            if existing.updated_at > document.updated_at {
+                return Ok(existing.clone());
+            }
+        }
+        data.source_documents.insert(key, document.clone());
+        Ok(document)
     }
 
     fn sanitize_context_node_for_egress(&self, mut node: ContextNode) -> ContextNode {
@@ -3704,18 +7115,28 @@ impl Store {
         owner_user_id: &str,
         req: EnsureUserEventIndexRequest,
     ) -> Result<UserEventIndexResponse, ApiError> {
+        if req
+            .schema_version
+            .is_some_and(|version| version != EVENT_INDEX_SCHEMA_VERSION)
+        {
+            return Err(ApiError::bad_request(format!(
+                "schema_version must be {EVENT_INDEX_SCHEMA_VERSION}"
+            )));
+        }
+        if !req.create_personal_context_index {
+            return Err(ApiError::bad_request(
+                "create_personal_context_index must be true",
+            ));
+        }
         let mut data = self.write()?;
         let (index, routing) = self.ensure_user_index_locked(
             &mut data,
             tenant_id,
             owner_user_id,
-            req.schema_version.unwrap_or(EVENT_INDEX_SCHEMA_VERSION),
+            EVENT_INDEX_SCHEMA_VERSION,
         )?;
 
-        let _ = (
-            req.force_reapply_settings,
-            req.create_personal_context_index,
-        );
+        let _ = req.force_reapply_settings;
 
         Ok(UserEventIndexResponse {
             index,
@@ -3845,11 +7266,42 @@ impl Store {
         tenant_id: &str,
         req: ReconcileUserEventIndexesRequest,
     ) -> Result<ReconcileUserEventIndexesResponse, ApiError> {
-        let dry_run = req.dry_run;
-        let response = self.reconcile_user_indexes(tenant_id, req)?;
-        if !dry_run {
-            for index in &response.indexes {
-                let _ = self.repository.ensure_user_event_index(index).await?;
+        if req.dry_run {
+            return self.reconcile_user_indexes(tenant_id, req);
+        }
+        let reapply_settings = req.reapply_settings;
+        let existing_ids = self
+            .read()?
+            .user_indexes
+            .values()
+            .filter(|index| index.tenant_id == tenant_id)
+            .map(|index| index.id.clone())
+            .collect::<HashSet<_>>();
+        let (response, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "user_event_indexes.reconcile",
+                None,
+                None,
+                MutationPrimary::UserIndex,
+                |staged| staged.reconcile_user_indexes(tenant_id, req),
+            )
+            .await?;
+        // Existing registry rows produce no mutation delta, but this admin
+        // endpoint also re-applies their dynamic-index settings. Newly
+        // created rows were already applied by their journal steps.
+        for index in &response.indexes {
+            if reapply_settings && existing_ids.contains(&index.id) {
+                self.execute_explicit_resource_operation(
+                    tenant_id,
+                    "user_event_indexes.settings_reapply",
+                    None,
+                    MutationPrimary::UserIndex,
+                    OperationResource::EnsureUserEventIndex {
+                        index: index.clone(),
+                    },
+                )
+                .await?;
             }
         }
         Ok(response)
@@ -3861,13 +7313,7 @@ impl Store {
         path_owner_user_id: Option<&str>,
         req: AppendHistoryEventRequest,
     ) -> Result<HistoryEventResponse, ApiError> {
-        let owner_user_id =
-            self.owner_from_path_or_body(path_owner_user_id, req.owner_user_id.as_deref())?;
-        if req.event_index_hint.is_some() {
-            return Err(ApiError::bad_request(
-                "event_index_hint is not accepted; event index routing is server-side",
-            ));
-        }
+        let owner_user_id = self.validate_append_event_request(path_owner_user_id, &req)?;
 
         let event_type = require_string(req.event_type, "event_type")?;
         let entity_type = require_string(req.entity_type, "entity_type")?;
@@ -3882,6 +7328,10 @@ impl Store {
         let source_ref = req
             .source_ref
             .ok_or_else(|| ApiError::bad_request("source_ref is required"))?;
+        let text = req.text.unwrap_or_default();
+        let payload = req.payload;
+        let tags = req.tags;
+        let privacy = req.privacy;
 
         let mut data = self.write()?;
         let (index, routing) = self.ensure_user_index_locked(
@@ -3901,12 +7351,31 @@ impl Store {
                 .get(&(routing.event_index_uid.clone(), hash.clone()))
             {
                 if let Some(event) = data.event_by_id.get(existing_id).cloned() {
+                    let same_request = event.event_type == event_type
+                        && event.entity_type == entity_type
+                        && event.entity_id == entity_id
+                        && event.occurred_at == occurred_at
+                        && event.observed_at == observed_at
+                        && event.source_kind == source_kind
+                        && event.source_ref == source_ref
+                        && event.text == text
+                        && event.payload == payload
+                        && event.tags == tags
+                        && event.privacy == privacy
+                        && event.tenant_id == tenant_id
+                        && event.owner_user_id == owner_user_id;
+                    if !same_request {
+                        return Err(ApiError::conflict(
+                            "idempotency key was already used for a different request",
+                        ));
+                    }
                     return Ok(HistoryEventResponse {
                         event,
                         duplicate: true,
                         materialization_job_id: None,
                         routing,
                         meili_task_uid: None,
+                        persistence: None,
                     });
                 }
             }
@@ -3921,10 +7390,10 @@ impl Store {
             observed_at,
             source_kind,
             source_ref,
-            text: req.text.unwrap_or_default(),
-            payload: req.payload,
-            tags: req.tags,
-            privacy: req.privacy,
+            text,
+            payload,
+            tags,
+            privacy,
             tenant_id: tenant_id.to_string(),
             owner_user_id: owner_user_id.clone(),
             owner_user_id_hash: routing.owner_user_id_hash.clone(),
@@ -3942,6 +7411,7 @@ impl Store {
             materialization_job_id: Some(new_id("job")),
             routing,
             meili_task_uid: None,
+            persistence: None,
         })
     }
 
@@ -3993,9 +7463,21 @@ impl Store {
         if req.events.is_empty() {
             return Err(ApiError::bad_request("events must not be empty"));
         }
+        if req
+            .events
+            .iter()
+            .any(|event| event.idempotency_key.is_some())
+        {
+            return Err(ApiError::bad_request(
+                "events[].idempotency_key is not supported; use the batch idempotency_key",
+            ));
+        }
 
         let owner = self
             .owner_from_path_or_body(path_owner_user_id, req.events[0].owner_user_id.as_deref())?;
+        for event in &req.events {
+            self.validate_append_event_request(Some(&owner), event)?;
+        }
         let mut inserted = 0;
         let mut duplicates = 0;
         let mut event_ids = Vec::new();
@@ -4029,6 +7511,7 @@ impl Store {
             materialization_job_ids: Vec::new(),
             routing: routing.expect("bulk events are non-empty"),
             meili_task_uid: None,
+            persistence: None,
         })
     }
 
@@ -4100,27 +7583,6 @@ impl Store {
             .and_then(|events| events.iter().find(|event| event.id == event_id))
             .cloned()
             .ok_or_else(|| ApiError::not_found("history event not found"))
-    }
-
-    fn latest_event_id_for_entity(
-        &self,
-        owner_user_id: &str,
-        event_type: &str,
-        entity_type: &str,
-        entity_id: &str,
-    ) -> Result<Option<String>, ApiError> {
-        let data = self.read()?;
-        Ok(data
-            .event_by_id
-            .values()
-            .filter(|event| {
-                event.owner_user_id == owner_user_id
-                    && event.event_type == event_type
-                    && event.entity_type == entity_type
-                    && event.entity_id == entity_id
-            })
-            .max_by_key(|event| event.observed_at)
-            .map(|event| event.id.clone()))
     }
 
     pub fn timeline(
@@ -4596,6 +8058,13 @@ impl Store {
                     .cloned()
                 {
                     if let Some(link) = data.links.get(&existing_id).cloned() {
+                        ensure_link_not_pending_company_source_delete(
+                            &data,
+                            tenant_id,
+                            Some(&existing_id),
+                            &link.source_uri,
+                            &link.target_uri,
+                        )?;
                         return Ok(LinkResponse {
                             link,
                             decision: "duplicate".to_string(),
@@ -4620,6 +8089,13 @@ impl Store {
                 .map(|link| link.id.clone());
 
             let (id, created_at, decision) = if let Some(existing_id) = existing_id {
+                ensure_link_not_pending_company_source_delete(
+                    &data,
+                    tenant_id,
+                    Some(&existing_id),
+                    &source_uri,
+                    &target_uri,
+                )?;
                 let created_at = data
                     .links
                     .get(&existing_id)
@@ -4627,6 +8103,13 @@ impl Store {
                     .unwrap_or(now);
                 (existing_id, created_at, "updated".to_string())
             } else {
+                ensure_link_not_pending_company_source_delete(
+                    &data,
+                    tenant_id,
+                    None,
+                    &source_uri,
+                    &target_uri,
+                )?;
                 (new_id("link"), now, "created".to_string())
             };
 
@@ -4867,6 +8350,7 @@ impl Store {
         };
 
         let mut data = self.write()?;
+        ensure_company_source_not_deleting(&data, tenant_id, source_id)?;
         data.sources
             .entry(source_id.to_string())
             .or_insert_with(|| CompanySource {
@@ -4916,6 +8400,7 @@ impl Store {
         _req: ActivateRevisionRequest,
     ) -> Result<ActivateRevisionResponse, ApiError> {
         let mut data = self.write()?;
+        ensure_company_source_not_deleting(&data, tenant_id, source_id)?;
         let revisions = data
             .source_revisions
             .get_mut(source_id)
@@ -5044,38 +8529,148 @@ impl Store {
         tenant_id: &str,
         source_id: &str,
     ) -> Result<Value, ApiError> {
-        // Existence check first so we can return a clean 404 without
-        // touching Meili.
+        let _mutation_guard = self.mutation_gate.lock().await;
         {
             let data = self.read()?;
-            if !data.sources.contains_key(source_id) {
+            ensure_company_source_not_deleting(&data, tenant_id, source_id)?;
+            if data
+                .sources
+                .get(source_id)
+                .is_none_or(|source| source.tenant_id != tenant_id)
+            {
                 return Err(ApiError::not_found("source not found"));
             }
         }
-
-        // Persistence cascade (Meili) BEFORE in-memory mutation so a Meili
-        // rejection leaves the in-memory state intact and recoverable.
-        let report = self
-            .repository
-            .delete_company_source(tenant_id, source_id)
+        self.ensure_company_source_documents_loaded(tenant_id, source_id)
             .await?;
+        let source_id_for_stage = source_id.to_string();
+        let (mut response, persistence) = self
+            .execute_staged_mutation_guarded(
+                tenant_id,
+                "company_doc.delete",
+                None,
+                MutationIdempotency {
+                    key: None,
+                    request_fingerprint: None,
+                },
+                MutationPrimary::DeleteCompanySource,
+                move |staged| {
+                    let mut data = staged.write()?;
+                    ensure_company_source_not_deleting(&data, tenant_id, &source_id_for_stage)?;
+                    if data
+                        .sources
+                        .get(&source_id_for_stage)
+                        .is_none_or(|source| source.tenant_id != tenant_id)
+                    {
+                        return Err(ApiError::not_found("source not found"));
+                    }
+                    let removed_document_keys = data
+                        .source_documents
+                        .iter()
+                        .filter(|(_, document)| {
+                            document.tenant_id == tenant_id
+                                && document.owner_user_id.is_none()
+                                && document.source_id == source_id_for_stage
+                        })
+                        .map(|(key, _)| key.clone())
+                        .collect::<HashSet<_>>();
+                    let mut removed_document_uris = removed_document_keys
+                        .iter()
+                        .map(|key| key.uri.clone())
+                        .collect::<HashSet<_>>();
+                    removed_document_uris.extend(company_source_related_uris(
+                        &data,
+                        tenant_id,
+                        &source_id_for_stage,
+                    ));
+                    ensure_company_source_mutations_reconciled_before_delete(
+                        &data,
+                        tenant_id,
+                        &source_id_for_stage,
+                        &removed_document_uris,
+                    )?;
+                    let removed_task_ids = data
+                        .ingest_tasks
+                        .values()
+                        .filter(|task| {
+                            task.tenant_id == tenant_id
+                                && task.owner_user_id.is_none()
+                                && task.source_id == source_id_for_stage
+                        })
+                        .map(|task| task.task_id.clone())
+                        .collect::<HashSet<_>>();
+                    let removed_link_ids = data
+                        .links
+                        .values()
+                        .filter(|link| {
+                            link.tenant_id == tenant_id
+                                && (removed_document_uris.contains(&link.source_uri)
+                                    || removed_document_uris.contains(&link.target_uri))
+                        })
+                        .map(|link| link.id.clone())
+                        .collect::<HashSet<_>>();
 
-        // In-memory cleanup.
-        let mut data = self.write()?;
-        data.sources.remove(source_id);
-        data.source_revisions.remove(source_id);
-        // Drop any company-context fragments that point at this source.
-        data.company_context
-            .retain(|n| n.source_id.as_deref() != Some(source_id));
-
-        Ok(json!({
-            "source_id": source_id,
-            "deleted": true,
-            "fragments_task": report.fragments_task,
-            "revisions_task": report.revisions_task,
-            "source_task": report.source_task,
-            "auxiliary_tasks": report.auxiliary_tasks,
-        }))
+                    data.sources.remove(&source_id_for_stage);
+                    let remove_revision_entry = if let Some(revisions) =
+                        data.source_revisions.get_mut(&source_id_for_stage)
+                    {
+                        revisions.retain(|revision| revision.tenant_id != tenant_id);
+                        revisions.is_empty()
+                    } else {
+                        false
+                    };
+                    if remove_revision_entry {
+                        data.source_revisions.remove(&source_id_for_stage);
+                    }
+                    data.company_context.retain(|node| {
+                        node.tenant_id != tenant_id
+                            || node.source_id.as_deref() != Some(&source_id_for_stage)
+                    });
+                    data.source_documents
+                        .retain(|key, _| !removed_document_keys.contains(key));
+                    data.parse_artifacts.retain(|_, artifact| {
+                        artifact.tenant_id != tenant_id
+                            || artifact.owner_user_id.is_some()
+                            || artifact.source_id != source_id_for_stage
+                    });
+                    data.parsed_blocks
+                        .retain(|key, _| !removed_document_keys.contains(key));
+                    data.ingest_tasks
+                        .retain(|task_id, _| !removed_task_ids.contains(task_id));
+                    data.ingest_results.retain(|task_id, result| {
+                        !removed_task_ids.contains(task_id)
+                            && (result.task.tenant_id != tenant_id
+                                || result.task.owner_user_id.is_some()
+                                || result.source_id != source_id_for_stage)
+                    });
+                    data.links
+                        .retain(|link_id, _| !removed_link_ids.contains(link_id));
+                    data.link_idempotency
+                        .retain(|_, link_id| !removed_link_ids.contains(link_id));
+                    Ok(json!({
+                        "source_id": source_id_for_stage,
+                        "deleted": true,
+                        "fragments_task": null,
+                        "revisions_task": null,
+                        "source_task": null,
+                        "auxiliary_tasks": [],
+                    }))
+                },
+            )
+            .await?;
+        if let Some(persistence) = persistence {
+            response["deleted"] = json!(
+                persistence.status == OperationStatus::Completed
+                    && persistence.indexing_state == OperationIndexingState::Completed
+            );
+            response["fragments_task"] = json!(persistence.task_uids.first());
+            response["revisions_task"] = json!(persistence.task_uids.get(1));
+            response["source_task"] = json!(persistence.task_uids.get(2));
+            response["auxiliary_tasks"] =
+                json!(persistence.task_uids.iter().skip(3).collect::<Vec<_>>());
+            response["persistence"] = json!(persistence);
+        }
+        Ok(response)
     }
 
     pub fn upsert_dataset(
@@ -5206,7 +8801,11 @@ impl Store {
         let mut invalid = 0;
         let mut row_ids = Vec::new();
         let mut rows_to_add = Vec::new();
-        for mut row in req.rows {
+        let batch_idempotency_hash = req
+            .idempotency_key
+            .as_deref()
+            .map(|key| self.resolver.idempotency_hash(key));
+        for (row_index, mut row) in req.rows.into_iter().enumerate() {
             if !row.is_object() {
                 invalid += 1;
                 continue;
@@ -5216,9 +8815,17 @@ impl Store {
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
                 .or_else(|| {
-                    req.idempotency_key
-                        .as_deref()
-                        .map(|key| self.resolver.idempotency_hash(key))
+                    batch_idempotency_hash.as_deref().map(|batch_hash| {
+                        format!(
+                            "row_{}",
+                            hmac_hex(
+                                &self.redaction_config.index_hash_secret,
+                                "structured-row-id-v1",
+                                &format!("{snapshot_id}\0{batch_hash}\0{row_index}"),
+                                32,
+                            )
+                        )
+                    })
                 })
                 .unwrap_or_else(|| new_id("row"));
             let key = (snapshot_id.to_string(), row_id.clone());
@@ -5257,6 +8864,32 @@ impl Store {
             .unwrap_or(0);
         if let Some(snapshot) = data.snapshots.get_mut(snapshot_id) {
             snapshot.row_count = row_count;
+        }
+        if inserted == 0 {
+            let history_event_id = data
+                .event_by_id
+                .values()
+                .filter(|event| {
+                    event.tenant_id == tenant_id
+                        && event.owner_user_id == owner_user_id
+                        && event.event_type == "structured.rows.bulk_inserted"
+                        && event.entity_id == snapshot_id
+                })
+                .max_by(|left, right| {
+                    left.observed_at
+                        .cmp(&right.observed_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                })
+                .map(|event| event.id.clone())
+                .unwrap_or_default();
+            return Ok(BulkStructuredRowsResponse {
+                snapshot_id: snapshot_id.to_string(),
+                inserted,
+                duplicates,
+                invalid,
+                row_ids,
+                history_event_id,
+            });
         }
         drop(data);
 
@@ -6394,47 +10027,6 @@ impl Store {
         run.overview_source_document_uri = Some(ingest.source_document_uri);
     }
 
-    fn context_nodes_for_index(&self, index_uid: &str) -> Result<Vec<ContextNode>, ApiError> {
-        let data = self.read()?;
-        if index_uid == "rag_company_context" {
-            return Ok(data.company_context.clone());
-        }
-        Ok(data
-            .personal_context
-            .get(index_uid)
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    async fn persist_ingest_outputs(
-        &self,
-        tenant_id: &str,
-        owner_user_id: Option<&str>,
-    ) -> Result<(), ApiError> {
-        let (index_uid, source_owner) = if let Some(owner) = owner_user_id {
-            self.ensure_user_indexes_for_owner(tenant_id, owner).await?;
-            let routing = self.resolver.resolve(tenant_id, owner, false, true)?;
-            (routing.personal_context_index_uid, Some(owner))
-        } else {
-            ("rag_company_context".to_string(), None)
-        };
-        let nodes = self.context_nodes_for_index(&index_uid)?;
-        let _ = self
-            .repository
-            .upsert_context_nodes(&index_uid, &nodes)
-            .await?;
-        let source_documents = self.source_documents_for_scope(tenant_id, source_owner)?;
-        let _ = self
-            .repository
-            .upsert_source_documents(&source_documents)
-            .await?;
-        let artifacts = self.parse_artifacts_for_scope(tenant_id, source_owner)?;
-        let _ = self.repository.upsert_parse_artifacts(&artifacts).await?;
-        let links = self.links_for_tenant(tenant_id)?;
-        let _ = self.repository.upsert_links(&links).await?;
-        Ok(())
-    }
-
     fn transition_ingest_task(
         &self,
         task_id: &str,
@@ -6475,33 +10067,20 @@ impl Store {
         task_id: &str,
         error: &'static str,
     ) -> Result<bool, ApiError> {
-        let Some(task) = self.fail_nonterminal_ingest_task(task_id, error)? else {
-            return Ok(false);
-        };
-        let _ = self.repository.upsert_ingest_task(&task).await?;
-        Ok(true)
-    }
-
-    pub(crate) fn mark_ingest_task_interrupted_local(
-        &self,
-        task_id: &str,
-    ) -> Result<Option<IngestTask>, ApiError> {
-        self.fail_nonterminal_ingest_task(task_id, INGEST_ERROR_INTERRUPTED)
-    }
-
-    pub(crate) fn mark_ingest_task_failed_local(
-        &self,
-        task_id: &str,
-    ) -> Result<Option<IngestTask>, ApiError> {
-        self.fail_nonterminal_ingest_task(task_id, INGEST_ERROR_FAILED)
-    }
-
-    pub(crate) async fn persist_ingest_task_record(
-        &self,
-        task: &IngestTask,
-    ) -> Result<(), ApiError> {
-        let _ = self.repository.upsert_ingest_task(task).await?;
-        Ok(())
+        let current = self.ingest_task_for_run(task_id)?;
+        let owner = current.owner_user_id.clone();
+        let tenant_id = current.tenant_id.clone();
+        let (task, _) = self
+            .execute_staged_mutation(
+                &tenant_id,
+                "ingest_task.fail",
+                owner.as_deref(),
+                None,
+                MutationPrimary::IngestTask,
+                |staged| staged.fail_nonterminal_ingest_task(task_id, error),
+            )
+            .await?;
+        Ok(task.is_some())
     }
 
     pub async fn mark_ingest_task_interrupted_async(
@@ -6521,10 +10100,16 @@ impl Store {
         &self,
         tenant_id: &str,
     ) -> Result<usize, ApiError> {
-        let tasks = self.interrupt_nonterminal_ingest_tasks_local(tenant_id)?;
-        for task in &tasks {
-            self.persist_ingest_task_record(task).await?;
-        }
+        let (tasks, _) = self
+            .execute_staged_mutation(
+                tenant_id,
+                "ingest_tasks.interrupt",
+                None,
+                None,
+                MutationPrimary::IngestTask,
+                |staged| staged.interrupt_nonterminal_ingest_tasks_local(tenant_id),
+            )
+            .await?;
         Ok(tasks.len())
     }
 
@@ -6543,24 +10128,25 @@ impl Store {
         Ok(interrupted)
     }
 
-    pub(crate) async fn persist_ingest_task_records(
-        &self,
-        tasks: &[IngestTask],
-    ) -> Result<(), ApiError> {
-        for task in tasks {
-            self.persist_ingest_task_record(task).await?;
-        }
-        Ok(())
-    }
-
     async fn transition_ingest_task_async(
         &self,
         task_id: &str,
         state: &str,
         error: Option<String>,
     ) -> Result<IngestTask, ApiError> {
-        let task = self.transition_ingest_task(task_id, state, error)?;
-        let _ = self.repository.upsert_ingest_task(&task).await?;
+        let current = self.ingest_task_for_run(task_id)?;
+        let tenant_id = current.tenant_id.clone();
+        let owner = current.owner_user_id.clone();
+        let (task, _) = self
+            .execute_staged_mutation(
+                &tenant_id,
+                "ingest_task.transition",
+                owner.as_deref(),
+                None,
+                MutationPrimary::IngestTask,
+                |staged| staged.transition_ingest_task(task_id, state, error),
+            )
+            .await?;
         Ok(task)
     }
 
@@ -6572,101 +10158,12 @@ impl Store {
             .ok_or_else(|| ApiError::not_found("ingest task not found"))
     }
 
-    fn company_source(&self, source_id: &str) -> Result<Option<CompanySource>, ApiError> {
-        let data = self.read()?;
-        Ok(data.sources.get(source_id).cloned())
-    }
-
-    fn source_revision(
-        &self,
-        source_id: &str,
-        revision_id: &str,
-    ) -> Result<Option<SourceRevision>, ApiError> {
-        let data = self.read()?;
-        Ok(data.source_revisions.get(source_id).and_then(|revisions| {
-            revisions
-                .iter()
-                .find(|revision| revision.id == revision_id)
-                .cloned()
-        }))
-    }
-
-    fn source_documents_for_scope(
-        &self,
-        tenant_id: &str,
-        owner_user_id: Option<&str>,
-    ) -> Result<Vec<SourceDocument>, ApiError> {
-        let data = self.read()?;
-        Ok(data
-            .source_documents
-            .values()
-            .filter(|document| document.tenant_id == tenant_id)
-            .filter(|document| document.owner_user_id.as_deref() == owner_user_id)
-            .cloned()
-            .collect())
-    }
-
-    fn parse_artifacts_for_scope(
-        &self,
-        tenant_id: &str,
-        owner_user_id: Option<&str>,
-    ) -> Result<Vec<ParseArtifact>, ApiError> {
-        let data = self.read()?;
-        Ok(data
-            .parse_artifacts
-            .values()
-            .filter(|artifact| artifact.tenant_id == tenant_id)
-            .filter(|artifact| artifact.owner_user_id.as_deref() == owner_user_id)
-            .cloned()
-            .collect())
-    }
-
-    fn links_for_tenant(&self, tenant_id: &str) -> Result<Vec<KnowledgeLink>, ApiError> {
-        let data = self.read()?;
-        Ok(data
-            .links
-            .values()
-            .filter(|link| link.tenant_id == tenant_id)
-            .cloned()
-            .collect())
-    }
-
-    fn snapshot(&self, snapshot_id: &str) -> Result<Option<StructuredSnapshot>, ApiError> {
-        let data = self.read()?;
-        Ok(data.snapshots.get(snapshot_id).cloned())
-    }
-
-    fn snapshot_rows(&self, snapshot_id: &str) -> Result<Vec<Value>, ApiError> {
-        let data = self.read()?;
-        Ok(data
-            .rows_by_snapshot
-            .get(snapshot_id)
-            .cloned()
-            .unwrap_or_default())
-    }
-
-    fn structured_summaries(&self, summary_ids: &[String]) -> Result<Vec<Value>, ApiError> {
-        let data = self.read()?;
-        Ok(summary_ids
-            .iter()
-            .filter_map(|id| data.structured_summaries.get(id).cloned())
-            .collect())
-    }
-
     fn session_owner(&self, session_id: &str) -> Result<Option<String>, ApiError> {
         let data = self.read()?;
         Ok(data
             .sessions
             .get(session_id)
             .map(|session| session.owner_user_id.clone()))
-    }
-
-    fn session_record(&self, session_id: &str) -> Result<SessionRecord, ApiError> {
-        self.read()?
-            .sessions
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| ApiError::not_found("session not found"))
     }
 
     fn insert_trace(&self, trace: TraceRecord) -> Result<(), ApiError> {
@@ -6688,6 +10185,40 @@ impl Store {
             (_, Some(body)) => Ok(body.to_string()),
             _ => Err(ApiError::bad_request("owner_user_id is required")),
         }
+    }
+
+    fn validate_append_event_request(
+        &self,
+        path_owner_user_id: Option<&str>,
+        req: &AppendHistoryEventRequest,
+    ) -> Result<String, ApiError> {
+        let owner =
+            self.owner_from_path_or_body(path_owner_user_id, req.owner_user_id.as_deref())?;
+        if req.event_index_hint.is_some() {
+            return Err(ApiError::bad_request(
+                "event_index_hint is not accepted; event index routing is server-side",
+            ));
+        }
+        for (value, field) in [
+            (req.event_type.as_deref(), "event_type"),
+            (req.entity_type.as_deref(), "entity_type"),
+            (req.entity_id.as_deref(), "entity_id"),
+            (req.source_kind.as_deref(), "source_kind"),
+        ] {
+            if value.is_none_or(|value| value.trim().is_empty()) {
+                return Err(ApiError::bad_request(format!("{field} is required")));
+            }
+        }
+        if req.occurred_at.is_none() {
+            return Err(ApiError::bad_request("occurred_at is required"));
+        }
+        if req.observed_at.is_none() {
+            return Err(ApiError::bad_request("observed_at is required"));
+        }
+        if req.source_ref.is_none() {
+            return Err(ApiError::bad_request("source_ref is required"));
+        }
+        Ok(owner)
     }
 
     fn ensure_user_index_locked(
@@ -6729,6 +10260,10 @@ impl Store {
             data.personal_context
                 .entry(routing.personal_context_index_uid.clone())
                 .or_default();
+        } else if let Some(index) = data.user_indexes.get_mut(&key) {
+            index.schema_version = schema_version;
+            index.settings_hash = EVENT_SETTINGS_HASH.to_string();
+            index.status = "active".to_string();
         }
 
         let index = data
@@ -6941,11 +10476,8 @@ impl Store {
         tenant_id: &str,
         revision: &SourceRevision,
     ) -> DocumentIngestResult {
-        let source_document_uri = format!(
-            "ctx://company/docs/{}/source/{}",
-            sanitize_slug(&revision.source_id),
-            sanitize_slug(&revision.id)
-        );
+        let source_document_uri =
+            company_revision_source_document_uri(&revision.source_id, &revision.id);
         self.write_source_document_fragments_locked(
             data,
             tenant_id,
@@ -6980,12 +10512,7 @@ impl Store {
         policy: Option<&FragmentPolicy>,
     ) -> Result<DocumentIngestResult, ApiError> {
         let content = require_string(document.content.clone(), "document.content")?;
-        let source_id = format!(
-            "state:{}:{}:{}",
-            sanitize_slug(owner_user_id),
-            sanitize_slug(state_type),
-            sanitize_slug(fact_key)
-        );
+        let source_id = state_document_source_id(owner_user_id, state_type, fact_key);
         let revision_id = format!("v{version}");
         let checksum = hmac_hex(
             tenant_id.as_bytes(),
@@ -8195,10 +11722,51 @@ fn markdown_list(values: &[String]) -> String {
     }
 }
 
+fn copy_idempotency_entries<K>(
+    current: &mut HashMap<K, String>,
+    staged: &HashMap<K, String>,
+    accepted_ids: &HashSet<String>,
+) where
+    K: Clone + Eq + std::hash::Hash,
+{
+    for (key, id) in staged {
+        if accepted_ids.contains(id) {
+            current.insert(key.clone(), id.clone());
+        }
+    }
+}
+
+fn upsert_source_document_cache(data: &mut StoreData, document: SourceDocument) {
+    let key = SourceDocumentKey::from_document(&document);
+    if data
+        .source_documents
+        .get(&key)
+        .is_none_or(|existing| existing.updated_at <= document.updated_at)
+    {
+        data.source_documents.insert(key, document);
+    }
+}
+
+fn upsert_ingest_task_cache(data: &mut StoreData, task: IngestTask) {
+    if data
+        .ingest_tasks
+        .get(&task.task_id)
+        .is_none_or(|existing| existing.updated_at <= task.updated_at)
+    {
+        data.ingest_tasks.insert(task.task_id.clone(), task);
+    }
+}
+
 fn upsert_context_nodes(target: &mut Vec<ContextNode>, nodes: Vec<ContextNode>) {
     for node in nodes {
-        if let Some(existing) = target.iter_mut().find(|existing| existing.uri == node.uri) {
-            *existing = node;
+        if let Some(existing) = target.iter_mut().find(|existing| {
+            existing.tenant_id == node.tenant_id
+                && existing.uri == node.uri
+                && existing.layer == node.layer
+        }) {
+            if existing.updated_at <= node.updated_at {
+                *existing = node;
+            }
         } else {
             target.push(node);
         }
@@ -9291,6 +12859,23 @@ fn user_event_index_id(tenant_hash: &str, owner_user_id_hash: &str) -> String {
     format!("uei__t_{tenant_hash}__u_{owner_user_id_hash}")
 }
 
+fn company_revision_source_document_uri(source_id: &str, revision_id: &str) -> String {
+    format!(
+        "ctx://company/docs/{}/source/{}",
+        sanitize_slug(source_id),
+        sanitize_slug(revision_id)
+    )
+}
+
+fn state_document_source_id(owner_user_id: &str, state_type: &str, fact_key: &str) -> String {
+    format!(
+        "state:{}:{}:{}",
+        sanitize_slug(owner_user_id),
+        sanitize_slug(state_type),
+        sanitize_slug(fact_key)
+    )
+}
+
 fn source_document_id(
     tenant_id: &str,
     owner_user_id: Option<&str>,
@@ -9447,6 +13032,172 @@ fn simple_slope(values: &[f64]) -> f64 {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn local_event_idempotency_rejects_a_different_request_without_a_journal_record() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let request = AppendHistoryEventRequest {
+            event_type: Some("status.changed".to_string()),
+            entity_type: Some("task".to_string()),
+            entity_id: Some("task-1".to_string()),
+            owner_user_id: Some("owner-a".to_string()),
+            occurred_at: Some(now()),
+            observed_at: Some(now()),
+            source_kind: Some("test".to_string()),
+            source_ref: Some(SourceRef {
+                kind: "test".to_string(),
+                id: "source-1".to_string(),
+                uri: None,
+                meta: None,
+            }),
+            text: Some("original".to_string()),
+            payload: json!({"state": "open"}),
+            tags: vec!["status".to_string()],
+            privacy: "private".to_string(),
+            promote_policy: "none".to_string(),
+            idempotency_key: Some("stable-key".to_string()),
+            event_index_hint: None,
+        };
+
+        let first = store
+            .append_event("tenant-a", Some("owner-a"), request.clone())
+            .unwrap();
+        assert!(!first.duplicate);
+
+        let replay = store
+            .append_event("tenant-a", Some("owner-a"), request.clone())
+            .unwrap();
+        assert!(replay.duplicate);
+        assert_eq!(replay.event.id, first.event.id);
+
+        let mut changed = request;
+        changed.text = Some("different".to_string());
+        assert!(matches!(
+            store.append_event("tenant-a", Some("owner-a"), changed),
+            Err(ApiError::Conflict(message))
+                if message == "idempotency key was already used for a different request"
+        ));
+    }
+
+    #[test]
+    fn mutation_plan_without_request_context_records_system_actor() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let plan = store
+            .mutation_plan(MutationPlanInput {
+                tenant_id: "tenant-a",
+                operation_kind: "structured_summary.upsert",
+                owner_user_id: Some("target-owner"),
+                idempotency_key: Some("stable-key"),
+                primary_kind: MutationPrimary::StructuredSummary,
+                resources: vec![OperationResource::StructuredSummary {
+                    summary: json!({"id": "summary-1"}),
+                }],
+                response_snapshot: Value::Null,
+                request_fingerprint: None,
+            })
+            .unwrap();
+
+        assert_eq!(plan.actor.scope, OperationActorScope::System);
+        assert!(plan.actor.owner_user_id_hash.is_none());
+        assert!(plan.actor.roles.is_empty());
+        assert!(plan.actor.request_id.is_none());
+    }
+
+    #[test]
+    fn accepted_resource_projection_preserves_live_state_and_hides_other_staged_resources() {
+        let created_at = now();
+        let concurrent_session = SessionRecord {
+            id: "session-concurrent".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            owner_user_id: "owner-a".to_string(),
+            title: "concurrent read-through".to_string(),
+            status: "active".to_string(),
+            messages: Vec::new(),
+            created_at,
+        };
+        let unaccepted_session = SessionRecord {
+            id: "session-unaccepted".to_string(),
+            title: "unaccepted side effect".to_string(),
+            ..concurrent_session.clone()
+        };
+        let trace = TraceRecord {
+            id: "trace-accepted".to_string(),
+            tenant_id: "tenant-a".to_string(),
+            owner_user_id: Some("owner-a".to_string()),
+            query: "accepted primary".to_string(),
+            mode: "hybrid".to_string(),
+            stages: Vec::new(),
+            context_uris: Vec::new(),
+            created_at,
+        };
+
+        let mut current = StoreData::default();
+        current
+            .sessions
+            .insert(concurrent_session.id.clone(), concurrent_session.clone());
+        let mut staged = StoreData::default();
+        staged
+            .sessions
+            .insert(unaccepted_session.id.clone(), unaccepted_session.clone());
+        staged.traces.insert(trace.id.clone(), trace.clone());
+
+        Store::publish_resource_cache(
+            &mut current,
+            &staged,
+            "tenant-a",
+            &OperationResource::Trace {
+                trace: trace.clone(),
+            },
+        );
+
+        assert_eq!(
+            current
+                .sessions
+                .get(&concurrent_session.id)
+                .map(|session| session.title.as_str()),
+            Some("concurrent read-through")
+        );
+        assert!(!current.sessions.contains_key(&unaccepted_session.id));
+        assert_eq!(
+            current
+                .traces
+                .get(&trace.id)
+                .map(|trace| trace.query.as_str()),
+            Some("accepted primary")
+        );
+    }
+
+    #[test]
+    fn context_cache_merge_never_replaces_a_newer_local_node() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let mut newer = store.context_node(
+            "ctx://company/fragments/stable",
+            "newer",
+            2,
+            "newer body",
+            "company",
+            "rag_company_context",
+            "tenant-a",
+            None,
+            None,
+            None,
+        );
+        newer.updated_at = now();
+        let mut stale = newer.clone();
+        stale.title = "stale".to_string();
+        stale.body = "stale body".to_string();
+        stale.updated_at -= chrono::Duration::seconds(1);
+
+        let mut nodes = vec![newer];
+        upsert_context_nodes(&mut nodes, vec![stale]);
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].title, "newer");
+        assert_eq!(nodes[0].body, "newer body");
+    }
 
     #[test]
     fn repository_context_validation_rejects_cross_scope_rows() {

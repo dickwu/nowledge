@@ -7,7 +7,7 @@
 Human-readable API reference for `nowledge`. The directory contains one
 hand-maintained markdown file per HTTP endpoint registered in
 `src/routes.rs::build_router`, plus a top-level index and a machine-readable
-manifest. Endpoint coverage is exhaustive — the manifest tracks 87 documented
+manifest. Endpoint coverage is exhaustive — the manifest tracks 89 documented
 APIs and must stay in sync with the router.
 
 ## Key Files

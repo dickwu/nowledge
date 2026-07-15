@@ -47,6 +47,9 @@ Schema: `StateItemResponse`
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Tenant-service principals must provide `owner_user_id`; the service never
   selects the sole matching owner implicitly for a mutation.
+- A patch returns 409 while an older operation for the same physical state
+  aggregate remains reconcilable, or when legacy rows collide on that
+  aggregate's normalized context path.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph

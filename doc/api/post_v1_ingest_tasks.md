@@ -14,6 +14,7 @@ JSON `IngestTaskRequest`.
 | content_list / content_list_v2 | object/array? | Supplied parser output; bypasses live parsing. |
 | parser_provider | string? | `builtin` or `mineru`. |
 | fragment_policy | object? | Chunk sizing overrides. |
+| idempotency_key | string? | Unsupported; supplying it returns 400 before task creation. |
 
 ## Response
 
@@ -22,6 +23,7 @@ JSON `IngestTaskRequest`.
 ## Rules
 
 - The task is owner-scoped; other owners cannot read it.
+- `idempotency_key` is rejected with 400 and is never silently ignored.
 - The JSON body is capped by `RAG_MAX_JSON_BYTES`; an oversized body returns
   413 `payload_too_large` before task creation.
 - Asynchronous creation is rejected with 503 when workers are disabled or the

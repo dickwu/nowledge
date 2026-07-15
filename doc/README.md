@@ -2,7 +2,7 @@
 
 This directory contains one standalone English document for every HTTP API registered in `src/routes.rs::build_router`.
 
-Total documented APIs: 87.
+Total documented APIs: 89.
 
 Each endpoint file includes request parameters, response fields, access rules, and a Mermaid internal logic call graph.
 
@@ -83,6 +83,8 @@ by `RAG_INGEST_MAX_CONCURRENT_TASKS`. When full, both sync ingest routes return
 | `POST` | `/v1/admin/harness/evolution/changes/{change_id}/verdict` | `create_harness_verdict` | [api/post_v1_admin_harness_evolution_changes_change_id_verdict.md](api/post_v1_admin_harness_evolution_changes_change_id_verdict.md) |
 | `GET` | `/v1/admin/history/user-event-indexes` | `list_user_event_indexes` | [api/get_v1_admin_history_user_event_indexes.md](api/get_v1_admin_history_user_event_indexes.md) |
 | `POST` | `/v1/admin/history/user-event-indexes:reconcile` | `reconcile_user_event_indexes` | [api/post_v1_admin_history_user_event_indexes_reconcile.md](api/post_v1_admin_history_user_event_indexes_reconcile.md) |
+| `POST` | `/v1/admin/operations:reconcile` | `reconcile_operations` | [api/post_v1_admin_operations_reconcile.md](api/post_v1_admin_operations_reconcile.md) |
+| `POST` | `/v1/admin/operations/search` | `search_operations` | [api/post_v1_admin_operations_search.md](api/post_v1_admin_operations_search.md) |
 | `POST` | `/v1/analysis/insights` | `analyze_insights` | [api/post_v1_analysis_insights.md](api/post_v1_analysis_insights.md) |
 | `POST` | `/v1/context/reveal` | `context_reveal` | [api/post_v1_context_reveal.md](api/post_v1_context_reveal.md) |
 | `POST` | `/v1/context/search` | `context_search` | [api/post_v1_context_search.md](api/post_v1_context_search.md) |

@@ -961,14 +961,24 @@ async fn sync_ingest_timeout_uses_stable_504_and_releases_capacity() {
 
     let (status, _, body) = json_call(app, Method::POST, "/v1/state/search", json!({})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, _, usage) = json_call(
-        build_router(state.clone()),
-        Method::GET,
-        "/v1/usage",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{usage}");
+    let usage = timeout(Duration::from_secs(1), async {
+        loop {
+            let (status, _, usage) = json_call(
+                build_router(state.clone()),
+                Method::GET,
+                "/v1/usage",
+                Value::Null,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{usage}");
+            if usage["providers"]["ingest"]["failed"] == 1 {
+                break usage;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timed-out sync ingest did not reach a terminal task state");
     assert_eq!(usage["providers"]["ingest"]["task_count"], 1, "{usage}");
     assert_eq!(usage["providers"]["ingest"]["failed"], 1, "{usage}");
     assert_eq!(usage["providers"]["ingest"]["queued"], 0, "{usage}");

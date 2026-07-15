@@ -1558,10 +1558,6 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
         .to_string();
 
     let (fresh_state, hydration, fresh) = start_meili_app(&config).await;
-    let source_document_result = fresh_state
-        .store
-        .fs_read_async(&tenant_id, &source_document_uri, None, false)
-        .await;
     let document_result = try_call(
         fresh.clone(),
         Method::GET,
@@ -1581,6 +1577,59 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
         Method::POST,
         "/v1/context/search",
         json!({ "query": marker, "limit": 10 }),
+    )
+    .await;
+    let delete_result = try_call(
+        fresh.clone(),
+        Method::DELETE,
+        &format!("/v1/state/company-docs/{source_id}"),
+        Value::Null,
+    )
+    .await;
+    let immediate_source_document_result = fresh_state
+        .store
+        .fs_read_async(&tenant_id, &source_document_uri, None, false)
+        .await;
+    let immediate_document_result = try_call(
+        fresh.clone(),
+        Method::GET,
+        &format!("/v1/state/company-docs/{source_id}"),
+        Value::Null,
+    )
+    .await;
+    let immediate_context_result = try_call(
+        fresh,
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": marker, "limit": 10 }),
+    )
+    .await;
+    fresh_state.shutdown().await;
+
+    let (deleted_state, deleted_hydration, deleted_app) = start_meili_app(&config).await;
+    let restarted_source_document_result = deleted_state
+        .store
+        .fs_read_async(&tenant_id, &source_document_uri, None, false)
+        .await;
+    let restarted_document_result = try_call(
+        deleted_app.clone(),
+        Method::GET,
+        &format!("/v1/state/company-docs/{source_id}"),
+        Value::Null,
+    )
+    .await;
+    let restarted_context_result = try_call(
+        deleted_app.clone(),
+        Method::POST,
+        "/v1/context/search",
+        json!({ "query": marker, "limit": 10 }),
+    )
+    .await;
+    let restarted_links_result = try_call(
+        deleted_app,
+        Method::POST,
+        "/v1/links/search",
+        json!({ "uri": source_document_uri, "limit": 100 }),
     )
     .await;
     // Teardown is independent of the behavior under test. Every operation is
@@ -1629,6 +1678,10 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
         (
             "traces",
             delete_by_filter_and_wait(&admin, "rag_traces", &tenant_filter).await,
+        ),
+        (
+            "operations",
+            delete_by_filter_and_wait(&admin, "rag_operations", &tenant_filter).await,
         ),
         (
             "user index registry",
@@ -1681,10 +1734,83 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
         .unwrap()
         .iter()
         .any(|hit| hit["source_id"] == source_id));
-    let source_document =
-        source_document_result.expect("company source document should read through after restart");
-    assert_eq!(source_document.uri, source_document_uri);
-    assert_eq!(source_document.tenant_id, tenant_id);
+    let (delete_status, deleted) = delete_result.expect("company delete call should finish");
+    assert_eq!(delete_status, StatusCode::OK, "{deleted}");
+    assert_eq!(deleted["deleted"], true, "{deleted}");
+    assert!(
+        immediate_source_document_result.is_err(),
+        "deleted source document remained in the live ContextFS cache"
+    );
+    let (immediate_document_status, immediate_document) =
+        immediate_document_result.expect("immediate company read should finish");
+    assert_eq!(
+        immediate_document_status,
+        StatusCode::NOT_FOUND,
+        "{immediate_document}"
+    );
+    let (immediate_context_status, immediate_context) =
+        immediate_context_result.expect("immediate company context search should finish");
+    assert_eq!(
+        immediate_context_status,
+        StatusCode::OK,
+        "{immediate_context}"
+    );
+    assert!(
+        immediate_context["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["source_id"] != source_id),
+        "{immediate_context}"
+    );
+
+    for key in [
+        "company_context_nodes",
+        "company_sources",
+        "source_revisions",
+    ] {
+        assert_eq!(
+            deleted_hydration[key], 0,
+            "deleted company hydration should report no {key}: {deleted_hydration}"
+        );
+    }
+    assert!(
+        restarted_source_document_result.is_err(),
+        "deleted source document reappeared through ContextFS after restart"
+    );
+    let (restarted_document_status, restarted_document) =
+        restarted_document_result.expect("restarted company read should finish");
+    assert_eq!(
+        restarted_document_status,
+        StatusCode::NOT_FOUND,
+        "{restarted_document}"
+    );
+    let (restarted_context_status, restarted_context) =
+        restarted_context_result.expect("restarted company context search should finish");
+    assert_eq!(
+        restarted_context_status,
+        StatusCode::OK,
+        "{restarted_context}"
+    );
+    assert!(
+        restarted_context["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| hit["source_id"] != source_id),
+        "{restarted_context}"
+    );
+    let (restarted_links_status, restarted_links) =
+        restarted_links_result.expect("restarted company link search should finish");
+    assert_eq!(restarted_links_status, StatusCode::OK, "{restarted_links}");
+    for field in ["links", "outbound", "backlinks"] {
+        assert_eq!(
+            restarted_links[field].as_array().map(Vec::len),
+            Some(0),
+            "deleted company links survived restart: {restarted_links}"
+        );
+    }
+    deleted_state.shutdown().await;
 }
 
 #[tokio::test]
@@ -4102,7 +4228,7 @@ async fn meili_company_source_delete_preserves_personal_auxiliary_rows() {
         }
 
         let report = repository
-            .delete_company_source(&tenant_id, &source_id)
+            .delete_company_source(&tenant_id, &source_id, &[], &[])
             .await
             .map_err(|error| format!("company source delete failed: {error}"))?;
         let mut deletion_tasks = report.auxiliary_tasks.clone();

@@ -11,6 +11,7 @@ pub const FIXED_INDEXES: &[&str] = &[
     "rag_company_context",
     "rag_state_items",
     "rag_user_event_indexes",
+    "rag_operations",
     "rag_sources",
     "rag_source_revisions",
     "rag_source_documents",
@@ -100,6 +101,9 @@ impl MeiliAdmin {
             let mut missing = Vec::new();
             for uid in FIXED_INDEXES {
                 if self.index_exists(uid).await? {
+                    if *uid == "rag_operations" {
+                        self.require_index_primary_key(uid, "id").await?;
+                    }
                     existing.push(*uid);
                 } else {
                     missing.push(*uid);
@@ -132,11 +136,14 @@ impl MeiliAdmin {
                     )));
                 }
                 if status.is_success() {
-                    let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-                    if let Some(task_uid) = task_uid(&body) {
-                        self.wait_for_task(&task_uid).await?;
-                        task_uids.push(task_uid);
-                    }
+                    let body = response
+                        .json::<Value>()
+                        .await
+                        .map_err(|error| ApiError::Upstream(error.to_string()))?;
+                    let task_uid =
+                        required_task_uid(&body, &format!("delete Meilisearch index {uid}"))?;
+                    self.wait_for_task(&task_uid).await?;
+                    task_uids.push(task_uid);
                 }
             }
 
@@ -248,19 +255,22 @@ impl MeiliAdmin {
                     )));
                 }
             } else {
-                let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-                if let Some(task_uid) = task_uid(&body) {
-                    match self.wait_for_task(&task_uid).await {
-                        Ok(()) => task_uids.push(task_uid),
-                        Err(error) => {
-                            if !self.index_exists(uid).await? {
-                                return Err(error);
-                            }
-                            tracing::info!(
-                                index_uid = uid,
-                                "concurrent Meilisearch index creation already satisfied"
-                            );
+                let body = response
+                    .json::<Value>()
+                    .await
+                    .map_err(|error| ApiError::Upstream(error.to_string()))?;
+                let task_uid =
+                    required_task_uid(&body, &format!("create Meilisearch index {uid}"))?;
+                match self.wait_for_task(&task_uid).await {
+                    Ok(()) => task_uids.push(task_uid),
+                    Err(error) => {
+                        if !self.index_exists(uid).await? {
+                            return Err(error);
                         }
+                        tracing::info!(
+                            index_uid = uid,
+                            "concurrent Meilisearch index creation already satisfied"
+                        );
                     }
                 }
             }
@@ -323,6 +333,68 @@ impl MeiliAdmin {
         }
     }
 
+    /// Read the primary key declared by an existing Meilisearch index.
+    ///
+    /// A missing index and an index with no primary key both return `None`;
+    /// callers that must distinguish them should check [`Self::index_exists`]
+    /// first. Malformed successful responses fail closed.
+    pub async fn index_primary_key(&self, uid: &str) -> Result<Option<String>, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(None);
+        };
+        let response = self
+            .client
+            .get(format!("{}/indexes/{}", url.trim_end_matches('/'), uid))
+            .headers(self.headers()?)
+            .send()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(ApiError::Upstream(format!(
+                "failed to inspect Meilisearch primary key for {uid}: {}",
+                response.status()
+            )));
+        }
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+        match body.get("primaryKey") {
+            Some(Value::String(primary_key)) => Ok(Some(primary_key.clone())),
+            Some(Value::Null) => Ok(None),
+            _ => Err(ApiError::Upstream(format!(
+                "Meilisearch index {uid} returned an invalid primaryKey field"
+            ))),
+        }
+    }
+
+    pub async fn require_index_primary_key(
+        &self,
+        uid: &str,
+        expected: &str,
+    ) -> Result<(), ApiError> {
+        let actual = self.index_primary_key(uid).await?;
+        if actual.as_deref() == Some(expected) {
+            return Ok(());
+        }
+        Err(ApiError::Upstream(format!(
+            "Meilisearch index {uid} has incompatible primary key {}; expected {expected}; refusing non-destructive reconciliation",
+            actual.as_deref().unwrap_or("<unset>")
+        )))
+    }
+
+    /// Read-only verification that an existing index has the exact managed
+    /// searchable, filterable, and sortable settings defined by this build.
+    pub async fn index_settings_match(&self, uid: &str) -> Result<bool, ApiError> {
+        if !self.index_exists(uid).await? {
+            return Ok(false);
+        }
+        self.managed_settings_match(uid, &settings_for(uid)).await
+    }
+
     pub async fn add_documents<T: Serialize + ?Sized>(
         &self,
         index_uid: &str,
@@ -345,8 +417,14 @@ impl MeiliAdmin {
             .map_err(|e| ApiError::Upstream(e.to_string()))?;
 
         if response.status().is_success() {
-            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-            Ok(task_uid(&body))
+            let body = response
+                .json::<Value>()
+                .await
+                .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            Ok(Some(required_task_uid(
+                &body,
+                &format!("add documents to Meilisearch index {index_uid}"),
+            )?))
         } else {
             Err(ApiError::Upstream(format!(
                 "failed to add Meilisearch documents into {index_uid}: {}",
@@ -381,8 +459,14 @@ impl MeiliAdmin {
         }
 
         if response.status().is_success() {
-            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-            Ok(task_uid(&body))
+            let body = response
+                .json::<Value>()
+                .await
+                .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            Ok(Some(required_task_uid(
+                &body,
+                &format!("delete documents from Meilisearch index {index_uid}"),
+            )?))
         } else {
             Err(ApiError::Upstream(format!(
                 "failed to delete Meilisearch documents from {index_uid}: {}",
@@ -420,8 +504,14 @@ impl MeiliAdmin {
         }
 
         if response.status().is_success() {
-            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-            Ok(task_uid(&body))
+            let body = response
+                .json::<Value>()
+                .await
+                .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            Ok(Some(required_task_uid(
+                &body,
+                &format!("delete documents from Meilisearch index {index_uid}"),
+            )?))
         } else {
             Err(ApiError::Upstream(format!(
                 "failed to delete Meilisearch documents from {index_uid}: {}",
@@ -537,6 +627,22 @@ impl MeiliAdmin {
         offset: usize,
         limit: usize,
     ) -> Result<DocumentPage, ApiError> {
+        self.fetch_projected_documents_page(index_uid, filter, sort, offset, limit, &[])
+            .await
+    }
+
+    /// Fetch one filtered document page while asking Meilisearch to return
+    /// only the fields needed by the caller. An empty projection preserves the
+    /// full-document behavior used by repository hydration.
+    pub async fn fetch_projected_documents_page(
+        &self,
+        index_uid: &str,
+        filter: &str,
+        sort: &[String],
+        offset: usize,
+        limit: usize,
+        fields: &[&str],
+    ) -> Result<DocumentPage, ApiError> {
         let Some(url) = &self.url else {
             return Ok(DocumentPage {
                 results: Vec::new(),
@@ -545,6 +651,15 @@ impl MeiliAdmin {
                 total: 0,
             });
         };
+        let mut request = json!({
+            "offset": offset,
+            "limit": limit,
+            "filter": filter,
+            "sort": sort,
+        });
+        if !fields.is_empty() {
+            request["fields"] = json!(fields);
+        }
         let response = self
             .client
             .post(format!(
@@ -553,12 +668,7 @@ impl MeiliAdmin {
                 index_uid
             ))
             .headers(self.headers()?)
-            .json(&json!({
-                "offset": offset,
-                "limit": limit,
-                "filter": filter,
-                "sort": sort,
-            }))
+            .json(&request)
             .send()
             .await
             .map_err(|error| ApiError::Upstream(error.to_string()))?;
@@ -677,8 +787,14 @@ impl MeiliAdmin {
             .map_err(|e| ApiError::Upstream(e.to_string()))?;
 
         if response.status().is_success() {
-            let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-            Ok(task_uid(&body))
+            let body = response
+                .json::<Value>()
+                .await
+                .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            Ok(Some(required_task_uid(
+                &body,
+                &format!("apply settings for Meilisearch index {uid}"),
+            )?))
         } else {
             Err(ApiError::Upstream(format!(
                 "failed to apply Meilisearch settings for {uid}: {}",
@@ -744,8 +860,22 @@ pub fn task_uid(value: &Value) -> Option<String> {
         })
 }
 
+fn required_task_uid(value: &Value, action: &str) -> Result<String, ApiError> {
+    task_uid(value).ok_or_else(|| {
+        ApiError::Upstream(format!(
+            "Meilisearch accepted {action} without returning a task UID"
+        ))
+    })
+}
+
 pub fn settings_for(uid: &str) -> Value {
-    let mut settings = if uid.contains("context") {
+    let mut settings = if uid == "rag_operations" {
+        json!({
+            "searchableAttributes": ["operation_kind", "idempotency_key_hash", "last_error_category", "last_error_fingerprint"],
+            "filterableAttributes": ["id", "tenant_id", "operation_kind", "actor_scope", "status", "indexing_state", "idempotency_key_hash"],
+            "sortableAttributes": ["created_at", "updated_at", "completed_at"]
+        })
+    } else if uid.contains("context") {
         json!({
             "searchableAttributes": ["title", "body", "uri"],
             "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "index_uid", "index_kind", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id", "node_kind", "retrieval_role", "retrieval_enabled", "parent_uri", "source_document_uri", "fragment_index", "block_type", "page_idx", "heading_level"],
@@ -997,5 +1127,32 @@ mod tests {
             .expect("sortable attributes");
         assert!(sortable.iter().any(|value| value == "logical_id"));
         assert!(sortable.iter().any(|value| value == "id"));
+    }
+
+    #[test]
+    fn operations_support_reconciliation_filters_and_stable_pagination() {
+        let settings = settings_for("rag_operations");
+        let filterable = settings["filterableAttributes"]
+            .as_array()
+            .expect("filterable attributes");
+        for required in [
+            "tenant_id",
+            "operation_kind",
+            "actor_scope",
+            "status",
+            "indexing_state",
+            "idempotency_key_hash",
+        ] {
+            assert!(
+                filterable.iter().any(|value| value == required),
+                "rag_operations is missing {required}"
+            );
+        }
+        let sortable = settings["sortableAttributes"]
+            .as_array()
+            .expect("sortable attributes");
+        for required in ["created_at", "updated_at", "completed_at", "id"] {
+            assert!(sortable.iter().any(|value| value == required));
+        }
     }
 }

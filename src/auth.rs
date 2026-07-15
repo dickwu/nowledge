@@ -8,6 +8,7 @@ use sha2::Sha256;
 use crate::{
     config::{AuthUserConfig, AuthUserScope, BearerTokenScope},
     error::ApiError,
+    request_context::{self, RequestPrincipal, RequestPrincipalScope},
     routes::{audit_shared_write_denial, AppState},
     util::hmac_hex,
 };
@@ -140,6 +141,7 @@ impl FromRequestParts<AppState> for UserGuard {
     ) -> Result<Self, Self::Rejection> {
         let principal = authenticate(parts, state)?;
         enforce_principal_rate_limit(&principal, state)?;
+        record_request_principal(&principal, state);
         Ok(Self { principal })
     }
 }
@@ -179,6 +181,7 @@ impl FromRequestParts<AppState> for CompanyWriterGuard {
                 return Err(error);
             }
         }
+        record_request_principal(&principal, state);
         Ok(Self { principal })
     }
 }
@@ -216,8 +219,28 @@ impl FromRequestParts<AppState> for AdminGuard {
             );
             return Err(error);
         }
+        record_request_principal(&principal, state);
         Ok(Self { principal })
     }
+}
+
+fn record_request_principal(principal: &Principal, state: &AppState) {
+    let scope = match &principal.scope {
+        PrincipalScope::Owner { owner_user_id } => RequestPrincipalScope::Owner {
+            owner_user_id_hash: hmac_hex(
+                &state.config.index_hash_secret,
+                "user",
+                owner_user_id,
+                16,
+            ),
+        },
+        PrincipalScope::TenantService => RequestPrincipalScope::TenantService,
+        PrincipalScope::Admin => RequestPrincipalScope::Admin,
+    };
+    request_context::set_current_principal(RequestPrincipal {
+        scope,
+        roles: principal.roles.clone(),
+    });
 }
 
 fn enforce_principal_rate_limit(principal: &Principal, state: &AppState) -> Result<(), ApiError> {

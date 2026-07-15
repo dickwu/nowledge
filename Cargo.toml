@@ -10,6 +10,10 @@ default-run = "nowledge"
 name = "tenant_scope_v1"
 path = "src/tenant_scope_v1_main.rs"
 
+[[bin]]
+name = "operations_v1"
+path = "src/operations_v1_main.rs"
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"

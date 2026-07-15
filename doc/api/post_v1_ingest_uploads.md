@@ -13,6 +13,7 @@ Create an asynchronous ingest task from a multipart file upload.
 | content_type | Optional MIME metadata. When present with a file, it must match the file part `Content-Type`. |
 | checksum | Optional SHA-256 checksum as exactly 64 hexadecimal characters; malformed values or mismatches reject the request before task creation. |
 | fragment_policy.chunk_size_chars / overlap_chars / min_chunk_chars | Optional numeric fragment policy fields. |
+| idempotency_key | Unsupported; supplying it returns 400 before task creation. |
 
 ## Response
 
@@ -21,6 +22,7 @@ Queued `IngestTask`.
 ## Rules
 
 - Builtin parser accepts UTF-8 text uploads only.
+- `idempotency_key` is rejected with 400 and is never silently ignored.
 - File bytes are streamed to a private generated temporary file and rejected
   with 413 when they exceed `RAG_MAX_UPLOAD_BYTES`. Metadata and total field
   counts are bounded by `RAG_MAX_JSON_BYTES` and `RAG_MAX_MULTIPART_FIELDS`.

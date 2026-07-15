@@ -20,6 +20,23 @@ impl RequestId {
     }
 }
 
+/// Authentication data retained only for the lifetime of the current request.
+///
+/// Owner identities are already HMAC-derived before entering this context so
+/// callers cannot accidentally persist or log the raw authenticated owner ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequestPrincipalScope {
+    Owner { owner_user_id_hash: String },
+    TenantService,
+    Admin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequestPrincipal {
+    pub scope: RequestPrincipalScope,
+    pub roles: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct RequestContextState {
     config: Arc<Config>,
@@ -41,6 +58,7 @@ impl RequestContextState {
 struct RequestContext {
     request_id: RequestId,
     config: Arc<Config>,
+    principal: Arc<OnceLock<RequestPrincipal>>,
 }
 
 tokio::task_local! {
@@ -63,6 +81,7 @@ pub async fn assign(
     let context = RequestContext {
         request_id,
         config: state.config,
+        principal: Arc::new(OnceLock::new()),
     };
     let mut response = CURRENT_REQUEST
         .scope(context, async move { next.run(request).await })
@@ -79,6 +98,17 @@ pub fn current_id() -> Option<String> {
 
 pub fn current_or_new_id() -> String {
     current_id().unwrap_or_else(|| uuid::Uuid::now_v7().to_string())
+}
+
+pub(crate) fn set_current_principal(principal: RequestPrincipal) {
+    let _ = CURRENT_REQUEST.try_with(|context| context.principal.set(principal));
+}
+
+pub(crate) fn current_principal() -> Option<RequestPrincipal> {
+    CURRENT_REQUEST
+        .try_with(|context| context.principal.get().cloned())
+        .ok()
+        .flatten()
 }
 
 pub fn fingerprint_current(input: &str) -> String {
