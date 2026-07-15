@@ -55,7 +55,7 @@ fn router_and_api_manifest_have_the_same_exact_endpoint_triples() {
 
     assert_eq!(
         REGISTERED_ROUTES.len(),
-        89,
+        90,
         "the registered endpoint count changed"
     );
     assert_eq!(
@@ -63,7 +63,7 @@ fn router_and_api_manifest_have_the_same_exact_endpoint_triples() {
         REGISTERED_ROUTES.len(),
         "the route registry contains duplicate endpoint triples"
     );
-    assert_eq!(manifest.len(), 89, "the endpoint manifest count changed");
+    assert_eq!(manifest.len(), 90, "the endpoint manifest count changed");
     assert_eq!(
         documented.len(),
         manifest.len(),

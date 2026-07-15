@@ -29,6 +29,13 @@
   },
   {
     "method": "GET",
+    "path": "/v1/admin/metrics",
+    "handler": "metrics",
+    "group": "Admin",
+    "file": "api/get_v1_admin_metrics.md"
+  },
+  {
+    "method": "GET",
     "path": "/v1/admin/harness/components",
     "handler": "list_harness_components",
     "group": "Harness",

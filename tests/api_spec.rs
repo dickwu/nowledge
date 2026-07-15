@@ -167,6 +167,26 @@ async fn call_with_token(
     (status, value)
 }
 
+async fn call_text_with_token(
+    app: Router,
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+) -> (StatusCode, HeaderMap, String) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, headers, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
 async fn call_multipart_with_token(
     app: Router,
     uri: &str,
@@ -509,6 +529,60 @@ async fn livez_is_minimal_process_liveness() {
     assert!(body["git_rev"].is_string(), "{body}");
     assert!(body.get("llm").is_none());
     assert!(body.get("usage").is_none());
+}
+
+#[tokio::test]
+async fn operational_metrics_are_admin_only_openmetrics_and_low_cardinality() {
+    let app = authed_app();
+    let (status, _) = call(app.clone(), Method::GET, "/livez", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, _) =
+        call_text_with_token(app.clone(), Method::GET, "/v1/admin/metrics", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = call_text_with_token(
+        app.clone(),
+        Method::GET,
+        "/v1/admin/metrics",
+        Some("u1-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _, _) = call_text_with_token(
+        app.clone(),
+        Method::GET,
+        "/not-found/owner-secret?token=query-secret",
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, headers, body) =
+        call_text_with_token(app, Method::GET, "/v1/admin/metrics", Some("admin-token")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers.get(CONTENT_TYPE).unwrap(),
+        "application/openmetrics-text; version=1.0.0; charset=utf-8"
+    );
+    assert!(
+        body.contains("# TYPE nowledge_http_requests counter"),
+        "{body}"
+    );
+    assert!(
+        body.contains("method=\"GET\",route=\"/livez\",status_class=\"2xx\""),
+        "{body}"
+    );
+    assert!(body.contains("route=\"unmatched\""), "{body}");
+    assert!(body.contains("nowledge_ingest_queue_depth"), "{body}");
+    assert!(body.contains("nowledge_operations"), "{body}");
+    assert!(body.ends_with("# EOF\n"), "{body}");
+    for forbidden in ["admin-token", "u1-token", "owner-secret", "query-secret"] {
+        assert!(
+            !body.contains(forbidden),
+            "metrics leaked {forbidden}: {body}"
+        );
+    }
 }
 
 #[tokio::test]

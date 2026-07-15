@@ -1797,7 +1797,7 @@ fn route_policy_matrix_covers_every_manifest_handler_and_group() {
         serde_json::from_str(include_str!("../doc/api_manifest.json")).unwrap();
     assert_eq!(
         manifest.len(),
-        89,
+        90,
         "the policy matrix must cover all routes"
     );
     assert_eq!(
@@ -1844,6 +1844,7 @@ fn route_policy_matrix_covers_every_manifest_handler_and_group() {
     assert_eq!(policy_for("livez"), RouteGuard::Public);
     assert_eq!(policy_for("readyz"), RouteGuard::Public);
     assert_eq!(policy_for("healthz"), RouteGuard::Admin);
+    assert_eq!(policy_for("metrics"), RouteGuard::Admin);
     assert_eq!(policy_for("llm_status"), RouteGuard::User);
     assert_eq!(policy_for("llm_test"), RouteGuard::Admin);
     assert_eq!(policy_for("llm_title"), RouteGuard::User);

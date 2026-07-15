@@ -19,6 +19,7 @@ use crate::{
     http_boundary::{HttpBoundaryState, RequestDeadline},
     llm::{LlmHealthProbe, LlmProviderRegistry},
     meili::MeiliAdmin,
+    metrics::{IngestRuntimeMetrics, Metrics},
     models::{IngestTask, IngestTaskRequest, IngestTaskResult},
     parser::StagedUpload,
     runtime::RuntimeSupervisor,
@@ -184,6 +185,13 @@ impl IngestTaskManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
+    }
+
+    pub(crate) fn metrics(&self) -> IngestRuntimeMetrics {
+        IngestRuntimeMetrics {
+            queue_depth: self.queued_depth.load(Ordering::Acquire),
+            accepting: self.accepting.load(Ordering::Acquire),
+        }
     }
 }
 
@@ -355,6 +363,7 @@ pub struct AppState {
     pub llm_health: LlmHealthProbe,
     pub llm_providers: LlmProviderRegistry,
     pub ingest_manager: IngestTaskManager,
+    pub(crate) metrics: Metrics,
     pub(crate) http_boundary: HttpBoundaryState,
     pub(crate) runtime: RuntimeSupervisor,
 }
@@ -394,6 +403,7 @@ impl AppState {
         let runtime = RuntimeSupervisor::new();
         let http_boundary = HttpBoundaryState::new(&config);
         let llm_providers = LlmProviderRegistry::new(config.clone());
+        let metrics = Metrics::new();
         config.start_codex_secret_refresh_task();
         let ingest_manager = IngestTaskManager::new(store.clone(), config.clone(), runtime.clone());
         spawn_ingest_task_cleanup(store.clone(), &config, &runtime);
@@ -403,6 +413,7 @@ impl AppState {
             llm_health: LlmHealthProbe::new(),
             llm_providers,
             ingest_manager,
+            metrics,
             http_boundary,
             runtime,
             config,

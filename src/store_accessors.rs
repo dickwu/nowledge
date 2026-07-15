@@ -1,6 +1,50 @@
 use super::*;
 
+use crate::metrics::{StoreMetricsSnapshot, INGEST_STATES, OPERATION_STATUSES};
+
 impl Store {
+    pub(crate) fn operational_metrics_snapshot(
+        &self,
+        tenant_id: &str,
+    ) -> Result<StoreMetricsSnapshot, ApiError> {
+        let data = self.read()?;
+        let mut snapshot = StoreMetricsSnapshot::default();
+
+        for task in data
+            .ingest_tasks
+            .values()
+            .filter(|task| task.tenant_id == tenant_id)
+        {
+            let index = INGEST_STATES
+                .iter()
+                .position(|state| *state == task.state)
+                .unwrap_or(INGEST_STATES.len() - 1);
+            snapshot.ingest_tasks[index] = snapshot.ingest_tasks[index].saturating_add(1);
+        }
+
+        for operation in data
+            .operations
+            .values()
+            .filter(|operation| operation.tenant_id == tenant_id)
+        {
+            let status = match operation.status {
+                OperationStatus::Pending => "pending",
+                OperationStatus::PrimaryCommitted => "primary_committed",
+                OperationStatus::EffectsSubmitted => "effects_submitted",
+                OperationStatus::PartiallyFailed => "partially_failed",
+                OperationStatus::Completed => "completed",
+                OperationStatus::Failed => "failed",
+            };
+            let index = OPERATION_STATUSES
+                .iter()
+                .position(|candidate| *candidate == status)
+                .expect("operation status labels cover every enum variant");
+            snapshot.operations[index] = snapshot.operations[index].saturating_add(1);
+        }
+
+        Ok(snapshot)
+    }
+
     pub fn get_trace(&self, tenant_id: &str, trace_id: &str) -> Result<TraceRecord, ApiError> {
         let data = self.read()?;
         data.traces

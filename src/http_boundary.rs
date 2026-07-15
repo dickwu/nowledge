@@ -8,7 +8,7 @@ use std::{
 
 use axum::{
     body::{to_bytes, Body, Bytes, HttpBody},
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     http::{
         header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, LINK, RETRY_AFTER},
         HeaderName, HeaderValue, Method,
@@ -23,6 +23,7 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::{
     config::{validate_cors_allowed_origins, Config},
     error::ApiError,
+    metrics::{HttpRequestObservation, Metrics},
 };
 
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
@@ -200,6 +201,57 @@ pub fn bypasses_global_limits(path: &str) -> bool {
 
 pub fn store_owns_timeout(path: &str) -> bool {
     SYNC_INGEST_PATHS.contains(&path)
+}
+
+struct MetricsBody {
+    inner: Pin<Box<Body>>,
+    observation: Option<HttpRequestObservation>,
+}
+
+impl HttpBody for MetricsBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = this.inner.as_mut().poll_frame(cx);
+        if matches!(&polled, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            this.observation.take();
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().get_ref().is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.as_ref().get_ref().size_hint()
+    }
+}
+
+pub(crate) async fn record_metrics(
+    State(metrics): State<Metrics>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("unmatched");
+    let observation = metrics.begin_http_request(request.method().as_str(), route);
+    let response = next.run(request).await;
+    let status = response.status().as_u16();
+    let (parts, body) = response.into_parts();
+    let body = Body::new(MetricsBody {
+        inner: Box::pin(body),
+        observation: Some(observation.complete(status)),
+    });
+    Response::from_parts(parts, body)
 }
 
 pub async fn load_shed(

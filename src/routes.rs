@@ -60,6 +60,7 @@ use crate::{
         get_ingest_task_result, ingest_file_sync, ingest_upload_sync, SyncIngestTimeoutState,
     },
     route_llm::llm_title,
+    route_metrics::metrics,
     route_rag::{prompt_preview, rag_answer, rag_debug, rag_stream},
     route_registry::declare_routes,
     route_sessions::{add_session_message, commit_session, create_session},
@@ -102,6 +103,7 @@ declare_routes! {
     "/readyz" => get(readyz, Public);
     "/v1/usage" => get(usage, User);
     "/v1/admin/bootstrap" => post(bootstrap, Admin);
+    "/v1/admin/metrics" => get(metrics, Admin);
     "/v1/admin/harness/components" => get(list_harness_components, Admin);
     "/v1/admin/harness/components/{component_id}" => get(get_harness_component, Admin);
     "/v1/admin/harness/components/{component_id}/revisions" => post(create_harness_component_revision, Admin);
@@ -236,6 +238,10 @@ pub fn build_router(state: AppState) -> Router {
                 })
                 .on_response(ExplicitParentOnResponse),
         )
+        .layer(middleware::from_fn_with_state(
+            state.metrics.clone(),
+            http_boundary::record_metrics,
+        ))
         .layer(middleware::from_fn_with_state(
             RequestContextState::from_shared_config(state.config.clone()),
             request_context::assign,
