@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, VecDeque},
+    fmt,
     path::Path,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
@@ -7,18 +8,19 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use reqwest::header::{HeaderMap, ACCEPT};
+use reqwest::header::{HeaderMap, ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{
     config::Config,
     error::ApiError,
     upstream::{
-        ClientPolicy, OperationPolicy, ProxyMode, RequestFactoryError, UpstreamError,
-        UpstreamHttpClient, UpstreamOperation,
+        ClientPolicy, OperationPolicy, ProxyMode, RequestFactoryError, StreamingResponse,
+        UpstreamError, UpstreamHttpClient, UpstreamOperation,
     },
-    util::{redact_egress_text, redact_string},
+    util::{redact_egress_text, redact_string, StreamingTextRedactor},
 };
 
 const PROVIDER_BUDGET_WINDOW: Duration = Duration::from_secs(60);
@@ -278,7 +280,7 @@ pub struct LlmTextResponse {
 /// Token counts as reported by the provider (OpenAI/Codex Responses API).
 /// Serialized flat into API `usage` blocks; absent fields are omitted so
 /// downstream consumers can distinguish "reported" from "unknown".
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct LlmTokenUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
@@ -302,6 +304,144 @@ impl LlmTokenUsage {
             (input.is_some() || output.is_some())
                 .then(|| input.unwrap_or(0).saturating_add(output.unwrap_or(0)))
         })
+    }
+}
+
+/// Incremental events produced by an LLM response body.
+///
+/// `Completed` is emitted only after the provider's terminal event has been
+/// validated and the HTTP body has reached a clean EOF. Callers therefore do
+/// not need to infer success from the last text delta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LlmStreamEvent {
+    Delta(String),
+    Completed {
+        latency_ms: u64,
+        usage: Option<LlmTokenUsage>,
+    },
+}
+
+#[async_trait]
+trait LlmTextStreamSource: Send {
+    async fn next_event(&mut self) -> Result<Option<LlmStreamEvent>, ApiError>;
+
+    fn abort(&mut self) {}
+}
+
+#[derive(Debug, Clone)]
+struct StreamBudgetReconciliation {
+    budget: ProviderBudget,
+    principal_key: String,
+    attempts: u64,
+    estimated_tokens_per_attempt: u64,
+    reserved_tokens: u64,
+}
+
+impl StreamBudgetReconciliation {
+    fn reconcile(&self, usage: Option<LlmTokenUsage>) -> Result<(), ApiError> {
+        let Some(actual_terminal_tokens) = usage.and_then(LlmTokenUsage::total_for_budget) else {
+            return Ok(());
+        };
+        let conservative_actual_tokens = self
+            .estimated_tokens_per_attempt
+            .saturating_mul(self.attempts.saturating_sub(1))
+            .saturating_add(actual_terminal_tokens);
+        self.budget.reconcile_actual_tokens(
+            &self.principal_key,
+            self.reserved_tokens,
+            conservative_actual_tokens,
+        )
+    }
+}
+
+/// A body-owned text stream. Dropping this value drops the provider response,
+/// cancelling unread upstream work without a detached producer task.
+pub struct LlmTextStream {
+    pub provider: String,
+    pub model: String,
+    source: Box<dyn LlmTextStreamSource>,
+    budget_reconciliation: Option<StreamBudgetReconciliation>,
+    max_response_bytes: usize,
+    emitted_bytes: usize,
+    finished: bool,
+}
+
+impl fmt::Debug for LlmTextStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LlmTextStream")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("emitted_bytes", &self.emitted_bytes)
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LlmTextStream {
+    fn new(provider: String, model: String, source: impl LlmTextStreamSource + 'static) -> Self {
+        Self {
+            provider,
+            model,
+            source: Box::new(source),
+            budget_reconciliation: None,
+            max_response_bytes: usize::MAX,
+            emitted_bytes: 0,
+            finished: false,
+        }
+    }
+
+    /// Read the next sanitized text or terminal completion event.
+    pub async fn next_event(&mut self) -> Result<Option<LlmStreamEvent>, ApiError> {
+        if self.finished {
+            return Ok(None);
+        }
+        let event = match self.source.next_event().await {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                self.source.abort();
+                self.finished = true;
+                return Err(invalid_llm_output());
+            }
+            Err(error) => {
+                self.source.abort();
+                self.finished = true;
+                return Err(error);
+            }
+        };
+        match event {
+            LlmStreamEvent::Delta(delta) => {
+                let Some(emitted_bytes) = self
+                    .emitted_bytes
+                    .checked_add(delta.len())
+                    .filter(|bytes| *bytes <= self.max_response_bytes)
+                else {
+                    self.source.abort();
+                    self.finished = true;
+                    return Err(ApiError::Upstream(
+                        "LLM response exceeded the configured size limit".to_string(),
+                    ));
+                };
+                self.emitted_bytes = emitted_bytes;
+                Ok(Some(LlmStreamEvent::Delta(delta)))
+            }
+            LlmStreamEvent::Completed { latency_ms, usage } => {
+                if let Some(reconciliation) = self.budget_reconciliation.take() {
+                    if let Err(error) = reconciliation.reconcile(usage) {
+                        self.source.abort();
+                        self.finished = true;
+                        return Err(error);
+                    }
+                }
+                self.finished = true;
+                Ok(Some(LlmStreamEvent::Completed { latency_ms, usage }))
+            }
+        }
+    }
+
+    fn constrain(&mut self, max_response_bytes: usize, reconciliation: StreamBudgetReconciliation) {
+        self.max_response_bytes = max_response_bytes;
+        self.budget_reconciliation = Some(reconciliation);
     }
 }
 
@@ -451,6 +591,39 @@ pub struct LlmHealthProbe {
 pub trait LlmClient: Send + Sync {
     async fn status(&self) -> LlmRuntimeStatus;
     async fn complete_text(&self, request: LlmRequest) -> Result<LlmTextResponse, ApiError>;
+    async fn stream_text(&self, request: LlmRequest) -> Result<LlmTextStream, ApiError>;
+}
+
+#[derive(Debug)]
+struct SyntheticLlmStreamSource {
+    events: VecDeque<LlmStreamEvent>,
+}
+
+#[async_trait]
+impl LlmTextStreamSource for SyntheticLlmStreamSource {
+    async fn next_event(&mut self) -> Result<Option<LlmStreamEvent>, ApiError> {
+        Ok(self.events.pop_front())
+    }
+
+    fn abort(&mut self) {
+        self.events.clear();
+    }
+}
+
+fn synthetic_text_stream(provider: &str, model: &str, response: LlmTextResponse) -> LlmTextStream {
+    LlmTextStream::new(
+        provider.to_string(),
+        model.to_string(),
+        SyntheticLlmStreamSource {
+            events: VecDeque::from([
+                LlmStreamEvent::Delta(response.text),
+                LlmStreamEvent::Completed {
+                    latency_ms: response.latency_ms,
+                    usage: response.usage,
+                },
+            ]),
+        },
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -484,6 +657,11 @@ impl LlmClient for NoneLlmClient {
             latency_ms: started.elapsed().as_millis() as u64,
             usage: None,
         })
+    }
+
+    async fn stream_text(&self, request: LlmRequest) -> Result<LlmTextStream, ApiError> {
+        let response = self.complete_text(request).await?;
+        Ok(synthetic_text_stream("none", &self.model, response))
     }
 }
 
@@ -536,6 +714,11 @@ impl LlmClient for MockLlmClient {
                 total_tokens: Some(input_tokens + output_tokens),
             }),
         })
+    }
+
+    async fn stream_text(&self, request: LlmRequest) -> Result<LlmTextStream, ApiError> {
+        let response = self.complete_text(request).await?;
+        Ok(synthetic_text_stream("mock", &self.model, response))
     }
 }
 
@@ -631,6 +814,30 @@ impl LlmClient for OpenAiResponsesClient {
             usage: token_usage_from_value(body.get("usage")),
         })
     }
+
+    async fn stream_text(&self, request: LlmRequest) -> Result<LlmTextStream, ApiError> {
+        let api_key = self
+            .api_key
+            .clone()
+            .ok_or_else(|| ApiError::Unauthorized("LLM API key is not configured".to_string()))?;
+        let secrets = vec![api_key.clone()];
+        let request = request.redact_for_provider(&secrets);
+        request.charge_attempt()?;
+        start_responses_stream(ResponsesStreamRequest {
+            upstream: &self.upstream,
+            operation_policy: &self.operation_policy,
+            provider: &self.provider,
+            model: &self.model,
+            reasoning_effort: self.reasoning_effort.as_deref(),
+            endpoint: "https://api.openai.com/v1/responses".to_string(),
+            token: &api_key,
+            account_id: None,
+            request: &request,
+            secrets: &secrets,
+            latest_rate_limits: &self.latest_rate_limits,
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -723,6 +930,94 @@ impl LlmClient for CodexResponsesClient {
             usage: extract_codex_sse_usage(&body),
         })
     }
+
+    async fn stream_text(&self, request: LlmRequest) -> Result<LlmTextStream, ApiError> {
+        let (credentials, request, secrets) = self.secure_request(request)?;
+        request.charge_attempt()?;
+        let uses_openai_endpoint = credentials.token_kind == CodexAuthTokenKind::OpenAiApiKey;
+        let endpoint = if uses_openai_endpoint {
+            "https://api.openai.com/v1/responses".to_string()
+        } else {
+            codex_responses_endpoint(&self.base_url)
+        };
+        start_responses_stream(ResponsesStreamRequest {
+            upstream: &self.upstream,
+            operation_policy: &self.operation_policy,
+            provider: "codex_auth",
+            model: &self.model,
+            reasoning_effort: self.reasoning_effort.as_deref(),
+            endpoint,
+            token: &credentials.token,
+            account_id: (!uses_openai_endpoint)
+                .then_some(credentials.account_id.as_deref())
+                .flatten(),
+            request: &request,
+            secrets: &secrets,
+            latest_rate_limits: &self.latest_rate_limits,
+        })
+        .await
+    }
+}
+
+struct ResponsesStreamRequest<'a> {
+    upstream: &'a UpstreamHttpClient,
+    operation_policy: &'a OperationPolicy,
+    provider: &'a str,
+    model: &'a str,
+    reasoning_effort: Option<&'a str>,
+    endpoint: String,
+    token: &'a str,
+    account_id: Option<&'a str>,
+    request: &'a LlmRequest,
+    secrets: &'a [String],
+    latest_rate_limits: &'a LatestRateLimits,
+}
+
+async fn start_responses_stream(
+    stream_request: ResponsesStreamRequest<'_>,
+) -> Result<LlmTextStream, ApiError> {
+    let started = Instant::now();
+    let payload = responses_payload(
+        stream_request.model,
+        stream_request.request,
+        stream_request.reasoning_effort,
+        true,
+    );
+    let client = stream_request.upstream.client();
+    let endpoint = stream_request.endpoint;
+    let token = stream_request.token.to_string();
+    let account_id = stream_request.account_id.map(ToString::to_string);
+    let response = stream_request
+        .upstream
+        .execute_stream(
+            UpstreamOperation::LlmCompletion,
+            stream_request.operation_policy,
+            &stream_request.request.metadata.request_id,
+            move |_| {
+                let mut builder = client
+                    .post(endpoint.clone())
+                    .bearer_auth(&token)
+                    .header(ACCEPT, "text/event-stream")
+                    .json(&payload);
+                if let Some(account_id) = account_id.as_deref() {
+                    builder = builder.header("ChatGPT-Account-Id", account_id);
+                }
+                std::future::ready(Ok::<_, RequestFactoryError>(builder))
+            },
+        )
+        .await
+        .map_err(map_upstream_error)?;
+    stream_request.latest_rate_limits.record(
+        stream_request.provider,
+        &rate_limits_from_headers(response.headers()),
+    );
+    require_event_stream_content_type(response.headers())?;
+
+    Ok(LlmTextStream::new(
+        stream_request.provider.to_string(),
+        stream_request.model.to_string(),
+        ProviderLlmStreamSource::new(response, stream_request.secrets, started),
+    ))
 }
 
 async fn complete_openai_responses(
@@ -754,6 +1049,592 @@ async fn complete_openai_responses(
         .map_err(map_upstream_error)?;
     rate_limit_sink.record(response.headers());
     decode_openai_response_body(response.body())
+}
+
+fn require_event_stream_content_type(headers: &HeaderMap) -> Result<(), ApiError> {
+    let is_event_stream = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    if is_event_stream {
+        Ok(())
+    } else {
+        Err(ApiError::Upstream(
+            "LLM streaming response did not use text/event-stream".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct SseMessage {
+    event: Option<String>,
+    data: String,
+}
+
+#[derive(Debug, Default)]
+struct IncrementalSseDecoder {
+    line_buffer: Vec<u8>,
+    event: Option<String>,
+    data_lines: Vec<String>,
+}
+
+impl IncrementalSseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseMessage>, ApiError> {
+        self.line_buffer.extend_from_slice(chunk);
+        let mut messages = Vec::new();
+        while let Some(newline) = self.line_buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line = self.line_buffer.drain(..=newline).collect::<Vec<_>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line = std::str::from_utf8(&line).map_err(|_| invalid_llm_output())?;
+            self.process_line(line, &mut messages);
+        }
+        Ok(messages)
+    }
+
+    fn process_line(&mut self, line: &str, messages: &mut Vec<SseMessage>) {
+        if line.is_empty() {
+            if !self.data_lines.is_empty() {
+                messages.push(SseMessage {
+                    event: self.event.take(),
+                    data: self.data_lines.join("\n"),
+                });
+                self.data_lines.clear();
+            } else {
+                self.event = None;
+            }
+            return;
+        }
+        if line.starts_with(':') {
+            return;
+        }
+        let (field, value) = line.split_once(':').map_or((line, ""), |(field, value)| {
+            (field, value.strip_prefix(' ').unwrap_or(value))
+        });
+        match field {
+            "event" => self.event = Some(value.to_string()),
+            "data" => self.data_lines.push(value.to_string()),
+            _ => {}
+        }
+    }
+
+    fn finish(&self) -> Result<(), ApiError> {
+        if self.line_buffer.is_empty() && self.event.is_none() && self.data_lines.is_empty() {
+            Ok(())
+        } else {
+            Err(invalid_llm_output())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextFingerprint {
+    bytes: u64,
+    sha256: [u8; 32],
+}
+
+impl TextFingerprint {
+    fn from_text(text: &str) -> Self {
+        Self {
+            bytes: u64::try_from(text.len()).unwrap_or(u64::MAX),
+            sha256: Sha256::digest(text.as_bytes()).into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DecodedProviderEvent {
+    Delta(String),
+}
+
+#[derive(Debug)]
+struct ValidatedProviderTerminal {
+    fallback_text: Option<String>,
+    usage: Option<LlmTokenUsage>,
+}
+
+#[derive(Debug)]
+struct PendingProviderTerminal {
+    text: String,
+    usage: Option<LlmTokenUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPartKey {
+    output_index: u64,
+    content_index: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TextPartMode {
+    #[default]
+    Unknown,
+    LegacySingle,
+    Indexed,
+}
+
+#[derive(Debug, Default)]
+struct StreamedTextPart {
+    item_id: Option<String>,
+    delta_hasher: Sha256,
+    delta_bytes: u64,
+    saw_delta: bool,
+    done: Option<TextFingerprint>,
+}
+
+impl StreamedTextPart {
+    fn delta_fingerprint(&self) -> TextFingerprint {
+        TextFingerprint {
+            bytes: self.delta_bytes,
+            sha256: self.delta_hasher.clone().finalize().into(),
+        }
+    }
+
+    fn observe_item_id(&mut self, item_id: Option<&str>) -> Result<(), ApiError> {
+        match (self.item_id.as_deref(), item_id) {
+            (Some(existing), Some(incoming)) if existing != incoming => Err(invalid_llm_output()),
+            (None, Some(incoming)) => {
+                self.item_id = Some(incoming.to_string());
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FinalTextPart {
+    key: TextPartKey,
+    item_id: Option<String>,
+    text: String,
+}
+
+#[derive(Debug, Default)]
+struct ResponsesSseDecoder {
+    sse: IncrementalSseDecoder,
+    mode: TextPartMode,
+    parts: BTreeMap<TextPartKey, StreamedTextPart>,
+    output_item_ids: BTreeMap<u64, String>,
+    last_text_part: Option<TextPartKey>,
+    saw_delta: bool,
+    completed: Option<PendingProviderTerminal>,
+}
+
+impl ResponsesSseDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<DecodedProviderEvent>, ApiError> {
+        let messages = self.sse.push(chunk)?;
+        let mut events = Vec::new();
+        for message in messages {
+            if let Some(event) = self.process_message(message)? {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
+    fn process_message(
+        &mut self,
+        message: SseMessage,
+    ) -> Result<Option<DecodedProviderEvent>, ApiError> {
+        if message.data == "[DONE]" {
+            return Err(invalid_llm_output());
+        }
+        if self.completed_text().is_some() {
+            return Err(invalid_llm_output());
+        }
+
+        let value =
+            serde_json::from_str::<Value>(&message.data).map_err(|_| invalid_llm_output())?;
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_llm_output)?;
+        if message
+            .event
+            .as_deref()
+            .filter(|event| !event.is_empty() && *event != "message")
+            .is_some_and(|event| event != event_type)
+        {
+            return Err(invalid_llm_output());
+        }
+
+        match event_type {
+            "response.output_text.delta" => {
+                let (key, item_id) = self.text_part_identity(&value)?;
+                self.observe_part_order(key)?;
+                let delta = value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_llm_output)?;
+                let part = self.parts.entry(key).or_default();
+                part.observe_item_id(item_id.as_deref())?;
+                if part.done.is_some() {
+                    return Err(invalid_llm_output());
+                }
+                part.delta_bytes = part
+                    .delta_bytes
+                    .checked_add(u64::try_from(delta.len()).map_err(|_| invalid_llm_output())?)
+                    .ok_or_else(invalid_llm_output)?;
+                part.delta_hasher.update(delta.as_bytes());
+                part.saw_delta = true;
+                self.saw_delta = true;
+                Ok((!delta.is_empty()).then(|| DecodedProviderEvent::Delta(delta.to_string())))
+            }
+            "response.output_text.done" => {
+                let (key, item_id) = self.text_part_identity(&value)?;
+                self.observe_part_order(key)?;
+                let text = value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(invalid_llm_output)?;
+                let fingerprint = TextFingerprint::from_text(text);
+                let part = self.parts.entry(key).or_default();
+                part.observe_item_id(item_id.as_deref())?;
+                if part.done.is_some()
+                    || (part.saw_delta && part.delta_fingerprint() != fingerprint)
+                {
+                    return Err(invalid_llm_output());
+                }
+                part.done = Some(fingerprint);
+                Ok(None)
+            }
+            "response.completed" => {
+                let response = value
+                    .get("response")
+                    .filter(|response| response.is_object())
+                    .ok_or_else(invalid_llm_output)?;
+                let text = self.validate_completed_parts(response)?;
+                self.completed = Some(PendingProviderTerminal {
+                    text,
+                    usage: token_usage_from_value(response.get("usage")),
+                });
+                Ok(None)
+            }
+            "response.failed" | "response.incomplete" | "error" => Err(invalid_llm_output()),
+            _ => Ok(None),
+        }
+    }
+
+    fn text_part_identity(
+        &mut self,
+        value: &Value,
+    ) -> Result<(TextPartKey, Option<String>), ApiError> {
+        let output_index = value.get("output_index");
+        let content_index = value.get("content_index");
+        let indexed = match (output_index, content_index) {
+            (Some(output_index), Some(content_index)) => Some(TextPartKey {
+                output_index: output_index.as_u64().ok_or_else(invalid_llm_output)?,
+                content_index: content_index.as_u64().ok_or_else(invalid_llm_output)?,
+            }),
+            (None, None) => None,
+            _ => return Err(invalid_llm_output()),
+        };
+        let item_id = match value.get("item_id") {
+            None => None,
+            Some(Value::String(item_id)) if !item_id.is_empty() => Some(item_id.clone()),
+            _ => return Err(invalid_llm_output()),
+        };
+
+        let key = if let Some(key) = indexed {
+            if self.mode == TextPartMode::LegacySingle || item_id.is_none() {
+                return Err(invalid_llm_output());
+            }
+            self.mode = TextPartMode::Indexed;
+            let item_id = item_id.as_deref().expect("indexed mode requires item id");
+            match self.output_item_ids.get(&key.output_index) {
+                Some(existing) if existing != item_id => return Err(invalid_llm_output()),
+                Some(_) => {}
+                None => {
+                    self.output_item_ids
+                        .insert(key.output_index, item_id.to_string());
+                }
+            }
+            key
+        } else {
+            if self.mode == TextPartMode::Indexed {
+                return Err(invalid_llm_output());
+            }
+            self.mode = TextPartMode::LegacySingle;
+            TextPartKey {
+                output_index: 0,
+                content_index: 0,
+            }
+        };
+        Ok((key, item_id))
+    }
+
+    fn observe_part_order(&mut self, key: TextPartKey) -> Result<(), ApiError> {
+        let Some(previous) = self.last_text_part else {
+            self.last_text_part = Some(key);
+            return Ok(());
+        };
+        if key < previous {
+            return Err(invalid_llm_output());
+        }
+        if key > previous {
+            if self
+                .parts
+                .get(&previous)
+                .and_then(|part| part.done.as_ref())
+                .is_none()
+            {
+                return Err(invalid_llm_output());
+            }
+            self.last_text_part = Some(key);
+        }
+        Ok(())
+    }
+
+    fn validate_completed_parts(&self, response: &Value) -> Result<String, ApiError> {
+        if response.get("status").and_then(Value::as_str) != Some("completed") {
+            return Err(invalid_llm_output());
+        }
+        let final_parts = final_response_text_parts(response)?;
+        let mut text = String::new();
+        match self.mode {
+            TextPartMode::LegacySingle => {
+                if self.parts.len() != 1 || final_parts.len() != 1 {
+                    return Err(invalid_llm_output());
+                }
+                let streamed = self.parts.values().next().ok_or_else(invalid_llm_output)?;
+                let final_part = final_parts.first().ok_or_else(invalid_llm_output)?;
+                self.validate_final_part(streamed, final_part)?;
+                text.push_str(&final_part.text);
+            }
+            TextPartMode::Indexed => {
+                if final_parts.len() != self.parts.len() || final_parts.is_empty() {
+                    return Err(invalid_llm_output());
+                }
+                for final_part in final_parts {
+                    let streamed = self
+                        .parts
+                        .get(&final_part.key)
+                        .ok_or_else(invalid_llm_output)?;
+                    self.validate_final_part(streamed, &final_part)?;
+                    text.push_str(&final_part.text);
+                }
+            }
+            TextPartMode::Unknown => return Err(invalid_llm_output()),
+        }
+        if text.trim().is_empty() {
+            return Err(invalid_llm_output());
+        }
+        Ok(text)
+    }
+
+    fn validate_final_part(
+        &self,
+        streamed: &StreamedTextPart,
+        final_part: &FinalTextPart,
+    ) -> Result<(), ApiError> {
+        let done = streamed.done.as_ref().ok_or_else(invalid_llm_output)?;
+        let completed = TextFingerprint::from_text(&final_part.text);
+        let item_id_mismatch = match self.mode {
+            TextPartMode::Indexed => streamed.item_id.as_deref() != final_part.item_id.as_deref(),
+            TextPartMode::LegacySingle => matches!(
+                (streamed.item_id.as_deref(), final_part.item_id.as_deref()),
+                (Some(streamed), Some(final_id)) if streamed != final_id
+            ),
+            TextPartMode::Unknown => true,
+        };
+        if done != &completed
+            || (streamed.saw_delta && streamed.delta_fingerprint() != completed)
+            || (self.saw_delta && !streamed.saw_delta && !final_part.text.is_empty())
+            || item_id_mismatch
+        {
+            return Err(invalid_llm_output());
+        }
+        Ok(())
+    }
+
+    fn completed_text(&self) -> Option<&str> {
+        self.completed
+            .as_ref()
+            .map(|terminal| terminal.text.as_str())
+    }
+
+    fn finish(&mut self) -> Result<ValidatedProviderTerminal, ApiError> {
+        self.sse.finish()?;
+        let terminal = self.completed.take().ok_or_else(invalid_llm_output)?;
+        if self.parts.is_empty() || self.parts.values().any(|part| part.done.is_none()) {
+            return Err(invalid_llm_output());
+        }
+        Ok(ValidatedProviderTerminal {
+            fallback_text: (!self.saw_delta).then_some(terminal.text),
+            usage: terminal.usage,
+        })
+    }
+}
+
+fn final_response_text_parts(response: &Value) -> Result<Vec<FinalTextPart>, ApiError> {
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid_llm_output)?;
+    let mut parts = Vec::new();
+    for (output_index, item) in output.iter().enumerate() {
+        let Some(content_value) = item.get("content") else {
+            continue;
+        };
+        let content = content_value.as_array().ok_or_else(invalid_llm_output)?;
+        let item_id = match item.get("id") {
+            None => None,
+            Some(Value::String(item_id)) if !item_id.is_empty() => Some(item_id.clone()),
+            _ => return Err(invalid_llm_output()),
+        };
+        for (content_index, part) in content.iter().enumerate() {
+            if part.get("type").and_then(Value::as_str) != Some("output_text") {
+                continue;
+            }
+            let text = part
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid_llm_output)?;
+            parts.push(FinalTextPart {
+                key: TextPartKey {
+                    output_index: u64::try_from(output_index).map_err(|_| invalid_llm_output())?,
+                    content_index: u64::try_from(content_index)
+                        .map_err(|_| invalid_llm_output())?,
+                },
+                item_id: item_id.clone(),
+                text: text.to_string(),
+            });
+        }
+    }
+    Ok(parts)
+}
+
+struct ProviderLlmStreamSource {
+    response: Option<StreamingResponse>,
+    decoder: ResponsesSseDecoder,
+    redactor: Option<StreamingTextRedactor>,
+    pending: VecDeque<LlmStreamEvent>,
+    started: Instant,
+    finished: bool,
+}
+
+impl fmt::Debug for ProviderLlmStreamSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderLlmStreamSource")
+            .field("response", &self.response)
+            .field("pending_events", &self.pending.len())
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProviderLlmStreamSource {
+    fn new(response: StreamingResponse, secrets: &[String], started: Instant) -> Self {
+        Self {
+            response: Some(response),
+            decoder: ResponsesSseDecoder::default(),
+            redactor: Some(StreamingTextRedactor::new(secrets)),
+            pending: VecDeque::new(),
+            started,
+            finished: false,
+        }
+    }
+
+    fn abort_redaction(&mut self) {
+        if let Some(redactor) = self.redactor.take() {
+            redactor.abort();
+        }
+    }
+
+    fn abort_stream(&mut self) {
+        self.pending.clear();
+        self.abort_redaction();
+        self.response.take();
+        self.finished = true;
+    }
+
+    fn fail(&mut self, error: ApiError) -> Result<Option<LlmStreamEvent>, ApiError> {
+        self.abort_stream();
+        Err(error)
+    }
+
+    fn queue_delta(&mut self, delta: &str) {
+        let Some(redactor) = self.redactor.as_mut() else {
+            return;
+        };
+        let safe = redactor.push(delta);
+        if !safe.is_empty() {
+            self.pending.push_back(LlmStreamEvent::Delta(safe));
+        }
+    }
+}
+
+impl Drop for ProviderLlmStreamSource {
+    fn drop(&mut self) {
+        self.abort_stream();
+    }
+}
+
+#[async_trait]
+impl LlmTextStreamSource for ProviderLlmStreamSource {
+    async fn next_event(&mut self) -> Result<Option<LlmStreamEvent>, ApiError> {
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(Some(event));
+        }
+        if self.finished {
+            return Ok(None);
+        }
+
+        loop {
+            let next_chunk = match self.response.as_mut() {
+                Some(response) => response.next_chunk().await,
+                None => return self.fail(invalid_llm_output()),
+            };
+            match next_chunk {
+                Ok(Some(chunk)) => {
+                    let decoded = match self.decoder.push(&chunk) {
+                        Ok(decoded) => decoded,
+                        Err(error) => return self.fail(error),
+                    };
+                    for event in decoded {
+                        match event {
+                            DecodedProviderEvent::Delta(delta) => self.queue_delta(&delta),
+                        }
+                    }
+                    if let Some(event) = self.pending.pop_front() {
+                        return Ok(Some(event));
+                    }
+                }
+                Ok(None) => {
+                    self.response.take();
+                    let terminal = match self.decoder.finish() {
+                        Ok(terminal) => terminal,
+                        Err(error) => return self.fail(error),
+                    };
+                    if let Some(fallback) = terminal.fallback_text.as_deref() {
+                        self.queue_delta(fallback);
+                    }
+                    if let Some(redactor) = self.redactor.take() {
+                        let tail = redactor.finish();
+                        if !tail.is_empty() {
+                            self.pending.push_back(LlmStreamEvent::Delta(tail));
+                        }
+                    }
+                    self.pending.push_back(LlmStreamEvent::Completed {
+                        latency_ms: u64::try_from(self.started.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        usage: terminal.usage,
+                    });
+                    self.finished = true;
+                    return Ok(self.pending.pop_front());
+                }
+                Err(error) => return self.fail(map_upstream_error(error)),
+            }
+        }
+    }
+
+    fn abort(&mut self) {
+        self.abort_stream();
+    }
 }
 
 fn decode_openai_response_body(body: &[u8]) -> Result<Value, ApiError> {
@@ -1002,6 +1883,38 @@ impl LlmProviderRegistry {
             ));
         }
         Ok(response)
+    }
+
+    pub async fn stream_text(
+        &self,
+        profile: LlmProfile,
+        principal_key: &str,
+        mut request: LlmRequest,
+    ) -> Result<LlmTextStream, ApiError> {
+        self.validate_request(&request)?;
+        let attempts = self.reserved_attempts(profile);
+        let (model, reasoning_effort) = self.request_shape(profile);
+        let estimated_tokens_per_attempt =
+            request.estimated_tokens_per_attempt(model, reasoning_effort);
+        let reserved_tokens = estimated_tokens_per_attempt.saturating_mul(attempts);
+        request.attempt_budget = Some(LlmAttemptBudget {
+            budget: self.budget.clone(),
+            principal_key: principal_key.to_string(),
+            requests: attempts,
+            estimated_tokens: reserved_tokens,
+        });
+        let mut stream = self.client(profile).stream_text(request).await?;
+        stream.constrain(
+            self.config.llm_max_response_bytes,
+            StreamBudgetReconciliation {
+                budget: self.budget.clone(),
+                principal_key: principal_key.to_string(),
+                attempts,
+                estimated_tokens_per_attempt,
+                reserved_tokens,
+            },
+        );
+        Ok(stream)
     }
 
     pub(crate) fn upstream(&self) -> UpstreamHttpClient {
@@ -2196,6 +3109,610 @@ fn extract_codex_sse_usage(body: &str) -> Option<LlmTokenUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::oneshot,
+    };
+
+    async fn spawn_sse_server(
+        chunks: Vec<Vec<u8>>,
+        content_type: &'static str,
+    ) -> (String, oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(headers_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers_end = headers_end + 4;
+                let headers = String::from_utf8_lossy(&request[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or(0);
+                if request.len() >= headers_end.saturating_add(content_length) {
+                    break;
+                }
+            }
+            let _ = request_tx.send(String::from_utf8(request).unwrap());
+
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            for chunk in chunks {
+                socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(&chunk).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        (format!("http://{address}/backend-api/codex"), request_rx)
+    }
+
+    fn terminal_sse(text: &str, usage: Option<Value>) -> String {
+        let mut response = json!({
+            "status": "completed",
+            "output": [{"content": [{"type": "output_text", "text": text}]}]
+        });
+        if let Some(usage) = usage {
+            response["usage"] = usage;
+        }
+        format!(
+            "event: response.output_text.done\r\ndata: {}\r\n\r\nevent: response.completed\r\ndata: {}\r\n\r\n",
+            json!({"type": "response.output_text.done", "text": text}),
+            json!({"type": "response.completed", "response": response})
+        )
+    }
+
+    fn collect_decoded_deltas(events: Vec<DecodedProviderEvent>, output: &mut String) {
+        for event in events {
+            match event {
+                DecodedProviderEvent::Delta(delta) => output.push_str(&delta),
+            }
+        }
+    }
+
+    fn sse_json(value: Value) -> String {
+        format!("data: {value}\n\n")
+    }
+
+    fn indexed_text_event(
+        event_type: &str,
+        output_index: i64,
+        content_index: i64,
+        item_id: Option<&str>,
+        field: &str,
+        text: &str,
+    ) -> String {
+        let mut value = json!({
+            "type": event_type,
+            "output_index": output_index,
+            "content_index": content_index
+        });
+        value[field] = json!(text);
+        if let Some(item_id) = item_id {
+            value["item_id"] = json!(item_id);
+        }
+        sse_json(value)
+    }
+
+    fn indexed_completed(content: Vec<Value>, item_id: Option<&str>) -> String {
+        let mut item = json!({"content": content});
+        if let Some(item_id) = item_id {
+            item["id"] = json!(item_id);
+        }
+        sse_json(json!({
+            "type": "response.completed",
+            "response": {"status": "completed", "output": [item]}
+        }))
+    }
+
+    #[test]
+    fn streaming_decoder_handles_every_byte_boundary_utf8_crlf_comments_and_multiline_data() {
+        let text = "你🙂 stream";
+        let delta = json!({
+            "type": "response.output_text.delta",
+            "delta": text
+        })
+        .to_string();
+        let split = delta.find(',').expect("two JSON fields") + 1;
+        let body = format!(
+            ": keepalive\r\nevent: response.output_text.delta\r\ndata: {}\r\ndata: {}\r\n\r\n{}",
+            &delta[..split],
+            &delta[split..],
+            terminal_sse(
+                text,
+                Some(json!({
+                    "input_tokens": 7,
+                    "output_tokens": 3,
+                    "total_tokens": 10
+                }))
+            )
+        );
+
+        let mut decoder = ResponsesSseDecoder::default();
+        let mut output = String::new();
+        for byte in body.as_bytes().chunks(1) {
+            collect_decoded_deltas(decoder.push(byte).unwrap(), &mut output);
+        }
+        assert_eq!(output, text);
+        let terminal = decoder.finish().unwrap();
+        assert_eq!(terminal.fallback_text, None);
+        assert_eq!(
+            terminal.usage,
+            Some(LlmTokenUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(3),
+                total_tokens: Some(10),
+                ..LlmTokenUsage::default()
+            })
+        );
+    }
+
+    #[test]
+    fn streaming_decoder_emits_delta_before_terminal_and_falls_back_without_deltas() {
+        let delta = format!(
+            "data: {}\n\n",
+            json!({"type": "response.output_text.delta", "delta": "first"})
+        );
+        let mut decoder = ResponsesSseDecoder::default();
+        let events = decoder.push(delta.as_bytes()).unwrap();
+        let mut output = String::new();
+        collect_decoded_deltas(events, &mut output);
+        assert_eq!(output, "first");
+        decoder
+            .push(terminal_sse("first", None).as_bytes())
+            .unwrap();
+        assert_eq!(decoder.finish().unwrap().fallback_text, None);
+
+        let mut fallback = ResponsesSseDecoder::default();
+        fallback
+            .push(terminal_sse("terminal only", None).as_bytes())
+            .unwrap();
+        assert_eq!(
+            fallback.finish().unwrap().fallback_text.as_deref(),
+            Some("terminal only")
+        );
+    }
+
+    #[test]
+    fn streaming_decoder_validates_and_concatenates_two_indexed_text_parts() {
+        let body = format!(
+            "{}{}{}{}{}",
+            indexed_text_event(
+                "response.output_text.delta",
+                0,
+                0,
+                Some("msg-1"),
+                "delta",
+                "alpha "
+            ),
+            indexed_text_event(
+                "response.output_text.done",
+                0,
+                0,
+                Some("msg-1"),
+                "text",
+                "alpha "
+            ),
+            indexed_text_event(
+                "response.output_text.delta",
+                0,
+                1,
+                Some("msg-1"),
+                "delta",
+                "beta"
+            ),
+            indexed_text_event(
+                "response.output_text.done",
+                0,
+                1,
+                Some("msg-1"),
+                "text",
+                "beta"
+            ),
+            indexed_completed(
+                vec![
+                    json!({"type": "output_text", "text": "alpha "}),
+                    json!({"type": "output_text", "text": "beta"}),
+                ],
+                Some("msg-1")
+            )
+        );
+        let mut decoder = ResponsesSseDecoder::default();
+        let mut output = String::new();
+        for chunk in body.as_bytes().chunks(3) {
+            collect_decoded_deltas(decoder.push(chunk).unwrap(), &mut output);
+        }
+        assert_eq!(output, "alpha beta");
+        assert_eq!(decoder.finish().unwrap().fallback_text, None);
+    }
+
+    #[test]
+    fn legacy_single_part_matches_the_only_final_text_independent_of_array_index() {
+        let body = format!(
+            "{}{}{}",
+            sse_json(json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg-1",
+                "delta": "answer"
+            })),
+            sse_json(json!({
+                "type": "response.output_text.done",
+                "item_id": "msg-1",
+                "text": "answer"
+            })),
+            sse_json(json!({
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {"type": "reasoning", "summary": []},
+                        {
+                            "id": "msg-1",
+                            "content": [{"type": "output_text", "text": "answer"}]
+                        }
+                    ]
+                }
+            }))
+        );
+        let mut decoder = ResponsesSseDecoder::default();
+        let mut output = String::new();
+        collect_decoded_deltas(decoder.push(body.as_bytes()).unwrap(), &mut output);
+        assert_eq!(output, "answer");
+        assert_eq!(decoder.finish().unwrap().fallback_text, None);
+    }
+
+    #[test]
+    fn streaming_decoder_rejects_malformed_multipart_identity_set_and_text() {
+        let valid_first = format!(
+            "{}{}",
+            indexed_text_event(
+                "response.output_text.delta",
+                0,
+                0,
+                Some("msg-1"),
+                "delta",
+                "ab"
+            ),
+            indexed_text_event(
+                "response.output_text.done",
+                0,
+                0,
+                Some("msg-1"),
+                "text",
+                "ab"
+            )
+        );
+        let valid_second = format!(
+            "{}{}",
+            indexed_text_event(
+                "response.output_text.delta",
+                0,
+                1,
+                Some("msg-1"),
+                "delta",
+                "cd"
+            ),
+            indexed_text_event(
+                "response.output_text.done",
+                0,
+                1,
+                Some("msg-1"),
+                "text",
+                "cd"
+            )
+        );
+        let malformed = [
+            indexed_text_event(
+                "response.output_text.delta",
+                -1,
+                0,
+                Some("msg-1"),
+                "delta",
+                "bad",
+            ),
+            sse_json(json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": "msg-1",
+                "delta": "bad"
+            })),
+            indexed_text_event("response.output_text.delta", 0, 0, None, "delta", "bad"),
+            format!(
+                "{}{}",
+                indexed_text_event(
+                    "response.output_text.delta",
+                    0,
+                    0,
+                    Some("msg-1"),
+                    "delta",
+                    "same"
+                ),
+                indexed_text_event(
+                    "response.output_text.done",
+                    0,
+                    0,
+                    Some("msg-2"),
+                    "text",
+                    "same"
+                )
+            ),
+            format!(
+                "{}{}",
+                sse_json(json!({
+                    "type": "response.output_text.delta",
+                    "delta": "legacy"
+                })),
+                indexed_text_event(
+                    "response.output_text.done",
+                    0,
+                    0,
+                    Some("msg-1"),
+                    "text",
+                    "legacy"
+                )
+            ),
+            format!(
+                "{}{}{}",
+                valid_first,
+                valid_second,
+                indexed_completed(
+                    vec![json!({"type": "output_text", "text": "abcd"})],
+                    Some("msg-1")
+                )
+            ),
+            format!(
+                "{}{}{}",
+                valid_first,
+                valid_second,
+                indexed_completed(
+                    vec![
+                        json!({"type": "output_text", "text": "a"}),
+                        json!({"type": "output_text", "text": "bcd"}),
+                    ],
+                    Some("msg-1")
+                )
+            ),
+            format!(
+                "{}{}",
+                valid_first,
+                indexed_completed(
+                    vec![json!({"type": "output_text", "text": "ab"})],
+                    Some("different-final-id")
+                )
+            ),
+            format!(
+                "{}{}",
+                valid_first,
+                indexed_completed(vec![json!({"type": "output_text", "text": "ab"})], None)
+            ),
+        ];
+        for body in malformed {
+            let mut decoder = ResponsesSseDecoder::default();
+            assert_invalid_llm_output(decoder.push(body.as_bytes()).unwrap_err());
+        }
+    }
+
+    #[test]
+    fn streaming_decoder_rejects_hash_mismatch_duplicates_failures_and_truncation() {
+        let delta = |text: &str| {
+            format!(
+                "data: {}\n\n",
+                json!({"type": "response.output_text.delta", "delta": text})
+            )
+        };
+        let done = |text: &str| {
+            format!(
+                "data: {}\n\n",
+                json!({"type": "response.output_text.done", "text": text})
+            )
+        };
+        let completed = |text: &str| {
+            let response = json!({
+                "status": "completed",
+                "output": [{"content": [{"type": "output_text", "text": text}]}]
+            });
+            format!(
+                "data: {}\n\n",
+                json!({"type": "response.completed", "response": response})
+            )
+        };
+
+        let malformed_bodies = [
+            format!("{}{}", delta("same"), done("lame")),
+            format!("{}{}", done("same"), done("same")),
+            completed("missing-done"),
+            format!("{}{}{}", done("same"), completed("same"), delta("late")),
+            format!(
+                "{}data: {}\n\n",
+                delta("partial"),
+                json!({"type": "response.failed", "response": {}})
+            ),
+            format!("data: {}\n\n", json!({"type": "response.incomplete"})),
+            format!(
+                "data: {}\n\n",
+                json!({"type": "error", "message": "private"})
+            ),
+            "event: response.completed\ndata: {\"type\":\"response.created\"}\n\n".to_string(),
+        ];
+        for body in malformed_bodies {
+            let mut decoder = ResponsesSseDecoder::default();
+            assert_invalid_llm_output(decoder.push(body.as_bytes()).unwrap_err());
+        }
+
+        let mut missing_completed = ResponsesSseDecoder::default();
+        missing_completed.push(done("partial").as_bytes()).unwrap();
+        assert_invalid_llm_output(missing_completed.finish().unwrap_err());
+
+        let mut truncated_frame = ResponsesSseDecoder::default();
+        truncated_frame
+            .push(b"data: {\"type\":\"response.output_text.done\"")
+            .unwrap();
+        assert_invalid_llm_output(truncated_frame.finish().unwrap_err());
+
+        let mut invalid_utf8 = ResponsesSseDecoder::default();
+        assert_invalid_llm_output(
+            invalid_utf8
+                .push(&[b'd', b'a', b't', b'a', b':', b' ', 0xff, b'\n'])
+                .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn streaming_content_type_requires_event_stream_essence() {
+        use reqwest::header::HeaderValue;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("Text/Event-Stream; charset=utf-8"),
+        );
+        require_event_stream_content_type(&headers).unwrap();
+
+        for value in [None, Some("application/json"), Some("text/plain")] {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert(CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
+            }
+            match require_event_stream_content_type(&headers).unwrap_err() {
+                ApiError::Upstream(message) => {
+                    assert_eq!(
+                        message,
+                        "LLM streaming response did not use text/event-stream"
+                    );
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_provider_streams_sanitized_deltas_and_completes_only_after_eof() {
+        let token = "provider-auth-secret";
+        let first = "safe prefix long enough to flush provider-auth-";
+        let second = "secret and safe suffix";
+        let text = format!("{first}{second}");
+        let chunks = vec![
+            format!(
+                "event: response.output_text.delta\r\ndata: {}\r\n\r\n",
+                json!({"type": "response.output_text.delta", "delta": first})
+            )
+            .into_bytes(),
+            format!(
+                "event: response.output_text.delta\r\ndata: {}\r\n\r\n",
+                json!({"type": "response.output_text.delta", "delta": second})
+            )
+            .into_bytes(),
+            terminal_sse(
+                &text,
+                Some(json!({
+                    "input_tokens": 11,
+                    "output_tokens": 9,
+                    "total_tokens": 20
+                })),
+            )
+            .into_bytes(),
+        ];
+        let (base_url, request_rx) = spawn_sse_server(chunks, "text/event-stream").await;
+        let config = Config::test();
+        let client = CodexResponsesClient {
+            model: "gpt-stream-test".to_string(),
+            reasoning_effort: Some("high".to_string()),
+            auth_source: "test".to_string(),
+            credentials: Some(CodexAuthCredentials {
+                token: token.to_string(),
+                account_id: Some("acct-test".to_string()),
+                token_kind: CodexAuthTokenKind::CodexOauth,
+            }),
+            credential_config: None,
+            base_url,
+            upstream: build_llm_upstream(&config).unwrap(),
+            operation_policy: llm_operation_policy(&config),
+            latest_rate_limits: LatestRateLimits::default(),
+        };
+        let request = LlmRequest::text(
+            "system",
+            format!("question containing {token}"),
+            128,
+            "rag.answer",
+        );
+        let mut stream = client.stream_text(request).await.unwrap();
+        assert_eq!(stream.provider, "codex_auth");
+        assert_eq!(stream.model, "gpt-stream-test");
+
+        let captured_request = request_rx.await.unwrap();
+        assert!(captured_request.starts_with("POST /backend-api/codex/responses HTTP/1.1"));
+        assert!(captured_request
+            .to_ascii_lowercase()
+            .contains("accept: text/event-stream"));
+        assert!(captured_request.contains("authorization: Bearer provider-auth-secret"));
+        assert!(captured_request.contains("chatgpt-account-id: acct-test"));
+        let payload = captured_request.split_once("\r\n\r\n").unwrap().1;
+        let payload = serde_json::from_str::<Value>(payload).unwrap();
+        assert_eq!(payload.get("stream").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            payload.pointer("/reasoning/effort").and_then(Value::as_str),
+            Some("high")
+        );
+        assert!(!payload.to_string().contains(token));
+
+        let mut output = String::new();
+        let mut completed = None;
+        while let Some(event) = stream.next_event().await.unwrap() {
+            match event {
+                LlmStreamEvent::Delta(delta) => {
+                    assert!(completed.is_none(), "delta emitted after completion");
+                    output.push_str(&delta);
+                }
+                LlmStreamEvent::Completed { usage, .. } => {
+                    assert!(completed.is_none(), "duplicate completion");
+                    completed = Some(usage);
+                }
+            }
+        }
+        assert!(output.contains("safe prefix"));
+        assert!(output.contains("safe suffix"));
+        assert_ne!(output, text);
+        assert!(!output.contains("provider-auth-"));
+        assert!(!output.contains(token));
+        assert_eq!(
+            completed,
+            Some(Some(LlmTokenUsage {
+                input_tokens: Some(11),
+                output_tokens: Some(9),
+                total_tokens: Some(20),
+                ..LlmTokenUsage::default()
+            }))
+        );
+    }
 
     #[test]
     fn codex_sse_text_requires_matching_terminal_text() {
@@ -2495,6 +4012,94 @@ mod tests {
             serde_json::from_str::<Value>(&response.text).unwrap(),
             json!({"links": [], "insights": []})
         );
+    }
+
+    #[tokio::test]
+    async fn none_and_mock_streams_are_deterministic_and_terminal() {
+        let none = NoneLlmClient {
+            model: "none-model".to_string(),
+        };
+        let mut none_stream = none
+            .stream_text(LlmRequest::text("system", "question", 32, "rag.answer"))
+            .await
+            .unwrap();
+        assert_eq!(none_stream.provider, "none");
+        assert_eq!(none_stream.model, "none-model");
+        assert!(matches!(
+            none_stream.next_event().await.unwrap(),
+            Some(LlmStreamEvent::Delta(text)) if text == "provider=none echo: question"
+        ));
+        assert!(matches!(
+            none_stream.next_event().await.unwrap(),
+            Some(LlmStreamEvent::Completed { usage: None, .. })
+        ));
+        assert_eq!(none_stream.next_event().await.unwrap(), None);
+
+        let mock = MockLlmClient {
+            model: "mock-model".to_string(),
+        };
+        let mut mock_stream = mock
+            .stream_text(LlmRequest::text("system", "question", 32, "rag.answer"))
+            .await
+            .unwrap();
+        assert_eq!(mock_stream.provider, "mock");
+        assert_eq!(mock_stream.model, "mock-model");
+        assert!(matches!(
+            mock_stream.next_event().await.unwrap(),
+            Some(LlmStreamEvent::Delta(text)) if text == "mock summary: question"
+        ));
+        assert!(matches!(
+            mock_stream.next_event().await.unwrap(),
+            Some(LlmStreamEvent::Completed { usage: Some(_), .. })
+        ));
+        assert_eq!(mock_stream.next_event().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn streaming_registry_reserves_budget_until_terminal_or_drop() {
+        let mut config = Config::test();
+        config.llm_provider = "mock".to_string();
+        config.llm_model = Some("mock".to_string());
+        config.llm_rate_limit_requests_per_minute = 1;
+        config.llm_rate_limit_tokens_per_minute = 10_000;
+        let registry = LlmProviderRegistry::new(Arc::new(config));
+        let request = || LlmRequest::text("system", "question", 8, "rag.answer");
+
+        let stream = registry
+            .stream_text(LlmProfile::Primary, "principal", request())
+            .await
+            .unwrap();
+        drop(stream);
+        assert!(matches!(
+            registry
+                .stream_text(LlmProfile::Primary, "principal", request())
+                .await,
+            Err(ApiError::TooManyRequests(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_registry_enforces_sanitized_output_limit() {
+        let mut config = Config::test();
+        config.llm_provider = "mock".to_string();
+        config.llm_model = Some("mock".to_string());
+        config.llm_max_response_bytes = 8;
+        let registry = LlmProviderRegistry::new(Arc::new(config));
+        let mut stream = registry
+            .stream_text(
+                LlmProfile::Primary,
+                "principal",
+                LlmRequest::text("system", "question", 8, "rag.answer"),
+            )
+            .await
+            .unwrap();
+        match stream.next_event().await.unwrap_err() {
+            ApiError::Upstream(message) => {
+                assert_eq!(message, "LLM response exceeded the configured size limit")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(stream.next_event().await.unwrap(), None);
     }
 
     #[tokio::test]
