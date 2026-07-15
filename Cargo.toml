@@ -3,6 +3,7 @@ name = "nowledge"
 version = "0.11.0"
 edition = "2021"
 rust-version = "1.88"
+publish = false
 description = "ContextFS-style State/History RAG service with per-user Meilisearch event indexes"
 license = "MIT"
 repository = "https://github.com/dickwu/nowledge"
@@ -42,8 +43,11 @@ tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-turbovec = "0.9"
+turbovec = "=0.9.0"
 uuid = { version = "1", features = ["v7", "serde"] }
+
+[patch.crates-io]
+turbovec = { path = "vendor/turbovec" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
