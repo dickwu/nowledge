@@ -39,6 +39,9 @@ use crate::{
     llm::{LlmEvidence, LlmProfile, LlmRequest, LlmStreamEvent, LlmTextStream, LlmTokenUsage},
     models::*,
     request_context::{self, RequestContextState, RequestId},
+    request_validation::{
+        validate_history_bulk, validate_max_items, validate_search_limit, validate_tags,
+    },
     route_health::{
         bootstrap, debug_meili_search, get_trace, healthz, livez, llm_status, llm_test, readyz,
         usage,
@@ -67,58 +70,6 @@ struct FsQuery {
     uri: Option<String>,
     depth: Option<usize>,
     owner_user_id: Option<String>,
-}
-
-fn validate_max_items(field: &str, actual: usize, maximum: usize) -> Result<(), ApiError> {
-    if actual > maximum {
-        return Err(ApiError::validation(
-            field,
-            format!("must contain at most {maximum} items"),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_search_limit(field: &str, limit: usize, config: &Config) -> Result<(), ApiError> {
-    if limit > config.max_search_limit {
-        return Err(ApiError::validation(
-            field,
-            format!("must be at most {}", config.max_search_limit),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_tags(field: &str, tags: &[String], config: &Config) -> Result<(), ApiError> {
-    validate_max_items(field, tags.len(), config.max_tags_per_item)?;
-    for (index, tag) in tags.iter().enumerate() {
-        if tag.len() > config.max_tag_bytes {
-            return Err(ApiError::validation(
-                format!("{field}[{index}]"),
-                format!("must be at most {} UTF-8 bytes", config.max_tag_bytes),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_history_event(
-    field: &str,
-    request: &AppendHistoryEventRequest,
-    config: &Config,
-) -> Result<(), ApiError> {
-    validate_tags(&format!("{field}.tags"), &request.tags, config)
-}
-
-fn validate_history_bulk(
-    request: &BulkHistoryEventsRequest,
-    config: &Config,
-) -> Result<(), ApiError> {
-    validate_max_items("events", request.events.len(), config.max_bulk_events)?;
-    for (index, event) in request.events.iter().enumerate() {
-        validate_history_event(&format!("events[{index}]"), event, config)?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default)]

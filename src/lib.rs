@@ -14,6 +14,7 @@ pub mod mutation;
 pub mod parser;
 pub mod repository;
 pub mod request_context;
+mod request_validation;
 pub mod resolver;
 mod route_health;
 mod route_ingest;
