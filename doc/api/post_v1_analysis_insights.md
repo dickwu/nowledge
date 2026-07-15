@@ -44,7 +44,8 @@ Schema: `AnalysisInsightResponse`
 | insight_candidates | InsightCandidate[] | Proposed insights from deterministic or LLM analysis. |
 | created_links | KnowledgeLink[] | Links persisted when create_links is true. |
 | insights | InsightRecord[] | Insights persisted when upsert_insights is true. |
-| usage | object | Provider/model/backend metadata; includes history_scope same_index for history_event_id mode. Admin debug may include a configured-secret-redacted provider preview. |
+| persistence | PersistenceMetadata? | Durable operation ID, completed operation/indexing states, and confirmed Meilisearch task UIDs when candidates were materialized. Omitted when no write was needed. |
+| usage | object | Provider/model/backend metadata; includes history_scope same_index for history_event_id mode. Admin debug includes only safe candidate rejection codes. |
 | prompt | string? | Configured-secret-redacted prompt included only when debug is true. |
 
 ## Errors and Access Rules
@@ -72,9 +73,9 @@ flowchart TD
   n7["build_analysis_prompt constructs grounded prompt"]
   n8["analysis_llm_config selects analysis-specific provider/model"]
   n9["deterministic or LLM draft yields link and insight candidates"]
-  n10["Optional Store.upsert_link_async persists links"]
-  n11["Optional Store.upsert_insight_async persists insights"]
-  n12["Redact configured secrets and return AnalysisInsightResponse; prompt only for admin debug"]
+  n10["Store.materialize_analysis_async stages accepted candidates as one owner-bound operation"]
+  n11["Journal every typed resource, confirm every Meilisearch task, then publish the cache atomically"]
+  n12["Return persistence confirmation and redacted AnalysisInsightResponse; prompt only for admin debug"]
   n0 --> n1
   n1 --> n2
   n2 --> n3
@@ -91,3 +92,9 @@ flowchart TD
 
 ## Internal Logic Notes
 - history_event_id mode resolves the selected event through Store.get_event_async(owner_user_id, history_event_id), searches only that owner routing, keeps hits whose event_index_uid matches the selected event, and reports usage.history_scope.mode = same_index.
+- Provider output is untrusted. Strict validation applies exact authorized-URI
+  membership, relation/score/field bounds, and first-valid-wins deduplication
+  before any durable write.
+- Link, insight, history, and ContextFS projection writes are committed through
+  one HMAC owner-bound `analysis.materialize` operation. The response is not
+  returned until every accepted Meilisearch task has completed successfully.

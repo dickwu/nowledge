@@ -93,6 +93,17 @@ RAG_INGEST_TASK_RETENTION_SECONDS=86400
 RAG_INGEST_CLEANUP_INTERVAL_SECONDS=300
 RAG_INGEST_WORKER_ENABLED=true
 RAG_SHUTDOWN_TIMEOUT_MS=30000
+RAG_PROVIDER_CONNECT_TIMEOUT_MS=5000
+RAG_LLM_TIMEOUT_MS=60000
+RAG_PARSER_TIMEOUT_MS=120000
+RAG_PROVIDER_MAX_RETRIES=2
+RAG_PROVIDER_PROXY_MODE=system
+RAG_LLM_MAX_INPUT_CHARS=65536
+RAG_LLM_MAX_OUTPUT_TOKENS=2048
+RAG_LLM_MAX_RESPONSE_BYTES=2097152
+RAG_PARSER_MAX_RESPONSE_BYTES=67108864
+RAG_LLM_RATE_LIMIT_REQUESTS_PER_MINUTE=30
+RAG_LLM_RATE_LIMIT_TOKENS_PER_MINUTE=100000
 RAG_LLM_PROVIDER=none
 RAG_LLM_MODEL=none
 RAG_LLM_REASONING_EFFORT=optional-low-medium-high-xhigh
@@ -139,7 +150,7 @@ unset: `true` maps to `wait_for_index`, while `false` maps to
 `read_your_writes`. Setting both variables is a startup error. This legacy
 compatibility path expires on 2026-10-01 / v0.13.0.
 
-History mutation responses include additive `persistence` metadata with the
+History mutation and analysis materialization responses include additive `persistence` metadata with the
 durable operation ID, operation/indexing states, ordered primary task UIDs,
 and all task UIDs. If an event batch is committed but a derived context write
 fails, the response is explicit (`status=partially_failed`) and retrying the
@@ -210,6 +221,19 @@ maximums. Limit failures use the normal error envelope and return 413 for body
 or upload size, 429 for rate/queue pressure, 503 for global capacity or a
 disabled/closing worker, and 504 for route timeouts. Pressure responses include
 `Retry-After`, and every response includes a server-generated `X-Request-Id`.
+
+LLM and MinerU calls share bounded HTTP clients. Connect, operation, decoded
+response-body, prompt/output, and per-principal request/token limits are
+configured by the `RAG_PROVIDER_*`, `RAG_LLM_*`, and
+`RAG_PARSER_MAX_RESPONSE_BYTES` variables above. `RAG_PROVIDER_MAX_RETRIES`
+accepts 0 through 2; retries are limited to connection failures before a
+response, HTTP 408, non-quota 429, and HTTP 500/502/503/504, and preserve one
+client request ID. Response/body timeouts are not retried because the upstream
+may already have consumed the request. `Retry-After` is honored within the
+overall deadline. `RAG_PROVIDER_PROXY_MODE=system` uses the process proxy
+environment, while `direct` disables proxies explicitly. Analysis uses a
+strict JSON schema plus an independent server-side authorization/validation
+pass; provider output cannot select tenant or owner scope.
 
 `RAG_CORS_ALLOWED_ORIGINS` is a comma-separated list of exact `http://` or
 `https://` origins. Development and test default to `*`; production defaults
@@ -295,7 +319,10 @@ Health endpoints split process liveness from operational readiness:
   Configured secrets are redacted before provider submission, model-output
   persistence/materialization, and response serialization. Analysis parses the
   provider JSON before redaction, validates proposed link locators against the
-  prompt's context/seed/existing-link locator set, and then sanitizes free text.
+  prompt's authorized context/seed locator set, deduplicates exact persisted
+  link/insight identities, and then sanitizes free text. Accepted analysis
+  candidates are written as one owner-bound durable operation and returned only
+  after every Meilisearch task is confirmed.
 - `GET /v1/usage` returns only the selected owner's usage counters to owner and
   tenant-service principals. Global counters and service-wide Meilisearch,
   parser, and LLM provider diagnostics are admin-only.

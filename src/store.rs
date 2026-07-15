@@ -18,7 +18,10 @@ use crate::{
         operation_step_completed, operation_step_failed, operation_summary, persistence_metadata,
         validate_operation_record, OPERATION_PLAN_SCHEMA_VERSION,
     },
-    parser::{parser_from_config, ParserInput, ParserOutput, StagedUpload},
+    parser::{
+        validate_parser_config, validate_parser_output, ParserInput, ParserOutput, ParserRegistry,
+        StagedUpload,
+    },
     repository::{
         repository_from_config, KnowledgeRepository, RepositoryContextSearchQuery,
         RepositoryOperationListQuery,
@@ -55,6 +58,7 @@ pub struct Store {
     repository: Arc<dyn KnowledgeRepository>,
     vector: Arc<Mutex<VectorMatcher>>,
     redaction_config: Arc<Config>,
+    parser_registry: ParserRegistry,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -469,6 +473,7 @@ enum MutationPrimary {
     StateItem,
     Insight,
     Links,
+    AnalysisMaterialization,
     DeleteCompanySource,
     SourceRevision,
     SourceDocuments,
@@ -517,6 +522,10 @@ impl MutationPrimary {
                 | (Self::StateItem, OperationResource::StateItem { .. })
                 | (Self::Insight, OperationResource::Insight { .. })
                 | (Self::Links, OperationResource::Links { .. })
+                | (
+                    Self::AnalysisMaterialization,
+                    OperationResource::Insight { .. } | OperationResource::Links { .. }
+                )
                 | (
                     Self::DeleteCompanySource,
                     OperationResource::DeleteCompanySourceIndex {
@@ -584,7 +593,10 @@ impl MutationPrimary {
     const fn requires_index_confirmation(self) -> bool {
         matches!(
             self,
-            Self::UserIndex | Self::DeleteCompanySource | Self::DeleteIngestTasks
+            Self::UserIndex
+                | Self::AnalysisMaterialization
+                | Self::DeleteCompanySource
+                | Self::DeleteIngestTasks
         )
     }
 }
@@ -947,7 +959,13 @@ impl Store {
             repository: repository_from_config(config),
             vector: Arc::new(Mutex::new(VectorMatcher::from_config(config))),
             redaction_config: Arc::new(config.clone()),
+            parser_registry: ParserRegistry::new(config),
         }
+    }
+
+    /// Reuse the same pooled parser client used by ingestion for health checks.
+    pub async fn parser_health_status(&self, config: &Config) -> Value {
+        self.parser_registry.health_status(config).await
     }
 
     /// Build an isolated copy used to validate and plan a mutation without
@@ -1616,7 +1634,8 @@ impl Store {
                 "resource_count": resource_count,
                 "write_consistency": self.redaction_config.write_consistency.as_str(),
                 "wait_for_index": wait_for_index,
-                "request_fingerprint": request_fingerprint
+                "request_fingerprint": request_fingerprint,
+                "target_owner_user_id_hash": target_owner_user_id_hash
             }),
             response_snapshot,
             created_at,
@@ -2607,6 +2626,20 @@ impl Store {
             ApiError::Internal(format!("invalid persisted operation record: {error}"))
         })?;
         let tenant_hash = self.resolver.tenant_hash(&record.tenant_id);
+        let analysis_target_owner_hash = (record.operation_kind == "analysis.materialize")
+            .then(|| {
+                record
+                    .plan
+                    .redacted_metadata
+                    .get("target_owner_user_id_hash")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ApiError::Internal(
+                            "analysis operation is missing its target owner commitment".to_string(),
+                        )
+                    })
+            })
+            .transpose()?;
         for step in std::iter::once(&record.plan.primary).chain(record.plan.side_effects.iter()) {
             match &step.resource {
                 OperationResource::EnsureUserEventIndex { index } => {
@@ -2627,6 +2660,8 @@ impl Store {
                         || index.schema_version != EVENT_INDEX_SCHEMA_VERSION
                         || index.settings_hash != EVENT_SETTINGS_HASH
                         || index.status != "active"
+                        || analysis_target_owner_hash
+                            .is_some_and(|expected| index.owner_user_id_hash != expected)
                     {
                         return Err(ApiError::Internal(
                             "persisted operation contains an invalid user-index route".to_string(),
@@ -2645,6 +2680,8 @@ impl Store {
                             || event.owner_user_id_hash != routing.owner_user_id_hash
                             || event.event_index_uid != routing.event_index_uid
                             || event.event_index_schema_version != EVENT_INDEX_SCHEMA_VERSION
+                            || analysis_target_owner_hash
+                                .is_some_and(|expected| routing.owner_user_id_hash != expected)
                         {
                             return Err(ApiError::Internal(
                                 "persisted operation contains an invalid history-event route"
@@ -2668,6 +2705,9 @@ impl Store {
                                 if *index_uid != routing.personal_context_index_uid
                                     || node.index_kind != "personal"
                                     || node.privacy != "private"
+                                    || analysis_target_owner_hash.is_some_and(|expected| {
+                                        routing.owner_user_id_hash != expected
+                                    })
                                 {
                                     return Err(ApiError::Internal(
                                         "persisted operation contains an invalid personal-context route"
@@ -2688,6 +2728,29 @@ impl Store {
                             }
                         }
                     }
+                }
+                OperationResource::Insight { insight } => {
+                    if analysis_target_owner_hash.is_some_and(|expected| {
+                        self.resolver.user_hash(&insight.owner_user_id) != expected
+                    }) {
+                        return Err(ApiError::Internal(
+                            "analysis insight does not match its target owner commitment"
+                                .to_string(),
+                        ));
+                    }
+                }
+                OperationResource::Links { links }
+                    if analysis_target_owner_hash.is_some_and(|expected| {
+                        links.iter().any(|link| {
+                            link.owner_user_id
+                                .as_deref()
+                                .is_none_or(|owner| self.resolver.user_hash(owner) != expected)
+                        })
+                    }) =>
+                {
+                    return Err(ApiError::Internal(
+                        "analysis link does not match its target owner commitment".to_string(),
+                    ));
                 }
                 _ => {}
             }
@@ -5375,6 +5438,52 @@ impl Store {
         Ok(response)
     }
 
+    /// Admit already-authorized analysis candidates as one durable operation.
+    ///
+    /// The request deliberately carries no tenant, owner, or idempotency
+    /// fields. The trusted server boundary supplies the scope, and this method
+    /// derives bounded HMAC fingerprints for both the operation and each
+    /// candidate before staging any cache changes.
+    pub async fn materialize_analysis_async(
+        &self,
+        tenant_id: &str,
+        owner_user_id: &str,
+        req: AnalysisMaterializationRequest,
+    ) -> Result<AnalysisMaterializationResponse, ApiError> {
+        let owner_user_id = require_string(Some(owner_user_id.to_string()), "owner_user_id")?;
+        if req.links.len() > MAX_ANALYSIS_MATERIALIZATION_LINKS {
+            return Err(ApiError::bad_request(
+                "analysis materialization link limit exceeded",
+            ));
+        }
+        if req.insights.len() > MAX_ANALYSIS_MATERIALIZATION_INSIGHTS {
+            return Err(ApiError::bad_request(
+                "analysis materialization insight limit exceeded",
+            ));
+        }
+
+        let request_fingerprint = self.mutation_request_fingerprint(
+            tenant_id,
+            "analysis.materialize",
+            &(owner_user_id.as_str(), &req),
+        )?;
+        let (mut response, persistence) = self
+            .execute_staged_mutation_with_idempotency(
+                tenant_id,
+                "analysis.materialize",
+                Some(&owner_user_id),
+                MutationIdempotency {
+                    key: Some(&request_fingerprint),
+                    request_fingerprint: Some(&request_fingerprint),
+                },
+                MutationPrimary::AnalysisMaterialization,
+                |staged| staged.materialize_analysis(tenant_id, &owner_user_id, req),
+            )
+            .await?;
+        response.persistence = persistence;
+        Ok(response)
+    }
+
     pub async fn patch_insight_async(
         &self,
         tenant_id: &str,
@@ -5575,11 +5684,7 @@ impl Store {
         if let Some(backend) = req.parser_backend.as_deref() {
             parser_config.mineru_backend = backend.to_string();
         }
-        if !matches!(parser_config.parser_provider.as_str(), "builtin" | "mineru") {
-            return Err(ApiError::bad_request(
-                "parser_provider must be builtin or mineru",
-            ));
-        }
+        validate_parser_config(&parser_config)?;
 
         let has_content = req
             .content
@@ -5694,6 +5799,7 @@ impl Store {
         if let Some(backend) = req.parser_backend.as_deref() {
             parser_config.mineru_backend = backend.to_string();
         }
+        validate_parser_config(&parser_config)?;
         let task = self.ingest_task_for_run(task_id)?;
         let uses_builtin_parser = parser_config.parser_provider == "builtin";
         let staged_builtin_upload = uses_builtin_parser && staged_upload.is_some();
@@ -5725,7 +5831,19 @@ impl Store {
 
         self.transition_ingest_task_async(task_id, "parsing", None)
             .await?;
-        let parser = parser_from_config(&parser_config);
+        let parser = match self.parser_registry.parser_for_config(&parser_config) {
+            Ok(parser) => parser,
+            Err(err) => {
+                let _ = self
+                    .transition_ingest_task_async(
+                        task_id,
+                        "failed",
+                        Some(INGEST_ERROR_PARSER_FAILED.to_string()),
+                    )
+                    .await;
+                return Err(err);
+            }
+        };
         let mut parsed = match parser
             .parse(ParserInput {
                 content: parser_content,
@@ -5752,6 +5870,16 @@ impl Store {
                 return Err(err);
             }
         };
+        if let Err(err) = validate_parser_output(&parsed, parser_config.parser_max_response_bytes) {
+            let _ = self
+                .transition_ingest_task_async(
+                    task_id,
+                    "failed",
+                    Some(INGEST_ERROR_PARSER_FAILED.to_string()),
+                )
+                .await;
+            return Err(err);
+        }
 
         let staged_original_content = if original_content.is_empty() {
             match staged_original {
@@ -7852,6 +7980,127 @@ impl Store {
         Ok(StateSearchResponse { hits })
     }
 
+    fn materialize_analysis(
+        &self,
+        tenant_id: &str,
+        owner_user_id: &str,
+        req: AnalysisMaterializationRequest,
+    ) -> Result<AnalysisMaterializationResponse, ApiError> {
+        let mut insight_context_uris = HashSet::with_capacity(req.insights.len());
+        for candidate in &req.insights {
+            require_string(Some(candidate.insight_type.clone()), "insight_type")?;
+            require_string(Some(candidate.title.clone()), "title")?;
+            require_string(Some(candidate.statement.clone()), "statement")?;
+            if !insight_context_uris.insert(crate::analysis::analysis_insight_context_uri(
+                &candidate.insight_type,
+                &candidate.title,
+            )) {
+                return Err(ApiError::bad_request(
+                    "analysis materialization contains a duplicate insight context identity",
+                ));
+            }
+        }
+
+        let mut created_links = Vec::with_capacity(req.links.len());
+        for candidate in req.links {
+            let candidate_key = self.mutation_request_fingerprint(
+                tenant_id,
+                "analysis.materialize.link",
+                &(owner_user_id, &candidate),
+            )?;
+            let mut tags = candidate.tags;
+            if !tags.iter().any(|tag| tag == "analysis") {
+                tags.push("analysis".to_string());
+            }
+            let response = self.upsert_link(
+                tenant_id,
+                LinkUpsertRequest {
+                    owner_user_id: Some(owner_user_id.to_string()),
+                    source_uri: Some(candidate.source_uri),
+                    target_uri: Some(candidate.target_uri),
+                    source_title: candidate.source_title,
+                    target_title: candidate.target_title,
+                    relation: candidate.relation,
+                    rationale: candidate.rationale,
+                    evidence_text: None,
+                    confidence: candidate.confidence,
+                    created_by: "analysis_api".to_string(),
+                    tags,
+                    idempotency_key: Some(candidate_key),
+                },
+            )?;
+            created_links.push(response.link);
+        }
+
+        let mut insights = Vec::with_capacity(req.insights.len());
+        for candidate in req.insights {
+            let candidate_key = self.mutation_request_fingerprint(
+                tenant_id,
+                "analysis.materialize.insight",
+                &(owner_user_id, &candidate),
+            )?;
+            let candidate_hash = self.resolver.idempotency_hash(&candidate_key);
+            let context_uri = crate::analysis::analysis_insight_context_uri(
+                &candidate.insight_type,
+                &candidate.title,
+            );
+            {
+                let mut data = self.write()?;
+                let existing_id = data
+                    .insights
+                    .values()
+                    .find(|insight| {
+                        insight.tenant_id == tenant_id
+                            && insight.owner_user_id == owner_user_id
+                            && insight.context_uri == context_uri
+                    })
+                    .map(|insight| insight.id.clone());
+                if let Some(existing_id) = existing_id {
+                    data.insight_idempotency
+                        .entry((
+                            tenant_id.to_string(),
+                            owner_user_id.to_string(),
+                            candidate_hash,
+                        ))
+                        .or_insert(existing_id);
+                }
+            }
+            let source_refs = candidate
+                .source_uris
+                .into_iter()
+                .map(|uri| SourceRef {
+                    kind: "context_uri".to_string(),
+                    id: uri.clone(),
+                    uri: Some(uri),
+                    meta: None,
+                })
+                .collect();
+            let response = self.upsert_insight(
+                tenant_id,
+                InsightUpsertRequest {
+                    owner_user_id: Some(owner_user_id.to_string()),
+                    insight_type: Some(candidate.insight_type),
+                    title: Some(candidate.title),
+                    statement: Some(candidate.statement),
+                    evidence_text: None,
+                    source_refs,
+                    confidence: candidate.confidence,
+                    salience: candidate.salience,
+                    privacy: "private".to_string(),
+                    merge_policy: "merge".to_string(),
+                    idempotency_key: Some(candidate_key),
+                },
+            )?;
+            insights.push(response.insight);
+        }
+
+        Ok(AnalysisMaterializationResponse {
+            created_links,
+            insights,
+            persistence: None,
+        })
+    }
+
     pub fn upsert_insight(
         &self,
         tenant_id: &str,
@@ -7884,11 +8133,11 @@ impl Store {
             new_id("insight")
         };
 
-        let context_uri = format!(
-            "ctx://user/insights/{}/{}",
-            sanitize_slug(&insight_type),
-            sanitize_slug(&title)
-        );
+        let context_uri = crate::analysis::analysis_insight_context_uri(&insight_type, &title);
+        let created_at = data
+            .insights
+            .get(&id)
+            .map_or(now, |existing| existing.created_at);
         let insight = InsightRecord {
             id: id.clone(),
             tenant_id: tenant_id.to_string(),
@@ -7902,7 +8151,7 @@ impl Store {
             source_refs: req.source_refs,
             owner_user_id: owner_user_id.clone(),
             privacy: req.privacy,
-            created_at: now,
+            created_at,
             updated_at: now,
         };
         data.insights.insert(id.clone(), insight.clone());
@@ -13103,6 +13352,347 @@ mod tests {
         assert!(plan.actor.owner_user_id_hash.is_none());
         assert!(plan.actor.roles.is_empty());
         assert!(plan.actor.request_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn analysis_materialization_is_one_replayable_confirmed_operation() {
+        let config = Config::test();
+        let tenant_id = config.tenant_id.clone();
+        let store = Store::new(&config);
+        let request = AnalysisMaterializationRequest {
+            links: vec![AnalysisLinkMaterialization {
+                source_uri: "ctx://user/source-a".to_string(),
+                target_uri: "ctx://user/source-b".to_string(),
+                source_title: Some("Source A".to_string()),
+                target_title: Some("Source B".to_string()),
+                relation: "supports".to_string(),
+                rationale: Some("Grounded association".to_string()),
+                confidence: 0.8,
+                tags: vec!["grounded".to_string()],
+            }],
+            insights: vec![
+                AnalysisInsightMaterialization {
+                    insight_type: "analysis".to_string(),
+                    title: "First insight".to_string(),
+                    statement: "First grounded statement".to_string(),
+                    confidence: 0.9,
+                    salience: 0.7,
+                    source_uris: vec!["ctx://user/source-a".to_string()],
+                },
+                AnalysisInsightMaterialization {
+                    insight_type: "analysis".to_string(),
+                    title: "Second insight".to_string(),
+                    statement: "Second grounded statement".to_string(),
+                    confidence: 0.75,
+                    salience: 0.6,
+                    source_uris: vec!["ctx://user/source-b".to_string()],
+                },
+            ],
+        };
+
+        let first = store
+            .materialize_analysis_async(&tenant_id, "owner-a", request.clone())
+            .await
+            .unwrap();
+        let replay = store
+            .materialize_analysis_async(&tenant_id, "owner-a", request)
+            .await
+            .unwrap();
+
+        assert_eq!(first.created_links.len(), 1);
+        assert_eq!(first.insights.len(), 2);
+        assert_eq!(replay.created_links[0].id, first.created_links[0].id);
+        assert_eq!(replay.insights[0].id, first.insights[0].id);
+        assert_eq!(replay.insights[1].id, first.insights[1].id);
+        let persistence = first.persistence.as_ref().unwrap();
+        assert_eq!(persistence.status, OperationStatus::Completed);
+        assert_eq!(
+            persistence.indexing_state,
+            OperationIndexingState::Completed
+        );
+        assert_eq!(
+            replay.persistence.as_ref().map(|value| &value.operation_id),
+            Some(&persistence.operation_id)
+        );
+        assert!(first
+            .created_links
+            .iter()
+            .all(|link| link.tenant_id == tenant_id
+                && link.owner_user_id.as_deref() == Some("owner-a")));
+        assert!(first.insights.iter().all(|insight| {
+            insight.tenant_id == tenant_id && insight.owner_user_id == "owner-a"
+        }));
+
+        let data = store.read().unwrap();
+        assert_eq!(data.operations.len(), 1);
+        let operation = data.operations.values().next().unwrap();
+        assert_eq!(operation.operation_kind, "analysis.materialize");
+        assert_eq!(operation.status, OperationStatus::Completed);
+        assert_eq!(operation.indexing_state, OperationIndexingState::Completed);
+        assert_eq!(
+            operation.plan.redacted_metadata["wait_for_index"],
+            json!(true)
+        );
+        assert_eq!(
+            operation.plan.redacted_metadata["target_owner_user_id_hash"],
+            json!(store.resolver.user_hash("owner-a"))
+        );
+        assert!(matches!(
+            operation.plan.primary.resource,
+            OperationResource::Insight { .. }
+        ));
+        assert!(operation
+            .plan
+            .side_effects
+            .iter()
+            .any(|step| matches!(step.resource, OperationResource::Insight { .. })));
+        assert!(operation
+            .plan
+            .side_effects
+            .iter()
+            .any(|step| matches!(step.resource, OperationResource::Links { .. })));
+        assert!(operation
+            .plan
+            .side_effects
+            .iter()
+            .any(|step| matches!(step.resource, OperationResource::HistoryEvents { .. })));
+        assert!(operation
+            .plan
+            .side_effects
+            .iter()
+            .any(|step| matches!(step.resource, OperationResource::ContextNodes { .. })));
+    }
+
+    #[tokio::test]
+    async fn invalid_analysis_batch_is_discarded_before_journal_or_publication() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let error = store
+            .materialize_analysis_async(
+                &config.tenant_id,
+                "owner-a",
+                AnalysisMaterializationRequest {
+                    links: vec![AnalysisLinkMaterialization {
+                        source_uri: "ctx://user/source-a".to_string(),
+                        target_uri: "ctx://user/source-b".to_string(),
+                        source_title: None,
+                        target_title: None,
+                        relation: "related".to_string(),
+                        rationale: None,
+                        confidence: 0.8,
+                        tags: Vec::new(),
+                    }],
+                    insights: vec![AnalysisInsightMaterialization {
+                        insight_type: "analysis".to_string(),
+                        title: "  ".to_string(),
+                        statement: "This candidate must fail".to_string(),
+                        confidence: 0.8,
+                        salience: 0.5,
+                        source_uris: vec!["ctx://user/source-a".to_string()],
+                    }],
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "title is required");
+        let data = store.read().unwrap();
+        assert!(data.operations.is_empty());
+        assert!(data.links.is_empty());
+        assert!(data.insights.is_empty());
+        assert!(data.event_by_id.is_empty());
+        assert!(data.user_indexes.is_empty());
+        assert!(data.personal_context.is_empty());
+    }
+
+    #[tokio::test]
+    async fn analysis_materialization_rejects_colliding_context_identities() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let error = store
+            .materialize_analysis_async(
+                &config.tenant_id,
+                "owner-a",
+                AnalysisMaterializationRequest {
+                    links: Vec::new(),
+                    insights: vec![
+                        AnalysisInsightMaterialization {
+                            insight_type: "Analysis".to_string(),
+                            title: "Same title".to_string(),
+                            statement: "First statement".to_string(),
+                            confidence: 0.8,
+                            salience: 0.5,
+                            source_uris: vec!["ctx://user/source-a".to_string()],
+                        },
+                        AnalysisInsightMaterialization {
+                            insight_type: "analysis".to_string(),
+                            title: "same-title".to_string(),
+                            statement: "Second statement".to_string(),
+                            confidence: 0.7,
+                            salience: 0.4,
+                            source_uris: vec!["ctx://user/source-b".to_string()],
+                        },
+                    ],
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "analysis materialization contains a duplicate insight context identity"
+        );
+        let data = store.read().unwrap();
+        assert!(data.operations.is_empty());
+        assert!(data.insights.is_empty());
+        assert!(data.personal_context.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hydrated_analysis_overlap_reuses_existing_insight_identity() {
+        let config = Config::test();
+        let tenant_id = config.tenant_id.clone();
+        let store = Store::new(&config);
+        let first_candidate = AnalysisInsightMaterialization {
+            insight_type: "analysis".to_string(),
+            title: "Stable insight".to_string(),
+            statement: "Stable grounded statement".to_string(),
+            confidence: 0.9,
+            salience: 0.7,
+            source_uris: vec!["ctx://user/source-a".to_string()],
+        };
+        let first = store
+            .materialize_analysis_async(
+                &tenant_id,
+                "owner-a",
+                AnalysisMaterializationRequest {
+                    links: Vec::new(),
+                    insights: vec![
+                        first_candidate.clone(),
+                        AnalysisInsightMaterialization {
+                            insight_type: "analysis".to_string(),
+                            title: "Old companion".to_string(),
+                            statement: "Old companion statement".to_string(),
+                            confidence: 0.7,
+                            salience: 0.4,
+                            source_uris: vec!["ctx://user/source-b".to_string()],
+                        },
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        let stable_id = first.insights[0].id.clone();
+        let stable_created_at = first.insights[0].created_at;
+
+        // Hydration intentionally does not restore ephemeral idempotency maps.
+        store.write().unwrap().insight_idempotency.clear();
+
+        let overlap = store
+            .materialize_analysis_async(
+                &tenant_id,
+                "owner-a",
+                AnalysisMaterializationRequest {
+                    links: Vec::new(),
+                    insights: vec![
+                        first_candidate,
+                        AnalysisInsightMaterialization {
+                            insight_type: "analysis".to_string(),
+                            title: "New companion".to_string(),
+                            statement: "New companion statement".to_string(),
+                            confidence: 0.8,
+                            salience: 0.6,
+                            source_uris: vec!["ctx://user/source-c".to_string()],
+                        },
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(overlap.insights[0].id, stable_id);
+        assert_eq!(overlap.insights[0].created_at, stable_created_at);
+        let data = store.read().unwrap();
+        assert_eq!(data.insights.len(), 3);
+        assert_eq!(data.operations.len(), 2);
+        assert_eq!(
+            data.insights
+                .values()
+                .filter(|insight| insight.context_uri.ends_with("/stable-insight"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn analysis_operation_replay_rejects_mixed_target_owners() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        store
+            .materialize_analysis_async(
+                &config.tenant_id,
+                "owner-a",
+                AnalysisMaterializationRequest {
+                    links: Vec::new(),
+                    insights: vec![AnalysisInsightMaterialization {
+                        insight_type: "analysis".to_string(),
+                        title: "Owner-bound insight".to_string(),
+                        statement: "Grounded statement".to_string(),
+                        confidence: 0.8,
+                        salience: 0.5,
+                        source_uris: vec!["ctx://user/source-a".to_string()],
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let mut operation = store
+            .read()
+            .unwrap()
+            .operations
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let insight = std::iter::once(&mut operation.plan.primary)
+            .chain(operation.plan.side_effects.iter_mut())
+            .find_map(|step| match &mut step.resource {
+                OperationResource::Insight { insight } => Some(insight),
+                _ => None,
+            })
+            .unwrap();
+        insight.owner_user_id = "owner-b".to_string();
+
+        let error = store.validate_operation_routing(&operation).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("analysis materialization mixes target owners"));
+    }
+
+    #[test]
+    fn analysis_candidate_idempotency_material_is_bounded_hmac_only() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let candidate = AnalysisInsightMaterialization {
+            insight_type: "analysis".to_string(),
+            title: "raw-query-marker".to_string(),
+            statement: "Grounded statement".to_string(),
+            confidence: 0.8,
+            salience: 0.5,
+            source_uris: vec!["ctx://user/source-a".to_string()],
+        };
+        let key = store
+            .mutation_request_fingerprint(
+                &config.tenant_id,
+                "analysis.materialize.insight",
+                &("owner-a", candidate),
+            )
+            .unwrap();
+
+        assert_eq!(key.len(), 32);
+        assert!(key.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(!key.contains("raw-query-marker"));
     }
 
     #[test]

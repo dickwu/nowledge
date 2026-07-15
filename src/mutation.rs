@@ -109,7 +109,97 @@ pub fn validate_operation_plan(plan: &OperationPlan) -> Result<(), MutationPlanE
         validate_step(&plan.tenant_id, step, &mut step_ids)?;
     }
     validate_company_source_delete_steps(plan)?;
+    validate_analysis_materialization_steps(plan)?;
     Ok(())
+}
+
+fn validate_analysis_materialization_steps(plan: &OperationPlan) -> Result<(), MutationPlanError> {
+    if plan.operation_kind != "analysis.materialize" {
+        return Ok(());
+    }
+
+    let expected_owner_hash = plan
+        .redacted_metadata
+        .get("target_owner_user_id_hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            MutationPlanError::InvalidPlan(
+                "analysis materialization is missing its target owner commitment".to_string(),
+            )
+        })?;
+    require_non_empty("analysis target owner hash", expected_owner_hash)?;
+
+    let mut target_owner = None;
+    for step in operation_steps(plan) {
+        match &step.resource {
+            OperationResource::EnsureUserEventIndex { index } => {
+                if index.owner_user_id_hash != expected_owner_hash {
+                    return invalid(
+                        "analysis user-index resource does not match its target owner commitment",
+                    );
+                }
+            }
+            OperationResource::HistoryEvents { events } => {
+                for event in events {
+                    if event.owner_user_id_hash != expected_owner_hash {
+                        return invalid(
+                            "analysis history resource does not match its target owner commitment",
+                        );
+                    }
+                    bind_analysis_owner(&mut target_owner, &event.owner_user_id)?;
+                }
+            }
+            OperationResource::ContextNodes { nodes, .. } => {
+                for node in nodes {
+                    let owner = node.owner_user_id.as_deref().ok_or_else(|| {
+                        MutationPlanError::InvalidPlan(
+                            "analysis context resource must be owner scoped".to_string(),
+                        )
+                    })?;
+                    bind_analysis_owner(&mut target_owner, owner)?;
+                }
+            }
+            OperationResource::Insight { insight } => {
+                bind_analysis_owner(&mut target_owner, &insight.owner_user_id)?;
+            }
+            OperationResource::Links { links } => {
+                for link in links {
+                    let owner = link.owner_user_id.as_deref().ok_or_else(|| {
+                        MutationPlanError::InvalidPlan(
+                            "analysis link resource must be owner scoped".to_string(),
+                        )
+                    })?;
+                    bind_analysis_owner(&mut target_owner, owner)?;
+                }
+            }
+            _ => {
+                return invalid(
+                    "analysis materialization contains an unsupported operation resource",
+                );
+            }
+        }
+    }
+    if target_owner.is_none() {
+        return invalid("analysis materialization contains no owner-scoped resource");
+    }
+    Ok(())
+}
+
+fn bind_analysis_owner<'a>(
+    target_owner: &mut Option<&'a str>,
+    owner: &'a str,
+) -> Result<(), MutationPlanError> {
+    require_non_empty("analysis resource owner", owner)?;
+    match target_owner {
+        Some(expected) if *expected != owner => {
+            invalid("analysis materialization mixes target owners")
+        }
+        Some(_) => Ok(()),
+        None => {
+            *target_owner = Some(owner);
+            Ok(())
+        }
+    }
 }
 
 fn validate_company_source_delete_steps(plan: &OperationPlan) -> Result<(), MutationPlanError> {
