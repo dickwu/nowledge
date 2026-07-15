@@ -19,9 +19,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tower::ServiceExt;
+use tracing::instrument::WithSubscriber;
 use tracing_subscriber::fmt::MakeWriter;
 
-static MULTIPART_TEMP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static HTTP_TRACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Default)]
 struct SharedLog(Arc<Mutex<Vec<u8>>>);
@@ -73,6 +74,7 @@ fn staged_upload_paths() -> HashSet<PathBuf> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn http_completion_log_is_info_and_uses_the_response_request_id() {
+    let _trace_guard = HTTP_TRACE_TEST_LOCK.lock().await;
     let logs = SharedLog::default();
     let subscriber = tracing_subscriber::fmt()
         .json()
@@ -81,7 +83,6 @@ async fn http_completion_log_is_info_and_uses_the_response_request_id() {
         .with_max_level(tracing::Level::INFO)
         .with_writer(logs.clone())
         .finish();
-    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
 
     let state = AppState::new(Arc::new(Config::test()));
     let response = build_router(state.clone())
@@ -92,6 +93,7 @@ async fn http_completion_log_is_info_and_uses_the_response_request_id() {
                 .body(Body::empty())
                 .unwrap(),
         )
+        .with_subscriber(subscriber)
         .await
         .unwrap();
 
@@ -127,7 +129,7 @@ async fn http_completion_log_is_info_and_uses_the_response_request_id() {
 
 #[tokio::test]
 async fn disconnecting_mid_multipart_body_removes_the_incomplete_temp_file() {
-    let _multipart_guard = MULTIPART_TEMP_TEST_LOCK.lock().await;
+    let _trace_guard = HTTP_TRACE_TEST_LOCK.lock().await;
     let before = staged_upload_paths();
     let state = AppState::new(Arc::new(Config::test()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -197,7 +199,7 @@ async fn disconnecting_mid_multipart_body_removes_the_incomplete_temp_file() {
 
 #[tokio::test]
 async fn disallowed_mime_is_rejected_from_headers_without_reading_or_staging_the_file() {
-    let _multipart_guard = MULTIPART_TEMP_TEST_LOCK.lock().await;
+    let _trace_guard = HTTP_TRACE_TEST_LOCK.lock().await;
     let before = staged_upload_paths();
     let state = AppState::new(Arc::new(Config::test()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

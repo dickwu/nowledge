@@ -30,8 +30,7 @@ use tokio::{
 };
 use tower_http::{
     compression::CompressionLayer,
-    trace::{DefaultOnResponse, TraceLayer},
-    LatencyUnit,
+    trace::{OnResponse, TraceLayer},
 };
 
 use crate::{
@@ -678,6 +677,28 @@ fn validate_history_bulk(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ExplicitParentOnResponse;
+
+impl<B> OnResponse<B> for ExplicitParentOnResponse {
+    fn on_response(
+        self,
+        response: &axum::http::Response<B>,
+        latency: Duration,
+        span: &tracing::Span,
+    ) {
+        let latency = format!("{} ms", latency.as_millis());
+        tracing::event!(
+            target: "tower_http::trace::on_response",
+            parent: span,
+            tracing::Level::INFO,
+            latency = %latency,
+            status = response.status().as_u16(),
+            "finished processing request"
+        );
+    }
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/livez", get(livez))
@@ -915,11 +936,7 @@ pub fn build_router(state: AppState) -> Router {
                         route
                     )
                 })
-                .on_response(
-                    DefaultOnResponse::new()
-                        .level(tracing::Level::INFO)
-                        .latency_unit(LatencyUnit::Millis),
-                ),
+                .on_response(ExplicitParentOnResponse),
         )
         .layer(middleware::from_fn_with_state(
             RequestContextState::from_shared_config(state.config.clone()),
