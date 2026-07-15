@@ -1068,7 +1068,8 @@ async fn rag_debug_and_analysis_debug_are_admin_only() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["prompt"].is_string(), "{body}");
-    assert!(body["usage"]["raw_response_preview"].is_string(), "{body}");
+    assert!(body["usage"]["raw_response_preview"].is_null(), "{body}");
+    assert!(body["usage"]["candidate_rejections"].is_array(), "{body}");
     assert!(body.to_string().contains("[REDACTED]"), "{body}");
     assert!(!body.to_string().contains(ADMIN_TOKEN), "{body}");
 }

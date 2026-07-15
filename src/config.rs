@@ -1,5 +1,7 @@
 use std::{
     collections::HashSet,
+    fs::File,
+    io::Read,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -13,6 +15,7 @@ const REJECTED_INDEX_HASH_SECRET_PLACEHOLDER: &str = "replace-with-at-least-32-r
 const MIN_AUTH_CREDENTIAL_CHARS: usize = 8;
 const MIN_REDACTION_SECRET_CHARS: usize = 4;
 const CODEX_SECRET_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_CODEX_AUTH_FILE_BYTES: u64 = 64 * 1024;
 const MIN_PRODUCTION_INDEX_HASH_SECRET_BYTES: usize = 32;
 const MIN_PRODUCTION_INDEX_HASH_SECRET_DISTINCT_BYTES: usize = 12;
 const DEFAULT_MAX_JSON_BYTES: usize = 2 * 1024 * 1024;
@@ -34,6 +37,16 @@ const DEFAULT_RATE_LIMIT_REQUESTS_PER_MINUTE: u64 = 600;
 const DEFAULT_INGEST_MAX_CONCURRENT_TASKS: usize = 2;
 const DEFAULT_INGEST_QUEUE_MULTIPLIER: usize = 8;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_LLM_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_PARSER_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_PROVIDER_MAX_RETRIES: usize = 2;
+const DEFAULT_LLM_MAX_INPUT_CHARS: usize = 65_536;
+const DEFAULT_LLM_MAX_OUTPUT_TOKENS: u32 = 2_048;
+const DEFAULT_LLM_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_PARSER_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_LLM_RATE_LIMIT_REQUESTS_PER_MINUTE: u64 = 30;
+const DEFAULT_LLM_RATE_LIMIT_TOKENS_PER_MINUTE: u64 = 100_000;
 const MAX_BOUNDARY_DEADLINE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -114,6 +127,17 @@ pub struct Config {
     pub rate_limit_requests_per_minute: u64,
     pub ingest_queue_capacity: usize,
     pub shutdown_timeout_ms: u64,
+    pub provider_connect_timeout_ms: u64,
+    pub llm_timeout_ms: u64,
+    pub parser_timeout_ms: u64,
+    pub provider_max_retries: usize,
+    pub provider_proxy_mode: String,
+    pub llm_max_input_chars: usize,
+    pub llm_max_output_tokens: u32,
+    pub llm_max_response_bytes: usize,
+    pub parser_max_response_bytes: usize,
+    pub llm_rate_limit_requests_per_minute: u64,
+    pub llm_rate_limit_tokens_per_minute: u64,
     pub cors_allowed_origins: Vec<String>,
     pub allow_wildcard_cors: bool,
     pub ingest_max_concurrent_tasks: usize,
@@ -391,6 +415,58 @@ impl Config {
                 DEFAULT_SHUTDOWN_TIMEOUT_MS,
                 &mut boundary_errors,
             ),
+            provider_connect_timeout_ms: parse_env_number(
+                "RAG_PROVIDER_CONNECT_TIMEOUT_MS",
+                DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS,
+                &mut boundary_errors,
+            ),
+            llm_timeout_ms: parse_env_number(
+                "RAG_LLM_TIMEOUT_MS",
+                DEFAULT_LLM_TIMEOUT_MS,
+                &mut boundary_errors,
+            ),
+            parser_timeout_ms: parse_env_number(
+                "RAG_PARSER_TIMEOUT_MS",
+                DEFAULT_PARSER_TIMEOUT_MS,
+                &mut boundary_errors,
+            ),
+            provider_max_retries: parse_env_number(
+                "RAG_PROVIDER_MAX_RETRIES",
+                DEFAULT_PROVIDER_MAX_RETRIES,
+                &mut boundary_errors,
+            ),
+            provider_proxy_mode: std::env::var("RAG_PROVIDER_PROXY_MODE")
+                .unwrap_or_else(|_| "system".to_string()),
+            llm_max_input_chars: parse_env_number(
+                "RAG_LLM_MAX_INPUT_CHARS",
+                DEFAULT_LLM_MAX_INPUT_CHARS,
+                &mut boundary_errors,
+            ),
+            llm_max_output_tokens: parse_env_number(
+                "RAG_LLM_MAX_OUTPUT_TOKENS",
+                DEFAULT_LLM_MAX_OUTPUT_TOKENS,
+                &mut boundary_errors,
+            ),
+            llm_max_response_bytes: parse_env_number(
+                "RAG_LLM_MAX_RESPONSE_BYTES",
+                DEFAULT_LLM_MAX_RESPONSE_BYTES,
+                &mut boundary_errors,
+            ),
+            parser_max_response_bytes: parse_env_number(
+                "RAG_PARSER_MAX_RESPONSE_BYTES",
+                DEFAULT_PARSER_MAX_RESPONSE_BYTES,
+                &mut boundary_errors,
+            ),
+            llm_rate_limit_requests_per_minute: parse_env_number(
+                "RAG_LLM_RATE_LIMIT_REQUESTS_PER_MINUTE",
+                DEFAULT_LLM_RATE_LIMIT_REQUESTS_PER_MINUTE,
+                &mut boundary_errors,
+            ),
+            llm_rate_limit_tokens_per_minute: parse_env_number(
+                "RAG_LLM_RATE_LIMIT_TOKENS_PER_MINUTE",
+                DEFAULT_LLM_RATE_LIMIT_TOKENS_PER_MINUTE,
+                &mut boundary_errors,
+            ),
             cors_allowed_origins,
             allow_wildcard_cors: std::env::var("RAG_ALLOW_WILDCARD_CORS")
                 .map(|v| truthy(&v))
@@ -594,9 +670,9 @@ impl Config {
     }
 
     fn observe_codex_auth_token(&self, force: bool) {
-        let Some(path) = self.codex_auth_path.as_deref() else {
+        if self.codex_auth_path.is_none() {
             return;
-        };
+        }
         let now = Instant::now();
         {
             let mut refresh = self
@@ -614,10 +690,12 @@ impl Config {
             refresh.in_progress = true;
         }
 
-        if let Some(credentials) = crate::llm::read_codex_auth_credentials(path).filter(|value| {
-            !value.token.trim().is_empty()
-                && value.token == value.token.trim()
-                && value.token.chars().count() >= MIN_REDACTION_SECRET_CHARS
+        if let Ok(Some(credentials)) = self.load_codex_auth_credentials().map(|credentials| {
+            credentials.filter(|value| {
+                !value.token.trim().is_empty()
+                    && value.token == value.token.trim()
+                    && value.token.chars().count() >= MIN_REDACTION_SECRET_CHARS
+            })
         }) {
             self.publish_codex_credentials(credentials);
         }
@@ -627,6 +705,22 @@ impl Config {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         refresh.last_refresh = Some(now);
         refresh.in_progress = false;
+    }
+
+    fn load_codex_auth_credentials(
+        &self,
+    ) -> anyhow::Result<Option<crate::llm::CodexAuthCredentials>> {
+        let Some(path) = self.codex_auth_path.as_deref() else {
+            return Ok(None);
+        };
+        if self.run_mode != "production" {
+            return Ok(crate::llm::read_codex_auth_credentials(path));
+        }
+
+        let content = read_production_codex_auth_file(path)?;
+        crate::llm::parse_codex_auth_credentials(&content)
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("production Codex auth file could not be parsed"))
     }
 
     fn codex_secret_history(&self) -> Vec<String> {
@@ -673,9 +767,19 @@ impl Config {
         if !matches!(self.parser_provider.as_str(), "builtin" | "mineru") {
             anyhow::bail!("RAG_PARSER_PROVIDER must be builtin or mineru");
         }
+        if !matches!(self.provider_proxy_mode.as_str(), "system" | "direct") {
+            anyhow::bail!("RAG_PROVIDER_PROXY_MODE must be system or direct");
+        }
+        if self.provider_max_retries > usize::from(crate::upstream::MAX_UPSTREAM_RETRIES) {
+            anyhow::bail!(
+                "RAG_PROVIDER_MAX_RETRIES must not exceed {}",
+                crate::upstream::MAX_UPSTREAM_RETRIES
+            );
+        }
 
         self.validate_http_boundaries()?;
         self.validate_index_hash_secret()?;
+        self.validate_codex_auth_file_security()?;
 
         self.validate_auth_configuration()?;
         self.validate_redaction_secret_sources()?;
@@ -689,6 +793,16 @@ impl Config {
             );
         }
 
+        Ok(())
+    }
+
+    fn validate_codex_auth_file_security(&self) -> anyhow::Result<()> {
+        if self.run_mode != "production" {
+            return Ok(());
+        }
+        if self.codex_auth_path.is_some() {
+            self.load_codex_auth_credentials()?;
+        }
         Ok(())
     }
 
@@ -748,6 +862,33 @@ impl Config {
                 self.ingest_queue_capacity as u128,
             ),
             ("RAG_SHUTDOWN_TIMEOUT_MS", self.shutdown_timeout_ms as u128),
+            (
+                "RAG_PROVIDER_CONNECT_TIMEOUT_MS",
+                self.provider_connect_timeout_ms as u128,
+            ),
+            ("RAG_LLM_TIMEOUT_MS", self.llm_timeout_ms as u128),
+            ("RAG_PARSER_TIMEOUT_MS", self.parser_timeout_ms as u128),
+            ("RAG_LLM_MAX_INPUT_CHARS", self.llm_max_input_chars as u128),
+            (
+                "RAG_LLM_MAX_OUTPUT_TOKENS",
+                self.llm_max_output_tokens as u128,
+            ),
+            (
+                "RAG_LLM_MAX_RESPONSE_BYTES",
+                self.llm_max_response_bytes as u128,
+            ),
+            (
+                "RAG_PARSER_MAX_RESPONSE_BYTES",
+                self.parser_max_response_bytes as u128,
+            ),
+            (
+                "RAG_LLM_RATE_LIMIT_REQUESTS_PER_MINUTE",
+                self.llm_rate_limit_requests_per_minute as u128,
+            ),
+            (
+                "RAG_LLM_RATE_LIMIT_TOKENS_PER_MINUTE",
+                self.llm_rate_limit_tokens_per_minute as u128,
+            ),
         ] {
             if value == 0 {
                 anyhow::bail!("{name} must be greater than zero");
@@ -759,6 +900,12 @@ impl Config {
             ("RAG_REQUEST_TIMEOUT_MS", self.request_timeout_ms),
             ("RAG_SYNC_INGEST_TIMEOUT_MS", self.sync_ingest_timeout_ms),
             ("RAG_SHUTDOWN_TIMEOUT_MS", self.shutdown_timeout_ms),
+            (
+                "RAG_PROVIDER_CONNECT_TIMEOUT_MS",
+                self.provider_connect_timeout_ms,
+            ),
+            ("RAG_LLM_TIMEOUT_MS", self.llm_timeout_ms),
+            ("RAG_PARSER_TIMEOUT_MS", self.parser_timeout_ms),
         ] {
             if value > MAX_BOUNDARY_DEADLINE_MS {
                 anyhow::bail!("{name} must not exceed {MAX_BOUNDARY_DEADLINE_MS} milliseconds");
@@ -771,6 +918,12 @@ impl Config {
             anyhow::bail!(
                 "RAG_SYNC_INGEST_TIMEOUT_MS must be greater than or equal to RAG_REQUEST_TIMEOUT_MS"
             );
+        }
+        if self.provider_connect_timeout_ms > self.llm_timeout_ms {
+            anyhow::bail!("RAG_PROVIDER_CONNECT_TIMEOUT_MS must not exceed RAG_LLM_TIMEOUT_MS");
+        }
+        if self.provider_connect_timeout_ms > self.parser_timeout_ms {
+            anyhow::bail!("RAG_PROVIDER_CONNECT_TIMEOUT_MS must not exceed RAG_PARSER_TIMEOUT_MS");
         }
         if self.meili_scan_page_size > MAX_MEILI_SCAN_PAGE_SIZE {
             anyhow::bail!("RAG_MEILI_SCAN_PAGE_SIZE must not exceed {MAX_MEILI_SCAN_PAGE_SIZE}");
@@ -816,7 +969,12 @@ impl Config {
             validate_redaction_secret("RAG_INDEX_HASH_SECRET", Some(secret))?;
         }
         if let Some(path) = self.codex_auth_path.as_deref() {
-            let token = crate::llm::read_codex_auth_token(path);
+            let token = if self.run_mode == "production" {
+                self.load_codex_auth_credentials()?
+                    .map(|credentials| credentials.token)
+            } else {
+                crate::llm::read_codex_auth_token(path)
+            };
             validate_redaction_secret("Codex auth token", token.as_deref())?;
         }
         for secret in &self.previous_redaction_secrets {
@@ -1075,6 +1233,17 @@ impl Config {
             ingest_queue_capacity: DEFAULT_INGEST_MAX_CONCURRENT_TASKS
                 * DEFAULT_INGEST_QUEUE_MULTIPLIER,
             shutdown_timeout_ms: DEFAULT_SHUTDOWN_TIMEOUT_MS,
+            provider_connect_timeout_ms: DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS,
+            llm_timeout_ms: DEFAULT_LLM_TIMEOUT_MS,
+            parser_timeout_ms: DEFAULT_PARSER_TIMEOUT_MS,
+            provider_max_retries: DEFAULT_PROVIDER_MAX_RETRIES,
+            provider_proxy_mode: "system".to_string(),
+            llm_max_input_chars: DEFAULT_LLM_MAX_INPUT_CHARS,
+            llm_max_output_tokens: DEFAULT_LLM_MAX_OUTPUT_TOKENS,
+            llm_max_response_bytes: DEFAULT_LLM_MAX_RESPONSE_BYTES,
+            parser_max_response_bytes: DEFAULT_PARSER_MAX_RESPONSE_BYTES,
+            llm_rate_limit_requests_per_minute: DEFAULT_LLM_RATE_LIMIT_REQUESTS_PER_MINUTE,
+            llm_rate_limit_tokens_per_minute: DEFAULT_LLM_RATE_LIMIT_TOKENS_PER_MINUTE,
             // Test fixtures do not need browser access. Keeping this empty also
             // lets tests promote the fixture to production without inheriting
             // a development-only wildcard origin.
@@ -1113,6 +1282,87 @@ impl Config {
             codex_secret_refresh_task_started: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+#[cfg(unix)]
+fn read_production_codex_auth_file(path: &str) -> anyhow::Result<String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let before = std::fs::symlink_metadata(path)
+        .map_err(|_| anyhow::anyhow!("production Codex auth file metadata is unavailable"))?;
+    if before.file_type().is_symlink() {
+        anyhow::bail!("production Codex auth source must not be a symbolic link");
+    }
+    if !before.is_file() {
+        anyhow::bail!("production Codex auth source must be a regular file");
+    }
+    let file = File::open(path)
+        .map_err(|_| anyhow::anyhow!("production Codex auth file could not be opened"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("production Codex auth file metadata is unavailable"))?;
+    if !opened.is_file() {
+        anyhow::bail!("production Codex auth source must be a regular file");
+    }
+    if opened.permissions().mode() & 0o077 != 0 {
+        anyhow::bail!(
+            "production Codex auth file permissions must deny all group and other access"
+        );
+    }
+    let after = std::fs::symlink_metadata(path)
+        .map_err(|_| anyhow::anyhow!("production Codex auth file metadata is unavailable"))?;
+    if after.file_type().is_symlink() {
+        anyhow::bail!("production Codex auth source must not be a symbolic link");
+    }
+    if !after.is_file()
+        || before.dev() != opened.dev()
+        || before.ino() != opened.ino()
+        || after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+    {
+        anyhow::bail!("production Codex auth source changed during validation");
+    }
+    read_bounded_codex_auth_file(file, opened.len())
+}
+
+#[cfg(not(unix))]
+fn read_production_codex_auth_file(path: &str) -> anyhow::Result<String> {
+    // Unix mode bits have no portable equivalent here. Non-Unix deployments
+    // must enforce private ACLs through platform policy, but still reject
+    // symbolic links and non-regular sources on every read.
+    let before = std::fs::symlink_metadata(path)
+        .map_err(|_| anyhow::anyhow!("production Codex auth file metadata is unavailable"))?;
+    if before.file_type().is_symlink() {
+        anyhow::bail!("production Codex auth source must not be a symbolic link");
+    }
+    if !before.is_file() {
+        anyhow::bail!("production Codex auth source must be a regular file");
+    }
+    let file = File::open(path)
+        .map_err(|_| anyhow::anyhow!("production Codex auth file could not be opened"))?;
+    let opened = file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("production Codex auth file metadata is unavailable"))?;
+    let after = std::fs::symlink_metadata(path)
+        .map_err(|_| anyhow::anyhow!("production Codex auth file metadata is unavailable"))?;
+    if !opened.is_file() || after.file_type().is_symlink() || !after.is_file() {
+        anyhow::bail!("production Codex auth source must remain a regular file");
+    }
+    read_bounded_codex_auth_file(file, opened.len())
+}
+
+fn read_bounded_codex_auth_file(file: File, observed_len: u64) -> anyhow::Result<String> {
+    if observed_len > MAX_CODEX_AUTH_FILE_BYTES {
+        anyhow::bail!("production Codex auth file exceeds the size limit");
+    }
+    let mut content = String::new();
+    file.take(MAX_CODEX_AUTH_FILE_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|_| anyhow::anyhow!("production Codex auth file could not be read"))?;
+    if content.len() as u64 > MAX_CODEX_AUTH_FILE_BYTES {
+        anyhow::bail!("production Codex auth file exceeds the size limit");
+    }
+    Ok(content)
 }
 
 fn validate_upload_allowed_mime_types(mime_types: &[String]) -> anyhow::Result<()> {
@@ -1878,6 +2128,152 @@ mod tests {
         assert!(!error.contains(DEVELOPMENT_INDEX_HASH_SECRET));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn production_codex_auth_file_requires_private_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let token = "codex-private-permission-test-token";
+        let auth_path = std::env::temp_dir().join(format!(
+            "nowledge-sensitive-auth-path-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(
+            &auth_path,
+            serde_json::json!({ "access_token": token }).to_string(),
+        )
+        .unwrap();
+        let auth_path_text = auth_path.to_string_lossy().into_owned();
+
+        let mut config = Config::test();
+        config.run_mode = "production".to_string();
+        config.index_hash_secret = b"7Qv!n2$La9@Xm4#Rp8%Wd3&Ks6*Hy1+Tz5".to_vec();
+        config.codex_auth_path = Some(auth_path_text.clone());
+
+        for secure_mode in [0o600, 0o400] {
+            std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(secure_mode))
+                .unwrap();
+            assert!(config.validate_startup().is_ok(), "mode {secure_mode:o}");
+        }
+
+        for insecure_mode in [0o640, 0o620, 0o610, 0o604, 0o602, 0o601] {
+            std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(insecure_mode))
+                .unwrap();
+            let error = config.validate_startup().unwrap_err().to_string();
+            assert!(error.contains("deny all group and other access"), "{error}");
+            assert!(!error.contains(token), "{error}");
+            assert!(!error.contains(&auth_path_text), "{error}");
+        }
+
+        // Development and tests retain their existing compatibility behavior.
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        config.run_mode = "development".to_string();
+        assert!(config.validate_startup().is_ok());
+
+        config.run_mode = "production".to_string();
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let symlink_path = std::env::temp_dir().join(format!(
+            "nowledge-sensitive-auth-symlink-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        std::os::unix::fs::symlink(&auth_path, &symlink_path).unwrap();
+        let symlink_path_text = symlink_path.to_string_lossy().into_owned();
+        config.codex_auth_path = Some(symlink_path_text.clone());
+        let error = config.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("must not be a symbolic link"), "{error}");
+        assert!(!error.contains(token), "{error}");
+        assert!(!error.contains(&symlink_path_text), "{error}");
+        std::fs::remove_file(&symlink_path).unwrap();
+
+        config.codex_auth_path = Some(auth_path_text.clone());
+        std::fs::remove_file(&auth_path).unwrap();
+        let error = config.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("metadata is unavailable"), "{error}");
+        assert!(!error.contains(token), "{error}");
+        assert!(!error.contains(&auth_path_text), "{error}");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_codex_auth_permissions_retain_platform_acl_behavior() {
+        let auth_path = std::env::temp_dir().join(format!(
+            "nowledge-sensitive-auth-path-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(
+            &auth_path,
+            serde_json::json!({ "access_token": "platform-private-token" }).to_string(),
+        )
+        .unwrap();
+        let result = read_production_codex_auth_file(&auth_path.to_string_lossy());
+        let _ = std::fs::remove_file(auth_path);
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_codex_rotation_rejects_insecure_or_symlink_replacements() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let auth_path = std::env::temp_dir().join(format!(
+            "nowledge-rotating-sensitive-auth-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        let symlink_target = std::env::temp_dir().join(format!(
+            "nowledge-rotating-sensitive-auth-target-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        let old_token = "codex-production-old-private-token";
+        let new_token = "codex-production-new-private-token";
+        let symlink_token = "codex-production-symlink-private-token";
+        std::fs::write(
+            &auth_path,
+            serde_json::json!({ "access_token": old_token }).to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut config = Config::test();
+        config.run_mode = "production".to_string();
+        config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
+        let initial = config.refresh_configured_secret_values();
+        assert_eq!(config.codex_auth_credentials().unwrap().token, old_token);
+        assert!(initial.iter().any(|secret| secret == old_token));
+
+        std::fs::write(
+            &auth_path,
+            serde_json::json!({ "access_token": new_token }).to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let rejected_insecure = config.refresh_configured_secret_values();
+        assert_eq!(config.codex_auth_credentials().unwrap().token, old_token);
+        assert!(!rejected_insecure.iter().any(|secret| secret == new_token));
+
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let accepted_secure = config.refresh_configured_secret_values();
+        assert_eq!(config.codex_auth_credentials().unwrap().token, new_token);
+        assert!(accepted_secure.iter().any(|secret| secret == old_token));
+        assert!(accepted_secure.iter().any(|secret| secret == new_token));
+
+        std::fs::write(
+            &symlink_target,
+            serde_json::json!({ "access_token": symlink_token }).to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&symlink_target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&auth_path).unwrap();
+        std::os::unix::fs::symlink(&symlink_target, &auth_path).unwrap();
+        let rejected_symlink = config.refresh_configured_secret_values();
+        assert_eq!(config.codex_auth_credentials().unwrap().token, new_token);
+        assert!(!rejected_symlink
+            .iter()
+            .any(|secret| secret == symlink_token));
+
+        let _ = std::fs::remove_file(&auth_path);
+        let _ = std::fs::remove_file(&symlink_target);
+    }
+
     #[test]
     fn legacy_weak_index_hash_secrets_require_an_explicit_bounded_compatibility_flag() {
         let mut config = Config::test();
@@ -1973,6 +2369,17 @@ mod tests {
         assert_eq!(config.ingest_queue_capacity, 16);
         assert_eq!(config.meili_scan_page_size, 500);
         assert_eq!(config.meili_scan_max_documents, 100_000);
+        assert_eq!(config.provider_connect_timeout_ms, 5_000);
+        assert_eq!(config.llm_timeout_ms, 60_000);
+        assert_eq!(config.parser_timeout_ms, 120_000);
+        assert_eq!(config.provider_max_retries, 2);
+        assert_eq!(config.provider_proxy_mode, "system");
+        assert_eq!(config.llm_max_input_chars, 65_536);
+        assert_eq!(config.llm_max_output_tokens, 2_048);
+        assert_eq!(config.llm_max_response_bytes, 2 * 1024 * 1024);
+        assert_eq!(config.parser_max_response_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.llm_rate_limit_requests_per_minute, 30);
+        assert_eq!(config.llm_rate_limit_tokens_per_minute, 100_000);
         assert_eq!(
             config.max_multipart_body_bytes(),
             Some(52 * 1024 * 1024 + 32 * 16 * 1024)
@@ -2002,6 +2409,74 @@ mod tests {
         overflow.max_upload_bytes = usize::MAX;
         assert!(overflow.validate_http_boundaries().is_err());
         assert_eq!(overflow.max_multipart_body_bytes(), None);
+    }
+
+    #[test]
+    fn provider_boundary_validation_rejects_unsafe_values() {
+        for (name, configure) in [
+            (
+                "RAG_PROVIDER_CONNECT_TIMEOUT_MS",
+                (|config: &mut Config| config.provider_connect_timeout_ms = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_LLM_TIMEOUT_MS",
+                (|config: &mut Config| config.llm_timeout_ms = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_PARSER_TIMEOUT_MS",
+                (|config: &mut Config| config.parser_timeout_ms = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_LLM_MAX_INPUT_CHARS",
+                (|config: &mut Config| config.llm_max_input_chars = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_LLM_MAX_OUTPUT_TOKENS",
+                (|config: &mut Config| config.llm_max_output_tokens = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_LLM_MAX_RESPONSE_BYTES",
+                (|config: &mut Config| config.llm_max_response_bytes = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_PARSER_MAX_RESPONSE_BYTES",
+                (|config: &mut Config| config.parser_max_response_bytes = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_LLM_RATE_LIMIT_REQUESTS_PER_MINUTE",
+                (|config: &mut Config| config.llm_rate_limit_requests_per_minute = 0)
+                    as fn(&mut Config),
+            ),
+            (
+                "RAG_LLM_RATE_LIMIT_TOKENS_PER_MINUTE",
+                (|config: &mut Config| config.llm_rate_limit_tokens_per_minute = 0)
+                    as fn(&mut Config),
+            ),
+        ] {
+            let mut config = Config::test();
+            configure(&mut config);
+            let error = config.validate_http_boundaries().unwrap_err().to_string();
+            assert!(error.contains(name), "unexpected error: {error}");
+        }
+
+        let mut retries = Config::test();
+        retries.provider_max_retries = usize::from(crate::upstream::MAX_UPSTREAM_RETRIES) + 1;
+        let error = retries.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("RAG_PROVIDER_MAX_RETRIES"), "{error}");
+
+        let mut proxy = Config::test();
+        proxy.provider_proxy_mode = "transparent".to_string();
+        let error = proxy.validate_startup().unwrap_err().to_string();
+        assert!(error.contains("RAG_PROVIDER_PROXY_MODE"), "{error}");
+
+        let mut connect = Config::test();
+        connect.provider_connect_timeout_ms = connect.llm_timeout_ms + 1;
+        let error = connect.validate_http_boundaries().unwrap_err().to_string();
+        assert!(error.contains("RAG_LLM_TIMEOUT_MS"), "{error}");
+
+        let mut no_retries = Config::test();
+        no_retries.provider_max_retries = 0;
+        assert!(no_retries.validate_startup().is_ok());
     }
 
     #[test]

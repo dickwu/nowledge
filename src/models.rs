@@ -1016,6 +1016,63 @@ pub struct InsightCandidate {
     pub source_uris: Vec<String>,
 }
 
+/// Maximum validated analysis candidates admitted into one durable
+/// materialization operation. These are defense-in-depth limits at the store
+/// boundary; provider output is expected to be checked before this type is
+/// constructed.
+pub const MAX_ANALYSIS_MATERIALIZATION_LINKS: usize = 32;
+pub const MAX_ANALYSIS_MATERIALIZATION_INSIGHTS: usize = 16;
+
+/// One server-authorized link proposal ready for durable materialization.
+///
+/// Tenant, owner, creator, privacy, and idempotency are intentionally absent:
+/// the server supplies those trust-boundary fields when the batch is staged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnalysisLinkMaterialization {
+    pub source_uri: String,
+    pub target_uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_title: Option<String>,
+    pub relation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    pub confidence: f32,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// One server-authorized insight proposal ready for durable materialization.
+/// Source URIs are converted to typed context references by the store.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AnalysisInsightMaterialization {
+    pub insight_type: String,
+    pub title: String,
+    pub statement: String,
+    pub confidence: f32,
+    pub salience: f32,
+    #[serde(default)]
+    pub source_uris: Vec<String>,
+}
+
+/// Already-validated analysis output admitted as one immutable mutation plan.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct AnalysisMaterializationRequest {
+    #[serde(default)]
+    pub links: Vec<AnalysisLinkMaterialization>,
+    #[serde(default)]
+    pub insights: Vec<AnalysisInsightMaterialization>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AnalysisMaterializationResponse {
+    pub created_links: Vec<KnowledgeLink>,
+    pub insights: Vec<InsightRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence: Option<PersistenceMetadata>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisInsightResponse {
     pub analysis_id: String,
@@ -1030,6 +1087,8 @@ pub struct AnalysisInsightResponse {
     pub insight_candidates: Vec<InsightCandidate>,
     pub created_links: Vec<KnowledgeLink>,
     pub insights: Vec<InsightRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence: Option<PersistenceMetadata>,
     #[serde(default)]
     pub usage: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]

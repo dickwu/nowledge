@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::{
     body::{to_bytes, Body},
-    extract::Multipart,
-    http::{header::CONTENT_TYPE, Method, Request, StatusCode},
+    extract::{Multipart, State},
+    http::{header::CONTENT_TYPE, HeaderMap, Method, Request, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -11,6 +11,7 @@ use axum::{
 use nowledge::{
     build_router,
     config::{AuthUserConfig, AuthUserScope, BearerTokenScope},
+    models::{InsightSearchRequest, LinkSearchRequest, OperationListRequest},
     AppState, Config,
 };
 use serde_json::{json, Value};
@@ -276,6 +277,62 @@ async fn spawn_mineru_mock() -> String {
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+#[derive(Clone)]
+struct CodexAnalysisStub {
+    token: String,
+    output: Arc<RwLock<String>>,
+}
+
+async fn spawn_codex_analysis_stub(token: &str) -> (String, Arc<RwLock<String>>) {
+    async fn responses(
+        State(state): State<CodexAnalysisStub>,
+        headers: HeaderMap,
+        Json(_request): Json<Value>,
+    ) -> impl IntoResponse {
+        let expected_authorization = format!("Bearer {}", state.token);
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_authorization.as_str())
+        );
+        let output = state
+            .output
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let terminal = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "content": [{ "type": "output_text", "text": output }]
+                }]
+            }
+        });
+        (
+            [(CONTENT_TYPE, "text/event-stream")],
+            format!("data: {terminal}\n\n"),
+        )
+    }
+
+    let output = Arc::new(RwLock::new(
+        json!({ "links": [], "insights": [] }).to_string(),
+    ));
+    let app = Router::new()
+        .route("/responses", post(responses))
+        .with_state(CodexAnalysisStub {
+            token: token.to_string(),
+            output: output.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), output)
 }
 
 fn event_body(owner: &str, entity: &str, text: &str) -> Value {
@@ -2556,6 +2613,149 @@ async fn analysis_api_uses_independent_model_and_materializes_links_and_insights
     .await;
     assert_eq!(status, StatusCode::OK, "{insights}");
     assert!(!insights["hits"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn analysis_provider_secrets_never_reach_raw_store_or_operation_plans() {
+    let secret = "codex-provider-output-secret-value";
+    let auth_path = std::env::temp_dir().join(format!(
+        "nowledge-analysis-codex-auth-{}.json",
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::write(&auth_path, json!({ "access_token": secret }).to_string()).unwrap();
+    let (codex_base_url, provider_output) = spawn_codex_analysis_stub(secret).await;
+
+    let mut config = Config::test();
+    config.llm_provider = "none".to_string();
+    config.analysis_llm_provider = "codex_auth".to_string();
+    config.analysis_llm_model = Some("analysis-security-test".to_string());
+    config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
+    config.codex_base_url = codex_base_url;
+    config.provider_max_retries = 0;
+    config.refresh_configured_secret_values();
+    let state = AppState::new(Arc::new(config));
+    let store = state.store.clone();
+    let tenant_id = state.tenant_id().to_string();
+    let app = build_router(state.clone());
+
+    let mut context_uris = Vec::new();
+    for (key, title, statement) in [
+        (
+            "provider-redaction-a",
+            "Provider redaction source A",
+            "provider-redaction-marker launch plan depends on readiness",
+        ),
+        (
+            "provider-redaction-b",
+            "Provider redaction source B",
+            "provider-redaction-marker readiness depends on staffing",
+        ),
+    ] {
+        let (status, item) = call(
+            app.clone(),
+            Method::PUT,
+            &format!("/v1/state/profile/facts/{key}"),
+            json!({
+                "owner_user_id": "u1",
+                "state_type": "analysis",
+                "title": title,
+                "statement": statement,
+                "source_refs": [{ "kind": "test", "id": key }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{item}");
+        context_uris.push(item["context_uri"].as_str().unwrap().to_string());
+    }
+    let seed_uris = context_uris
+        .iter()
+        .map(|uri| format!("{uri}/.overview"))
+        .collect::<Vec<_>>();
+
+    *provider_output
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = json!({
+        "links": [{
+            "source_uri": context_uris[0],
+            "target_uri": context_uris[1],
+            "relation": "supports",
+            "rationale": format!("provider rationale contains {secret}"),
+            "confidence": 0.91,
+            "tags": [format!("provider-tag-{secret}")]
+        }],
+        "insights": [{
+            "insight_type": format!("analysis-{secret}"),
+            "title": format!("Provider title contains {secret}"),
+            "statement": format!("Provider statement contains {secret}"),
+            "confidence": 0.92,
+            "salience": 0.82,
+            "source_uris": [context_uris[0], context_uris[1]],
+            "tags": [format!("insight-tag-{secret}")]
+        }]
+    })
+    .to_string();
+
+    let (status, analysis) = call(
+        app,
+        Method::POST,
+        "/v1/analysis/insights",
+        json!({
+            "owner_user_id": "u1",
+            "query": "provider-redaction-marker readiness",
+            "seed_uris": seed_uris,
+            "create_links": true,
+            "upsert_insights": true,
+            "context_limit": 8
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{analysis}");
+
+    let raw_links = store
+        .search_links(
+            &tenant_id,
+            LinkSearchRequest {
+                owner_user_id: Some("u1".to_string()),
+                limit: 100,
+                ..LinkSearchRequest::default()
+            },
+            false,
+        )
+        .unwrap();
+    assert!(raw_links
+        .links
+        .iter()
+        .any(|link| link.relation == "supports"));
+    let raw_insights = store
+        .search_insights(InsightSearchRequest {
+            owner_user_id: Some("u1".to_string()),
+            limit: 100,
+            ..InsightSearchRequest::default()
+        })
+        .unwrap();
+    assert!(raw_insights
+        .hits
+        .iter()
+        .any(|insight| insight.title.contains("[REDACTED]")));
+    let raw_operations = store
+        .list_operations(
+            &tenant_id,
+            OperationListRequest {
+                operation_kinds: vec!["analysis.materialize".to_string()],
+                limit: 100,
+                include_plan: true,
+                ..OperationListRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    let persisted = serde_json::to_string(&(raw_links, raw_insights, raw_operations)).unwrap();
+
+    state.shutdown().await;
+    let _ = std::fs::remove_file(auth_path);
+    assert!(!analysis.to_string().contains(secret));
+    assert!(!persisted.contains(secret));
+    assert!(persisted.contains("[REDACTED]"), "{persisted}");
 }
 
 #[tokio::test]

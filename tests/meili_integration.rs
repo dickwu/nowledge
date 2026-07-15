@@ -17,9 +17,11 @@ use nowledge::{
     config::{AuthUserConfig, AuthUserScope},
     meili::{task_uid, MeiliAdmin, FIXED_INDEXES},
     models::{
-        ContextNode, HarnessChangeManifest, IngestTask, IngestTaskResult, RagEvalCaseResult,
-        RagEvalMetrics, RagEvalOverview, RagEvalRun, SourceDocument, StructuredSnapshot,
-        TraceRecord, UserEventIndex,
+        AnalysisInsightMaterialization, AnalysisLinkMaterialization,
+        AnalysisMaterializationRequest, ContextNode, HarnessChangeManifest, IngestTask,
+        IngestTaskResult, OperationIndexingState, OperationStatus, OperationStepStatus,
+        RagEvalCaseResult, RagEvalMetrics, RagEvalOverview, RagEvalRun, SourceDocument,
+        StructuredSnapshot, TraceRecord, UserEventIndex,
     },
     repository::{KnowledgeRepository, MeiliRepository},
     tenant_scope::{
@@ -1811,6 +1813,167 @@ async fn meili_restart_hydrates_company_context_sources_and_revisions() {
         );
     }
     deleted_state.shutdown().await;
+}
+
+#[tokio::test]
+async fn meili_analysis_materialization_confirms_tasks_and_dedupes_after_restart() {
+    let _guard = live_meili_test_guard().await;
+    let tenant_id = format!("test-tenant-{}", uuid::Uuid::now_v7());
+    let Some(config) = meili_config_with_tenant(tenant_id.clone()).await else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    let (state, _, _) = start_meili_app(&config).await;
+    let admin = state.meili.clone();
+    let run_id = uuid::Uuid::now_v7().to_string();
+    let owner = format!("pr7-analysis-owner-{run_id}");
+    let routing = state
+        .store
+        .resolver()
+        .resolve(&tenant_id, &owner, false, true)
+        .expect("analysis owner routing should resolve");
+    let stable_candidate = AnalysisInsightMaterialization {
+        insight_type: "analysis".to_string(),
+        title: format!("PR7 stable insight {run_id}"),
+        statement: "The first authorized context supports this insight.".to_string(),
+        confidence: 0.9,
+        salience: 0.7,
+        source_uris: vec![format!("ctx://user/pr7-analysis/{run_id}/source-a")],
+    };
+    let first = state
+        .store
+        .materialize_analysis_async(
+            &tenant_id,
+            &owner,
+            AnalysisMaterializationRequest {
+                links: vec![AnalysisLinkMaterialization {
+                    source_uri: format!("ctx://user/pr7-analysis/{run_id}/source-a"),
+                    target_uri: format!("ctx://user/pr7-analysis/{run_id}/source-b"),
+                    source_title: Some("Source A".to_string()),
+                    target_title: Some("Source B".to_string()),
+                    relation: "supports".to_string(),
+                    rationale: Some("Both locators were authorized before persistence".to_string()),
+                    confidence: 0.8,
+                    tags: vec!["analysis".to_string()],
+                }],
+                insights: vec![
+                    stable_candidate.clone(),
+                    AnalysisInsightMaterialization {
+                        insight_type: "analysis".to_string(),
+                        title: format!("PR7 old companion {run_id}"),
+                        statement: "The second authorized context supports a companion insight."
+                            .to_string(),
+                        confidence: 0.75,
+                        salience: 0.5,
+                        source_uris: vec![format!("ctx://user/pr7-analysis/{run_id}/source-b")],
+                    },
+                ],
+            },
+        )
+        .await
+        .expect("Meili analysis materialization should complete");
+    let stable_id = first.insights[0].id.clone();
+    let first_persistence = first
+        .persistence
+        .clone()
+        .expect("analysis response should expose persistence confirmation");
+    let repository = MeiliRepository::new(admin.clone(), true);
+    let first_operations = repository
+        .list_operations(&tenant_id, &[])
+        .await
+        .expect("analysis operation lookup should succeed")
+        .expect("Meili should return durable operations");
+    let first_operation = first_operations
+        .iter()
+        .find(|operation| operation.id == first_persistence.operation_id)
+        .cloned()
+        .expect("analysis operation should be persisted");
+    state.shutdown().await;
+
+    let (restarted, hydration, _) = start_meili_app(&config).await;
+    let overlap = restarted
+        .store
+        .materialize_analysis_async(
+            &tenant_id,
+            &owner,
+            AnalysisMaterializationRequest {
+                links: Vec::new(),
+                insights: vec![
+                    stable_candidate,
+                    AnalysisInsightMaterialization {
+                        insight_type: "analysis".to_string(),
+                        title: format!("PR7 new companion {run_id}"),
+                        statement: "A post-restart context supports a new companion insight."
+                            .to_string(),
+                        confidence: 0.8,
+                        salience: 0.6,
+                        source_uris: vec![format!("ctx://user/pr7-analysis/{run_id}/source-c")],
+                    },
+                ],
+            },
+        )
+        .await
+        .expect("overlapping post-restart materialization should complete");
+    let persisted_insights = repository
+        .list_insights(&tenant_id)
+        .await
+        .expect("persisted insight lookup should succeed")
+        .expect("Meili should return durable insights");
+    restarted.shutdown().await;
+
+    let fixed_cleanup = delete_tenant_rows_and_wait(
+        &admin,
+        &tenant_id,
+        &[
+            "rag_insights",
+            "rag_links",
+            "rag_operations",
+            "rag_user_event_indexes",
+        ],
+    )
+    .await;
+    let event_cleanup = delete_index_and_wait(&config, &admin, &routing.event_index_uid).await;
+    let context_cleanup =
+        delete_index_and_wait(&config, &admin, &routing.personal_context_index_uid).await;
+    assert_cleanup_results(vec![
+        ("analysis fixed rows", fixed_cleanup),
+        ("analysis event index", event_cleanup),
+        ("analysis context index", context_cleanup),
+    ]);
+
+    assert_eq!(first_persistence.status, OperationStatus::Completed);
+    assert_eq!(
+        first_persistence.indexing_state,
+        OperationIndexingState::Completed
+    );
+    assert_eq!(first_operation.status, OperationStatus::Completed);
+    assert_eq!(
+        first_operation.indexing_state,
+        OperationIndexingState::Completed
+    );
+    assert!(
+        first_operation.progress.steps.values().all(|progress| {
+            progress.status == OperationStepStatus::Completed && !progress.task_uids.is_empty()
+        }),
+        "every materialization step must retain and confirm its Meili task UID: {:?}",
+        first_operation.progress.steps
+    );
+    assert_eq!(hydration["status"], "complete", "{hydration}");
+    assert_eq!(overlap.insights[0].id, stable_id);
+    assert_eq!(
+        persisted_insights
+            .iter()
+            .filter(|insight| insight.owner_user_id == owner)
+            .count(),
+        3
+    );
+    assert_eq!(
+        persisted_insights
+            .iter()
+            .filter(|insight| insight.id == stable_id)
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

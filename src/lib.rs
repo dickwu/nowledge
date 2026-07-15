@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod auth;
 pub mod config;
 pub mod error;
@@ -16,6 +17,7 @@ pub(crate) mod runtime;
 pub mod store;
 pub mod tenant_scope;
 pub mod tenant_scope_v1;
+pub mod upstream;
 pub mod util;
 pub mod vector_match;
 

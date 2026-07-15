@@ -130,6 +130,21 @@ impl Principal {
         let identity = format!("{}\0{}\0{owner}", self.tenant_id, self.scope_label());
         hmac_hex(index_hash_secret, "rate-limit-principal", &identity, 32)
     }
+
+    /// Stable, non-secret identity for application-scoped upstream budgets.
+    /// It intentionally reuses the authenticated principal scope but a
+    /// distinct HMAC domain so provider accounting cannot reveal raw owner or
+    /// tenant identifiers and cannot be confused with the HTTP limiter key.
+    pub(crate) fn provider_budget_key(&self, index_hash_secret: &[u8]) -> String {
+        let owner = self.owner_user_id().unwrap_or_default();
+        let identity = format!("{}\0{}\0{owner}", self.tenant_id, self.scope_label());
+        hmac_hex(
+            index_hash_secret,
+            "provider-budget-principal",
+            &identity,
+            32,
+        )
+    }
 }
 
 impl FromRequestParts<AppState> for UserGuard {
