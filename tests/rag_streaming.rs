@@ -773,3 +773,40 @@ async fn unread_stream_holds_capacity_livez_bypasses_and_drop_releases_upstream(
     assert_eq!(stub.request_count(), 1);
     drop(release_tx);
 }
+
+#[tokio::test]
+async fn stream_meta_and_usage_report_the_request_model_and_effort_overrides() {
+    let token = "codex-stream-override-private-token";
+    let stub = CodexStub::spawn(
+        token,
+        StubMode::Static(provider_success(&["override answer"])),
+    )
+    .await;
+    let (config, _auth_file) = codex_config(token, &stub.base_url);
+    let app = build_router(AppState::new(Arc::new(config)));
+    let mut body = rag_body("u1", "which model answered?");
+    body["model"] = json!("gpt-5.4-mini");
+    body["reasoning_effort"] = json!("low");
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/v1/rag/stream",
+            body,
+            None,
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let events = parse_sse(&bytes);
+    assert_success_sequence(&events);
+    // The override rides the meta event and the usage event alike, matching
+    // the non-streaming usage block.
+    assert_eq!(events[0].data["model"], "gpt-5.4-mini", "{events:?}");
+    assert_eq!(events[0].data["reasoning_effort"], "low", "{events:?}");
+    let usage = &events[events.len() - 2].data;
+    assert_eq!(usage["model"], "gpt-5.4-mini", "{usage}");
+    assert_eq!(usage["reasoning_effort"], "low", "{usage}");
+    assert_eq!(stub.request_count(), 1);
+}

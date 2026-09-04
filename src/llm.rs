@@ -2244,7 +2244,7 @@ impl LlmProviderRegistry {
         principal_key: &str,
         mut request: LlmRequest,
     ) -> Result<LlmTextResponse, ApiError> {
-        self.validate_request(&request)?;
+        self.validate_request(profile, &request)?;
         let attempts = self.reserved_attempts(profile);
         let (model, reasoning_effort) = self.request_shape(profile);
         let (model, reasoning_effort) = request.effective_shape(model, reasoning_effort);
@@ -2324,7 +2324,7 @@ impl LlmProviderRegistry {
         principal_key: &str,
         mut request: LlmRequest,
     ) -> Result<LlmTextStream, ApiError> {
-        self.validate_request(&request)?;
+        self.validate_request(profile, &request)?;
         let attempts = self.reserved_attempts(profile);
         let (model, reasoning_effort) = self.request_shape(profile);
         let (model, reasoning_effort) = request.effective_shape(model, reasoning_effort);
@@ -2434,7 +2434,19 @@ impl LlmProviderRegistry {
         }
     }
 
-    fn validate_request(&self, request: &LlmRequest) -> Result<(), ApiError> {
+    fn validate_request(&self, profile: LlmProfile, request: &LlmRequest) -> Result<(), ApiError> {
+        // Overrides are a primary-profile feature: RAG_LLM_MODEL_OVERRIDES is
+        // the primary allowlist and no analysis-side list exists, so an
+        // override on the analysis profile is refused rather than silently
+        // checked against the wrong list.
+        if matches!(profile, LlmProfile::Analysis)
+            && (request.model_override.is_some() || request.reasoning_effort_override.is_some())
+        {
+            return Err(ApiError::validation(
+                "model",
+                "overrides are only supported for the primary LLM profile",
+            ));
+        }
         validate_llm_overrides(
             request.model_override.as_deref(),
             request.reasoning_effort_override.as_deref(),
