@@ -24,6 +24,8 @@ Schema: `RagAnswerRequest`
 | session_id | string | optional | Session to associate with the answer. |
 | owner_user_id | string | optional, auth default may apply | Owner scope. |
 | debug | boolean | optional, default false | Request debug data from retrieval. |
+| model | string | optional | Model for this call only (1-64 chars of letters, digits, `.`, `_`, `-`). Absent means the configured `RAG_LLM_MODEL`. When `RAG_LLM_MODEL_OVERRIDES` is set, the value must be on that allowlist; otherwise any well-formed name is forwarded and the provider owns the "unsupported model" verdict (`llm_model_unsupported`). |
+| reasoning_effort | string | optional | `low`, `medium`, `high` or `xhigh` for this call only. Absent means the configured `RAG_LLM_REASONING_EFFORT`. |
 
 ## Response
 Schema: `RagAnswerResponse`
@@ -40,7 +42,8 @@ Schema: `RagAnswerResponse`
 | Field | Type | Description |
 | --- | --- | --- |
 | provider | string | LLM provider that generated the answer. |
-| model | string | Model name. |
+| model | string | Model that generated the answer — the request override when one was given, else the configured model. |
+| reasoning_effort | string? | Reasoning effort the call ran with (request override, else configured); absent when neither is set. |
 | latency_ms | integer | Generation latency. |
 | backend | string | Store backend that served retrieval. |
 | grounded | boolean | True when the answer was grounded in retrieved citations. |
@@ -85,7 +88,9 @@ consumers should fall back to estimation only when they are absent.
 - Default RAG retrieval searches only active fragments; source documents are not directly searched.
 - The generated prompt includes each citation's source title, `page_idx`, `block_type`, `section_path`, URI, and quote. Configured secrets are redacted before provider submission and from the complete response.
 - Citation `source_document_uri` is metadata only. Full source document bodies are readable only through explicit `GET /v1/fs/read` with ACL checks.
-- Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
+- Malformed `model` / `reasoning_effort` values, or a `model` outside `RAG_LLM_MODEL_OVERRIDES`, return `400 validation_error` with `details.field` naming the offender before any provider budget is reserved.
+- When the provider answers with an HTTP failure the response is `502` with a classified code instead of the opaque `upstream_error`: `llm_auth_failed` (401/403 — expired or rejected credentials), `llm_rate_limited` (429), `llm_quota_exhausted` (structured quota markers such as `insufficient_quota` / `usage_limit_reached`), `llm_model_unsupported` (400/404 naming the model), `llm_server_error` (5xx) or `llm_request_failed` (other). `details` carries `kind`, `provider`, `model`, `upstream_status`, `attempts`, `request_id` and, when the provider sent one, `retry_after_seconds` (also echoed as a `Retry-After` header). The provider body is never included.
+- Transport failures that never reached the provider (connection, DNS, decode) and store or Meilisearch failures keep the shared `upstream_error` envelope; deadlines return `timeout`.
 
 ## Internal Logic Call Graph
 ```mermaid

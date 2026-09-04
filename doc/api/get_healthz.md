@@ -34,6 +34,15 @@ Schema: `HealthResponse`
 | analysis_llm | object | Analysis-profile LLM health payload. A distinct analysis profile is probed independently and can make readiness unhealthy. |
 | usage | object | Compact usage summary. |
 
+### `llm` Credential Fields
+| Field | Type | Description |
+| --- | --- | --- |
+| auth_token_kind | string? | Credential shape behind the provider: `codex_oauth`, `openai_api_key` or `other`. Absent when no credential is loaded or the provider is not `codex_auth`. |
+| auth_expires_at | RFC 3339? | Expiry of the active Codex OAuth access token, read from the JWT `exp` claim (signature not verified — informational only). Absent for API keys. |
+| auth_expires_in_seconds | integer? | Seconds until `auth_expires_at`; negative once the sign-in has already expired. Lets dashboards warn before the next probe reports `auth_failed`. |
+
+The same fields are present under `analysis_llm`.
+
 ### `llm.rate_limits` Fields
 The freshest live snapshot for the configured provider. Health probes and
 real completions (RAG answer, analysis, title) both refresh it; `captured_at`
