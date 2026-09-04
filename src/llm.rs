@@ -1988,7 +1988,14 @@ pub fn validate_llm_overrides(
                 "must be 1-64 characters of letters, digits, '.', '_' or '-'",
             ));
         }
-        if !allowed_models.is_empty() && !allowed_models.iter().any(|allowed| allowed == model) {
+        // Model ids are case-insensitive slugs and callers (the GFIT api)
+        // lower-case them before sending, so a mixed-case allowlist entry
+        // must not reject every request.
+        if !allowed_models.is_empty()
+            && !allowed_models
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(model))
+        {
             return Err(ApiError::validation(
                 "model",
                 "is not in the configured model override allowlist",
@@ -5279,8 +5286,12 @@ mod tests {
             validate_llm_overrides(Some("gpt-5.5"), Some("ultra"), &[]),
             Err(ApiError::Validation { field, .. }) if field == "reasoning_effort"
         ));
-        let allowlist = vec!["gpt-5.5".to_string(), "gpt-5.4-mini".to_string()];
+        let allowlist = vec!["GPT-5.5".to_string(), "gpt-5.4-mini".to_string()];
         assert!(validate_llm_overrides(Some("gpt-5.4-mini"), None, &allowlist).is_ok());
+        assert!(
+            validate_llm_overrides(Some("gpt-5.5"), None, &allowlist).is_ok(),
+            "allowlist entries match case-insensitively"
+        );
         assert!(matches!(
             validate_llm_overrides(Some("gpt-4o"), None, &allowlist),
             Err(ApiError::Validation { field, .. }) if field == "model"
