@@ -49,7 +49,8 @@ impl RagStreamService {
                 &answer.citations,
                 &security.secrets,
                 state.config.llm_max_output_tokens,
-            );
+            )
+            .with_llm_overrides(req.model.clone(), req.reasoning_effort.clone());
             Some(
                 state
                     .llm_providers

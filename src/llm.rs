@@ -15,11 +15,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     config::Config,
-    error::ApiError,
+    error::{ApiError, LlmFailureKind, LlmUpstreamError},
     metrics::Metrics,
     upstream::{
-        ClientPolicy, OperationPolicy, ProxyMode, RequestFactoryError, StreamingResponse,
-        UpstreamError, UpstreamHttpClient, UpstreamOperation,
+        ClientPolicy, HttpFailureKind, OperationPolicy, ProxyMode, RequestFactoryError,
+        StreamingResponse, UpstreamError, UpstreamHttpClient, UpstreamOperation,
     },
     util::{redact_egress_text, redact_string, StreamingTextRedactor},
 };
@@ -40,6 +40,11 @@ pub struct LlmRequest {
     pub max_output_tokens: u32,
     pub response_format: LlmResponseFormat,
     pub metadata: LlmMetadata,
+    /// Caller-chosen model for this request only; `None` keeps the profile's
+    /// configured model. Validated against `RAG_LLM_MODEL_OVERRIDES`.
+    pub model_override: Option<String>,
+    /// Caller-chosen reasoning effort for this request only.
+    pub reasoning_effort_override: Option<String>,
     attempt_budget: Option<LlmAttemptBudget>,
 }
 
@@ -82,8 +87,41 @@ impl LlmRequest {
                 operation: operation.into(),
                 request_id: crate::request_context::current_or_new_id().to_string(),
             },
+            model_override: None,
+            reasoning_effort_override: None,
             attempt_budget: None,
         }
+    }
+
+    /// Route this request to a caller-chosen model and/or reasoning effort
+    /// instead of the profile defaults. `None` (or blank) keeps the default.
+    pub fn with_llm_overrides(
+        mut self,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> Self {
+        self.model_override = model
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self.reasoning_effort_override = reasoning_effort
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self
+    }
+
+    /// The model and reasoning effort this request actually runs with, given
+    /// the profile defaults it would otherwise inherit.
+    pub fn effective_shape<'a>(
+        &'a self,
+        model: &'a str,
+        reasoning_effort: Option<&'a str>,
+    ) -> (&'a str, Option<&'a str>) {
+        (
+            self.model_override.as_deref().unwrap_or(model),
+            self.reasoning_effort_override
+                .as_deref()
+                .or(reasoning_effort),
+        )
     }
 
     pub fn with_evidence(mut self, evidence: Vec<LlmEvidence>) -> Self {
@@ -550,6 +588,16 @@ pub enum CodexAuthTokenKind {
     Other,
 }
 
+impl CodexAuthTokenKind {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::OpenAiApiKey => "openai_api_key",
+            Self::CodexOauth => "codex_oauth",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CodexAuthCredentials {
     pub token: String,
@@ -663,6 +711,17 @@ pub struct LlmHealthProbeResult {
     pub error_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Expiry of the active provider credential when it carries one (Codex
+    /// OAuth access tokens are JWTs with an `exp` claim); absent for API keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_expires_at: Option<DateTime<Utc>>,
+    /// Seconds until `auth_expires_at`; negative once the credential expired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_expires_in_seconds: Option<i64>,
+    /// Which credential shape backs the provider (`codex_oauth`,
+    /// `openai_api_key`, `other`); absent when no credential is loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_token_kind: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -753,8 +812,9 @@ impl LlmClient for NoneLlmClient {
     }
 
     async fn stream_text(&self, request: LlmRequest) -> Result<LlmTextStream, ApiError> {
+        let model = request.effective_shape(&self.model, None).0.to_string();
         let response = self.complete_text(request).await?;
-        Ok(synthetic_text_stream("none", &self.model, response))
+        Ok(synthetic_text_stream("none", &model, response))
     }
 }
 
@@ -811,8 +871,9 @@ impl LlmClient for MockLlmClient {
     }
 
     async fn stream_text(&self, request: LlmRequest) -> Result<LlmTextStream, ApiError> {
+        let model = request.effective_shape(&self.model, None).0.to_string();
         let response = self.complete_text(request).await?;
-        Ok(synthetic_text_stream("mock", &self.model, response))
+        Ok(synthetic_text_stream("mock", &model, response))
     }
 }
 
@@ -888,11 +949,13 @@ impl LlmClient for OpenAiResponsesClient {
         let request = request.redact_for_provider(&secrets);
         request.charge_attempt()?;
         let started = Instant::now();
+        let (model, reasoning_effort) =
+            request.effective_shape(&self.model, self.reasoning_effort.as_deref());
         let (body, attempts) = complete_openai_responses(
             &self.upstream,
             &self.operation_policy,
-            &self.model,
-            self.reasoning_effort.as_deref(),
+            model,
+            reasoning_effort,
             &api_key,
             &request,
             ProviderRateLimitSink {
@@ -918,12 +981,14 @@ impl LlmClient for OpenAiResponsesClient {
         let secrets = vec![api_key.clone()];
         let request = request.redact_for_provider(&secrets);
         request.charge_attempt()?;
+        let (model, reasoning_effort) =
+            request.effective_shape(&self.model, self.reasoning_effort.as_deref());
         start_responses_stream(ResponsesStreamRequest {
             upstream: &self.upstream,
             operation_policy: &self.operation_policy,
             provider: &self.provider,
-            model: &self.model,
-            reasoning_effort: self.reasoning_effort.as_deref(),
+            model,
+            reasoning_effort,
             codex_oauth: false,
             endpoint: "https://api.openai.com/v1/responses".to_string(),
             token: &api_key,
@@ -959,14 +1024,16 @@ impl LlmClient for CodexResponsesClient {
         // same token unredacted in the outbound prompt.
         let (credentials, request, secrets) = self.secure_request(request)?;
         request.charge_attempt()?;
+        let (model, reasoning_effort) =
+            request.effective_shape(&self.model, self.reasoning_effort.as_deref());
 
         if credentials.token_kind == CodexAuthTokenKind::OpenAiApiKey {
             let started = Instant::now();
             let (body, attempts) = complete_openai_responses(
                 &self.upstream,
                 &self.operation_policy,
-                &self.model,
-                self.reasoning_effort.as_deref(),
+                model,
+                reasoning_effort,
                 &credentials.token,
                 &request,
                 ProviderRateLimitSink {
@@ -986,12 +1053,7 @@ impl LlmClient for CodexResponsesClient {
 
         let started = Instant::now();
         let endpoint = codex_responses_endpoint(&self.base_url);
-        let payload = codex_responses_payload(
-            &self.model,
-            &request,
-            self.reasoning_effort.as_deref(),
-            true,
-        );
+        let payload = codex_responses_payload(model, &request, reasoning_effort, true);
         let client = self.upstream.client();
         let token = credentials.token.clone();
         let account_id = credentials.account_id.clone();
@@ -1014,7 +1076,7 @@ impl LlmClient for CodexResponsesClient {
                 },
             )
             .await
-            .map_err(map_upstream_error)?;
+            .map_err(|error| map_upstream_error(error, "codex_auth", model))?;
         self.latest_rate_limits
             .record("codex_auth", &rate_limits_from_headers(response.headers()));
         let attempts = response.attempts();
@@ -1039,12 +1101,14 @@ impl LlmClient for CodexResponsesClient {
         } else {
             codex_responses_endpoint(&self.base_url)
         };
+        let (model, reasoning_effort) =
+            request.effective_shape(&self.model, self.reasoning_effort.as_deref());
         start_responses_stream(ResponsesStreamRequest {
             upstream: &self.upstream,
             operation_policy: &self.operation_policy,
             provider: "codex_auth",
-            model: &self.model,
-            reasoning_effort: self.reasoning_effort.as_deref(),
+            model,
+            reasoning_effort,
             codex_oauth: !uses_openai_endpoint,
             endpoint,
             token: &credentials.token,
@@ -1116,7 +1180,9 @@ async fn start_responses_stream(
             },
         )
         .await
-        .map_err(map_upstream_error)?;
+        .map_err(|error| {
+            map_upstream_error(error, stream_request.provider, stream_request.model)
+        })?;
     stream_request.latest_rate_limits.record(
         stream_request.provider,
         &rate_limits_from_headers(response.headers()),
@@ -1132,6 +1198,8 @@ async fn start_responses_stream(
             stream_request.secrets,
             started,
             stream_request.codex_oauth,
+            stream_request.provider,
+            stream_request.model,
         ),
         attempts,
     ))
@@ -1163,7 +1231,7 @@ async fn complete_openai_responses(
             },
         )
         .await
-        .map_err(map_upstream_error)?;
+        .map_err(|error| map_upstream_error(error, rate_limit_sink.provider, model))?;
     rate_limit_sink.record(response.headers());
     let attempts = response.attempts();
     let body = decode_openai_response_body(response.body())?;
@@ -1686,6 +1754,8 @@ struct ProviderLlmStreamSource {
     pending: VecDeque<LlmStreamEvent>,
     started: Instant,
     finished: bool,
+    provider: String,
+    model: String,
 }
 
 impl fmt::Debug for ProviderLlmStreamSource {
@@ -1705,6 +1775,8 @@ impl ProviderLlmStreamSource {
         secrets: &[String],
         started: Instant,
         allow_empty_terminal_output: bool,
+        provider: &str,
+        model: &str,
     ) -> Self {
         Self {
             response: Some(response),
@@ -1717,6 +1789,8 @@ impl ProviderLlmStreamSource {
             pending: VecDeque::new(),
             started,
             finished: false,
+            provider: provider.to_string(),
+            model: model.to_string(),
         }
     }
 
@@ -1808,7 +1882,10 @@ impl LlmTextStreamSource for ProviderLlmStreamSource {
                     self.finished = true;
                     return Ok(self.pending.pop_front());
                 }
-                Err(error) => return self.fail(map_upstream_error(error)),
+                Err(error) => {
+                    let error = map_upstream_error(error, &self.provider, &self.model);
+                    return self.fail(error);
+                }
             }
         }
     }
@@ -1827,7 +1904,7 @@ fn invalid_llm_output() -> ApiError {
     ApiError::Upstream(INVALID_LLM_OUTPUT_CAUSE.to_string())
 }
 
-fn map_upstream_error(error: UpstreamError) -> ApiError {
+fn map_upstream_error(error: UpstreamError, provider: &str, model: &str) -> ApiError {
     let diagnostic = error.diagnostic();
     match diagnostic.category {
         crate::upstream::UpstreamFailureCategory::Deadline
@@ -1836,20 +1913,97 @@ fn map_upstream_error(error: UpstreamError) -> ApiError {
             ApiError::Upstream("LLM response exceeded the configured size limit".to_string())
         }
         category => {
-            // Never propagate a provider body or reqwest diagnostic. The
-            // shared upstream layer intentionally exposes only this bounded,
-            // structured diagnostic surface.
-            let status = diagnostic
-                .status
-                .map(|status| status.to_string())
-                .unwrap_or_else(|| "none".to_string());
+            if let UpstreamError::HttpStatus {
+                status,
+                kind,
+                attempts,
+                retry_after_seconds,
+                ..
+            } = error
+            {
+                // The provider answered. Expose the classified reason (never
+                // the body) so callers can refresh credentials, wait for a
+                // usage window to reset, or pick another model.
+                return ApiError::LlmUpstream(LlmUpstreamError {
+                    kind: llm_failure_kind(kind),
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    upstream_status: Some(status),
+                    retry_after_seconds,
+                    attempts,
+                });
+            }
+            // Transport-level failures never reached the provider. Keep the
+            // bounded diagnostic; reqwest details stay private.
             ApiError::Upstream(format!(
-                "LLM provider request failed: category={} status={status} attempts={}",
+                "LLM provider request failed: category={} status=none attempts={}",
                 category.as_str(),
                 diagnostic.attempts
             ))
         }
     }
+}
+
+fn llm_failure_kind(kind: HttpFailureKind) -> LlmFailureKind {
+    match kind {
+        HttpFailureKind::Authentication => LlmFailureKind::AuthFailed,
+        HttpFailureKind::RateLimited => LlmFailureKind::RateLimited,
+        HttpFailureKind::Quota => LlmFailureKind::QuotaExhausted,
+        HttpFailureKind::ModelUnsupported => LlmFailureKind::ModelUnsupported,
+        HttpFailureKind::Server => LlmFailureKind::ServerError,
+        HttpFailureKind::RequestRejected
+        | HttpFailureKind::RequestTimeout
+        | HttpFailureKind::Other => LlmFailureKind::RequestFailed,
+    }
+}
+
+const MAX_MODEL_NAME_CHARS: usize = 64;
+
+/// Model identifiers are short provider slugs such as `gpt-5.5` or
+/// `gpt-5.4-mini`; anything else is rejected before it can reach a provider.
+pub fn valid_model_name(model: &str) -> bool {
+    let chars = model.chars().count();
+    (1..=MAX_MODEL_NAME_CHARS).contains(&chars)
+        && model
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '_' | '-'))
+}
+
+pub fn valid_reasoning_effort(effort: &str) -> bool {
+    matches!(effort, "low" | "medium" | "high" | "xhigh")
+}
+
+/// Validate caller overrides before any budget is reserved or provider call
+/// is made. An empty allowlist accepts any well-formed model name and leaves
+/// the "unsupported model" verdict to the provider.
+pub fn validate_llm_overrides(
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    allowed_models: &[String],
+) -> Result<(), ApiError> {
+    if let Some(model) = model {
+        if !valid_model_name(model) {
+            return Err(ApiError::validation(
+                "model",
+                "must be 1-64 characters of letters, digits, '.', '_' or '-'",
+            ));
+        }
+        if !allowed_models.is_empty() && !allowed_models.iter().any(|allowed| allowed == model) {
+            return Err(ApiError::validation(
+                "model",
+                "is not in the configured model override allowlist",
+            ));
+        }
+    }
+    if let Some(effort) = reasoning_effort {
+        if !valid_reasoning_effort(effort) {
+            return Err(ApiError::validation(
+                "reasoning_effort",
+                "must be one of: low, medium, high, xhigh",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn responses_payload(
@@ -2093,6 +2247,7 @@ impl LlmProviderRegistry {
         self.validate_request(&request)?;
         let attempts = self.reserved_attempts(profile);
         let (model, reasoning_effort) = self.request_shape(profile);
+        let (model, reasoning_effort) = request.effective_shape(model, reasoning_effort);
         let estimated_tokens_per_attempt =
             request.estimated_tokens_per_attempt(model, reasoning_effort);
         let reserved_tokens = estimated_tokens_per_attempt.saturating_mul(attempts);
@@ -2172,6 +2327,7 @@ impl LlmProviderRegistry {
         self.validate_request(&request)?;
         let attempts = self.reserved_attempts(profile);
         let (model, reasoning_effort) = self.request_shape(profile);
+        let (model, reasoning_effort) = request.effective_shape(model, reasoning_effort);
         let estimated_tokens_per_attempt =
             request.estimated_tokens_per_attempt(model, reasoning_effort);
         let reserved_tokens = estimated_tokens_per_attempt.saturating_mul(attempts);
@@ -2209,6 +2365,14 @@ impl LlmProviderRegistry {
         error: Option<&ApiError>,
     ) {
         let state = if matches!(error, Some(ApiError::TooManyRequests(_)))
+            || matches!(
+                error,
+                Some(ApiError::LlmUpstream(error))
+                    if matches!(
+                        error.kind,
+                        LlmFailureKind::RateLimited | LlmFailureKind::QuotaExhausted
+                    )
+            )
             || matches!(error, Some(ApiError::Upstream(message)) if message.contains("category=rate_limited"))
         {
             "limited"
@@ -2271,6 +2435,11 @@ impl LlmProviderRegistry {
     }
 
     fn validate_request(&self, request: &LlmRequest) -> Result<(), ApiError> {
+        validate_llm_overrides(
+            request.model_override.as_deref(),
+            request.reasoning_effort_override.as_deref(),
+            &self.config.llm_model_overrides,
+        )?;
         if request.input_chars() > self.config.llm_max_input_chars {
             return Err(ApiError::validation(
                 "prompt",
@@ -2342,6 +2511,9 @@ impl LlmProviderRegistry {
 }
 
 fn observed_retries_from_error(error: &ApiError) -> u64 {
+    if let ApiError::LlmUpstream(error) = error {
+        return u64::from(error.attempts.saturating_sub(1));
+    }
     let ApiError::Upstream(message) = error else {
         return 0;
     };
@@ -2465,6 +2637,19 @@ impl LlmHealthProbe {
         upstream: &UpstreamHttpClient,
         latest_rate_limits: &LatestRateLimits,
     ) -> LlmHealthProbeResult {
+        let mut result = self
+            .check_with_upstream_unannotated(config, upstream, latest_rate_limits)
+            .await;
+        annotate_auth_expiry(&mut result, config);
+        result
+    }
+
+    async fn check_with_upstream_unannotated(
+        &self,
+        config: &Config,
+        upstream: &UpstreamHttpClient,
+        latest_rate_limits: &LatestRateLimits,
+    ) -> LlmHealthProbeResult {
         if !config.health_llm_enabled {
             return with_reasoning_effort(disabled_probe(config), config);
         }
@@ -2526,9 +2711,11 @@ impl LlmHealthProbe {
 
     pub fn cached(&self, config: &Config) -> Option<LlmHealthProbeResult> {
         self.cache.read().ok().and_then(|cache| {
-            cache
-                .as_ref()
-                .map(|cached| self.cached_with_age(cached, config))
+            cache.as_ref().map(|cached| {
+                let mut result = self.cached_with_age(cached, config);
+                annotate_auth_expiry(&mut result, config);
+                result
+            })
         })
     }
 
@@ -2547,6 +2734,68 @@ impl LlmHealthProbe {
         }
         result
     }
+}
+
+/// Stamp credential expiry onto a probe result so status surfaces can show
+/// "token expires in N" (or "expired N ago") ahead of the next auth failure.
+/// Only Codex OAuth access tokens carry an expiry; API keys report the kind
+/// alone, and providers without a loaded credential report nothing.
+fn annotate_auth_expiry(result: &mut LlmHealthProbeResult, config: &Config) {
+    if config.llm_provider != "codex_auth" {
+        return;
+    }
+    let Some(credentials) = config.codex_auth_credentials() else {
+        return;
+    };
+    result.auth_token_kind = Some(credentials.token_kind.as_str().to_string());
+    if let Some(expires_at) = codex_token_expiry(&credentials) {
+        result.auth_expires_at = Some(expires_at);
+        result.auth_expires_in_seconds = Some((expires_at - Utc::now()).num_seconds());
+    }
+}
+
+/// `exp` claim of a Codex OAuth access token. The token is a JWT whose
+/// payload is base64url JSON; the signature is deliberately not verified —
+/// this only feeds status surfaces, never an authorization decision.
+pub fn codex_token_expiry(credentials: &CodexAuthCredentials) -> Option<DateTime<Utc>> {
+    if credentials.token_kind != CodexAuthTokenKind::CodexOauth {
+        return None;
+    }
+    jwt_expiry(&credentials.token)
+}
+
+fn jwt_expiry(token: &str) -> Option<DateTime<Utc>> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = decode_base64url(payload)?;
+    let claims = serde_json::from_slice::<Value>(&bytes).ok()?;
+    let exp = claims.get("exp").and_then(Value::as_i64)?;
+    DateTime::<Utc>::from_timestamp(exp, 0)
+}
+
+/// Minimal base64url (and standard base64) decoder; padding is optional.
+fn decode_base64url(input: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(((buffer >> bits) & 0xff) as u8);
+            buffer &= (1u32 << bits) - 1;
+        }
+    }
+    Some(output)
 }
 
 fn with_reasoning_effort(
@@ -3050,6 +3299,9 @@ fn probe_result(input: ProbeResultInput<'_>) -> LlmHealthProbeResult {
         rate_limits: input.rate_limits,
         error_kind: input.error_kind.map(ToString::to_string),
         message: input.message,
+        auth_expires_at: None,
+        auth_expires_in_seconds: None,
+        auth_token_kind: None,
     }
 }
 
@@ -4893,31 +5145,241 @@ mod tests {
 
     #[test]
     fn upstream_errors_are_mapped_without_provider_body_content() {
-        let mapped = map_upstream_error(UpstreamError::HttpStatus {
-            operation: UpstreamOperation::LlmCompletion,
-            status: 502,
-            kind: crate::upstream::HttpFailureKind::Server,
-            attempts: 3,
-        });
+        let mapped = map_upstream_error(
+            UpstreamError::HttpStatus {
+                operation: UpstreamOperation::LlmCompletion,
+                status: 502,
+                kind: HttpFailureKind::Server,
+                attempts: 3,
+                retry_after_seconds: None,
+            },
+            "codex_auth",
+            "gpt-5.5",
+        );
         assert_eq!(observed_retries_from_error(&mapped), 2);
         match mapped {
-            ApiError::Upstream(message) => {
-                assert_eq!(
-                    message,
-                    "LLM provider request failed: category=server status=502 attempts=3"
-                );
-                assert!(message.len() < 128);
+            ApiError::LlmUpstream(error) => {
+                assert_eq!(error.kind, LlmFailureKind::ServerError);
+                assert_eq!(error.provider, "codex_auth");
+                assert_eq!(error.model, "gpt-5.5");
+                assert_eq!(error.upstream_status, Some(502));
+                assert_eq!(error.attempts, 3);
+                assert_eq!(error.retry_after_seconds, None);
             }
             other => panic!("unexpected error: {other:?}"),
         }
 
         assert!(matches!(
-            map_upstream_error(UpstreamError::DeadlineExceeded {
-                operation: UpstreamOperation::LlmCompletion,
-                attempts: 1,
-            }),
+            map_upstream_error(
+                UpstreamError::DeadlineExceeded {
+                    operation: UpstreamOperation::LlmCompletion,
+                    attempts: 1,
+                },
+                "codex_auth",
+                "gpt-5.5",
+            ),
             ApiError::Timeout
         ));
+
+        // Transport failures never reached the provider: keep the bounded
+        // diagnostic and no classification.
+        match map_upstream_error(
+            UpstreamError::Transport {
+                operation: UpstreamOperation::LlmCompletion,
+                kind: crate::upstream::TransportFailureKind::Connection,
+                attempts: 1,
+            },
+            "codex_auth",
+            "gpt-5.5",
+        ) {
+            ApiError::Upstream(message) => {
+                assert_eq!(
+                    message,
+                    "LLM provider request failed: category=connection status=none attempts=1"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn llm_failure_kinds_follow_the_upstream_classification() {
+        let cases = [
+            (
+                HttpFailureKind::Authentication,
+                401,
+                LlmFailureKind::AuthFailed,
+            ),
+            (
+                HttpFailureKind::RateLimited,
+                429,
+                LlmFailureKind::RateLimited,
+            ),
+            (HttpFailureKind::Quota, 429, LlmFailureKind::QuotaExhausted),
+            (
+                HttpFailureKind::ModelUnsupported,
+                400,
+                LlmFailureKind::ModelUnsupported,
+            ),
+            (HttpFailureKind::Server, 503, LlmFailureKind::ServerError),
+            (
+                HttpFailureKind::RequestRejected,
+                400,
+                LlmFailureKind::RequestFailed,
+            ),
+        ];
+        for (kind, status, expected) in cases {
+            let mapped = map_upstream_error(
+                UpstreamError::HttpStatus {
+                    operation: UpstreamOperation::LlmCompletion,
+                    status,
+                    kind,
+                    attempts: 1,
+                    retry_after_seconds: Some(42),
+                },
+                "openai_api_key",
+                "gpt-5.4-mini",
+            );
+            match mapped {
+                ApiError::LlmUpstream(error) => {
+                    assert_eq!(error.kind, expected, "{kind:?}");
+                    assert_eq!(error.upstream_status, Some(status));
+                    assert_eq!(error.retry_after_seconds, Some(42));
+                }
+                other => panic!("unexpected error for {kind:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn llm_overrides_are_validated_and_shape_the_effective_request() {
+        assert!(validate_llm_overrides(None, None, &[]).is_ok());
+        assert!(validate_llm_overrides(Some("gpt-5.4-mini"), Some("low"), &[]).is_ok());
+        assert!(matches!(
+            validate_llm_overrides(Some("gpt 5"), None, &[]),
+            Err(ApiError::Validation { field, .. }) if field == "model"
+        ));
+        assert!(matches!(
+            validate_llm_overrides(Some(&"x".repeat(65)), None, &[]),
+            Err(ApiError::Validation { field, .. }) if field == "model"
+        ));
+        assert!(matches!(
+            validate_llm_overrides(Some("gpt-5.5"), Some("ultra"), &[]),
+            Err(ApiError::Validation { field, .. }) if field == "reasoning_effort"
+        ));
+        let allowlist = vec!["gpt-5.5".to_string(), "gpt-5.4-mini".to_string()];
+        assert!(validate_llm_overrides(Some("gpt-5.4-mini"), None, &allowlist).is_ok());
+        assert!(matches!(
+            validate_llm_overrides(Some("gpt-4o"), None, &allowlist),
+            Err(ApiError::Validation { field, .. }) if field == "model"
+        ));
+
+        let request = LlmRequest::text("system", "hello", 128, "test");
+        assert_eq!(
+            request.effective_shape("gpt-5.5", Some("xhigh")),
+            ("gpt-5.5", Some("xhigh"))
+        );
+        let request =
+            request.with_llm_overrides(Some(" gpt-5.4-mini ".to_string()), Some(String::new()));
+        assert_eq!(request.model_override.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(request.reasoning_effort_override, None);
+        assert_eq!(
+            request.effective_shape("gpt-5.5", Some("xhigh")),
+            ("gpt-5.4-mini", Some("xhigh"))
+        );
+        let request = request.with_llm_overrides(None, Some("low".to_string()));
+        assert_eq!(
+            request.effective_shape("gpt-5.5", Some("xhigh")),
+            ("gpt-5.5", Some("low"))
+        );
+        let payload = codex_responses_payload("gpt-5.4-mini", &request, Some("low"), true);
+        assert_eq!(payload["model"], "gpt-5.4-mini");
+        assert_eq!(payload["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn codex_oauth_token_expiry_is_read_from_the_jwt_exp_claim() {
+        fn base64url(bytes: &[u8]) -> String {
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let mut buffer = [0u8; 3];
+                buffer[..chunk.len()].copy_from_slice(chunk);
+                let value = (u32::from(buffer[0]) << 16)
+                    | (u32::from(buffer[1]) << 8)
+                    | u32::from(buffer[2]);
+                let count = chunk.len() + 1;
+                for index in 0..count {
+                    let shift = 18 - 6 * index;
+                    out.push(ALPHABET[((value >> shift) & 0x3f) as usize] as char);
+                }
+            }
+            out
+        }
+        let header = base64url(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = base64url(
+            br#"{"exp":1800000000,"https://api.openai.com/auth":{"chatgpt_plan_type":"plus"}}"#,
+        );
+        let token = format!("{header}.{payload}.signature");
+
+        let credentials = CodexAuthCredentials {
+            token: token.clone(),
+            account_id: Some("acct".to_string()),
+            token_kind: CodexAuthTokenKind::CodexOauth,
+        };
+        let expires_at = codex_token_expiry(&credentials).expect("exp claim");
+        assert_eq!(expires_at.timestamp(), 1_800_000_000);
+
+        let api_key = CodexAuthCredentials {
+            token: "sk-test".to_string(),
+            account_id: None,
+            token_kind: CodexAuthTokenKind::OpenAiApiKey,
+        };
+        assert_eq!(codex_token_expiry(&api_key), None);
+        assert_eq!(jwt_expiry("not-a-jwt"), None);
+        assert_eq!(jwt_expiry("a.!!!.c"), None);
+        assert_eq!(
+            decode_base64url("aGVsbG8gd29ybGQ").as_deref(),
+            Some(&b"hello world"[..])
+        );
+        assert_eq!(
+            decode_base64url("aGVsbG8gd29ybGQ=").as_deref(),
+            Some(&b"hello world"[..])
+        );
+
+        let mut result = probe_result(ProbeResultInput {
+            provider: "codex_auth".to_string(),
+            model: "gpt-5.5".to_string(),
+            status: "ok",
+            can_call: true,
+            auth_valid: true,
+            quota_state: "available",
+            rate_limit_state: "ok",
+            error_kind: None,
+            message: None,
+            rate_limits: RateLimitSnapshot::default(),
+            latency_ms: 1,
+        });
+        let auth_path =
+            std::env::temp_dir().join(format!("nowledge-expiry-{}.json", uuid::Uuid::now_v7()));
+        std::fs::write(
+            &auth_path,
+            json!({ "tokens": { "access_token": token, "account_id": "acct" } }).to_string(),
+        )
+        .unwrap();
+        let mut config = Config::test();
+        config.llm_provider = "codex_auth".to_string();
+        config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
+        config.refresh_configured_secret_values();
+        annotate_auth_expiry(&mut result, &config);
+        std::fs::remove_file(&auth_path).ok();
+        assert_eq!(result.auth_token_kind.as_deref(), Some("codex_oauth"));
+        assert_eq!(
+            result.auth_expires_at.map(|value| value.timestamp()),
+            Some(1_800_000_000)
+        );
+        assert!(result.auth_expires_in_seconds.is_some());
     }
 
     #[test]

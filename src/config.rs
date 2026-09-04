@@ -154,6 +154,10 @@ pub struct Config {
     pub llm_provider: String,
     pub llm_model: Option<String>,
     pub llm_reasoning_effort: Option<String>,
+    /// Models callers may request per `/v1/rag/answer` call. Empty means any
+    /// well-formed model name is forwarded to the provider, which then owns
+    /// the "unsupported model" verdict.
+    pub llm_model_overrides: Vec<String>,
     pub analysis_llm_provider: String,
     pub analysis_llm_model: Option<String>,
     pub analysis_llm_reasoning_effort: Option<String>,
@@ -505,6 +509,9 @@ impl Config {
             llm_provider: std::env::var("RAG_LLM_PROVIDER").unwrap_or_else(|_| "none".to_string()),
             llm_model: std::env::var("RAG_LLM_MODEL").ok(),
             llm_reasoning_effort: std::env::var("RAG_LLM_REASONING_EFFORT").ok(),
+            llm_model_overrides: parse_model_overrides(
+                &std::env::var("RAG_LLM_MODEL_OVERRIDES").unwrap_or_default(),
+            ),
             analysis_llm_provider: std::env::var("RAG_ANALYSIS_LLM_PROVIDER").unwrap_or_else(
                 |_| std::env::var("RAG_LLM_PROVIDER").unwrap_or_else(|_| "none".to_string()),
             ),
@@ -926,6 +933,15 @@ impl Config {
             "RAG_ANALYSIS_LLM_REASONING_EFFORT",
             self.analysis_llm_reasoning_effort.as_deref(),
         )?;
+        if let Some(model) = self
+            .llm_model_overrides
+            .iter()
+            .find(|model| !crate::llm::valid_model_name(model))
+        {
+            anyhow::bail!(
+                "RAG_LLM_MODEL_OVERRIDES entry {model:?} must be 1-64 characters of letters, digits, '.', '_' or '-'"
+            );
+        }
         if !matches!(self.parser_provider.as_str(), "builtin" | "mineru") {
             anyhow::bail!("RAG_PARSER_PROVIDER must be builtin or mineru");
         }
@@ -1476,6 +1492,7 @@ impl Config {
             llm_provider: "none".to_string(),
             llm_model: Some("none".to_string()),
             llm_reasoning_effort: None,
+            llm_model_overrides: Vec::new(),
             analysis_llm_provider: "none".to_string(),
             analysis_llm_model: Some("none".to_string()),
             analysis_llm_reasoning_effort: None,
@@ -1653,6 +1670,17 @@ fn validate_reasoning_effort(name: &str, value: Option<&str>) -> anyhow::Result<
         anyhow::bail!("{name} must be low, medium, high, or xhigh when configured");
     }
     Ok(())
+}
+
+/// Comma-separated model allowlist; blanks are dropped so a trailing comma
+/// never becomes an empty (and therefore invalid) entry.
+fn parse_model_overrides(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn parse_cors_allowed_origins(value: &str) -> Vec<String> {

@@ -104,7 +104,12 @@ async fn answer_rag_with_llm(
             &answer.citations,
             &security.secrets,
             state.config.llm_max_output_tokens,
-        );
+        )
+        .with_llm_overrides(req.model.clone(), req.reasoning_effort.clone());
+        let (model, reasoning_effort) =
+            llm_request.effective_shape(&status.model, config.llm_reasoning_effort.as_deref());
+        let model = model.to_string();
+        let reasoning_effort = reasoning_effort.map(ToString::to_string);
         let generation_started_at = Instant::now();
         let generation = state
             .llm_providers
@@ -119,7 +124,8 @@ async fn answer_rag_with_llm(
         answer.answer = redact_text_for_state(state, &llm.text);
         let mut usage = json!({
             "provider": status.provider,
-            "model": status.model,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
             "latency_ms": llm.latency_ms,
             "backend": state.store.backend_name(),
             "grounded": true

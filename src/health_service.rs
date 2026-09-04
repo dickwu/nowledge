@@ -388,7 +388,10 @@ fn llm_health_json(llm: &LlmHealthProbeResult, registry: &LlmProviderRegistry) -
         "age_seconds": llm.age_seconds,
         "consecutive_failures": llm.consecutive_failures,
         "error_kind": &llm.error_kind,
-        "message": public_message
+        "message": public_message,
+        "auth_token_kind": &llm.auth_token_kind,
+        "auth_expires_at": &llm.auth_expires_at,
+        "auth_expires_in_seconds": &llm.auth_expires_in_seconds
     })
 }
 
@@ -413,6 +416,9 @@ fn unprobed_llm_health(config: &Config) -> LlmHealthProbeResult {
         rate_limits: crate::llm::RateLimitSnapshot::default(),
         error_kind: Some("not_probed".to_string()),
         message: Some("LLM health has not been probed yet".to_string()),
+        auth_expires_at: None,
+        auth_expires_in_seconds: None,
+        auth_token_kind: None,
     }
 }
 

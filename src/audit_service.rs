@@ -362,7 +362,7 @@ pub(crate) fn api_error_kind(error: &ApiError) -> AuditErrorKind {
         ApiError::TooManyRequests(_) => AuditErrorKind::TooManyRequests,
         ApiError::ServiceUnavailable(_) => AuditErrorKind::ServiceUnavailable,
         ApiError::Timeout => AuditErrorKind::Timeout,
-        ApiError::Upstream(_) => AuditErrorKind::UpstreamError,
+        ApiError::LlmUpstream(_) | ApiError::Upstream(_) => AuditErrorKind::UpstreamError,
         ApiError::Internal(_) => AuditErrorKind::InternalError,
     }
 }
