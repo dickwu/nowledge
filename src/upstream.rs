@@ -1042,25 +1042,30 @@ pub fn classify_response(status: StatusCode, body: &[u8]) -> ResponseDisposition
     }
 }
 
-/// The provider refused the model, not the request. The ChatGPT Codex backend
-/// answers `{"detail":"The 'x' model is not supported when using Codex with a
-/// ChatGPT account."}` and the OpenAI API answers
-/// `{"error":{"code":"model_not_found","message":"The model 'x' does not exist"}}`.
-/// Only a bounded prefix is inspected and nothing from it is retained.
+/// The provider refused the model itself, not the request. The ChatGPT Codex
+/// backend answers `{"detail":"The 'x' model is not supported when using Codex
+/// with a ChatGPT account."}` and the OpenAI API answers
+/// `{"error":{"code":"model_not_found","message":"The model `x` does not exist"}}`.
+/// A bare "model" next to "not supported" is deliberately NOT enough: an
+/// unsupported reasoning effort reads "'xhigh' is not supported with the
+/// gpt-5.4-mini model" and must stay a plain rejection. Only a bounded prefix
+/// is inspected and nothing from it is retained.
 fn unsupported_model_marker(body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(&body[..body.len().min(4_096)]).to_ascii_lowercase();
     if text.contains("model_not_found") {
         return true;
     }
-    text.contains("model")
-        && [
-            "not supported",
-            "unsupported",
-            "does not exist",
-            "not found",
-            "invalid model",
-            "not available",
-        ]
+    if text.contains("' model is not supported") || text.contains("' model is not available") {
+        return true;
+    }
+    if text.contains("does not exist")
+        && ["model `", "model '", "model \""]
+            .iter()
+            .any(|marker| text.contains(marker))
+    {
+        return true;
+    }
+    ["unknown model", "invalid model", "model not found"]
         .iter()
         .any(|marker| text.contains(marker))
 }
@@ -1294,6 +1299,22 @@ mod tests {
         assert_eq!(
             classify_response(StatusCode::NOT_FOUND, b"Not Found"),
             ResponseDisposition::Terminal(HttpFailureKind::RequestRejected)
+        );
+        // An unsupported reasoning effort names the model too; it is not a
+        // model rejection.
+        assert_eq!(
+            classify_response(
+                StatusCode::BAD_REQUEST,
+                br#"{"error":{"message":"Unsupported value: 'xhigh' is not supported with the gpt-5.4-mini model.","type":"invalid_request_error","param":"reasoning.effort"}}"#,
+            ),
+            ResponseDisposition::Terminal(HttpFailureKind::RequestRejected)
+        );
+        assert_eq!(
+            classify_response(
+                StatusCode::NOT_FOUND,
+                br#"{"error":{"message":"The model `gpt-9` does not exist or you do not have access to it.","type":"invalid_request_error"}}"#,
+            ),
+            ResponseDisposition::Terminal(HttpFailureKind::ModelUnsupported)
         );
         assert_eq!(
             http_category(HttpFailureKind::ModelUnsupported).as_str(),
