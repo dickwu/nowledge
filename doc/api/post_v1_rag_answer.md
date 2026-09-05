@@ -43,7 +43,7 @@ Schema: `RagAnswerResponse`
 | --- | --- | --- |
 | provider | string | LLM provider that generated the answer. |
 | model | string | Model that generated the answer — the request override when one was given, else the configured model. |
-| reasoning_effort | string? | Reasoning effort the call ran with (request override, else configured); absent when neither is set. |
+| reasoning_effort | string or null | Reasoning effort the call ran with (request override, else configured); `null` when neither is set. |
 | latency_ms | integer | Generation latency. |
 | backend | string | Store backend that served retrieval. |
 | grounded | boolean | True when the answer was grounded in retrieved citations. |

@@ -2446,13 +2446,20 @@ impl LlmProviderRegistry {
         // the primary allowlist and no analysis-side list exists, so an
         // override on the analysis profile is refused rather than silently
         // checked against the wrong list.
-        if matches!(profile, LlmProfile::Analysis)
-            && (request.model_override.is_some() || request.reasoning_effort_override.is_some())
-        {
-            return Err(ApiError::validation(
-                "model",
-                "overrides are only supported for the primary LLM profile",
-            ));
+        if matches!(profile, LlmProfile::Analysis) {
+            let offending = if request.model_override.is_some() {
+                Some("model")
+            } else if request.reasoning_effort_override.is_some() {
+                Some("reasoning_effort")
+            } else {
+                None
+            };
+            if let Some(field) = offending {
+                return Err(ApiError::validation(
+                    field,
+                    "overrides are only supported for the primary LLM profile",
+                ));
+            }
         }
         validate_llm_overrides(
             request.model_override.as_deref(),
