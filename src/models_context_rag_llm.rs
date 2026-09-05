@@ -256,6 +256,15 @@ pub struct RagAnswerRequest {
     pub owner_user_id: Option<String>,
     #[serde(default)]
     pub debug: bool,
+    /// Per-request primary LLM model (for example `gpt-5.4-mini`). Absent
+    /// means the configured `RAG_LLM_MODEL`; `RAG_LLM_MODEL_OVERRIDES`
+    /// restricts which values callers may ask for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Per-request reasoning effort (`low`, `medium`, `high` or `xhigh`).
+    /// Absent means the configured `RAG_LLM_REASONING_EFFORT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

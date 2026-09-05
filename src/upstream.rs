@@ -201,6 +201,9 @@ pub enum HttpFailureKind {
     Authentication,
     RateLimited,
     Quota,
+    /// The provider rejected the requested model itself (unknown, retired,
+    /// or not available to this account) rather than the request shape.
+    ModelUnsupported,
     RequestRejected,
     RequestTimeout,
     Server,
@@ -229,6 +232,7 @@ pub enum UpstreamFailureCategory {
     Authentication,
     RateLimited,
     Quota,
+    ModelUnsupported,
     RequestRejected,
     Server,
     Other,
@@ -250,6 +254,7 @@ impl UpstreamFailureCategory {
             Self::Authentication => "authentication",
             Self::RateLimited => "rate_limited",
             Self::Quota => "quota",
+            Self::ModelUnsupported => "model_unsupported",
             Self::RequestRejected => "request_rejected",
             Self::Server => "server",
             Self::Other => "other",
@@ -297,6 +302,9 @@ pub enum UpstreamError {
         status: u16,
         kind: HttpFailureKind,
         attempts: u8,
+        /// `Retry-After` from the final failed response, when the provider
+        /// sent one, so callers can surface "try again in N seconds".
+        retry_after_seconds: Option<u64>,
     },
 }
 
@@ -356,6 +364,7 @@ impl UpstreamError {
                 status,
                 kind,
                 attempts,
+                ..
             } => UpstreamDiagnostic {
                 operation,
                 category: http_category(kind),
@@ -401,6 +410,7 @@ fn http_category(kind: HttpFailureKind) -> UpstreamFailureCategory {
         HttpFailureKind::Authentication => UpstreamFailureCategory::Authentication,
         HttpFailureKind::RateLimited => UpstreamFailureCategory::RateLimited,
         HttpFailureKind::Quota => UpstreamFailureCategory::Quota,
+        HttpFailureKind::ModelUnsupported => UpstreamFailureCategory::ModelUnsupported,
         HttpFailureKind::RequestRejected => UpstreamFailureCategory::RequestRejected,
         HttpFailureKind::RequestTimeout => UpstreamFailureCategory::Timeout,
         HttpFailureKind::Server => UpstreamFailureCategory::Server,
@@ -582,6 +592,7 @@ impl UpstreamHttpClient {
                         status: status.as_u16(),
                         kind,
                         attempts: attempt,
+                        retry_after_seconds: retry_after.map(|delay| delay.as_secs()),
                     });
                 }
             }
@@ -735,6 +746,7 @@ impl UpstreamHttpClient {
                         status: status.as_u16(),
                         kind,
                         attempts: attempt,
+                        retry_after_seconds: retry_after.map(|delay| delay.as_secs()),
                     });
                 }
             }
@@ -1020,11 +1032,42 @@ pub fn classify_response(status: StatusCode, body: &[u8]) -> ResponseDisposition
         | StatusCode::BAD_GATEWAY
         | StatusCode::SERVICE_UNAVAILABLE
         | StatusCode::GATEWAY_TIMEOUT => ResponseDisposition::Retryable(HttpFailureKind::Server),
+        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND if unsupported_model_marker(body) => {
+            ResponseDisposition::Terminal(HttpFailureKind::ModelUnsupported)
+        }
         status if status.is_client_error() => {
             ResponseDisposition::Terminal(HttpFailureKind::RequestRejected)
         }
         _ => ResponseDisposition::Terminal(HttpFailureKind::Other),
     }
+}
+
+/// The provider refused the model itself, not the request. The ChatGPT Codex
+/// backend answers `{"detail":"The 'x' model is not supported when using Codex
+/// with a ChatGPT account."}` and the OpenAI API answers
+/// `{"error":{"code":"model_not_found","message":"The model `x` does not exist"}}`.
+/// A bare "model" next to "not supported" is deliberately NOT enough: an
+/// unsupported reasoning effort reads "'xhigh' is not supported with the
+/// gpt-5.4-mini model" and must stay a plain rejection. Only a bounded prefix
+/// is inspected and nothing from it is retained.
+fn unsupported_model_marker(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(&body[..body.len().min(4_096)]).to_ascii_lowercase();
+    if text.contains("model_not_found") {
+        return true;
+    }
+    if text.contains("' model is not supported") || text.contains("' model is not available") {
+        return true;
+    }
+    if text.contains("does not exist")
+        && ["model `", "model '", "model \""]
+            .iter()
+            .any(|marker| text.contains(marker))
+    {
+        return true;
+    }
+    ["unknown model", "invalid model", "model not found"]
+        .iter()
+        .any(|marker| text.contains(marker))
 }
 
 fn structured_quota_exhaustion(body: &[u8]) -> bool {
@@ -1234,6 +1277,52 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_models_are_terminal_and_distinct_from_other_rejections() {
+        assert_eq!(
+            classify_response(
+                StatusCode::BAD_REQUEST,
+                br#"{"detail":"The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account."}"#,
+            ),
+            ResponseDisposition::Terminal(HttpFailureKind::ModelUnsupported)
+        );
+        assert_eq!(
+            classify_response(
+                StatusCode::NOT_FOUND,
+                br#"{"error":{"code":"model_not_found","message":"The model 'x' does not exist"}}"#,
+            ),
+            ResponseDisposition::Terminal(HttpFailureKind::ModelUnsupported)
+        );
+        assert_eq!(
+            classify_response(StatusCode::BAD_REQUEST, br#"{"detail":"invalid input"}"#),
+            ResponseDisposition::Terminal(HttpFailureKind::RequestRejected)
+        );
+        assert_eq!(
+            classify_response(StatusCode::NOT_FOUND, b"Not Found"),
+            ResponseDisposition::Terminal(HttpFailureKind::RequestRejected)
+        );
+        // An unsupported reasoning effort names the model too; it is not a
+        // model rejection.
+        assert_eq!(
+            classify_response(
+                StatusCode::BAD_REQUEST,
+                br#"{"error":{"message":"Unsupported value: 'xhigh' is not supported with the gpt-5.4-mini model.","type":"invalid_request_error","param":"reasoning.effort"}}"#,
+            ),
+            ResponseDisposition::Terminal(HttpFailureKind::RequestRejected)
+        );
+        assert_eq!(
+            classify_response(
+                StatusCode::NOT_FOUND,
+                br#"{"error":{"message":"The model `gpt-9` does not exist or you do not have access to it.","type":"invalid_request_error"}}"#,
+            ),
+            ResponseDisposition::Terminal(HttpFailureKind::ModelUnsupported)
+        );
+        assert_eq!(
+            http_category(HttpFailureKind::ModelUnsupported).as_str(),
+            "model_unsupported"
+        );
+    }
+
+    #[test]
     fn retry_delay_is_deterministic_capped_and_honors_retry_after() {
         let first = retry_delay(
             Duration::from_millis(100),
@@ -1270,6 +1359,7 @@ mod tests {
             status: 429,
             kind: HttpFailureKind::Quota,
             attempts: 1,
+            retry_after_seconds: Some(30),
         };
         let rendered = error.to_string();
         assert_eq!(
@@ -1379,6 +1469,7 @@ mod tests {
                     },
                     kind: expected_kind,
                     attempts: 1,
+                    retry_after_seconds: None,
                 }
             );
             assert_eq!(requests.lock().await.len(), 1);
@@ -1976,6 +2067,7 @@ mod tests {
                 status: 429,
                 kind: HttpFailureKind::Quota,
                 attempts: 1,
+                retry_after_seconds: None,
             }
         );
         assert_eq!(quota_requests.lock().await.len(), 1);

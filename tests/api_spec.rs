@@ -3760,3 +3760,190 @@ async fn document_level_vector_evidence_supports_fragments() {
     );
     assert!(breakdown["combined"].as_f64().unwrap() > 0.0, "{search}");
 }
+
+#[tokio::test]
+async fn rag_answer_honors_model_and_reasoning_effort_overrides() {
+    let app = mock_llm_app();
+    let (status, event) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/history/users/u1/events",
+        event_body(
+            "u1",
+            "override-note",
+            "override-grounding-keyword from context",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{event}");
+
+    // Defaults: the configured model, no effort configured.
+    let (status, answer) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/rag/answer",
+        json!({
+            "owner_user_id": "u1",
+            "question": "What does override-grounding-keyword say?"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["usage"]["model"], "mock-model");
+    assert!(answer["usage"]["reasoning_effort"].is_null(), "{answer}");
+
+    // Overrides ride the request and are reported back in usage.
+    let (status, answer) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/rag/answer",
+        json!({
+            "owner_user_id": "u1",
+            "question": "What does override-grounding-keyword say?",
+            "model": "mock-override",
+            "reasoning_effort": "low"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["usage"]["model"], "mock-override");
+    assert_eq!(answer["usage"]["reasoning_effort"], "low");
+    assert!(answer["answer"].as_str().unwrap().contains("mock summary"));
+
+    // Malformed values are rejected before any provider budget is spent.
+    let (status, rejected) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/rag/answer",
+        json!({
+            "owner_user_id": "u1",
+            "question": "What does override-grounding-keyword say?",
+            "model": "gpt 5"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "validation_error");
+    assert_eq!(rejected["error"]["details"]["field"], "model");
+
+    let (status, rejected) = call(
+        app,
+        Method::POST,
+        "/v1/rag/answer",
+        json!({
+            "owner_user_id": "u1",
+            "question": "What does override-grounding-keyword say?",
+            "reasoning_effort": "ultra"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "validation_error");
+    assert_eq!(rejected["error"]["details"]["field"], "reasoning_effort");
+}
+
+#[tokio::test]
+async fn rag_answer_model_override_respects_the_configured_allowlist() {
+    let mut config = Config::test();
+    config.llm_provider = "mock".to_string();
+    config.llm_model = Some("mock-model".to_string());
+    config.llm_model_overrides = vec!["mock-model".to_string(), "mock-mini".to_string()];
+    let app = build_router(AppState::new(Arc::new(config)));
+
+    let (status, allowed) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/rag/answer",
+        json!({
+            "owner_user_id": "u1",
+            "question": "anything",
+            "model": "mock-mini"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{allowed}");
+    assert_eq!(allowed["usage"]["model"], "mock-mini");
+
+    let (status, rejected) = call(
+        app,
+        Method::POST,
+        "/v1/rag/answer",
+        json!({
+            "owner_user_id": "u1",
+            "question": "anything",
+            "model": "gpt-4o"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "validation_error");
+    assert_eq!(rejected["error"]["details"]["field"], "model");
+}
+
+#[tokio::test]
+async fn healthz_reports_codex_oauth_token_expiry() {
+    // A structurally valid JWT whose payload carries `exp` one hour ahead.
+    fn base64url(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let mut buffer = [0u8; 3];
+            buffer[..chunk.len()].copy_from_slice(chunk);
+            let value =
+                (u32::from(buffer[0]) << 16) | (u32::from(buffer[1]) << 8) | u32::from(buffer[2]);
+            for index in 0..chunk.len() + 1 {
+                let shift = 18 - 6 * index;
+                out.push(ALPHABET[((value >> shift) & 0x3f) as usize] as char);
+            }
+        }
+        out
+    }
+    let exp = chrono::Utc::now().timestamp() + 3_600;
+    let token = format!(
+        "{}.{}.signature",
+        base64url(br#"{"alg":"RS256","typ":"JWT"}"#),
+        base64url(format!(r#"{{"exp":{exp},"sub":"user"}}"#).as_bytes())
+    );
+    let auth_path = std::env::temp_dir().join(format!(
+        "nowledge-healthz-expiry-{}.json",
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::write(
+        &auth_path,
+        json!({ "tokens": { "access_token": token, "account_id": "acct" } }).to_string(),
+    )
+    .unwrap();
+
+    let mut config = Config::test();
+    config.llm_provider = "codex_auth".to_string();
+    config.llm_model = Some("gpt-5.5".to_string());
+    config.analysis_llm_provider = "codex_auth".to_string();
+    config.analysis_llm_model = Some("gpt-5.5".to_string());
+    config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
+    // No live probe: expiry is read from the credential itself.
+    config.health_llm_enabled = false;
+    config.auth_users = vec![AuthUserConfig {
+        token: "admin-token".to_string(),
+        scope: AuthUserScope::Admin,
+        roles: vec!["admin".to_string()],
+    }];
+    config.refresh_configured_secret_values();
+    let app = build_router(AppState::new(Arc::new(config)));
+
+    let (_, body) = call_with_token(
+        app,
+        Method::GET,
+        "/healthz",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
+    std::fs::remove_file(&auth_path).ok();
+    assert_eq!(body["llm"]["auth_token_kind"], "codex_oauth", "{body}");
+    assert!(body["llm"]["auth_expires_at"].is_string(), "{body}");
+    let expires_in = body["llm"]["auth_expires_in_seconds"]
+        .as_i64()
+        .expect("expiry countdown");
+    assert!((3_500..=3_600).contains(&expires_in), "{expires_in}");
+}

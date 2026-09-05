@@ -34,6 +34,8 @@ Schema: `RagAnswerRequest`
 | `session_id` | string | optional | Session to associate with the answer. |
 | `owner_user_id` | string | optional, auth default may apply | Owner scope. |
 | `debug` | boolean | optional, default `false` | Request debug data from retrieval. |
+| `model` | string | optional | Per-call model override; same rules and `RAG_LLM_MODEL_OVERRIDES` allowlist as `/v1/rag/answer`. The `meta` event reports the model that runs. |
+| `reasoning_effort` | string | optional | Per-call `low` / `medium` / `high` / `xhigh` override. |
 
 ## SSE Response
 

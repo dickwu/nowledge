@@ -49,7 +49,8 @@ impl RagStreamService {
                 &answer.citations,
                 &security.secrets,
                 state.config.llm_max_output_tokens,
-            );
+            )
+            .with_llm_overrides(req.model.clone(), req.reasoning_effort.clone());
             Some(
                 state
                     .llm_providers
@@ -67,6 +68,13 @@ impl RagStreamService {
             .as_ref()
             .map(|stream| stream.model.clone())
             .unwrap_or(status.model);
+        // Same rule as the non-streaming path: the request override wins,
+        // else the configured effort; nothing when no LLM runs at all.
+        let reasoning_effort = provider_stream.as_ref().and_then(|_| {
+            req.reasoning_effort
+                .clone()
+                .or_else(|| state.config.llm_reasoning_effort.clone())
+        });
 
         let mut pending = VecDeque::new();
         pending.push_back(RagStreamEvent::new(
@@ -77,6 +85,7 @@ impl RagStreamService {
                     "trace_id": answer.trace_id,
                     "provider": provider,
                     "model": model,
+                    "reasoning_effort": reasoning_effort,
                     "backend": backend,
                     "grounded": grounded
                 }),
@@ -102,6 +111,7 @@ impl RagStreamService {
             trace_id: answer.trace_id,
             provider,
             model,
+            reasoning_effort,
             backend,
             grounded,
             completed: false,
@@ -122,15 +132,7 @@ impl RagStreamService {
                     .pending
                     .push_back(RagStreamEvent::new("delta", json!({ "text": tail })));
             }
-            let usage = stream_usage(
-                answer.usage,
-                &session.provider,
-                &session.model,
-                &session.backend,
-                session.grounded,
-                None,
-                None,
-            );
+            let usage = session.stream_usage(answer.usage, None, None);
             session.pending.push_back(RagStreamEvent::new(
                 "usage",
                 redact_secrets(&usage, &session.known_secrets),
@@ -174,6 +176,7 @@ pub(crate) struct RagStreamSession {
     trace_id: String,
     provider: String,
     model: String,
+    reasoning_effort: Option<String>,
     backend: String,
     grounded: bool,
     completed: bool,
@@ -210,15 +213,7 @@ impl RagStreamSession {
                         self.pending
                             .push_back(RagStreamEvent::new("delta", json!({ "text": tail })));
                     }
-                    let usage = stream_usage(
-                        json!({}),
-                        &self.provider,
-                        &self.model,
-                        &self.backend,
-                        self.grounded,
-                        Some(latency_ms),
-                        usage.as_ref(),
-                    );
+                    let usage = self.stream_usage(json!({}), Some(latency_ms), usage.as_ref());
                     self.pending.push_back(RagStreamEvent::new(
                         "usage",
                         redact_secrets(&usage, &self.known_secrets),
@@ -265,27 +260,30 @@ impl RagStreamSession {
     }
 }
 
-fn stream_usage(
-    mut usage: Value,
-    provider: &str,
-    model: &str,
-    backend: &str,
-    grounded: bool,
-    latency_ms: Option<u64>,
-    tokens: Option<&LlmTokenUsage>,
-) -> Value {
-    if !usage.is_object() {
-        usage = json!({});
+impl RagStreamSession {
+    /// The `usage` event body: the session's provider shape (provider, model,
+    /// effort, backend, grounding) stamped over whatever the store or the
+    /// provider already reported.
+    fn stream_usage(
+        &self,
+        mut usage: Value,
+        latency_ms: Option<u64>,
+        tokens: Option<&LlmTokenUsage>,
+    ) -> Value {
+        if !usage.is_object() {
+            usage = json!({});
+        }
+        usage["provider"] = json!(self.provider);
+        usage["model"] = json!(self.model);
+        usage["reasoning_effort"] = json!(self.reasoning_effort);
+        usage["backend"] = json!(self.backend);
+        usage["grounded"] = json!(self.grounded);
+        if let Some(latency_ms) = latency_ms {
+            usage["latency_ms"] = json!(latency_ms);
+        }
+        if let Some(tokens) = tokens {
+            merge_token_usage(&mut usage, tokens);
+        }
+        usage
     }
-    usage["provider"] = json!(provider);
-    usage["model"] = json!(model);
-    usage["backend"] = json!(backend);
-    usage["grounded"] = json!(grounded);
-    if let Some(latency_ms) = latency_ms {
-        usage["latency_ms"] = json!(latency_ms);
-    }
-    if let Some(tokens) = tokens {
-        merge_token_usage(&mut usage, tokens);
-    }
-    usage
 }

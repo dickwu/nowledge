@@ -44,6 +44,67 @@ pub struct ErrorInfo {
     pub details: Option<Value>,
 }
 
+/// Why an LLM provider call failed, classified from the upstream status so
+/// callers can react — refresh credentials, wait for a usage window to reset,
+/// or pick another model — without ever seeing provider response bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmFailureKind {
+    AuthFailed,
+    RateLimited,
+    QuotaExhausted,
+    ModelUnsupported,
+    ServerError,
+    RequestFailed,
+}
+
+impl LlmFailureKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthFailed => "auth_failed",
+            Self::RateLimited => "rate_limited",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::ModelUnsupported => "model_unsupported",
+            Self::ServerError => "server_error",
+            Self::RequestFailed => "request_failed",
+        }
+    }
+
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::AuthFailed => "llm_auth_failed",
+            Self::RateLimited => "llm_rate_limited",
+            Self::QuotaExhausted => "llm_quota_exhausted",
+            Self::ModelUnsupported => "llm_model_unsupported",
+            Self::ServerError => "llm_server_error",
+            Self::RequestFailed => "llm_request_failed",
+        }
+    }
+
+    pub const fn public_message(self) -> &'static str {
+        match self {
+            Self::AuthFailed => "LLM provider rejected the configured credentials",
+            Self::RateLimited => "LLM provider usage limit reached",
+            Self::QuotaExhausted => "LLM provider quota is exhausted",
+            Self::ModelUnsupported => "LLM provider does not support the requested model",
+            Self::ServerError => "LLM provider is temporarily unavailable",
+            Self::RequestFailed => "LLM provider rejected the request",
+        }
+    }
+}
+
+/// A classified LLM provider failure. Everything here is derived from the
+/// upstream status line and our own request (provider label, model name); the
+/// provider body never reaches this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmUpstreamError {
+    pub kind: LlmFailureKind,
+    pub provider: String,
+    pub model: String,
+    pub upstream_status: Option<u16>,
+    pub retry_after_seconds: Option<u64>,
+    pub attempts: u8,
+}
+
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("{0}")]
@@ -66,6 +127,8 @@ pub enum ApiError {
     ServiceUnavailable(u64),
     #[error("request timed out")]
     Timeout,
+    #[error("{}", .0.kind.public_message())]
+    LlmUpstream(LlmUpstreamError),
     #[error("{0}")]
     Upstream(String),
     #[error("{0}")]
@@ -124,6 +187,7 @@ impl ApiError {
             Self::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, "too_many_requests"),
             Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
+            Self::LlmUpstream(error) => (StatusCode::BAD_GATEWAY, error.kind.code()),
             Self::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
@@ -141,6 +205,7 @@ impl ApiError {
             Self::TooManyRequests(_) => "too many requests",
             Self::ServiceUnavailable(_) => "service unavailable",
             Self::Timeout => "request timed out",
+            Self::LlmUpstream(error) => error.kind.public_message(),
             Self::Upstream(_) => "upstream service unavailable",
             Self::Internal(_) => "internal server error",
         }
@@ -156,6 +221,7 @@ impl ApiError {
     fn retry_after_seconds(&self) -> Option<u64> {
         match self {
             Self::TooManyRequests(seconds) | Self::ServiceUnavailable(seconds) => Some(*seconds),
+            Self::LlmUpstream(error) => error.retry_after_seconds,
             _ => None,
         }
     }
@@ -191,7 +257,49 @@ impl ApiError {
             }
             request_id
         });
+        // Classified provider failures carry no private cause, but they are
+        // still 502s an operator may need to trace, so they get the same
+        // correlation ID and a structured (body-free) log line.
+        let request_id = request_id.or_else(|| {
+            let Self::LlmUpstream(error) = self else {
+                return None;
+            };
+            let request_id = captured_request_id
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(crate::request_context::current_or_new_id);
+            tracing::warn!(
+                target: "nowledge::error",
+                %request_id,
+                error_kind = code,
+                llm_failure = error.kind.as_str(),
+                provider = %error.provider,
+                model = %error.model,
+                upstream_status = error.upstream_status,
+                attempts = error.attempts,
+                "llm provider request failed"
+            );
+            Some(request_id)
+        });
         let details = match (self, request_id) {
+            (Self::LlmUpstream(error), request_id) => {
+                let mut details = json!({
+                    "status": status.as_u16(),
+                    "kind": error.kind.as_str(),
+                    "provider": error.provider,
+                    "model": error.model,
+                    "attempts": error.attempts
+                });
+                if let Some(upstream_status) = error.upstream_status {
+                    details["upstream_status"] = json!(upstream_status);
+                }
+                if let Some(seconds) = error.retry_after_seconds {
+                    details["retry_after_seconds"] = json!(seconds);
+                }
+                if let Some(request_id) = request_id {
+                    details["request_id"] = json!(request_id);
+                }
+                details
+            }
             (Self::Validation { field, .. }, Some(request_id)) => json!({
                 "status": status.as_u16(),
                 "field": field,
@@ -319,6 +427,61 @@ mod tests {
         assert_eq!(body["error"]["code"], "validation_error");
         assert_eq!(body["error"]["details"]["status"], 400);
         assert_eq!(body["error"]["details"]["field"], "rows");
+    }
+
+    #[tokio::test]
+    async fn llm_upstream_errors_expose_the_classification_without_provider_material() {
+        let error = ApiError::LlmUpstream(super::LlmUpstreamError {
+            kind: super::LlmFailureKind::RateLimited,
+            provider: "codex_auth".to_string(),
+            model: "gpt-5.5".to_string(),
+            upstream_status: Some(429),
+            retry_after_seconds: Some(1800),
+            attempts: 2,
+        });
+        assert_eq!(error.to_string(), "LLM provider usage limit reached");
+
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1800")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "llm_rate_limited");
+        assert_eq!(body["error"]["message"], "LLM provider usage limit reached");
+        assert_eq!(body["error"]["details"]["status"], 502);
+        assert_eq!(body["error"]["details"]["kind"], "rate_limited");
+        assert_eq!(body["error"]["details"]["provider"], "codex_auth");
+        assert_eq!(body["error"]["details"]["model"], "gpt-5.5");
+        assert_eq!(body["error"]["details"]["upstream_status"], 429);
+        assert_eq!(body["error"]["details"]["retry_after_seconds"], 1800);
+        assert_eq!(body["error"]["details"]["attempts"], 2);
+        let request_id = body["error"]["details"]["request_id"]
+            .as_str()
+            .expect("classified provider failures carry a correlation ID");
+        assert!(uuid::Uuid::parse_str(request_id).is_ok(), "{request_id}");
+
+        let auth = ApiError::LlmUpstream(super::LlmUpstreamError {
+            kind: super::LlmFailureKind::AuthFailed,
+            provider: "codex_auth".to_string(),
+            model: "gpt-5.5".to_string(),
+            upstream_status: Some(401),
+            retry_after_seconds: None,
+            attempts: 1,
+        })
+        .into_response();
+        assert!(auth.headers().get(RETRY_AFTER).is_none());
+        let body = to_bytes(auth.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "llm_auth_failed");
+        assert!(body["error"]["details"]
+            .get("retry_after_seconds")
+            .is_none());
     }
 
     #[test]
