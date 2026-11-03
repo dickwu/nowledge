@@ -38,7 +38,9 @@ Ignored and excluded from AGENTS.md generation: `target/` (build output),
 - The crate is published as the public repo `dickwu/nowledge`. The deployed
   production-style service lives on the `gfit` host at `/server` with Nowledge
   on `127.0.0.1:14242` and Meili on `127.0.0.1:7700`; that boundary intentionally
-  excludes local deployment scripts and runtime artifacts.
+  excludes local deployment scripts and runtime artifacts. Production is the
+  Git checkout `/server/nowledge` run by `nowledge.service`; the deploy,
+  verification, and rollback procedure is `doc/runbooks/gfit-deploy.md`.
 - Default bind address is `127.0.0.1:14242`. Override with `RAG_HOST` / `RAG_PORT`.
 - Storage backend is `memory` by default. Set `RAG_STORE_BACKEND=meili` plus
   `RAG_MEILI_URL` to use Meilisearch. Production also requires distinct
@@ -58,7 +60,8 @@ Ignored and excluded from AGENTS.md generation: `target/` (build output),
   token redaction explicitly.
 
 ### Testing Requirements
-- Default verify gauntlet:
+- Default verify gauntlet (the single source of truth; `CLAUDE.md` points
+  here):
   ```sh
   cargo fmt --check
   cargo clippy --locked --all-targets -- -D warnings
@@ -67,14 +70,20 @@ Ignored and excluded from AGENTS.md generation: `target/` (build output),
   cargo test --locked
   cargo package --locked
   ```
-- Optional Meili integration tests are gated by `RAG_TEST_MEILI_URL`
-  (and `RAG_TEST_MEILI_API_KEY` when the server requires a key):
-  `cargo test --test meili_integration`.
+- Optional Meili integration tests (`tests/meili_integration.rs` and the Meili
+  case in `tests/insight_history.rs`) are gated by `RAG_TEST_MEILI_URL` (and
+  `RAG_TEST_MEILI_API_KEY` when the server requires a key):
+  `cargo test --test meili_integration`. Without the URL they skip and report
+  as passed. Set `RAG_TEST_REQUIRE_MEILI=1` to make a missing/unreachable
+  server or a missing key fail instead of skip; CI sets it.
 - Optional MinerU integration tests are gated by `RAG_TEST_MINERU_API_URL`:
   `cargo test --test mineru_integration`.
-- CI (`.github/workflows/ci.yml`) runs locked stable quality/package gates,
+- CI (`.github/workflows/ci.yml`) runs the full gauntlet above on stable,
+  runs the Meili-gated suites against a `getmeili/meilisearch` service
+  container pinned to the production version with `RAG_TEST_REQUIRE_MEILI=1`,
   checks Rust 1.88 compatibility, audits RustSec advisories, and applies the
   `cargo-deny` dependency policy on every push/PR and on a weekly schedule.
+  Details live in `.github/workflows/AGENTS.md`.
 
 ### Common Patterns
 - One axum `Router` built in `src/routes.rs::build_router`, shared `AppState`

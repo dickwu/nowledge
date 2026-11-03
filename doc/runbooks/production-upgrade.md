@@ -7,8 +7,8 @@ installed. Keep migration artifacts and backups private (`0700` directory,
 
 ## 1. Release and backup gate
 
-1. Require the target commit's GitHub quality, MSRV, RustSec, and dependency
-   policy checks to be green. Re-run the locked local verification gauntlet.
+1. Require the target commit's GitHub quality, Meilisearch integration, MSRV,
+   RustSec, and dependency policy checks to be green. Re-run the locked local verification gauntlet.
 2. Build in an isolated, clean checkout with
    `NOWLEDGE_GIT_REVISION=<full-target-sha>` and retain the previous binary.
    The build script treats that value as an assertion against Git `HEAD`; it

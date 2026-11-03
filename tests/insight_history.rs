@@ -1,8 +1,4 @@
-use std::{
-    net::{TcpStream, ToSocketAddrs},
-    sync::Arc,
-    time::Duration,
-};
+use std::sync::Arc;
 
 use axum::{
     body::{to_bytes, Body},
@@ -18,6 +14,9 @@ use nowledge::{
 };
 use serde_json::{json, Value};
 use tower::ServiceExt;
+
+#[path = "support/meili_gate.rs"]
+mod meili_gate;
 
 const OWNER_U1_TOKEN: &str = "owner-u1-token";
 const OWNER_U2_TOKEN: &str = "owner-u2-token";
@@ -112,26 +111,6 @@ async fn create_and_patch_insight(app: &Router) -> (String, String, String) {
     let patch_event_id = patched["history_event_id"].as_str().unwrap().to_string();
 
     (insight_id, upsert_event_id, patch_event_id)
-}
-
-fn meili_available(url: &str) -> bool {
-    let authority = url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    let address = if authority.contains(':') {
-        authority.to_string()
-    } else {
-        format!("{authority}:7700")
-    };
-    let Ok(addrs) = address.to_socket_addrs() else {
-        return false;
-    };
-    addrs
-        .into_iter()
-        .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok())
 }
 
 async fn delete_meili_index(config: &Config, admin: &MeiliAdmin, index_uid: &str) {
@@ -358,36 +337,17 @@ async fn insight_history_never_resolves_an_insight_from_another_tenant() {
 
 #[tokio::test]
 async fn insight_history_survives_a_meili_backed_restart() {
-    let Ok(meili_url) = std::env::var("RAG_TEST_MEILI_URL") else {
-        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+    // Skips without RAG_TEST_MEILI_URL; panics instead when
+    // RAG_TEST_REQUIRE_MEILI is set (CI) so the test cannot pass vacuously.
+    let Some(target) = meili_gate::meili_target().await else {
         return;
     };
-    if !meili_available(&meili_url) {
-        eprintln!("skipping Meilisearch integration test; {meili_url} is not reachable");
-        return;
-    }
-    let meili_api_key = std::env::var("RAG_TEST_MEILI_API_KEY").ok();
-    if meili_api_key.is_none() {
-        let indexes = reqwest::Client::new()
-            .get(format!("{}/indexes", meili_url.trim_end_matches('/')))
-            .send()
-            .await;
-        if indexes
-            .as_ref()
-            .is_ok_and(|response| response.status() == StatusCode::UNAUTHORIZED)
-        {
-            eprintln!(
-                "skipping Meilisearch integration test; server requires RAG_TEST_MEILI_API_KEY"
-            );
-            return;
-        }
-    }
 
     let mut config = authenticated_config();
     config.tenant_id = format!("insight-history-test-{}", uuid::Uuid::now_v7());
     config.store_backend = "meili".to_string();
-    config.meili_url = Some(meili_url);
-    config.meili_api_key = meili_api_key;
+    config.meili_url = Some(target.url);
+    config.meili_api_key = target.api_key;
     config.meili_wait_for_tasks = true;
     config.request_timeout_ms = 180_000;
 
