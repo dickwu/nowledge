@@ -624,10 +624,14 @@ pub struct RateLimitSnapshot {
     /// Which limit bucket is currently governing (`x-codex-active-limit`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_limit: Option<String>,
-    /// Codex short-window budget (5h rolling window).
+    /// First Codex usage window (`x-codex-primary-*`). Its length is whatever
+    /// Codex reports in `window_minutes`; do not assume a fixed duration.
+    /// Absent when Codex sends no active primary window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary: Option<RateLimitWindow>,
-    /// Codex long-window budget (weekly rolling window).
+    /// Second Codex usage window (`x-codex-secondary-*`), described the same
+    /// way as `primary`. Absent when Codex sends none or only an inactive
+    /// zero-length placeholder.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary: Option<RateLimitWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -655,12 +659,18 @@ impl RateLimitSnapshot {
 /// One rolling rate-limit window as reported by the Codex backend.
 /// `remaining_percent` is derived (`100 - used_percent`, clamped) so status
 /// consumers can render "left available usage" without recomputing.
+/// The window length comes from Codex itself (`window_minutes`), and
+/// `window_label` is a compact human form of it (`5h`, `7d`, `90m`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RateLimitWindow {
     pub used_percent: f64,
     pub remaining_percent: f64,
+    /// Window length in minutes from `x-codex-*-window-minutes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_minutes: Option<u64>,
+    /// Human label derived from `window_minutes`, e.g. `5h` or `7d`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resets_in_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3399,14 +3409,35 @@ fn rate_limits_from_headers(headers: &HeaderMap) -> RateLimitSnapshot {
 
 fn codex_window_from_headers(headers: &HeaderMap, prefix: &str) -> Option<RateLimitWindow> {
     let used_percent = header_f64(headers, &format!("{prefix}-used-percent"))?;
+    let window_minutes = match header_u64(headers, &format!("{prefix}-window-minutes")) {
+        // Codex keeps sending a zero-length, zero-usage window for a limit it
+        // no longer enforces; report that window as absent.
+        Some(0) if used_percent <= 0.0 => return None,
+        Some(0) => None,
+        minutes => minutes,
+    };
     Some(RateLimitWindow {
         used_percent,
         remaining_percent: (100.0 - used_percent).clamp(0.0, 100.0),
-        window_minutes: header_u64(headers, &format!("{prefix}-window-minutes")),
+        window_minutes,
+        window_label: window_minutes.map(rate_limit_window_label),
         resets_in_seconds: header_u64(headers, &format!("{prefix}-reset-after-seconds")),
         resets_at: header_u64(headers, &format!("{prefix}-reset-at"))
             .and_then(|ts| DateTime::<Utc>::from_timestamp(ts as i64, 0)),
     })
+}
+
+/// Compact human label for a window length reported in minutes, using the
+/// largest whole unit: `10080 -> "7d"`, `300 -> "5h"`, `90 -> "90m"`.
+fn rate_limit_window_label(minutes: u64) -> String {
+    const DAY: u64 = 24 * 60;
+    if minutes >= DAY && minutes.is_multiple_of(DAY) {
+        format!("{}d", minutes / DAY)
+    } else if minutes >= 60 && minutes.is_multiple_of(60) {
+        format!("{}h", minutes / 60)
+    } else {
+        format!("{minutes}m")
+    }
 }
 
 fn codex_credits_from_headers(headers: &HeaderMap) -> Option<CodexCredits> {
@@ -3452,8 +3483,9 @@ fn codex_named_limits_from_headers(headers: &HeaderMap) -> Vec<NamedRateLimit> {
         .collect()
 }
 
-/// Worst-case state across the plain Codex windows; `None` means the snapshot
-/// carries no window data (OpenAI-key style or mock providers).
+/// Worst-case state across whichever plain Codex windows are present (either
+/// may be missing); `None` means the snapshot carries no window data
+/// (OpenAI-key style or mock providers).
 fn codex_rate_limit_state(snapshot: &RateLimitSnapshot) -> Option<&'static str> {
     let mut worst = None;
     for window in [snapshot.primary.as_ref(), snapshot.secondary.as_ref()]
@@ -5470,6 +5502,7 @@ mod tests {
         assert_eq!(primary.used_percent, 0.0);
         assert_eq!(primary.remaining_percent, 100.0);
         assert_eq!(primary.window_minutes, Some(300));
+        assert_eq!(primary.window_label.as_deref(), Some("5h"));
         assert_eq!(primary.resets_in_seconds, Some(18000));
         assert!(primary.resets_at.is_some());
 
@@ -5477,6 +5510,7 @@ mod tests {
         assert_eq!(secondary.used_percent, 55.0);
         assert_eq!(secondary.remaining_percent, 45.0);
         assert_eq!(secondary.window_minutes, Some(10080));
+        assert_eq!(secondary.window_label.as_deref(), Some("7d"));
 
         assert_eq!(snapshot.plan_type.as_deref(), Some("prolite"));
         assert_eq!(snapshot.active_limit.as_deref(), Some("premium"));
@@ -5497,6 +5531,112 @@ mod tests {
             Some(96.0)
         );
         assert!(snapshot.has_data());
+    }
+
+    /// Header shape Codex returned in production on 2026-11-03: the only
+    /// enforced window is the 7-day one in the `primary` slot, and the
+    /// `secondary` slot is a zero-length, zero-usage placeholder.
+    fn codex_weekly_only_headers(primary_used: &'static str) -> HeaderMap {
+        use reqwest::header::HeaderValue;
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-codex-primary-used-percent", primary_used),
+            ("x-codex-primary-window-minutes", "10080"),
+            ("x-codex-primary-reset-after-seconds", "92857"),
+            ("x-codex-primary-reset-at", "1793827449"),
+            ("x-codex-secondary-used-percent", "0"),
+            ("x-codex-secondary-window-minutes", "0"),
+            ("x-codex-secondary-reset-after-seconds", "0"),
+            ("x-codex-plan-type", "prolite"),
+            ("x-codex-active-limit", "premium"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[test]
+    fn codex_windows_are_described_by_reported_duration() {
+        let snapshot = rate_limits_from_headers(&codex_weekly_only_headers("73"));
+
+        let primary = snapshot.primary.as_ref().expect("primary window");
+        assert_eq!(primary.used_percent, 73.0);
+        assert_eq!(primary.remaining_percent, 27.0);
+        assert_eq!(primary.window_minutes, Some(10080));
+        assert_eq!(primary.window_label.as_deref(), Some("7d"));
+        assert_eq!(primary.resets_in_seconds, Some(92857));
+        assert!(
+            snapshot.secondary.is_none(),
+            "zero-length placeholder window must be reported as absent"
+        );
+        assert_eq!(codex_rate_limit_state(&snapshot), None);
+
+        let json = serde_json::to_value(&snapshot).expect("serialize");
+        assert_eq!(json["primary"]["window_minutes"], 10080);
+        assert_eq!(json["primary"]["window_label"], "7d");
+        assert!(json.get("secondary").is_none());
+
+        let near = rate_limits_from_headers(&codex_weekly_only_headers("95"));
+        assert_eq!(codex_rate_limit_state(&near), Some("near_limit"));
+        let limited = rate_limits_from_headers(&codex_weekly_only_headers("100"));
+        assert_eq!(codex_rate_limit_state(&limited), Some("limited"));
+    }
+
+    #[test]
+    fn codex_window_without_duration_or_with_used_zero_length_is_kept() {
+        use reqwest::header::HeaderValue;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-codex-secondary-used-percent",
+            HeaderValue::from_static("91"),
+        );
+        headers.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("12"),
+        );
+        headers.insert(
+            "x-codex-primary-window-minutes",
+            HeaderValue::from_static("0"),
+        );
+        let snapshot = rate_limits_from_headers(&headers);
+
+        let primary = snapshot.primary.as_ref().expect("used window is kept");
+        assert_eq!(primary.window_minutes, None);
+        assert_eq!(primary.window_label, None);
+        let secondary = snapshot.secondary.as_ref().expect("secondary window");
+        assert_eq!(secondary.window_minutes, None);
+        assert_eq!(secondary.window_label, None);
+        assert_eq!(codex_rate_limit_state(&snapshot), Some("near_limit"));
+
+        let mut only_secondary = HeaderMap::new();
+        only_secondary.insert(
+            "x-codex-secondary-used-percent",
+            HeaderValue::from_static("40"),
+        );
+        only_secondary.insert(
+            "x-codex-secondary-window-minutes",
+            HeaderValue::from_static("43200"),
+        );
+        let snapshot = rate_limits_from_headers(&only_secondary);
+        assert!(snapshot.primary.is_none());
+        assert_eq!(
+            snapshot
+                .secondary
+                .as_ref()
+                .and_then(|window| window.window_label.as_deref()),
+            Some("30d")
+        );
+        assert_eq!(codex_rate_limit_state(&snapshot), None);
+    }
+
+    #[test]
+    fn rate_limit_window_labels_use_largest_whole_unit() {
+        assert_eq!(rate_limit_window_label(300), "5h");
+        assert_eq!(rate_limit_window_label(10080), "7d");
+        assert_eq!(rate_limit_window_label(1440), "1d");
+        assert_eq!(rate_limit_window_label(90), "90m");
+        assert_eq!(rate_limit_window_label(45), "45m");
+        assert_eq!(rate_limit_window_label(2160), "36h");
     }
 
     #[test]
