@@ -438,7 +438,122 @@ impl Store {
     }
 }
 
+const ROWS_CURSOR_PREFIX: &str = "rows1.";
+const ROWS_CURSOR_MAX_BYTES: usize = 4_096;
+
+/// Optional keyset page over a snapshot's rows. Pages are ordered by the
+/// logical row `id` ascending, so they are stable regardless of whether the
+/// rows came from the in-process cache (insertion order) or a Meilisearch
+/// scan, and concurrent appends never shift already-returned rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowsPageRequest {
+    pub(crate) limit: usize,
+    pub(crate) after_row_id: Option<String>,
+}
+
+pub(crate) fn encode_rows_cursor(row_id: &str) -> String {
+    format!("{ROWS_CURSOR_PREFIX}{}", hex::encode(row_id))
+}
+
+/// The cursor is an opaque, unsigned encoding of the last returned row id.
+/// It only narrows rows inside a snapshot the caller is already authorized
+/// for, so tampering cannot widen access.
+pub(crate) fn decode_rows_cursor(cursor: &str) -> Result<String, ApiError> {
+    let invalid = || ApiError::validation("cursor", "is invalid");
+    if cursor.len() > ROWS_CURSOR_MAX_BYTES {
+        return Err(invalid());
+    }
+    let payload = cursor
+        .strip_prefix(ROWS_CURSOR_PREFIX)
+        .ok_or_else(invalid)?;
+    let decoded = hex::decode(payload).map_err(|_| invalid())?;
+    let row_id = String::from_utf8(decoded).map_err(|_| invalid())?;
+    if row_id.is_empty() {
+        return Err(invalid());
+    }
+    Ok(row_id)
+}
+
+fn row_sort_id(row: &Value) -> &str {
+    row.get("id").and_then(Value::as_str).unwrap_or_default()
+}
+
+/// Select one keyset page from `rows` and build the response body. Only the
+/// selected rows are cloned.
+fn rows_page_response(snapshot_id: &str, rows: &[Value], page: &RowsPageRequest) -> Value {
+    let mut candidates = rows
+        .iter()
+        .filter(|row| {
+            page.after_row_id
+                .as_deref()
+                .is_none_or(|after| row_sort_id(row) > after)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| row_sort_id(left).cmp(row_sort_id(right)));
+    let has_more = candidates.len() > page.limit;
+    candidates.truncate(page.limit);
+    let next_cursor = has_more
+        .then(|| {
+            candidates
+                .last()
+                .map(|row| encode_rows_cursor(row_sort_id(row)))
+        })
+        .flatten();
+    json!({
+        "snapshot_id": snapshot_id,
+        "rows": candidates.into_iter().cloned().collect::<Vec<_>>(),
+        "next_cursor": next_cursor,
+    })
+}
+
 impl Store {
+    /// Read rows for a snapshot, optionally as one keyset page.
+    ///
+    /// When the rows are already resident (they were written or applied in
+    /// this process) the cached vector is used, preserving read-your-writes.
+    /// Otherwise the rows are read through the repository for this request
+    /// only and are *not* inserted into `rows_by_snapshot`: a read-only list
+    /// must not grow resident memory. Write and apply paths still load the
+    /// cache because row idempotency and deterministic stats depend on it.
+    pub(crate) async fn list_rows_page_async(
+        &self,
+        tenant_id: &str,
+        snapshot_id: &str,
+        page: Option<RowsPageRequest>,
+    ) -> Result<Value, ApiError> {
+        self.get_snapshot_async(tenant_id, snapshot_id).await?;
+        {
+            let data = self.read()?;
+            if let Some(rows) = data.rows_by_snapshot.get(snapshot_id) {
+                self.metrics.record_cache_access("structured_rows", "hit");
+                return Ok(match page.as_ref() {
+                    Some(page) => rows_page_response(snapshot_id, rows, page),
+                    None => json!({ "snapshot_id": snapshot_id, "rows": rows }),
+                });
+            }
+        }
+        self.metrics.record_cache_access("structured_rows", "miss");
+        let rows = match self.repository.list_rows(tenant_id, snapshot_id).await {
+            Ok(rows) => rows.unwrap_or_default(),
+            Err(error) => {
+                self.metrics
+                    .record_read_through("structured_rows", "failure", 1);
+                return Err(error);
+            }
+        };
+        if rows.is_empty() {
+            self.metrics
+                .record_read_through("structured_rows", "not_found", 1);
+        } else {
+            self.metrics
+                .record_read_through("structured_rows", "loaded", rows.len());
+        }
+        Ok(match page.as_ref() {
+            Some(page) => rows_page_response(snapshot_id, &rows, page),
+            None => json!({ "snapshot_id": snapshot_id, "rows": rows }),
+        })
+    }
+
     pub async fn create_snapshot_async(
         &self,
         tenant_id: &str,
