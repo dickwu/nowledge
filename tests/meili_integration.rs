@@ -2728,6 +2728,11 @@ async fn meili_restart_restores_insights_structured_rows_summaries_and_trace_acl
         )
         .await;
 
+    // Retrieval traces are persisted by a background writer. Stop the first
+    // process gracefully, as a real restart would, so its queued trace is
+    // flushed to Meilisearch before the fresh process reads it through.
+    state.shutdown().await;
+
     // Use the fallible startup path after fixture creation so teardown still
     // runs if hydration itself is the regression under test.
     let fresh_start_result = try_start_meili_app(&config).await;
@@ -2963,13 +2968,23 @@ async fn meili_restart_restores_insights_structured_rows_summaries_and_trace_acl
         "datasets",
         "structured_snapshots",
         "structured_summaries",
-        "traces",
     ] {
         assert!(
             hydration[hydrated_domain].as_u64().unwrap_or_default() >= 1,
             "hydration did not report {hydrated_domain}: {hydration}"
         );
     }
+    // Retrieval traces are diagnostic records: startup deliberately does not
+    // load them. The reveal and debug-trace reads below prove the persisted
+    // trace (and its owner ACL) is read through by id after the restart.
+    assert_eq!(
+        hydration["domains"]["traces"]["strategy"], "read_through",
+        "{hydration}"
+    );
+    assert_eq!(
+        hydration["domains"]["traces"]["mandatory"], false,
+        "{hydration}"
+    );
     assert_eq!(hydration["status"], "complete", "{hydration}");
     assert_eq!(hydration["ready"], true, "{hydration}");
 
