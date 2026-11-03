@@ -159,9 +159,17 @@ and been verified. The compatibility path expires on 2026-10-01 / v0.13.0.
 values are startup errors and never enable unauthenticated access by default.
 
 `RAG_WRITE_CONSISTENCY` accepts only `eventual`, `read_your_writes`, or
-`wait_for_index`. Development and production default to `read_your_writes`;
-test mode defaults to `wait_for_index`. Production rejects `eventual` because
-it cannot guarantee visibility of a completed write. The deprecated
+`wait_for_index`. When it is unset, development and production default to
+`read_your_writes` and test mode defaults to `wait_for_index`. Production
+rejects `eventual` because it cannot guarantee visibility of a completed
+write. The recommended production setting, and the one the reference
+deployment runs, is an explicit `RAG_WRITE_CONSISTENCY=wait_for_index`: every
+write waits until Meilisearch confirms its tasks before the response returns,
+so searches served directly from Meilisearch (by this or a restarted process)
+see it immediately. `read_your_writes` responds once Meilisearch accepts most
+writes (kinds that require index confirmation still wait) and merges the process's own in-memory copy into searches until
+indexing catches up, which favors write latency but relies on that single
+process's mirror. The deprecated
 `RAG_MEILI_WAIT_FOR_TASKS` is consulted only when `RAG_WRITE_CONSISTENCY` is
 unset: `true` maps to `wait_for_index`, while `false` maps to
 `read_your_writes`. Setting both variables is a startup error. This legacy
@@ -576,6 +584,14 @@ Link and analysis surfaces:
   `owner_user_id`; analysis evidence is then constrained to that owner's same
   history event index.
 
+## Deploy
+
+The reference deployment builds from a Git checkout and runs under systemd
+next to a separate Meilisearch unit. Routine deploys, verification, and
+binary rollback follow [doc/runbooks/gfit-deploy.md](doc/runbooks/gfit-deploy.md);
+releases with data migrations follow the
+[production upgrade runbook](doc/runbooks/production-upgrade.md).
+
 ## Verify
 
 ```sh
@@ -586,9 +602,11 @@ cargo test --locked
 cargo package --locked
 ```
 
-CI also checks the same lockfile with Rust 1.88, runs the exact route-manifest
-contract test, audits RustSec advisories, and enforces the dependency license,
-source, ban, and advisory policy in `deny.toml`.
+CI also runs the exact route-manifest contract test, runs the Meilisearch
+integration suites against a Meilisearch service container pinned to the
+production version, checks the same lockfile with Rust 1.88, audits RustSec
+advisories, and enforces the dependency license, source, ban, and advisory
+policy in `deny.toml`.
 
 Optional Meilisearch integration tests run when `RAG_TEST_MEILI_URL` is set.
 If the server requires a key, set `RAG_TEST_MEILI_API_KEY` too:
@@ -596,8 +614,13 @@ If the server requires a key, set `RAG_TEST_MEILI_API_KEY` too:
 ```sh
 RAG_TEST_MEILI_URL=http://127.0.0.1:7700 \
 RAG_TEST_MEILI_API_KEY=$MEILI_MASTER_KEY \
-cargo test --test meili_integration
+cargo test --test meili_integration --test insight_history
 ```
+
+Without `RAG_TEST_MEILI_URL`, or when the server is unreachable or needs a key
+that was not provided, those tests skip and report as passed. Set
+`RAG_TEST_REQUIRE_MEILI=1` to make each of those conditions, and a missing
+`RAG_TEST_MEILI_API_KEY`, fail the test instead; CI sets it.
 
 Optional live MinerU integration tests run when `RAG_TEST_MINERU_API_URL` is set:
 

@@ -11,7 +11,7 @@ Per-directory context lives in `AGENTS.md` files, organized hierarchically from 
 
 ## Verify gauntlet
 
-Pre-merge verification is the four-step gauntlet in `AGENTS.md` (fmt → clippy → check → test) — run it in that order and report results in that order. Clippy `-D warnings` is non-negotiable. CI is not identical: it has no `cargo check` step but adds `libopenblas-dev` install and `cargo package --allow-dirty --no-verify`.
+The pre-merge gauntlet is defined once, in `AGENTS.md` → *Testing Requirements* — that list is the source of truth; run it in that order and report results in that order. Clippy `-D warnings` is non-negotiable. What CI runs (including the Meilisearch integration job) is described in `.github/workflows/AGENTS.md`; don't restate either list here.
 
 ## Hard invariants
 
@@ -38,4 +38,5 @@ Isolation and token-redaction invariants are covered in `AGENTS.md`. Additionall
 - All ids use `util::new_id("prefix")` (uuid v7 simple form) — don't hand-mint identifiers.
 - ContextFS ancestor walking goes through `util::ancestor_uris`; don't split on `/` directly because the `ctx://` prefix must be preserved.
 - `build.rs` injects `NOWLEDGE_GIT_REV`, consumed at compile time via `env!` in the `routes.rs` health surfaces — the crate does not compile without the build script; don't remove or bypass it.
-- The reported git rev gets a `-dirty` suffix whenever tracked files are modified; `.omc/` session state is git-tracked, so `/healthz` showing `<sha>-dirty` during agent sessions is expected, not a deploy anomaly.
+- The reported git rev gets a `-dirty` suffix only when tracked files are modified; untracked files are ignored by `build.rs`. `.omc/`, `.omx/`, `.agents/`, `.env`, and `scripts/` are gitignored, so agent session state does not dirty the build — a `<sha>-dirty` on a deployed `/livez` means modified tracked source and is worth investigating.
+- Production deploy, verification, and rollback on `gfit` follow `doc/runbooks/gfit-deploy.md`.
