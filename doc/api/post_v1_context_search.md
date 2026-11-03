@@ -131,6 +131,11 @@ an eight-character heuristic floor to avoid rewriting ordinary short words.
 - `debug=true` for non-admin users redacts personal context index ids and owner filter details.
 - Admin debug can see full raw stage details in `raw_stage_debug`.
 - Full source documents remain readable only through explicit `GET /v1/fs/read` with ACL checks.
+- Search is a read: the trace is cached in process immediately (so `trace_id`
+  works for reveal/debug right away) and persisted to `rag_traces` by a
+  batched background writer, outside the mutation journal and global write
+  lock. Trace persistence failures never fail the search. Persisted traces
+  expire after `RAG_TRACE_RETENTION_DAYS` (default 30; 0 keeps them forever).
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph
@@ -138,7 +143,7 @@ an eight-character heuristic floor to avoid rewriting ordinary short words.
 flowchart TD
   n0["UserGuard authenticates caller"]
   n1["apply_owner_default fills owner_user_id when possible"]
-  n2["Store.search_context_async searches active fragment context indexes and stores trace"]
+  n2["Store.search_context_async searches active fragment context indexes and records trace asynchronously"]
   n3["Return ContextSearchResponse"]
   n0 --> n1
   n1 --> n2

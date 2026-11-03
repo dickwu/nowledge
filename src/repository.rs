@@ -292,7 +292,30 @@ pub trait KnowledgeRepository: Send + Sync {
 
     async fn upsert_trace(&self, trace: &TraceRecord) -> Result<Option<String>, ApiError>;
 
+    /// Persist a batch of retrieval traces. Backends that support it submit
+    /// the whole batch as one document write; the default falls back to one
+    /// write per trace and reports the last accepted task.
+    async fn upsert_traces(&self, traces: &[TraceRecord]) -> Result<Option<String>, ApiError> {
+        let mut last_task_uid = None;
+        for trace in traces {
+            if let Some(task_uid) = self.upsert_trace(trace).await? {
+                last_task_uid = Some(task_uid);
+            }
+        }
+        Ok(last_task_uid)
+    }
+
     async fn list_traces(&self, tenant_id: &str) -> Result<Option<Vec<TraceRecord>>, ApiError>;
+
+    /// Delete one tenant's persisted traces created before `cutoff`. The
+    /// memory backend is a no-op: its bounded trace cache is canonical there.
+    async fn delete_traces_before(
+        &self,
+        _tenant_id: &str,
+        _cutoff: DateTime<Utc>,
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        Ok(RepositoryWriteReceipt::empty())
+    }
 
     async fn upsert_links(&self, links: &[KnowledgeLink]) -> Result<Option<String>, ApiError>;
 
@@ -1192,6 +1215,23 @@ pub struct MeiliRepository {
 
 const OPERATION_IDENTITY_FIELDS: &[&str] = &["id", "logical_id", "tenant_id"];
 const MAX_OPERATION_CANDIDATE_LIMIT: usize = 1_000;
+/// Numeric mirror of `TraceRecord::created_at` stored only in `rag_traces`
+/// documents so retention can use a numeric range filter.
+const TRACE_CREATED_AT_MS_FIELD: &str = "created_at_ms";
+const LEGACY_TRACE_RETENTION_PAGE_SIZE: usize = 1_000;
+
+/// Build the tenant-scoped `rag_traces` document for one trace, including the
+/// numeric `created_at_ms` retention key. Decoding ignores the extra field.
+fn trace_document(trace: &TraceRecord) -> Result<Value, ApiError> {
+    let mut document = tenant_document(&trace.tenant_id, "rag_traces", &trace.id, trace)?;
+    if let Value::Object(map) = &mut document {
+        map.insert(
+            TRACE_CREATED_AT_MS_FIELD.to_string(),
+            json!(trace.created_at.timestamp_millis()),
+        );
+    }
+    Ok(document)
+}
 const OPERATION_SUMMARY_FIELDS: &[&str] = &[
     "id",
     "logical_id",
@@ -2465,16 +2505,85 @@ impl KnowledgeRepository for MeiliRepository {
     }
 
     async fn upsert_trace(&self, trace: &TraceRecord) -> Result<Option<String>, ApiError> {
-        self.upsert_values(
-            "rag_traces",
-            &[tenant_document(
-                &trace.tenant_id,
+        self.upsert_values("rag_traces", &[trace_document(trace)?])
+            .await
+    }
+
+    async fn upsert_traces(&self, traces: &[TraceRecord]) -> Result<Option<String>, ApiError> {
+        let documents = traces
+            .iter()
+            .map(trace_document)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.upsert_values("rag_traces", &documents).await
+    }
+
+    async fn delete_traces_before(
+        &self,
+        tenant_id: &str,
+        cutoff: DateTime<Utc>,
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        let mut receipt = RepositoryWriteReceipt::empty();
+        let filter = TenantFilter::new(tenant_id)?
+            .lt_i64(TRACE_CREATED_AT_MS_FIELD, cutoff.timestamp_millis())
+            .finish();
+        if let Some(task_uid) = self
+            .admin
+            .delete_documents_by_filter("rag_traces", &filter)
+            .await?
+        {
+            receipt.task_uids.push(task_uid);
+        }
+
+        // Traces written before `created_at_ms` existed only carry the RFC
+        // 3339 `created_at`. Examine the oldest bounded page of them and
+        // delete the expired ones by logical id; later sweeps continue until
+        // the legacy set ages out.
+        let legacy_filter = TenantFilter::new(tenant_id)?
+            .not_exists(TRACE_CREATED_AT_MS_FIELD)
+            .finish();
+        let page = self
+            .admin
+            .fetch_projected_documents_page(
                 "rag_traces",
-                &trace.id,
-                trace,
-            )?],
-        )
-        .await
+                &legacy_filter,
+                &["created_at:asc".to_string(), "id:asc".to_string()],
+                0,
+                LEGACY_TRACE_RETENTION_PAGE_SIZE,
+                &["id", "tenant_id", "logical_id", "created_at"],
+            )
+            .await?;
+        let expired = page
+            .results
+            .into_iter()
+            .filter(|document| is_tenant_document("rag_traces", document))
+            .filter(|document| document.get("tenant_id").and_then(Value::as_str) == Some(tenant_id))
+            .filter(|document| {
+                document
+                    .get("created_at")
+                    .and_then(Value::as_str)
+                    .and_then(|created_at| DateTime::parse_from_rfc3339(created_at).ok())
+                    .is_some_and(|created_at| created_at.with_timezone(&Utc) < cutoff)
+            })
+            .filter_map(|document| {
+                document
+                    .get("logical_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+        if !expired.is_empty() {
+            let filter = TenantFilter::new(tenant_id)?
+                .logical_ids(&expired)?
+                .finish();
+            if let Some(task_uid) = self
+                .admin
+                .delete_documents_by_filter("rag_traces", &filter)
+                .await?
+            {
+                receipt.task_uids.push(task_uid);
+            }
+        }
+        Ok(receipt)
     }
 
     async fn list_traces(&self, tenant_id: &str) -> Result<Option<Vec<TraceRecord>>, ApiError> {

@@ -260,8 +260,7 @@ impl Store {
             groups,
             stages,
         };
-        let mut data = self.write()?;
-        data.traces.insert(trace.id.clone(), trace.clone());
+        self.record_trace(trace.clone());
 
         Ok(ContextSearchOutcome {
             response,
@@ -281,9 +280,7 @@ impl Store {
         let uri = if let Some(uri) = req.uri {
             uri
         } else if let Some(trace_id) = req.trace_id {
-            let data = self.read()?;
-            data.traces
-                .get(&trace_id)
+            self.cached_trace(tenant_id, &trace_id)
                 .and_then(|trace| trace.context_uris.first().cloned())
                 .ok_or_else(|| ApiError::not_found("trace has no context to reveal"))?
         } else {
@@ -441,39 +438,16 @@ impl Store {
                 groups,
                 stages,
             };
-            let outcome = ContextSearchOutcome {
+            // Searches are reads: the trace is recorded off the mutation path
+            // (no mutation gate, operation journal, or backend task wait).
+            self.record_trace(trace.clone());
+            return Ok(ContextSearchOutcome {
                 response,
                 trace,
                 nodes,
-            };
-            let outcome_for_stage = outcome.clone();
-            let (outcome, _) = self
-                .execute_staged_mutation(
-                    tenant_id,
-                    "trace.create",
-                    owner_user_id.as_deref(),
-                    None,
-                    MutationPrimary::Trace,
-                    move |staged| {
-                        staged.insert_trace(outcome_for_stage.trace.clone())?;
-                        Ok(outcome_for_stage)
-                    },
-                )
-                .await?;
-            return Ok(outcome);
+            });
         }
-        let owner = owner_user_id;
-        let (outcome, _) = self
-            .execute_staged_mutation(
-                tenant_id,
-                "trace.create",
-                owner.as_deref(),
-                None,
-                MutationPrimary::Trace,
-                |staged| staged.search_context(tenant_id, req, is_admin),
-            )
-            .await?;
-        Ok(outcome)
+        self.search_context(tenant_id, req, is_admin)
     }
 
     pub async fn answer_rag_async(

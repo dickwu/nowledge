@@ -31,6 +31,9 @@ Schema: `TraceRecord`
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Configured auth, Meilisearch, OpenAI, and Codex credentials are redacted from
   the trace before serialization.
+- Recent traces are served from a bounded in-process cache; older traces are
+  read through from `rag_traces` by tenant-scoped id. Traces older than
+  `RAG_TRACE_RETENTION_DAYS` (default 30) are deleted and return 404.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph
