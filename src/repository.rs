@@ -22,7 +22,7 @@ use crate::{
         scoped_storage_identity, tenant_document, tenant_document_with_storage_identity,
         tenant_structured_row_document, TenantFilter,
     },
-    util::{hmac_hex, meili_query_terms},
+    util::{hmac_hex, meili_query_terms, ENGLISH_STOP_WORDS},
 };
 
 #[derive(Debug, Clone)]
@@ -3629,13 +3629,15 @@ impl MeiliRepository {
         let mut processing_time_ms = 0;
         let mut offset = 0;
         let mut pages = 0;
+        let mut effective_query = query.to_string();
+        let mut dropped_leading_terms = 0;
         loop {
             let response: SearchResponse<Value> = self
                 .admin
                 .search(
                     index_uid,
                     json!({
-                        "q": query,
+                        "q": effective_query,
                         "offset": offset,
                         "limit": page_size,
                         "filter": filter,
@@ -3643,9 +3645,24 @@ impl MeiliRepository {
                     }),
                 )
                 .await?;
-            pages += 1;
             processing_time_ms += response.processing_time_ms;
             let returned = response.hits.len();
+            // Meilisearch's default `last` matching strategy never drops the
+            // first query term, so an empty first page proves that term
+            // matches no filtered document. Drop it (with any leading stop
+            // words) and retry, so "Explain ..."/"Tell me ..." questions do
+            // not return nothing. Bounded; no hit can be lost this way.
+            if returned == 0
+                && offset == 0
+                && dropped_leading_terms < CONTEXT_MAX_LEADING_TERM_DROPS
+            {
+                if let Some(rest) = drop_leading_query_term(&effective_query) {
+                    effective_query = rest;
+                    dropped_leading_terms += 1;
+                    continue;
+                }
+            }
+            pages += 1;
             offset += returned;
             documents.extend(response.hits);
             hits = decode_ranked_context_documents(index_uid, documents.clone())?
@@ -3665,8 +3682,34 @@ impl MeiliRepository {
             hits,
             processing_time_ms,
             pages,
+            effective_query,
+            dropped_leading_terms,
         })
     }
+}
+
+/// Upper bound on unmatched leading terms dropped by one fragment search.
+const CONTEXT_MAX_LEADING_TERM_DROPS: usize = 3;
+
+/// Remove leading stop words plus the first real term of a Meilisearch `q`,
+/// or `None` when nothing searchable would remain.
+fn drop_leading_query_term(query: &str) -> Option<String> {
+    let mut tokens = query.split_whitespace();
+    loop {
+        let word = tokens
+            .next()?
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        if !word.is_empty() && !ENGLISH_STOP_WORDS.contains(&word.as_str()) {
+            break;
+        }
+    }
+    let rest = tokens.collect::<Vec<_>>().join(" ");
+    rest.split(|c: char| !c.is_alphanumeric())
+        .any(|word| !word.is_empty() && !ENGLISH_STOP_WORDS.contains(&word.to_lowercase().as_str()))
+        .then_some(rest)
 }
 
 /// Meilisearch's default `pagination.maxTotalHits`.
@@ -3680,6 +3723,9 @@ struct RankedContextFragments {
     hits: Vec<(ContextNode, Option<f32>)>,
     processing_time_ms: u64,
     pages: usize,
+    /// The `q` that produced `hits` after unmatched leading terms were dropped.
+    effective_query: String,
+    dropped_leading_terms: usize,
 }
 
 fn decode_ranked_context_documents(
@@ -4062,6 +4108,8 @@ fn context_stage(
         "index_uid": index_uid,
         "query": query,
         "meili_query": meili_query,
+        "effective_meili_query": fragments.effective_query,
+        "dropped_leading_terms": fragments.dropped_leading_terms,
         "filter": filter,
         "hits": fragments.hits.len(),
         "pages": fragments.pages,
@@ -4442,6 +4490,106 @@ mod tests {
         let mut document = tenant_document(tenant_id, index_uid, uri, &node).unwrap();
         document["_rankingScore"] = json!(score);
         document
+    }
+
+    #[test]
+    fn leading_query_terms_drop_with_their_stop_words() {
+        assert_eq!(
+            drop_leading_query_term("explain onboarding playbook").as_deref(),
+            Some("onboarding playbook")
+        );
+        assert_eq!(
+            drop_leading_query_term("can you explain the onboarding playbook?").as_deref(),
+            Some("the onboarding playbook?")
+        );
+        assert_eq!(drop_leading_query_term("explain the"), None);
+        assert_eq!(drop_leading_query_term("playbook"), None);
+        assert_eq!(drop_leading_query_term(""), None);
+    }
+
+    async fn query_keyed_context_stub(
+        State(stub): State<ContextSearchStub>,
+        request: AxumRequest,
+    ) -> Response {
+        let path = request.uri().path().to_string();
+        let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let q = body["q"].as_str().unwrap_or_default().to_string();
+        stub.requests.lock().unwrap().push((path, body));
+        let response = stub
+            .responses
+            .lock()
+            .unwrap()
+            .get(&q)
+            .cloned()
+            .unwrap_or_else(|| json!({"hits": []}));
+        (StatusCode::OK, Json(response)).into_response()
+    }
+
+    #[tokio::test]
+    async fn fragment_search_drops_unmatched_leading_terms_only_after_an_empty_page() {
+        let stub = ContextSearchStub::default();
+        stub.responses.lock().unwrap().insert(
+            "onboarding playbook".to_string(),
+            json!({"hits": [context_hit("tenant-a", "rag_company_context", "ctx://company/a", 0.9)]}),
+        );
+        let app = Router::new()
+            .fallback(query_keyed_context_stub)
+            .with_state(stub.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = Config::test();
+        config.meili_url = Some(format!("http://{address}"));
+        let repository = MeiliRepository::new(MeiliAdmin::from_config(&config), false);
+
+        let filters = ContextStructuredFilters::default();
+        let result = repository
+            .search_context_fragments(
+                "rag_company_context",
+                "can you explain tell onboarding playbook",
+                "tenant_id = \"tenant-a\"",
+                5,
+                &filters,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.effective_query, "onboarding playbook");
+        assert_eq!(result.dropped_leading_terms, 2);
+        assert_eq!(result.pages, 1);
+        let queries: Vec<String> = stub
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, body)| body["q"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            queries,
+            vec![
+                "can you explain tell onboarding playbook",
+                "tell onboarding playbook",
+                "onboarding playbook"
+            ]
+        );
+
+        // A query whose first page already has hits is never rewritten.
+        stub.requests.lock().unwrap().clear();
+        let result = repository
+            .search_context_fragments(
+                "rag_company_context",
+                "onboarding playbook",
+                "tenant_id = \"tenant-a\"",
+                5,
+                &filters,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.dropped_leading_terms, 0);
+        assert_eq!(stub.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

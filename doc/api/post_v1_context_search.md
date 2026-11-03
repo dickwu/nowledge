@@ -45,7 +45,13 @@ Schema: `ContextSearchRequest`
 With the Meilisearch backend, the query sent to Meilisearch is reduced to at
 most ten key terms when it is longer than ten words (English stop words and
 duplicates are dropped, the longest remaining terms are kept in order); the
-reduced query is reported as `meili_query` in the fragment stages. Context
+reduced query is reported as `meili_query` in the fragment stages. Queries
+are lowercased first because Meilisearch matches query stop words
+case-sensitively. Meilisearch's default `last` matching strategy never drops
+the first term, so when an index returns no hit at all the leading term (and
+any leading stop words) is dropped and the search retried, at most three
+times; the query actually used is reported as `effective_meili_query` with
+`dropped_leading_terms`. Context
 indexes are configured with English `stopWords`. `artifact_kind` and a
 trigram prefilter for `section_path_contains` are evaluated by Meilisearch;
 both are rechecked exactly after retrieval, so filter semantics are unchanged.
