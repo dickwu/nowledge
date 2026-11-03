@@ -54,8 +54,8 @@ says when it was last observed. For `codex_auth` the windows come from the
 | captured_at | string? | RFC3339 time the snapshot was observed on a live upstream response. |
 | plan_type | string? | Codex subscription plan (`x-codex-plan-type`). |
 | active_limit | string? | Limit bucket currently governing (`x-codex-active-limit`). |
-| primary | object? | Short (5h) window: `used_percent`, `remaining_percent`, `window_minutes`, `resets_in_seconds`, `resets_at`. |
-| secondary | object? | Long (weekly) window, same fields as `primary`. |
+| primary | object? | First Codex usage window (`x-codex-primary-*`): `used_percent`, `remaining_percent`, `window_minutes`, `window_label`, `resets_in_seconds`, `resets_at`. |
+| secondary | object? | Second Codex usage window (`x-codex-secondary-*`), same fields as `primary`. |
 | credits | object? | `has_credits`, `unlimited`, `balance` from the Codex credits headers. |
 | additional_limits | array? | Model-scoped buckets (`name`, `limit_name`, `primary`, `secondary`). |
 | remaining_requests / remaining_tokens / reset_requests / reset_tokens | string? | OpenAI API-style `x-ratelimit-*` values when the provider is `openai_api_key`. |
@@ -64,6 +64,14 @@ The same fields are present under `analysis_llm.rate_limits`.
 `llm.rate_limit_state` and `analysis_llm.rate_limit_state` are `ok`, `near_limit` (any window ≥ 90% used),
 `limited` (any window ≥ 100% used or upstream 429), or `unknown`.
 `remaining_percent` is the "left available usage" for dashboards.
+
+Window lengths are not fixed: read `window_minutes` (from
+`x-codex-*-window-minutes`) and the derived `window_label` (largest whole unit,
+e.g. `5h`, `7d`, `90m`) instead of assuming which slot is short or long. Either
+window may be absent; a zero-length, zero-usage placeholder that Codex sends
+for a limit it no longer enforces is reported as absent. As of 2026-11 Codex
+reports a single 7-day window in `primary` (`window_minutes: 10080`) and only
+that placeholder in `secondary`.
 
 ## Errors and Access Rules
 - Missing or invalid bearer authentication returns 401.

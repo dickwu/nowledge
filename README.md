@@ -410,9 +410,12 @@ Health endpoints split process liveness from operational readiness:
 
 - The protected health `llm.rate_limits` block carries the freshest live
   provider budget snapshot. For `codex_auth` it is parsed from the ChatGPT Codex `x-codex-*`
-  response headers on every health probe and real completion: `primary` (5h)
-  and `secondary` (weekly) windows with `used_percent` / `remaining_percent` /
-  reset times, `plan_type`, credits, and model-scoped `additional_limits`.
+  response headers on every health probe and real completion: `primary` and
+  `secondary` windows with `used_percent` / `remaining_percent` / reset times
+  and the length Codex reports (`window_minutes`, plus a derived
+  `window_label` such as `7d`), `plan_type`, credits, and model-scoped
+  `additional_limits`. Window lengths come from Codex, not from fixed
+  assumptions, and either window may be absent.
   `llm.rate_limit_state` becomes `near_limit` at ≥90% window usage and
   `limited` at 100%, so dashboards can warn before hard 429s.
 - LLM-backed responses (`/v1/rag/answer`, `/v1/analysis/insights`,
