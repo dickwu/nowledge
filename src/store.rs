@@ -9130,8 +9130,19 @@ mod tests {
             )
             .unwrap()
         };
-        let (url, requests) =
-            spawn_trace_meili_stub(vec![legacy("legacy-old", 90), legacy("legacy-new", 1)]).await;
+        // A pre-tenant-scope trace (physical id == trace id, no logical_id)
+        // that never received a migrated twin must still age out.
+        let pre_scope_orphan = json!({
+            "id": "pre-scope-old",
+            "tenant_id": &tenant,
+            "created_at": (now() - chrono::Duration::days(90)).to_rfc3339(),
+        });
+        let (url, requests) = spawn_trace_meili_stub(vec![
+            legacy("legacy-old", 90),
+            legacy("legacy-new", 1),
+            pre_scope_orphan,
+        ])
+        .await;
         let (_, store) = meili_trace_store(url);
 
         let (_, task_uids) = store.prune_expired_traces_async(&tenant, 30).await.unwrap();
@@ -9150,6 +9161,7 @@ mod tests {
         assert!(deletes[0].contains("created_at_ms < "), "{}", deletes[0]);
         assert!(deletes[1].contains("tenant_id = "), "{}", deletes[1]);
         assert!(deletes[1].contains("legacy-old"), "{}", deletes[1]);
+        assert!(deletes[1].contains("pre-scope-old"), "{}", deletes[1]);
         assert!(!deletes[1].contains("legacy-new"), "{}", deletes[1]);
     }
 

@@ -2564,10 +2564,14 @@ impl KnowledgeRepository for MeiliRepository {
                 &["id", "tenant_id", "logical_id", "created_at"],
             )
             .await?;
-        let expired = page
+        // A tenant-scoped trace is deleted by logical id, which also removes
+        // its rollback mirror. A pre-tenant-scope trace without a migrated
+        // twin carries no `logical_id`; address it by its physical id through
+        // the same filter's legacy branch. Skipping it would never prune it
+        // and could pin this bounded oldest-first page indefinitely.
+        let mut expired = page
             .results
             .into_iter()
-            .filter(|document| is_tenant_document("rag_traces", document))
             .filter(|document| document.get("tenant_id").and_then(Value::as_str) == Some(tenant_id))
             .filter(|document| {
                 document
@@ -2577,12 +2581,21 @@ impl KnowledgeRepository for MeiliRepository {
                     .is_some_and(|created_at| created_at.with_timezone(&Utc) < cutoff)
             })
             .filter_map(|document| {
+                let key = if is_tenant_document("rag_traces", &document) {
+                    "logical_id"
+                } else if document.get("logical_id").is_none_or(Value::is_null) {
+                    "id"
+                } else {
+                    return None;
+                };
                 document
-                    .get("logical_id")
+                    .get(key)
                     .and_then(Value::as_str)
                     .map(ToString::to_string)
             })
             .collect::<Vec<_>>();
+        expired.sort();
+        expired.dedup();
         if !expired.is_empty() {
             let filter = TenantFilter::new(tenant_id)?
                 .logical_ids(&expired)?
