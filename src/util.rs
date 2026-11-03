@@ -134,8 +134,12 @@ pub const MEILI_MAX_QUERY_WORDS: usize = 10;
 /// Reduce a long natural-language question to at most
 /// [`MEILI_MAX_QUERY_WORDS`] key terms for a Meilisearch `q`.
 ///
-/// Queries that already fit are returned unchanged (Meilisearch applies the
-/// context-index `stopWords` itself, and short queries keep their phrasing).
+/// Queries that already fit keep their phrasing but are lowercased:
+/// Meilisearch applies the context-index `stopWords` itself, yet its
+/// query-time stop-word check is case-sensitive (verified on 1.56.1), so a
+/// sentence-case "What"/"How" would become a mandatory leading term under the
+/// default `last` matching strategy and return no hits. Meilisearch matching
+/// is case-insensitive, so lowercasing changes nothing else.
 /// Longer queries drop stop words and duplicates; if more than ten terms
 /// remain, the longest terms are kept (earlier position breaks ties) and
 /// emitted in their original order. Deterministic: no model calls.
@@ -145,7 +149,7 @@ pub fn meili_query_terms(query: &str) -> String {
         .filter(|word| !word.is_empty())
         .collect();
     if words.len() <= MEILI_MAX_QUERY_WORDS {
-        return query.trim().to_string();
+        return query.trim().to_lowercase();
     }
     let mut seen = HashSet::new();
     let terms: Vec<String> = words
@@ -155,7 +159,7 @@ pub fn meili_query_terms(query: &str) -> String {
         .filter(|word| seen.insert(word.clone()))
         .collect();
     if terms.is_empty() {
-        return words[..MEILI_MAX_QUERY_WORDS].join(" ");
+        return words[..MEILI_MAX_QUERY_WORDS].join(" ").to_lowercase();
     }
     if terms.len() <= MEILI_MAX_QUERY_WORDS {
         return terms.join(" ");
@@ -1259,6 +1263,24 @@ mod query_term_tests {
         assert_eq!(
             meili_query_terms("what is the deployment rollback procedure"),
             "what is the deployment rollback procedure"
+        );
+    }
+
+    #[test]
+    fn short_queries_are_lowercased_so_meili_stop_words_apply() {
+        // Meilisearch's query-time stop-word check is case-sensitive, so a
+        // sentence-case leading stop word must not reach it capitalized.
+        assert_eq!(
+            meili_query_terms("What does the Onboarding playbook say?"),
+            "what does the onboarding playbook say?"
+        );
+        assert_eq!(
+            meili_query_terms("How Should The Coach Sequence The First Three Sessions"),
+            "how should the coach sequence the first three sessions"
+        );
+        assert_eq!(
+            meili_query_terms("WHAT IS IT THAT YOU WOULD DO IF THEY WERE HERE AND THERE"),
+            "what is it that you would do if they were"
         );
     }
 
