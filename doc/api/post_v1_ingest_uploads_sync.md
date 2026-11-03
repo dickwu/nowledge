@@ -20,7 +20,11 @@ Completed `IngestTaskResult`.
 
 - Text files can use `parser_provider=builtin`.
 - `idempotency_key` is rejected with 400 and is never silently ignored.
-- PDF/DOCX/PPTX/XLSX/image bytes should use `parser_provider=mineru`.
+- PDF/DOCX/PPTX/XLSX/image bytes need the `mineru` parser. Only admin callers
+  may select a parser provider/backend different from the configured
+  `RAG_PARSER_PROVIDER` / `RAG_MINERU_BACKEND` (otherwise 403 `forbidden`).
+- Non-admin callers may only set `source_document_uri` inside `ctx://user/`
+  (otherwise 400 `validation_error`, `details.field=source_document_uri`).
 - The same streamed temporary-file, upload/field limits, duplicate-file,
   filename, MIME, exact 64-hex SHA-256 checksum, and cleanup rules as the
   asynchronous upload apply.

@@ -14,8 +14,9 @@ Create an asynchronous ingest task from a multipart file upload.
 | --- | --- |
 | file / document / upload | Binary file part; at most one of these aliases is accepted. The part must include `Content-Type`. |
 | owner_user_id, source_id, revision_id, title, source_uri | Optional source metadata. |
-| parser_provider | `builtin` for UTF-8 text or `mineru` for document/image bytes. |
-| parser_backend | MinerU backend override. |
+| source_document_uri | Optional explicit source-document URI; non-admin callers may only use `ctx://user/...`. |
+| parser_provider | `builtin` for UTF-8 text or `mineru` for document/image bytes. Overriding `RAG_PARSER_PROVIDER` requires admin scope. |
+| parser_backend | MinerU backend override. Overriding `RAG_MINERU_BACKEND` requires admin scope. |
 | content_type | Optional MIME metadata. When present with a file, it must match the file part `Content-Type`. |
 | checksum | Optional SHA-256 checksum as exactly 64 hexadecimal characters; malformed values or mismatches reject the request before task creation. |
 | fragment_policy.chunk_size_chars / overlap_chars / min_chunk_chars | Optional numeric fragment policy fields. |
@@ -28,6 +29,10 @@ Queued `IngestTask`.
 ## Rules
 
 - Builtin parser accepts UTF-8 text uploads only.
+- Non-admin callers: a `source_document_uri` outside `ctx://user/` returns 400
+  `validation_error` (`details.field=source_document_uri`); a parser
+  provider/backend different from the configured default returns 403
+  `forbidden`. Neither creates a task, and the staged file is removed.
 - `idempotency_key` is rejected with 400 and is never silently ignored.
 - File bytes are streamed to a private generated temporary file and rejected
   with 413 when they exceed `RAG_MAX_UPLOAD_BYTES`. Metadata and total field
