@@ -113,6 +113,72 @@ pub fn text_score(text: &str, query: &str) -> f32 {
     score
 }
 
+/// English function words configured as Meilisearch `stopWords` on context
+/// indexes and dropped by [`meili_query_terms`]. Negations (`no`, `not`) are
+/// deliberately absent so they are never silently discarded.
+pub const ENGLISH_STOP_WORDS: &[&str] = &[
+    "a", "about", "after", "all", "also", "am", "an", "and", "any", "are", "as", "at", "be",
+    "because", "been", "before", "being", "between", "both", "but", "by", "can", "could", "did",
+    "do", "does", "doing", "during", "each", "for", "from", "had", "has", "have", "having", "he",
+    "her", "here", "hers", "him", "his", "how", "i", "if", "in", "into", "is", "it", "its",
+    "itself", "just", "me", "more", "most", "my", "of", "on", "or", "other", "our", "ours",
+    "please", "she", "should", "so", "some", "such", "than", "that", "the", "their", "theirs",
+    "them", "then", "there", "these", "they", "this", "those", "through", "to", "too", "us",
+    "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why",
+    "will", "with", "would", "you", "your", "yours",
+];
+
+/// Meilisearch only considers the first ten words of a query.
+pub const MEILI_MAX_QUERY_WORDS: usize = 10;
+
+/// Reduce a long natural-language question to at most
+/// [`MEILI_MAX_QUERY_WORDS`] key terms for a Meilisearch `q`.
+///
+/// Queries that already fit are returned unchanged (Meilisearch applies the
+/// context-index `stopWords` itself, and short queries keep their phrasing).
+/// Longer queries drop stop words and duplicates; if more than ten terms
+/// remain, the longest terms are kept (earlier position breaks ties) and
+/// emitted in their original order. Deterministic: no model calls.
+pub fn meili_query_terms(query: &str) -> String {
+    let words: Vec<&str> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words.len() <= MEILI_MAX_QUERY_WORDS {
+        return query.trim().to_string();
+    }
+    let mut seen = HashSet::new();
+    let terms: Vec<String> = words
+        .iter()
+        .map(|word| word.to_lowercase())
+        .filter(|word| !ENGLISH_STOP_WORDS.contains(&word.as_str()))
+        .filter(|word| seen.insert(word.clone()))
+        .collect();
+    if terms.is_empty() {
+        return words[..MEILI_MAX_QUERY_WORDS].join(" ");
+    }
+    if terms.len() <= MEILI_MAX_QUERY_WORDS {
+        return terms.join(" ");
+    }
+    let mut ranked: Vec<(usize, &String)> = terms.iter().enumerate().collect();
+    ranked.sort_by(|a, b| {
+        b.1.chars()
+            .count()
+            .cmp(&a.1.chars().count())
+            .then(a.0.cmp(&b.0))
+    });
+    let mut kept: Vec<usize> = ranked
+        .into_iter()
+        .take(MEILI_MAX_QUERY_WORDS)
+        .map(|(position, _)| position)
+        .collect();
+    kept.sort_unstable();
+    kept.into_iter()
+        .map(|position| terms[position].as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn truncate_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -1181,6 +1247,68 @@ fn normalized_json_key(key: &str) -> String {
         }
     }
     normalized
+}
+
+#[cfg(test)]
+mod query_term_tests {
+    use super::{meili_query_terms, ENGLISH_STOP_WORDS, MEILI_MAX_QUERY_WORDS};
+
+    #[test]
+    fn short_queries_are_passed_through_unchanged() {
+        assert_eq!(meili_query_terms("  deploy rollback  "), "deploy rollback");
+        assert_eq!(
+            meili_query_terms("what is the deployment rollback procedure"),
+            "what is the deployment rollback procedure"
+        );
+    }
+
+    #[test]
+    fn long_questions_drop_stop_words_and_duplicates() {
+        let question =
+            "What is the procedure that we should follow for the deployment rollback of the API?";
+        assert_eq!(
+            meili_query_terms(question),
+            "procedure follow deployment rollback api"
+        );
+    }
+
+    #[test]
+    fn long_questions_keep_at_most_ten_longest_terms_in_original_order() {
+        let question = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda omicron \
+                        sigma upsilon";
+        let reduced = meili_query_terms(question);
+        assert_eq!(
+            reduced.split(' ').count(),
+            MEILI_MAX_QUERY_WORDS,
+            "{reduced}"
+        );
+        // The shortest terms (eta, beta, zeta, iota) go first; order is kept.
+        assert_eq!(
+            reduced,
+            "alpha gamma delta epsilon theta kappa lambda omicron sigma upsilon"
+        );
+        assert_eq!(meili_query_terms(question), reduced, "deterministic");
+    }
+
+    #[test]
+    fn all_stop_word_questions_fall_back_to_the_first_ten_words() {
+        let question = "what is it that you would do if they were here and we were there";
+        assert_eq!(
+            meili_query_terms(question),
+            "what is it that you would do if they were"
+        );
+    }
+
+    #[test]
+    fn stop_words_are_lowercase_unique_and_keep_negations() {
+        let mut seen = std::collections::HashSet::new();
+        for word in ENGLISH_STOP_WORDS {
+            assert_eq!(*word, word.to_lowercase());
+            assert!(seen.insert(*word), "duplicate stop word {word}");
+        }
+        assert!(!ENGLISH_STOP_WORDS.contains(&"not"));
+        assert!(!ENGLISH_STOP_WORDS.contains(&"no"));
+    }
 }
 
 #[cfg(test)]
