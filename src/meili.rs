@@ -9,7 +9,13 @@ use std::{
 
 use tokio::time::{sleep, timeout, Duration};
 
-use crate::{config::Config, error::ApiError};
+use crate::{config::Config, error::ApiError, util::ENGLISH_STOP_WORDS};
+
+/// Derived, filter-only field on context documents: the distinct ASCII-
+/// lowercased character trigrams of every `section_path` part. It lets
+/// `section_path_contains` push a necessary-condition prefilter down to
+/// Meilisearch; the exact substring check still runs locally.
+pub const CONTEXT_SECTION_PATH_TRIGRAMS_FIELD: &str = "section_path_trigrams";
 
 pub const FIXED_INDEXES: &[&str] = &[
     "rag_company_context",
@@ -1342,8 +1348,9 @@ pub fn settings_for(uid: &str) -> Value {
     } else if uid.contains("context") {
         json!({
             "searchableAttributes": ["title", "body", "uri"],
-            "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "index_uid", "index_kind", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id", "node_kind", "retrieval_role", "retrieval_enabled", "parent_uri", "source_document_uri", "fragment_index", "block_type", "page_idx", "heading_level"],
-            "sortableAttributes": ["updated_at", "layer"]
+            "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "index_uid", "index_kind", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id", "node_kind", "retrieval_role", "retrieval_enabled", "parent_uri", "source_document_uri", "fragment_index", "block_type", "page_idx", "heading_level", "artifact_refs.artifact_kind", CONTEXT_SECTION_PATH_TRIGRAMS_FIELD],
+            "sortableAttributes": ["updated_at", "layer"],
+            "stopWords": ENGLISH_STOP_WORDS
         })
     } else if uid == "rag_source_documents" {
         json!({
@@ -1448,6 +1455,11 @@ fn managed_settings_equal(current: &Value, desired: &Value) -> bool {
             current.get("sortableAttributes"),
             desired.get("sortableAttributes"),
         )
+        // Only indexes whose managed settings declare stop words pin them;
+        // Meilisearch reports stop words as a set.
+        && desired.get("stopWords").is_none_or(|stop_words| {
+            unordered_string_arrays_equal(current.get("stopWords"), Some(stop_words))
+        })
 }
 
 fn unordered_string_arrays_equal(left: Option<&Value>, right: Option<&Value>) -> bool {
@@ -1628,6 +1640,45 @@ mod tests {
             "sortableAttributes": ["id", "created_at"]
         });
         assert!(!managed_settings_equal(&duplicated_filter, &desired));
+    }
+
+    #[test]
+    fn context_indexes_pin_english_stop_words_and_pushdown_filters() {
+        for uid in ["rag_company_context", "rag_context__t_abc__u_def"] {
+            let settings = settings_for(uid);
+            let filterable = settings["filterableAttributes"]
+                .as_array()
+                .expect("filterable attributes");
+            for required in [
+                "artifact_refs.artifact_kind",
+                CONTEXT_SECTION_PATH_TRIGRAMS_FIELD,
+            ] {
+                assert!(
+                    filterable.iter().any(|value| value == required),
+                    "{uid} is missing {required}"
+                );
+            }
+            assert_eq!(
+                settings["stopWords"].as_array().map(Vec::len),
+                Some(ENGLISH_STOP_WORDS.len())
+            );
+
+            let mut drifted = settings.clone();
+            drifted["stopWords"] = json!([]);
+            assert!(!managed_settings_equal(&drifted, &settings));
+            let mut reordered = settings.clone();
+            reordered["stopWords"]
+                .as_array_mut()
+                .expect("stop words")
+                .reverse();
+            assert!(managed_settings_equal(&reordered, &settings));
+        }
+        // Indexes without managed stop words do not pin them.
+        let events = settings_for("rag_events__t_abc__u_def");
+        assert!(events.get("stopWords").is_none());
+        let mut with_stop_words = events.clone();
+        with_stop_words["stopWords"] = json!(["the"]);
+        assert!(managed_settings_equal(&with_stop_words, &events));
     }
 
     #[test]
