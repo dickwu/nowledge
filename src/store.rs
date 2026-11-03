@@ -57,6 +57,8 @@ mod state_insights;
 #[path = "store_structured.rs"]
 mod structured;
 
+pub(crate) use structured::{decode_rows_cursor, RowsPageRequest};
+
 const INGEST_ERROR_PARSER_FAILED: &str = "parser_failed";
 const INGEST_ERROR_INDEXING_FAILED: &str = "indexing_failed";
 const INGEST_ERROR_FAILED: &str = "ingest_failed";
@@ -4575,15 +4577,8 @@ impl Store {
         tenant_id: &str,
         snapshot_id: &str,
     ) -> Result<Value, ApiError> {
-        self.ensure_snapshot_rows_loaded(tenant_id, snapshot_id)
-            .await?;
-        let rows = self
-            .read()?
-            .rows_by_snapshot
-            .get(snapshot_id)
-            .cloned()
-            .unwrap_or_default();
-        Ok(json!({ "snapshot_id": snapshot_id, "rows": rows }))
+        self.list_rows_page_async(tenant_id, snapshot_id, None)
+            .await
     }
 
     async fn ensure_snapshot_rows_loaded(

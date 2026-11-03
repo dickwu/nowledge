@@ -1350,6 +1350,8 @@ async fn multipart_upload_supports_builtin_text_and_mineru_bytes() {
 
     let mineru_url = spawn_mineru_mock().await;
     let mut config = Config::test();
+    // Non-admin callers may only echo the operator-configured parser.
+    config.parser_provider = "mineru".to_string();
     config.mineru_api_url = mineru_url;
     let mineru_app = authed_app_with_config(config);
     let (status, mineru_result) = call_multipart_with_token(
@@ -1436,6 +1438,7 @@ async fn async_mineru_failure_never_exposes_private_upstream_urls() {
     drop(listener);
 
     let mut config = Config::test();
+    config.parser_provider = "mineru".to_string();
     config.mineru_api_url = format!("http://{addr}/{PRIVATE_MARKER}");
     let app = authed_app_with_config(config);
     let (status, task) = call_with_token(

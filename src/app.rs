@@ -15,6 +15,7 @@ use tokio::{
 
 use crate::{
     audit_service::AuditRecorder,
+    auth::CredentialIndex,
     config::Config,
     error::{safe_cause_diagnostic, safe_value_fingerprint, ApiError},
     http_boundary::{HttpBoundaryState, RequestDeadline},
@@ -370,6 +371,7 @@ pub struct AppState {
     pub(crate) audit_recorder: AuditRecorder,
     pub(crate) http_boundary: HttpBoundaryState,
     pub(crate) runtime: RuntimeSupervisor,
+    pub(crate) credentials: Arc<CredentialIndex>,
 }
 
 #[derive(Clone)]
@@ -377,11 +379,16 @@ pub(crate) struct AuthState {
     config: Arc<Config>,
     http_boundary: HttpBoundaryState,
     audit_recorder: AuditRecorder,
+    credentials: Arc<CredentialIndex>,
 }
 
 impl AuthState {
     pub(crate) fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub(crate) fn credentials(&self) -> &CredentialIndex {
+        &self.credentials
     }
 
     pub(crate) fn http_boundary(&self) -> &HttpBoundaryState {
@@ -399,6 +406,7 @@ impl FromRef<AppState> for AuthState {
             config: state.config.clone(),
             http_boundary: state.http_boundary.clone(),
             audit_recorder: state.audit_recorder.clone(),
+            credentials: state.credentials.clone(),
         }
     }
 }
@@ -427,7 +435,9 @@ impl AppState {
         spawn_ingest_task_cleanup(store.clone(), &config, &runtime);
         spawn_trace_persister(store.clone(), &runtime);
         spawn_trace_retention(store.clone(), &config, &runtime);
+        let credentials = Arc::new(CredentialIndex::from_config(&config));
         Self {
+            credentials,
             store,
             runtime_meili,
             meili: index_admin,
