@@ -78,6 +78,7 @@ pub struct Store {
     resolver: EventIndexResolver,
     repository: Arc<dyn KnowledgeRepository>,
     vector: Arc<Mutex<VectorMatcher>>,
+    traces: Arc<TraceRecorder>,
     redaction_config: Arc<Config>,
     parser_registry: ParserRegistry,
     metrics: Metrics,
@@ -155,7 +156,6 @@ struct StoreData {
     row_idempotency: HashSet<(String, String)>,
     structured_summaries: HashMap<String, Value>,
     sessions: HashMap<String, SessionRecord>,
-    traces: HashMap<String, TraceRecord>,
     links: HashMap<String, KnowledgeLink>,
     link_idempotency: HashMap<(String, String, String), String>,
     harness_components: HashMap<String, HarnessComponent>,
@@ -169,6 +169,84 @@ struct StoreData {
 }
 
 const MAX_IN_MEMORY_AUDIT_RECORDS: usize = 10_000;
+/// Recently recorded or read-through traces kept in process. Older traces
+/// remain readable by id through the repository.
+const MAX_CACHED_TRACES: usize = 10_000;
+/// Pending trace writes awaiting the background persister. When the queue is
+/// full new traces are still cached and returned but not persisted.
+const TRACE_PERSIST_QUEUE_CAPACITY: usize = 4_096;
+/// Maximum traces submitted in one repository document write.
+const TRACE_PERSIST_BATCH_MAX: usize = 256;
+
+/// Bounded insertion-ordered cache of retrieval traces.
+#[derive(Default)]
+struct TraceCache {
+    entries: HashMap<String, TraceRecord>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl TraceCache {
+    fn insert(&mut self, trace: TraceRecord) {
+        let id = trace.id.clone();
+        if self.entries.insert(id.clone(), trace).is_none() {
+            self.order.push_back(id);
+        }
+        while self.entries.len() > MAX_CACHED_TRACES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn get(&self, tenant_id: &str, trace_id: &str) -> Option<TraceRecord> {
+        self.entries
+            .get(trace_id)
+            .filter(|trace| trace.tenant_id == tenant_id)
+            .cloned()
+    }
+
+    fn prune_before(&mut self, tenant_id: &str, cutoff: chrono::DateTime<chrono::Utc>) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, trace| trace.tenant_id != tenant_id || trace.created_at >= cutoff);
+        let entries = &self.entries;
+        self.order.retain(|id| entries.contains_key(id));
+        before - self.entries.len()
+    }
+}
+
+/// Records retrieval traces off the mutation path.
+///
+/// Search and RAG answers are reads: recording their trace must never take
+/// the global mutation gate, clone the store, or wait for backend tasks. A
+/// trace is published to the bounded in-process cache immediately (so the
+/// caller can read its own trace by id) and, for durable backends, queued for
+/// a background persister that writes batches with one document request.
+struct TraceRecorder {
+    cache: Mutex<TraceCache>,
+    persist: bool,
+    sender: tokio::sync::mpsc::Sender<TraceRecord>,
+    receiver: Mutex<Option<tokio::sync::mpsc::Receiver<TraceRecord>>>,
+}
+
+impl TraceRecorder {
+    fn new(persist: bool) -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::channel(TRACE_PERSIST_QUEUE_CAPACITY);
+        Self {
+            cache: Mutex::new(TraceCache::default()),
+            persist,
+            sender,
+            receiver: Mutex::new(Some(receiver)),
+        }
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, TraceCache> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 #[derive(Default)]
 struct HydrationStage {
@@ -184,7 +262,6 @@ struct HydrationStage {
     snapshots: Vec<StructuredSnapshot>,
     structured_summaries: Vec<Value>,
     sessions: Vec<SessionRecord>,
-    traces: Vec<TraceRecord>,
     harness_components: Vec<HarnessComponent>,
     harness_revisions: Vec<HarnessComponentRevision>,
     harness_changes: Vec<HarnessChangeManifest>,
@@ -283,7 +360,9 @@ fn durability_contract() -> BTreeMap<&'static str, (DurabilityClass, HydrationSt
         ("structured_rows", (DurableCanonical, LazySnapshot, false)),
         ("structured_summaries", (DerivedDurable, Startup, true)),
         ("sessions", (DurableCanonical, Startup, true)),
-        ("traces", (DurableCanonical, Startup, true)),
+        // Diagnostic traces are persisted asynchronously and read through by
+        // id; a large trace history must never gate or break startup.
+        ("traces", (DerivedDurable, ReadThrough, false)),
         ("harness_components", (DurableCanonical, Startup, true)),
         ("harness_revisions", (DurableCanonical, Startup, true)),
         ("harness_changes", (DurableCanonical, Startup, true)),
@@ -423,7 +502,6 @@ fn completed_hydration_report(
         ("structured_snapshots", stage.snapshots.len(), 0),
         ("structured_summaries", stage.structured_summaries.len(), 0),
         ("sessions", stage.sessions.len(), 0),
-        ("traces", stage.traces.len(), 0),
         ("harness_components", stage.harness_components.len(), 0),
         ("harness_revisions", stage.harness_revisions.len(), 0),
         ("harness_changes", stage.harness_changes.len(), 0),
@@ -508,7 +586,6 @@ enum MutationPrimary {
     StructuredRows,
     StructuredSummary,
     Session,
-    Trace,
     HarnessComponents,
     HarnessChanges,
     HarnessVerdicts,
@@ -584,7 +661,6 @@ impl MutationPrimary {
                     OperationResource::StructuredSummary { .. }
                 )
                 | (Self::Session, OperationResource::Session { .. })
-                | (Self::Trace, OperationResource::Trace { .. })
                 | (
                     Self::HarnessComponents,
                     OperationResource::HarnessComponents { .. }
@@ -998,12 +1074,14 @@ impl Store {
             ..StoreData::default()
         };
         data.seed_harness_components(&config.tenant_id);
+        let persist_traces = repository.backend_name() != "memory";
         Self {
             inner: Arc::new(RwLock::new(data)),
             mutation_gate: Arc::new(tokio::sync::Mutex::new(())),
             resolver: EventIndexResolver::new(config.index_hash_secret.clone()),
             repository,
             vector: Arc::new(Mutex::new(VectorMatcher::from_config(config))),
+            traces: Arc::new(TraceRecorder::new(persist_traces)),
             redaction_config: Arc::new(config.clone()),
             parser_registry: ParserRegistry::new(config),
             metrics,
@@ -1442,19 +1520,8 @@ impl Store {
                 .map(|session| OperationResource::Session { session }),
         );
 
-        let mut traces = after
-            .traces
-            .values()
-            .filter(|trace| trace.tenant_id == tenant_id)
-            .filter(|trace| serialized_changed(before.traces.get(&trace.id), *trace))
-            .cloned()
-            .collect::<Vec<_>>();
-        traces.sort_by(|left, right| left.id.cmp(&right.id));
-        resources.extend(
-            traces
-                .into_iter()
-                .map(|trace| OperationResource::Trace { trace }),
-        );
+        // Retrieval traces are not part of StoreData: they are recorded by the
+        // asynchronous trace persister outside the operation journal.
 
         let mut links = after
             .links
@@ -2187,11 +2254,9 @@ impl Store {
             OperationResource::Session { session } => {
                 current.sessions.insert(session.id.clone(), session.clone());
             }
-            OperationResource::Trace { trace } => {
-                current
-                    .traces
-                    .entry(trace.id.clone())
-                    .or_insert_with(|| trace.clone());
+            OperationResource::Trace { .. } => {
+                // Legacy journaled traces are read through by id on demand;
+                // they are never projected into the mutation cache.
             }
             OperationResource::Links { links } => {
                 let link_ids = links
@@ -3646,10 +3711,6 @@ impl Store {
                 "sessions",
                 self.repository.list_sessions(tenant_id).await,
             )?,
-            traces: required_hydration_rows(
-                "traces",
-                self.repository.list_traces(tenant_id).await,
-            )?,
             harness_components: required_hydration_rows(
                 "harness_components",
                 self.repository.list_harness_components(tenant_id).await,
@@ -3922,7 +3983,6 @@ impl Store {
             snapshots,
             structured_summaries,
             sessions,
-            traces,
             harness_components,
             harness_revisions,
             harness_changes,
@@ -4095,9 +4155,6 @@ impl Store {
                 .into_iter()
                 .map(|session| (session.id.clone(), session)),
         );
-        data.traces.retain(|_, trace| trace.tenant_id != tenant_id);
-        data.traces
-            .extend(traces.into_iter().map(|trace| (trace.id.clone(), trace)));
 
         let default_component_ids = default_harness_components()
             .into_iter()
@@ -4323,8 +4380,12 @@ impl Store {
                     && owner_matches(&item.owner_user_id)
             })
             .count();
-        let trace_count = data
+        // Traces are not hydrated at startup; this counts the bounded set of
+        // recent traces retained by this process.
+        let trace_count = self
             .traces
+            .cache()
+            .entries
             .values()
             .filter(|trace| trace.tenant_id == tenant_id)
             .filter(|trace| {
@@ -4585,11 +4646,11 @@ impl Store {
         };
         if let Some(trace) = trace {
             self.metrics.record_read_through("trace", "loaded", 1);
-            let mut data = self.write()?;
-            if let Some(current) = data.traces.get(trace_id) {
-                return Ok(current.clone());
+            let mut cache = self.traces.cache();
+            if let Some(current) = cache.get(tenant_id, trace_id) {
+                return Ok(current);
             }
-            data.traces.insert(trace.id.clone(), trace.clone());
+            cache.insert(trace.clone());
             return Ok(trace);
         }
         self.metrics.record_read_through("trace", "not_found", 1);
@@ -5734,10 +5795,120 @@ impl Store {
             .map(|session| session.owner_user_id.clone()))
     }
 
-    fn insert_trace(&self, trace: TraceRecord) -> Result<(), ApiError> {
-        let mut data = self.write()?;
-        data.traces.insert(trace.id.clone(), trace);
-        Ok(())
+    /// Publish a retrieval trace without entering the mutation path.
+    ///
+    /// The trace is cached immediately so the caller can read it back by id,
+    /// then queued for the background persister when the backend is durable.
+    /// A full or closed queue drops persistence for this trace only; the
+    /// search result itself never fails or waits because of trace storage.
+    pub(crate) fn record_trace(&self, trace: TraceRecord) {
+        if self.traces.persist {
+            match self.traces.sender.try_send(trace.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!("trace persistence queue is full; trace kept in cache only");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!("trace persister has stopped; trace kept in cache only");
+                }
+            }
+        }
+        self.traces.cache().insert(trace);
+    }
+
+    fn cached_trace(&self, tenant_id: &str, trace_id: &str) -> Option<TraceRecord> {
+        self.traces.cache().get(tenant_id, trace_id)
+    }
+
+    /// Drain queued traces into batched repository writes until shutdown.
+    ///
+    /// Only the first call takes ownership of the queue; later calls return
+    /// immediately. On shutdown the already queued traces are flushed once
+    /// before returning so a graceful stop does not lose recent traces.
+    pub(crate) async fn run_trace_persister(
+        &self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let receiver = self
+            .traces
+            .receiver
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(mut receiver) = receiver else {
+            return;
+        };
+        loop {
+            let first = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                received = receiver.recv() => received,
+            };
+            let Some(first) = first else {
+                return;
+            };
+            let mut batch = vec![first];
+            while batch.len() < TRACE_PERSIST_BATCH_MAX {
+                match receiver.try_recv() {
+                    Ok(trace) => batch.push(trace),
+                    Err(_) => break,
+                }
+            }
+            self.persist_trace_batch(&batch).await;
+        }
+        receiver.close();
+        loop {
+            let mut batch = Vec::new();
+            while batch.len() < TRACE_PERSIST_BATCH_MAX {
+                match receiver.try_recv() {
+                    Ok(trace) => batch.push(trace),
+                    Err(_) => break,
+                }
+            }
+            if batch.is_empty() {
+                return;
+            }
+            self.persist_trace_batch(&batch).await;
+        }
+    }
+
+    async fn persist_trace_batch(&self, batch: &[TraceRecord]) {
+        if let Err(error) = self.repository.upsert_traces(batch).await {
+            let diagnostic = safe_cause_diagnostic(&error);
+            tracing::warn!(
+                trace_count = batch.len(),
+                cause_category = diagnostic.category,
+                cause_fingerprint = %diagnostic.fingerprint,
+                "failed to persist retrieval trace batch"
+            );
+        }
+    }
+
+    /// Delete traces older than `retention_days` from the cache and the
+    /// durable backend. Returns the number of cached traces pruned and the
+    /// accepted backend task UIDs. Zero retention keeps traces forever.
+    pub(crate) async fn prune_expired_traces_async(
+        &self,
+        tenant_id: &str,
+        retention_days: u64,
+    ) -> Result<(usize, Vec<String>), ApiError> {
+        if retention_days == 0 {
+            return Ok((0, Vec::new()));
+        }
+        let days = i64::try_from(retention_days)
+            .map_err(|_| ApiError::Internal("trace retention is out of range".to_string()))?;
+        let cutoff = now() - chrono::Duration::days(days);
+        let pruned = self.traces.cache().prune_before(tenant_id, cutoff);
+        let receipt = self
+            .repository
+            .delete_traces_before(tenant_id, cutoff)
+            .await?;
+        Ok((pruned, receipt.task_uids))
     }
 
     fn owner_from_path_or_body(
@@ -8744,6 +8915,249 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    fn trace_fixture(tenant_id: &str, id: &str, age_days: i64) -> TraceRecord {
+        TraceRecord {
+            id: id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            owner_user_id: Some("owner-a".to_string()),
+            query: format!("query {id}"),
+            mode: "hybrid".to_string(),
+            stages: Vec::new(),
+            context_uris: Vec::new(),
+            created_at: now() - chrono::Duration::days(age_days),
+        }
+    }
+
+    type RecordedMeiliRequests = Arc<Mutex<Vec<(String, String, Value)>>>;
+
+    /// Minimal Meilisearch stub that records every request and accepts
+    /// document writes/deletes. `legacy_traces` are returned only for the
+    /// retention scan of traces that lack `created_at_ms`.
+    async fn spawn_trace_meili_stub(legacy_traces: Vec<Value>) -> (String, RecordedMeiliRequests) {
+        use axum::{extract::Request, response::IntoResponse, Router};
+
+        let recorded: RecordedMeiliRequests = Arc::new(Mutex::new(Vec::new()));
+        let requests = recorded.clone();
+        let app = Router::new().fallback(move |request: Request| {
+            let requests = requests.clone();
+            let legacy_traces = legacy_traces.clone();
+            async move {
+                let method = request.method().to_string();
+                let path = request.uri().path().to_string();
+                let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+                requests
+                    .lock()
+                    .unwrap()
+                    .push((method.clone(), path.clone(), body.clone()));
+                let response = if path.starts_with("/tasks") {
+                    json!({ "uid": 1, "status": "succeeded" })
+                } else if path.ends_with("/documents/delete") || path.ends_with("/documents") {
+                    json!({ "taskUid": 7 })
+                } else if path == "/indexes/rag_traces/documents/fetch"
+                    && body["filter"]
+                        .as_str()
+                        .is_some_and(|filter| filter.contains("created_at_ms NOT EXISTS"))
+                {
+                    json!({ "results": legacy_traces, "offset": 0, "limit": 1000, "total": legacy_traces.len() })
+                } else {
+                    json!({ "results": [], "hits": [], "offset": 0, "limit": 0, "total": 0 })
+                };
+                axum::Json(response).into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), recorded)
+    }
+
+    fn meili_trace_store(url: String) -> (Config, Store) {
+        let mut config = Config::test();
+        config.store_backend = "meili".to_string();
+        config.meili_url = Some(url);
+        let (runtime, index_admin) = MeiliAdmin::pair_from_config(&config);
+        let store =
+            Store::new_with_meili_admins_and_metrics(&config, runtime, index_admin, Metrics::new());
+        (config, store)
+    }
+
+    #[tokio::test]
+    async fn context_search_never_waits_for_the_mutation_gate_or_journals_its_trace() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let _held_gate = store.mutation_gate.lock().await;
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.search_context_async(
+                &config.tenant_id,
+                ContextSearchRequest {
+                    query: Some("anything".to_string()),
+                    owner_user_id: Some("owner-a".to_string()),
+                    ..ContextSearchRequest::default()
+                },
+                false,
+            ),
+        )
+        .await
+        .expect("a read-only search must not wait for the global mutation gate")
+        .unwrap();
+
+        assert!(store.read().unwrap().operations.is_empty());
+        let trace = store
+            .get_trace(&config.tenant_id, &outcome.response.trace_id)
+            .expect("the caller can read its own trace immediately");
+        assert_eq!(trace.owner_user_id.as_deref(), Some("owner-a"));
+        assert!(store
+            .get_trace("another-tenant", &outcome.response.trace_id)
+            .is_err());
+    }
+
+    #[test]
+    fn trace_cache_is_bounded_and_evicts_oldest_first() {
+        let mut cache = TraceCache::default();
+        for index in 0..(MAX_CACHED_TRACES + 5) {
+            cache.insert(trace_fixture("tenant-a", &format!("trace-{index}"), 0));
+        }
+        assert_eq!(cache.entries.len(), MAX_CACHED_TRACES);
+        assert_eq!(cache.order.len(), MAX_CACHED_TRACES);
+        assert!(cache.get("tenant-a", "trace-0").is_none());
+        assert!(cache.get("tenant-a", "trace-4").is_none());
+        assert!(cache.get("tenant-a", "trace-5").is_some());
+        assert!(cache
+            .get("tenant-a", &format!("trace-{}", MAX_CACHED_TRACES + 4))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn memory_trace_retention_prunes_only_expired_traces_of_the_tenant() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant = config.tenant_id.as_str();
+        store.record_trace(trace_fixture(tenant, "trace-old", 45));
+        store.record_trace(trace_fixture(tenant, "trace-new", 1));
+        store.record_trace(trace_fixture("other-tenant", "trace-other-old", 45));
+
+        let (pruned, task_uids) = store.prune_expired_traces_async(tenant, 30).await.unwrap();
+        assert_eq!(pruned, 1);
+        assert!(task_uids.is_empty());
+        assert!(store.get_trace(tenant, "trace-old").is_err());
+        assert!(store.get_trace(tenant, "trace-new").is_ok());
+        assert!(store.get_trace("other-tenant", "trace-other-old").is_ok());
+
+        let (pruned, _) = store.prune_expired_traces_async(tenant, 0).await.unwrap();
+        assert_eq!(pruned, 0, "zero retention keeps traces forever");
+    }
+
+    #[tokio::test]
+    async fn trace_persister_writes_queued_traces_in_one_batched_request() {
+        let (url, requests) = spawn_trace_meili_stub(Vec::new()).await;
+        let (config, store) = meili_trace_store(url);
+        let tenant = config.tenant_id.as_str();
+        for id in ["trace-a", "trace-b", "trace-c"] {
+            store.record_trace(trace_fixture(tenant, id, 0));
+        }
+        assert!(store.get_trace(tenant, "trace-b").is_ok());
+
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let persister = {
+            let store = store.clone();
+            tokio::spawn(async move { store.run_trace_persister(shutdown_rx).await })
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, path, _)| method == "POST" && path == "/indexes/rag_traces/documents")
+        {
+            assert!(Instant::now() < deadline, "trace batch was never written");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        shutdown.send(true).unwrap();
+        persister.await.unwrap();
+
+        let requests = requests.lock().unwrap().clone();
+        let writes = requests
+            .iter()
+            .filter(|(method, path, _)| method == "POST" && path == "/indexes/rag_traces/documents")
+            .collect::<Vec<_>>();
+        assert_eq!(writes.len(), 1, "{requests:?}");
+        let documents = writes[0].2.as_array().unwrap();
+        assert_eq!(documents.len(), 3);
+        for document in documents {
+            assert_eq!(document["tenant_id"], tenant);
+            assert!(document["created_at_ms"].as_i64().is_some(), "{document}");
+            assert!(crate::tenant_scope::is_tenant_document(
+                "rag_traces",
+                document
+            ));
+        }
+        assert!(
+            !requests
+                .iter()
+                .any(|(_, path, _)| path == "/indexes/rag_operations/documents"),
+            "trace writes must not touch the operation journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_persister_flushes_queued_traces_on_shutdown() {
+        let (url, requests) = spawn_trace_meili_stub(Vec::new()).await;
+        let (config, store) = meili_trace_store(url);
+        store.record_trace(trace_fixture(&config.tenant_id, "trace-late", 0));
+
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        shutdown.send(true).unwrap();
+        store.run_trace_persister(shutdown_rx).await;
+
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, path, _)| method == "POST" && path == "/indexes/rag_traces/documents"));
+    }
+
+    #[tokio::test]
+    async fn meili_trace_retention_deletes_by_numeric_cutoff_and_expired_legacy_ids() {
+        let tenant = Config::test().tenant_id;
+        let legacy = |id: &str, age_days: i64| {
+            crate::tenant_scope::tenant_document(
+                &tenant,
+                "rag_traces",
+                id,
+                &trace_fixture(&tenant, id, age_days),
+            )
+            .unwrap()
+        };
+        let (url, requests) =
+            spawn_trace_meili_stub(vec![legacy("legacy-old", 90), legacy("legacy-new", 1)]).await;
+        let (_, store) = meili_trace_store(url);
+
+        let (_, task_uids) = store.prune_expired_traces_async(&tenant, 30).await.unwrap();
+        assert_eq!(task_uids.len(), 2);
+
+        let requests = requests.lock().unwrap().clone();
+        let deletes = requests
+            .iter()
+            .filter(|(method, path, _)| {
+                method == "POST" && path == "/indexes/rag_traces/documents/delete"
+            })
+            .map(|(_, _, body)| body["filter"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(deletes.len(), 2, "{requests:?}");
+        assert!(deletes[0].contains("tenant_id = "), "{}", deletes[0]);
+        assert!(deletes[0].contains("created_at_ms < "), "{}", deletes[0]);
+        assert!(deletes[1].contains("tenant_id = "), "{}", deletes[1]);
+        assert!(deletes[1].contains("legacy-old"), "{}", deletes[1]);
+        assert!(!deletes[1].contains("legacy-new"), "{}", deletes[1]);
+    }
+
     #[tokio::test]
     async fn memory_audit_persistence_updates_one_record_in_place() {
         let config = Config::test();
@@ -9759,15 +10173,10 @@ mod tests {
             title: "unaccepted side effect".to_string(),
             ..concurrent_session.clone()
         };
-        let trace = TraceRecord {
-            id: "trace-accepted".to_string(),
-            tenant_id: "tenant-a".to_string(),
-            owner_user_id: Some("owner-a".to_string()),
-            query: "accepted primary".to_string(),
-            mode: "hybrid".to_string(),
-            stages: Vec::new(),
-            context_uris: Vec::new(),
-            created_at,
+        let accepted_session = SessionRecord {
+            id: "session-accepted".to_string(),
+            title: "accepted primary".to_string(),
+            ..concurrent_session.clone()
         };
 
         let mut current = StoreData::default();
@@ -9778,14 +10187,16 @@ mod tests {
         staged
             .sessions
             .insert(unaccepted_session.id.clone(), unaccepted_session.clone());
-        staged.traces.insert(trace.id.clone(), trace.clone());
+        staged
+            .sessions
+            .insert(accepted_session.id.clone(), accepted_session.clone());
 
         Store::publish_resource_cache(
             &mut current,
             &staged,
             "tenant-a",
-            &OperationResource::Trace {
-                trace: trace.clone(),
+            &OperationResource::Session {
+                session: accepted_session.clone(),
             },
         );
 
@@ -9799,9 +10210,9 @@ mod tests {
         assert!(!current.sessions.contains_key(&unaccepted_session.id));
         assert_eq!(
             current
-                .traces
-                .get(&trace.id)
-                .map(|trace| trace.query.as_str()),
+                .sessions
+                .get(&accepted_session.id)
+                .map(|session| session.title.as_str()),
             Some("accepted primary")
         );
     }

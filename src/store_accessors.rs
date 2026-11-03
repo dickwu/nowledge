@@ -46,11 +46,7 @@ impl Store {
     }
 
     pub fn get_trace(&self, tenant_id: &str, trace_id: &str) -> Result<TraceRecord, ApiError> {
-        let data = self.read()?;
-        data.traces
-            .get(trace_id)
-            .filter(|trace| trace.tenant_id == tenant_id)
-            .cloned()
+        self.cached_trace(tenant_id, trace_id)
             .ok_or_else(|| ApiError::not_found("trace not found"))
     }
 
@@ -59,11 +55,8 @@ impl Store {
         tenant_id: &str,
         trace_id: &str,
     ) -> Result<Option<String>, ApiError> {
-        let data = self.read()?;
-        data.traces
-            .get(trace_id)
-            .filter(|trace| trace.tenant_id == tenant_id)
-            .map(|trace| trace.owner_user_id.clone())
+        self.cached_trace(tenant_id, trace_id)
+            .map(|trace| trace.owner_user_id)
             .ok_or_else(|| ApiError::not_found("trace not found"))
     }
 

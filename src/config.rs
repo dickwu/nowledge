@@ -28,6 +28,9 @@ const DEFAULT_MAX_SEARCH_LIMIT: usize = 100;
 pub(crate) const DEFAULT_MEILI_SCAN_PAGE_SIZE: usize = 500;
 pub(crate) const DEFAULT_MEILI_SCAN_MAX_DOCUMENTS: usize = 100_000;
 const MAX_MEILI_SCAN_PAGE_SIZE: usize = 1_000;
+pub(crate) const DEFAULT_TRACE_RETENTION_DAYS: u64 = 30;
+/// One hundred years keeps the cutoff arithmetic far from chrono's range.
+const MAX_TRACE_RETENTION_DAYS: u64 = 36_500;
 const DEFAULT_MAX_TAGS_PER_ITEM: usize = 64;
 const DEFAULT_MAX_TAG_BYTES: usize = 128;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
@@ -151,6 +154,10 @@ pub struct Config {
     pub ingest_task_retention_seconds: u64,
     pub ingest_cleanup_interval_seconds: u64,
     pub ingest_worker_enabled: bool,
+    /// Retrieval traces older than this many days are deleted by a periodic
+    /// background sweep (`RAG_TRACE_RETENTION_DAYS`, default 30). Zero keeps
+    /// traces forever.
+    pub trace_retention_days: u64,
     pub llm_provider: String,
     pub llm_model: Option<String>,
     pub llm_reasoning_effort: Option<String>,
@@ -506,6 +513,21 @@ impl Config {
             ingest_worker_enabled: std::env::var("RAG_INGEST_WORKER_ENABLED")
                 .map(|v| truthy(&v))
                 .unwrap_or(true),
+            trace_retention_days: {
+                let days = parse_env_number(
+                    "RAG_TRACE_RETENTION_DAYS",
+                    DEFAULT_TRACE_RETENTION_DAYS,
+                    &mut boundary_errors,
+                );
+                if days > MAX_TRACE_RETENTION_DAYS {
+                    boundary_errors.push(format!(
+                        "RAG_TRACE_RETENTION_DAYS must be at most {MAX_TRACE_RETENTION_DAYS}"
+                    ));
+                    DEFAULT_TRACE_RETENTION_DAYS
+                } else {
+                    days
+                }
+            },
             llm_provider: std::env::var("RAG_LLM_PROVIDER").unwrap_or_else(|_| "none".to_string()),
             llm_model: std::env::var("RAG_LLM_MODEL").ok(),
             llm_reasoning_effort: std::env::var("RAG_LLM_REASONING_EFFORT").ok(),
@@ -1489,6 +1511,7 @@ impl Config {
             ingest_task_retention_seconds: 86_400,
             ingest_cleanup_interval_seconds: 300,
             ingest_worker_enabled: true,
+            trace_retention_days: DEFAULT_TRACE_RETENTION_DAYS,
             llm_provider: "none".to_string(),
             llm_model: Some("none".to_string()),
             llm_reasoning_effort: None,

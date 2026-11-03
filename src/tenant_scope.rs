@@ -238,6 +238,16 @@ impl TenantFilter {
         self
     }
 
+    pub fn lt_i64(mut self, field: &'static str, value: i64) -> Self {
+        self.clauses.push(format!("{field} < {value}"));
+        self
+    }
+
+    pub fn not_exists(mut self, field: &'static str) -> Self {
+        self.clauses.push(format!("{field} NOT EXISTS"));
+        self
+    }
+
     pub fn is_null(mut self, field: &'static str) -> Self {
         self.clauses
             .push(format!("({field} IS NULL OR {field} NOT EXISTS)"));

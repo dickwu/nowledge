@@ -282,14 +282,16 @@ const DURABILITY_MATRIX: &[DurabilityDomain] = &[
     },
     DurabilityDomain {
         name: "traces",
-        store_fields: &["traces"],
-        durability: DurabilityClass::DurableCanonical,
-        strategy: RestartStrategy::StartupHydrated,
-        repository_writes: &["upsert_trace"],
-        repository_reads: &["get_trace", "list_traces"],
-        startup_methods: &["list_traces"],
+        // Traces live in a bounded cache outside StoreData so mutations never
+        // clone them and searches never enter the mutation path.
+        store_fields: &[],
+        durability: DurabilityClass::DerivedDurable,
+        strategy: RestartStrategy::ReadThrough,
+        repository_writes: &["upsert_trace", "upsert_traces", "delete_traces_before"],
+        repository_reads: &["get_trace"],
+        startup_methods: &[],
         report_domains: &["traces"],
-        evidence: "trace ownership and reveal authorization require complete startup hydration",
+        evidence: "diagnostic traces are persisted asynchronously in batches, expire by retention, and are read through by tenant-scoped id so ownership checks never need startup hydration",
     },
     DurabilityDomain {
         name: "eval_and_harness",
