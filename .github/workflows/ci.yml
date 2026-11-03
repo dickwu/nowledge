@@ -24,6 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
       # turbovec links OpenBLAS on Linux (Accelerate on macOS).
       - run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - run: cargo fmt --check
@@ -33,6 +34,48 @@ jobs:
       - run: cargo test --locked
       - run: cargo package --locked
 
+  meili:
+    name: Meilisearch integration
+    runs-on: ubuntu-latest
+    services:
+      meilisearch:
+        # Keep in step with the production Meilisearch version.
+        image: getmeili/meilisearch:v1.56.1
+        env:
+          # Throwaway key for the job-local container only; not a secret.
+          MEILI_MASTER_KEY: ci-only-meili-master-key-not-a-secret
+          MEILI_ENV: development
+          MEILI_NO_ANALYTICS: "true"
+        ports:
+          - 7700:7700
+    env:
+      RAG_TEST_MEILI_URL: http://127.0.0.1:7700
+      RAG_TEST_MEILI_API_KEY: ci-only-meili-master-key-not-a-secret
+      # Fail, instead of silently skipping, when Meili is missing or unkeyed.
+      RAG_TEST_REQUIRE_MEILI: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+      - name: Wait for Meilisearch
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS "$RAG_TEST_MEILI_URL/health"; then
+              echo
+              curl -fsS -H "Authorization: Bearer $RAG_TEST_MEILI_API_KEY" \
+                "$RAG_TEST_MEILI_URL/version"
+              echo
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Meilisearch did not become healthy" >&2
+          exit 1
+      - run: cargo test --locked --test meili_integration --test insight_history
+
   msrv:
     name: Rust 1.88 MSRV
     runs-on: ubuntu-latest
@@ -41,6 +84,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - run: cargo check --locked --all-targets
 
