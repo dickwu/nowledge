@@ -837,11 +837,16 @@ async fn meili_stub(State(state): State<MeiliStubState>, request: AxumRequest) -
 }
 
 fn take_failure(remaining: &AtomicUsize) -> bool {
-    remaining
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            count.checked_sub(1)
-        })
-        .is_ok()
+    // Explicit CAS loop: `fetch_update` is deprecated on newer stable
+    // toolchains, while its `try_update` replacement is newer than the MSRV.
+    let mut current = remaining.load(Ordering::SeqCst);
+    while let Some(next) = current.checked_sub(1) {
+        match remaining.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
 }
 
 async fn request_json(request: AxumRequest) -> Value {

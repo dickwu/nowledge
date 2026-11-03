@@ -935,9 +935,9 @@ fn decode_operation_list_cursor(
         return Err(invalid());
     }
     let mut parts = cursor.split('.');
-    let prefix = parts.next().ok_or_else(&invalid)?;
-    let payload = parts.next().ok_or_else(&invalid)?;
-    let signature = parts.next().ok_or_else(&invalid)?;
+    let prefix = parts.next().ok_or_else(invalid)?;
+    let payload = parts.next().ok_or_else(invalid)?;
+    let signature = parts.next().ok_or_else(invalid)?;
     if prefix != OPERATION_LIST_CURSOR_PREFIX || parts.next().is_some() {
         return Err(invalid());
     }
@@ -953,7 +953,7 @@ fn decode_operation_list_cursor(
     }
     let decoded = hex::decode(payload).map_err(|_| invalid())?;
     let decoded = String::from_utf8(decoded).map_err(|_| invalid())?;
-    let (offset, previous_operation_id) = decoded.split_once('\0').ok_or_else(&invalid)?;
+    let (offset, previous_operation_id) = decoded.split_once('\0').ok_or_else(invalid)?;
     let offset = offset.parse::<usize>().map_err(|_| invalid())?;
     if offset == 0
         || previous_operation_id.trim().is_empty()

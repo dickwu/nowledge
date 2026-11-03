@@ -13,7 +13,7 @@ RAG answer surfaces. Built as a single Rust + axum binary that runs on
 ## Key Files
 | File | Description |
 |------|-------------|
-| `Cargo.toml` | Crate manifest. Name `nowledge`, edition 2021, MSRV 1.88. Pins axum 0.8, meilisearch-sdk 0.33, reqwest 0.12, and uuid v7. |
+| `Cargo.toml` | Crate manifest. Name `nowledge`, edition 2021, MSRV 1.88. Pins axum 0.8, meilisearch-sdk 0.33, reqwest 0.13, and uuid v7. |
 | `Cargo.lock` | Locked dependency graph for reproducible builds. |
 | `README.md` | Public-facing run/verify guide. Lists environment variables, the locked verify/package command set, and optional Meili/MinerU integration test gates. |
 | `.env.example` | Safe, explicitly local development baseline with secret placeholders only. |
@@ -93,11 +93,11 @@ Ignored and excluded from AGENTS.md generation: `target/` (build output),
 ### External
 - `axum` 0.8 — HTTP router and extractors.
 - `tokio` 1 — async runtime.
-- `tower-http` 0.6 — compression, CORS, tracing middleware.
+- `tower-http` 0.7 — compression, CORS, tracing middleware.
 - `meilisearch-sdk` 0.33 — Meilisearch client (plus direct `reqwest` for admin
   bootstrap calls).
-- `reqwest` 0.12 — HTTP client for Meili admin, MinerU, and LLM providers.
-- `hmac` / `sha2` — per-user index HMAC derivation.
+- `reqwest` 0.13 (rustls default TLS, `query` feature) — HTTP client for Meili admin, MinerU, and LLM providers. `meilisearch-sdk` still pulls its own reqwest 0.12 internally.
+- `hmac` 0.13 / `sha2` 0.11 — per-user index HMAC derivation (`KeyInit` must be in scope for `new_from_slice`).
 - `serde` / `serde_json` — wire format.
 - `uuid` 1 (v7) — id minting.
 - `chrono` — timestamps.
