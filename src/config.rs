@@ -28,6 +28,11 @@ const DEFAULT_MAX_SEARCH_LIMIT: usize = 100;
 pub(crate) const DEFAULT_MEILI_SCAN_PAGE_SIZE: usize = 500;
 pub(crate) const DEFAULT_MEILI_SCAN_MAX_DOCUMENTS: usize = 100_000;
 const MAX_MEILI_SCAN_PAGE_SIZE: usize = 1_000;
+const DEFAULT_MEILI_CONNECT_TIMEOUT_MS: u64 = 5_000;
+/// Bounds one Meilisearch HTTP request. `wait_for_index` task confirmation is
+/// a series of short polls under its own 60 s budget, so this per-request
+/// limit never shortens a legitimate task wait.
+const DEFAULT_MEILI_REQUEST_TIMEOUT_MS: u64 = 30_000;
 pub(crate) const DEFAULT_TRACE_RETENTION_DAYS: u64 = 30;
 /// One hundred years keeps the cutoff arithmetic far from chrono's range.
 const MAX_TRACE_RETENTION_DAYS: u64 = 36_500;
@@ -115,6 +120,11 @@ pub struct Config {
     pub meili_wait_for_tasks: bool,
     pub meili_scan_page_size: usize,
     pub meili_scan_max_documents: usize,
+    /// Connect bound for every Meilisearch request.
+    pub meili_connect_timeout_ms: u64,
+    /// Total bound for one Meilisearch HTTP request, including its response
+    /// body. Each task-status poll is a separate request.
+    pub meili_request_timeout_ms: u64,
     pub parser_provider: String,
     pub mineru_api_url: String,
     pub mineru_backend: String,
@@ -362,6 +372,16 @@ impl Config {
             meili_scan_max_documents: parse_env_number(
                 "RAG_MEILI_SCAN_MAX_DOCUMENTS",
                 DEFAULT_MEILI_SCAN_MAX_DOCUMENTS,
+                &mut boundary_errors,
+            ),
+            meili_connect_timeout_ms: parse_env_number(
+                "RAG_MEILI_CONNECT_TIMEOUT_MS",
+                DEFAULT_MEILI_CONNECT_TIMEOUT_MS,
+                &mut boundary_errors,
+            ),
+            meili_request_timeout_ms: parse_env_number(
+                "RAG_MEILI_REQUEST_TIMEOUT_MS",
+                DEFAULT_MEILI_REQUEST_TIMEOUT_MS,
                 &mut boundary_errors,
             ),
             parser_provider: std::env::var("RAG_PARSER_PROVIDER")
@@ -1061,6 +1081,14 @@ impl Config {
                 "RAG_MEILI_SCAN_MAX_DOCUMENTS",
                 self.meili_scan_max_documents as u128,
             ),
+            (
+                "RAG_MEILI_CONNECT_TIMEOUT_MS",
+                self.meili_connect_timeout_ms as u128,
+            ),
+            (
+                "RAG_MEILI_REQUEST_TIMEOUT_MS",
+                self.meili_request_timeout_ms as u128,
+            ),
             ("RAG_MAX_TAGS_PER_ITEM", self.max_tags_per_item as u128),
             ("RAG_MAX_TAG_BYTES", self.max_tag_bytes as u128),
             ("RAG_REQUEST_TIMEOUT_MS", self.request_timeout_ms as u128),
@@ -1150,6 +1178,14 @@ impl Config {
             ("RAG_LLM_TIMEOUT_MS", self.llm_timeout_ms),
             ("RAG_PARSER_TIMEOUT_MS", self.parser_timeout_ms),
             ("RAG_HEALTH_LLM_TIMEOUT_MS", self.health_llm_timeout_ms),
+            (
+                "RAG_MEILI_CONNECT_TIMEOUT_MS",
+                self.meili_connect_timeout_ms,
+            ),
+            (
+                "RAG_MEILI_REQUEST_TIMEOUT_MS",
+                self.meili_request_timeout_ms,
+            ),
         ] {
             if value > MAX_BOUNDARY_DEADLINE_MS {
                 anyhow::bail!("{name} must not exceed {MAX_BOUNDARY_DEADLINE_MS} milliseconds");
@@ -1168,6 +1204,11 @@ impl Config {
         }
         if self.provider_connect_timeout_ms > self.parser_timeout_ms {
             anyhow::bail!("RAG_PROVIDER_CONNECT_TIMEOUT_MS must not exceed RAG_PARSER_TIMEOUT_MS");
+        }
+        if self.meili_connect_timeout_ms > self.meili_request_timeout_ms {
+            anyhow::bail!(
+                "RAG_MEILI_CONNECT_TIMEOUT_MS must not exceed RAG_MEILI_REQUEST_TIMEOUT_MS"
+            );
         }
         if self.health_llm_probe_ttl_seconds > self.health_llm_max_stale_seconds {
             anyhow::bail!(
@@ -1468,6 +1509,8 @@ impl Config {
             meili_wait_for_tasks: true,
             meili_scan_page_size: DEFAULT_MEILI_SCAN_PAGE_SIZE,
             meili_scan_max_documents: DEFAULT_MEILI_SCAN_MAX_DOCUMENTS,
+            meili_connect_timeout_ms: DEFAULT_MEILI_CONNECT_TIMEOUT_MS,
+            meili_request_timeout_ms: DEFAULT_MEILI_REQUEST_TIMEOUT_MS,
             parser_provider: "builtin".to_string(),
             mineru_api_url: "http://127.0.0.1:8000".to_string(),
             mineru_backend: "hybrid-auto-engine".to_string(),
@@ -2931,6 +2974,8 @@ mod tests {
         assert_eq!(config.ingest_queue_capacity, 16);
         assert_eq!(config.meili_scan_page_size, 500);
         assert_eq!(config.meili_scan_max_documents, 100_000);
+        assert_eq!(config.meili_connect_timeout_ms, 5_000);
+        assert_eq!(config.meili_request_timeout_ms, 30_000);
         assert_eq!(config.provider_connect_timeout_ms, 5_000);
         assert_eq!(config.llm_timeout_ms, 60_000);
         assert_eq!(config.parser_timeout_ms, 120_000);
@@ -3067,6 +3112,41 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("RAG_MEILI_SCAN_MAX_DOCUMENTS"));
+    }
+
+    #[test]
+    fn meili_timeouts_reject_zero_oversized_and_inverted_values() {
+        for (name, configure) in [
+            (
+                "RAG_MEILI_CONNECT_TIMEOUT_MS",
+                (|config: &mut Config| config.meili_connect_timeout_ms = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_MEILI_REQUEST_TIMEOUT_MS",
+                (|config: &mut Config| config.meili_request_timeout_ms = 0) as fn(&mut Config),
+            ),
+            (
+                "RAG_MEILI_REQUEST_TIMEOUT_MS",
+                (|config: &mut Config| {
+                    config.meili_request_timeout_ms = MAX_BOUNDARY_DEADLINE_MS + 1
+                }) as fn(&mut Config),
+            ),
+            (
+                "RAG_MEILI_REQUEST_TIMEOUT_MS",
+                (|config: &mut Config| {
+                    config.meili_connect_timeout_ms = config.meili_request_timeout_ms + 1
+                }) as fn(&mut Config),
+            ),
+        ] {
+            let mut config = Config::test();
+            configure(&mut config);
+            let error = config.validate_http_boundaries().unwrap_err().to_string();
+            assert!(error.contains(name), "unexpected error: {error}");
+        }
+
+        let mut equal = Config::test();
+        equal.meili_connect_timeout_ms = equal.meili_request_timeout_ms;
+        assert!(equal.validate_http_boundaries().is_ok());
     }
 
     #[test]

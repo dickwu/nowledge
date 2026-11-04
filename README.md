@@ -78,6 +78,8 @@ RAG_MEILI_AUDIT_INDEX_CREATED_AT=required-production-rfc3339-createdAt
 RAG_WRITE_CONSISTENCY=read_your_writes
 RAG_MEILI_SCAN_PAGE_SIZE=500
 RAG_MEILI_SCAN_MAX_DOCUMENTS=100000
+RAG_MEILI_CONNECT_TIMEOUT_MS=5000
+RAG_MEILI_REQUEST_TIMEOUT_MS=30000
 RAG_PARSER_PROVIDER=builtin
 RAG_MINERU_API_URL=http://127.0.0.1:8000
 RAG_MINERU_BACKEND=hybrid-auto-engine
@@ -553,6 +555,12 @@ Meilisearch task confirmation polls with exponential backoff (5 ms doubling
 to 200 ms, same 60 s total timeout). Several task UIDs from one step are
 confirmed together through `GET /tasks?uids=...`; a server or key scope that
 cannot list them falls back to per-task `GET /tasks/{uid}` probes.
+Every Meilisearch HTTP request is bounded by `RAG_MEILI_CONNECT_TIMEOUT_MS`
+(default 5000) for connection setup and `RAG_MEILI_REQUEST_TIMEOUT_MS`
+(default 30000) for the whole exchange including the response body; the
+connect bound must not exceed the request bound. Task confirmation issues one
+short request per poll, so the request bound limits each poll rather than the
+60 s task wait that `wait_for_index` relies on.
 Multipart uploads are staged with a generated private filename, incrementally
 hashed, and deleted after parsing or on cancellation/error. Duplicate file
 parts, excess metadata fields, an empty file, invalid or disallowed MIME values,

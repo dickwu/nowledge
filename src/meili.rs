@@ -174,7 +174,7 @@ impl MeiliAdmin {
         Self {
             url: config.meili_url.clone(),
             api_key,
-            client: reqwest::Client::new(),
+            client: meili_http_client(config),
             durable_index_identities,
             require_captured_durable_identities: config.run_mode == "production",
             allow_initial_provision: config.meili_allow_initial_provision,
@@ -241,7 +241,7 @@ impl MeiliAdmin {
             .query(&[("limit", 1_usize)])
             .send()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
         if !response.status().is_success() {
             return Err(ApiError::Upstream(format!(
                 "failed to prove that the Meilisearch instance is empty: {}",
@@ -251,7 +251,7 @@ impl MeiliAdmin {
         let body = response
             .json::<Value>()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
         let total = body.get("total").and_then(Value::as_u64).ok_or_else(|| {
             ApiError::Upstream(
                 "Meilisearch index listing omitted a valid total; refusing initial provision"
@@ -374,7 +374,7 @@ impl MeiliAdmin {
             .headers(self.headers()?)
             .send()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
         if !response.status().is_success() {
             return Err(ApiError::Upstream(format!(
                 "Meilisearch durable index {uid} is unavailable; refusing persistence"
@@ -383,7 +383,7 @@ impl MeiliAdmin {
         let body = response
             .json::<Value>()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
         let returned_uid = body.get("uid").and_then(Value::as_str);
         let primary_key = body.get("primaryKey").and_then(Value::as_str);
         let created_at = body.get("createdAt").and_then(Value::as_str);
@@ -452,7 +452,7 @@ impl MeiliAdmin {
                     .headers(self.headers()?)
                     .send()
                     .await
-                    .map_err(|e| ApiError::Upstream(e.to_string()))?;
+                    .map_err(meili_transport_error)?;
                 let status = response.status();
                 if !status.is_success() && status.as_u16() != 404 {
                     return Err(ApiError::Upstream(format!(
@@ -464,7 +464,7 @@ impl MeiliAdmin {
                     let body = response
                         .json::<Value>()
                         .await
-                        .map_err(|error| ApiError::Upstream(error.to_string()))?;
+                        .map_err(meili_transport_error)?;
                     let task_uid =
                         required_task_uid(&body, &format!("delete Meilisearch index {uid}"))?;
                     self.wait_for_task(&task_uid).await?;
@@ -586,7 +586,7 @@ impl MeiliAdmin {
                 .json(&json!({ "uid": uid, "primaryKey": primary_key }))
                 .send()
                 .await
-                .map_err(|e| ApiError::Upstream(e.to_string()))?;
+                .map_err(meili_transport_error)?;
             if !response.status().is_success() {
                 let status = response.status();
                 if !self.index_exists(uid).await? {
@@ -598,7 +598,7 @@ impl MeiliAdmin {
                 let body = response
                     .json::<Value>()
                     .await
-                    .map_err(|error| ApiError::Upstream(error.to_string()))?;
+                    .map_err(meili_transport_error)?;
                 let task_uid =
                     required_task_uid(&body, &format!("create Meilisearch index {uid}"))?;
                 match self.wait_for_task(&task_uid).await {
@@ -653,7 +653,7 @@ impl MeiliAdmin {
             .json(&json!({ "uid": uid, "primaryKey": primary_key }))
             .send()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
         if !response.status().is_success() {
             return Err(ApiError::Upstream(format!(
                 "failed to strictly create Meilisearch index {uid}: {}; refusing to adopt any concurrently-created index",
@@ -664,7 +664,7 @@ impl MeiliAdmin {
         let body = response
             .json::<Value>()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
         let create_task_uid =
             required_task_uid(&body, &format!("strictly create Meilisearch index {uid}"))?;
         self.wait_for_task(&create_task_uid).await.map_err(|error| {
@@ -750,7 +750,7 @@ impl MeiliAdmin {
             .headers(self.headers()?)
             .send()
             .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            .map_err(meili_transport_error)?;
         if response.status().is_success() {
             Ok(true)
         } else if response.status().as_u16() == 404 {
@@ -778,7 +778,7 @@ impl MeiliAdmin {
             .headers(self.headers()?)
             .send()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
         if response.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -791,7 +791,7 @@ impl MeiliAdmin {
         let body = response
             .json::<Value>()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
         match body.get("primaryKey") {
             Some(Value::String(primary_key)) => Ok(Some(primary_key.clone())),
             Some(Value::Null) => Ok(None),
@@ -813,7 +813,7 @@ impl MeiliAdmin {
             .headers(self.headers()?)
             .send()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
         if response.status().as_u16() == 404 {
             return Ok(None);
         }
@@ -826,7 +826,7 @@ impl MeiliAdmin {
         let body = response
             .json::<Value>()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
         if body.get("uid").and_then(Value::as_str) != Some(uid) {
             return Err(ApiError::Upstream(format!(
                 "Meilisearch index {uid} returned mismatched identity metadata"
@@ -885,13 +885,13 @@ impl MeiliAdmin {
             .json(documents)
             .send()
             .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            .map_err(meili_transport_error)?;
 
         if response.status().is_success() {
             let body = response
                 .json::<Value>()
                 .await
-                .map_err(|error| ApiError::Upstream(error.to_string()))?;
+                .map_err(meili_transport_error)?;
             Ok(Some(required_task_uid(
                 &body,
                 &format!("add documents to Meilisearch index {index_uid}"),
@@ -923,7 +923,7 @@ impl MeiliAdmin {
             .json(&json!({ "filter": filter }))
             .send()
             .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            .map_err(meili_transport_error)?;
 
         if response.status().as_u16() == 404 {
             return Ok(None);
@@ -933,7 +933,7 @@ impl MeiliAdmin {
             let body = response
                 .json::<Value>()
                 .await
-                .map_err(|error| ApiError::Upstream(error.to_string()))?;
+                .map_err(meili_transport_error)?;
             Ok(Some(required_task_uid(
                 &body,
                 &format!("delete documents from Meilisearch index {index_uid}"),
@@ -968,7 +968,7 @@ impl MeiliAdmin {
             .json(ids)
             .send()
             .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            .map_err(meili_transport_error)?;
 
         if response.status().as_u16() == 404 {
             return Ok(None);
@@ -978,7 +978,7 @@ impl MeiliAdmin {
             let body = response
                 .json::<Value>()
                 .await
-                .map_err(|error| ApiError::Upstream(error.to_string()))?;
+                .map_err(meili_transport_error)?;
             Ok(Some(required_task_uid(
                 &body,
                 &format!("delete documents from Meilisearch index {index_uid}"),
@@ -1013,7 +1013,7 @@ impl MeiliAdmin {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            .map_err(meili_transport_error)?;
 
         if response.status().as_u16() == 404 {
             return Ok(SearchResponse {
@@ -1026,7 +1026,7 @@ impl MeiliAdmin {
             response
                 .json::<SearchResponse<T>>()
                 .await
-                .map_err(|e| ApiError::Upstream(e.to_string()))
+                .map_err(meili_transport_error)
         } else {
             Err(ApiError::Upstream(format!(
                 "failed to search Meilisearch index {index_uid}: {}",
@@ -1061,7 +1061,7 @@ impl MeiliAdmin {
             .query(&[("offset", offset), ("limit", limit)])
             .send()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
 
         if response.status().as_u16() == 404 {
             return Ok(DocumentPage {
@@ -1075,7 +1075,7 @@ impl MeiliAdmin {
             response
                 .json::<DocumentPage>()
                 .await
-                .map_err(|error| ApiError::Upstream(error.to_string()))
+                .map_err(meili_transport_error)
         } else {
             Err(ApiError::Upstream(format!(
                 "failed to list Meilisearch documents from {index_uid}: {}",
@@ -1142,7 +1142,7 @@ impl MeiliAdmin {
             .json(&request)
             .send()
             .await
-            .map_err(|error| ApiError::Upstream(error.to_string()))?;
+            .map_err(meili_transport_error)?;
 
         if response.status().as_u16() == 404 {
             return Err(ApiError::Upstream(format!(
@@ -1153,7 +1153,7 @@ impl MeiliAdmin {
             response
                 .json::<DocumentPage>()
                 .await
-                .map_err(|error| ApiError::Upstream(error.to_string()))
+                .map_err(meili_transport_error)
         } else {
             Err(ApiError::Upstream(format!(
                 "failed to fetch filtered Meilisearch documents from {index_uid}: {}",
@@ -1177,7 +1177,7 @@ impl MeiliAdmin {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            .map_err(meili_transport_error)?;
 
         if response.status().as_u16() == 404 {
             return Ok(json!({ "hits": [] }));
@@ -1186,7 +1186,7 @@ impl MeiliAdmin {
             response
                 .json::<Value>()
                 .await
-                .map_err(|e| ApiError::Upstream(e.to_string()))
+                .map_err(meili_transport_error)
         } else {
             Err(ApiError::Upstream(format!(
                 "failed to search Meilisearch index {index_uid}: {}",
@@ -1208,7 +1208,7 @@ impl MeiliAdmin {
                 .headers(self.headers()?)
                 .send()
                 .await
-                .map_err(|e| ApiError::Upstream(e.to_string()))?;
+                .map_err(meili_transport_error)?;
             if !response.status().is_success() {
                 return Err(ApiError::Upstream(format!(
                     "failed to read Meilisearch task {task_uid}: {}",
@@ -1286,7 +1286,7 @@ impl MeiliAdmin {
                 .headers(self.headers()?)
                 .send()
                 .await
-                .map_err(|e| ApiError::Upstream(e.to_string()))?;
+                .map_err(meili_transport_error)?;
             if !response.status().is_success() {
                 return Ok(pending.into_iter().collect());
             }
@@ -1354,13 +1354,13 @@ impl MeiliAdmin {
             .json(&settings)
             .send()
             .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            .map_err(meili_transport_error)?;
 
         if response.status().is_success() {
             let body = response
                 .json::<Value>()
                 .await
-                .map_err(|error| ApiError::Upstream(error.to_string()))?;
+                .map_err(meili_transport_error)?;
             Ok(Some(required_task_uid(
                 &body,
                 &format!("apply settings for Meilisearch index {uid}"),
@@ -1387,7 +1387,7 @@ impl MeiliAdmin {
             .headers(self.headers()?)
             .send()
             .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            .map_err(meili_transport_error)?;
         if !response.status().is_success() {
             return Err(ApiError::Upstream(format!(
                 "failed to read Meilisearch settings for {uid}: {}",
@@ -1397,7 +1397,7 @@ impl MeiliAdmin {
         let current = response
             .json::<Value>()
             .await
-            .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            .map_err(meili_transport_error)?;
         Ok(managed_settings_equal(&current, desired))
     }
 
@@ -1413,6 +1413,41 @@ impl MeiliAdmin {
         }
         Ok(headers)
     }
+}
+
+/// Build the shared Meilisearch HTTP client with bounded connect and request
+/// times, so a stalled server cannot hold a startup, worker, or task wait
+/// forever. The request timeout covers one HTTP exchange including its body;
+/// task waits poll with separate requests under their own total budget.
+fn meili_http_client(config: &Config) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(config.meili_connect_timeout_ms))
+        .timeout(Duration::from_millis(config.meili_request_timeout_ms))
+        .build()
+        // `reqwest::Client::new()` panics on the same backend initialization
+        // failure; never fall back to a client without timeouts.
+        .expect("Meilisearch HTTP client initialization failed")
+}
+
+/// Map a Meilisearch transport or body failure to a private upstream cause.
+///
+/// The cause names the failure class (timeout, connection, decode) so it can
+/// be classified, and carries only the request path: the configured base URL
+/// may embed credentials and is never echoed.
+fn meili_transport_error(error: reqwest::Error) -> ApiError {
+    let path = error
+        .url()
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let failure = match (error.is_connect(), error.is_timeout()) {
+        (true, true) => "connect timed out",
+        (false, true) => "timed out",
+        (true, false) => "connection failed",
+        _ if error.is_decode() => "response could not be decoded",
+        _ if error.is_body() => "body transfer failed",
+        _ => "request failed",
+    };
+    ApiError::Upstream(format!("Meilisearch request {path} {failure}"))
 }
 
 /// Sleep for the current poll delay and double it up to the cap. Returns
@@ -1703,6 +1738,47 @@ mod tests {
             status["error"], "Meilisearch health check timed out",
             "{status}"
         );
+    }
+
+    #[tokio::test]
+    async fn search_write_and_task_requests_time_out_against_a_stalled_server() {
+        let app = Router::new().fallback(healthy_then_stalled_meili);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = Config::test();
+        config.meili_url = Some(format!("http://{address}"));
+        config.meili_connect_timeout_ms = 100;
+        config.meili_request_timeout_ms = 200;
+        let admin = MeiliAdmin::from_config(&config);
+        let documents = json!([{ "id": "doc" }]);
+
+        let (search, write, task) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                admin.search::<Value>("rag_company_context", json!({ "q": "" })),
+                admin.add_documents("rag_company_context", &documents),
+                admin.wait_for_task("7"),
+            )
+        })
+        .await
+        .expect("Meilisearch requests must honor the configured request timeout");
+
+        for error in [
+            search.map(|_| ()).unwrap_err(),
+            write.map(|_| ()).unwrap_err(),
+            task.unwrap_err(),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains("timed out"), "{message}");
+            assert!(!message.contains(&address.to_string()), "{message}");
+            assert_eq!(
+                crate::error::safe_cause_diagnostic(&error).category,
+                "timeout"
+            );
+        }
     }
 
     async fn spawn_task_stub(
