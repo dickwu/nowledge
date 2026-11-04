@@ -1,7 +1,8 @@
 use crate::{
     config::Config,
     error::ApiError,
-    models::{AppendHistoryEventRequest, BulkHistoryEventsRequest},
+    fragmenter::{DocumentFragmenter, MAX_FRAGMENT_CHUNK_CHARS},
+    models::{AppendHistoryEventRequest, BulkHistoryEventsRequest, FragmentPolicy},
 };
 
 pub(crate) fn validate_max_items(
@@ -27,6 +28,47 @@ pub(crate) fn validate_search_limit(
         return Err(ApiError::validation(
             field,
             format!("must be at most {}", config.max_search_limit),
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects fragment policies outside the supported envelope instead of letting
+/// callers choose values that amplify one document into unbounded work. Unset
+/// fields keep their defaults, which the fragmenter clamps to the chunk size,
+/// so only explicitly supplied values are checked against each other.
+pub(crate) fn validate_fragment_policy(
+    field: &str,
+    policy: Option<&FragmentPolicy>,
+) -> Result<(), ApiError> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    let chunk_size = policy
+        .chunk_size_chars
+        .unwrap_or(DocumentFragmenter::default().chunk_size_chars);
+    if !(1..=MAX_FRAGMENT_CHUNK_CHARS).contains(&chunk_size) {
+        return Err(ApiError::validation(
+            format!("{field}.chunk_size_chars"),
+            format!("must be between 1 and {MAX_FRAGMENT_CHUNK_CHARS}"),
+        ));
+    }
+    if policy
+        .overlap_chars
+        .is_some_and(|overlap| overlap >= chunk_size)
+    {
+        return Err(ApiError::validation(
+            format!("{field}.overlap_chars"),
+            "must be less than chunk_size_chars",
+        ));
+    }
+    if policy
+        .min_chunk_chars
+        .is_some_and(|min_chunk| !(1..=chunk_size).contains(&min_chunk))
+    {
+        return Err(ApiError::validation(
+            format!("{field}.min_chunk_chars"),
+            "must be between 1 and chunk_size_chars",
         ));
     }
     Ok(())

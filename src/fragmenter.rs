@@ -5,6 +5,15 @@ use sha2::{Digest, Sha256};
 
 use crate::models::{FragmentPolicy, ParsedBlock};
 
+/// Largest `chunk_size_chars` a caller may request. The fragmenter clamps to
+/// it as well, so internal callers cannot bypass request validation.
+pub const MAX_FRAGMENT_CHUNK_CHARS: usize = 8_000;
+
+/// Most fragments one document may produce. A policy that would exceed it on
+/// a large document is coarsened (larger effective chunks) instead of turning
+/// the document into an unbounded number of fragments, nodes and links.
+pub const MAX_FRAGMENTS_PER_DOCUMENT: usize = 10_000;
+
 #[derive(Debug, Clone)]
 pub struct DocumentFragment {
     pub fragment_index: u32,
@@ -53,7 +62,7 @@ impl DocumentFragmenter {
         let mut fragmenter = Self::default();
         if let Some(policy) = policy {
             if let Some(chunk_size_chars) = policy.chunk_size_chars {
-                fragmenter.chunk_size_chars = chunk_size_chars.max(1);
+                fragmenter.chunk_size_chars = chunk_size_chars.clamp(1, MAX_FRAGMENT_CHUNK_CHARS);
             }
             if let Some(overlap_chars) = policy.overlap_chars {
                 fragmenter.overlap_chars = overlap_chars;
@@ -70,27 +79,41 @@ impl DocumentFragmenter {
     }
 
     pub fn fragment(&self, content: &str) -> Vec<DocumentFragment> {
-        let char_len = content.chars().count();
+        self.fragment_with_min_step(content, min_step_for(content.chars().count()))
+    }
+
+    /// Fragments `content` in time linear in its length. Every non-final step
+    /// advances by at least `min_step` characters and a quarter of the
+    /// fragment just emitted, which bounds both the fragment count and the
+    /// total emitted text whatever policy the caller supplied.
+    fn fragment_with_min_step(&self, content: &str, min_step: usize) -> Vec<DocumentFragment> {
+        // Index the characters once. Re-walking the document from the start
+        // for every fragment made fragmentation quadratic in its length.
+        let chars: Vec<char> = content.chars().collect();
+        let char_len = chars.len();
         if char_len == 0 {
             return Vec::new();
         }
 
-        let breaks = Breakpoints::new(content);
+        let min_step = min_step.max(1);
+        let chunk_size_chars = self.chunk_size_chars.max(min_step);
+        let min_chunk_chars = self.min_chunk_chars.max(min_step).min(chunk_size_chars);
+        let breaks = Breakpoints::new(content, &chars);
         let mut fragments = Vec::new();
         let mut start = 0;
 
         while start < char_len {
-            let max_end = (start + self.chunk_size_chars).min(char_len);
+            let max_end = (start + chunk_size_chars).min(char_len);
             let end = if max_end == char_len {
                 char_len
             } else {
                 breaks
-                    .best_between(start + self.min_chunk_chars, max_end)
+                    .best_between(start + min_chunk_chars, max_end)
                     .unwrap_or(max_end)
             };
-            let (trimmed_start, trimmed_end) = trim_range(content, start, end);
+            let (trimmed_start, trimmed_end) = trim_range(&chars, start, end);
             if trimmed_start < trimmed_end {
-                let text = slice_chars(content, trimmed_start, trimmed_end);
+                let text: String = chars[trimmed_start..trimmed_end].iter().collect();
                 let fragment_index = fragments.len() as u32;
                 fragments.push(DocumentFragment {
                     fragment_index,
@@ -105,7 +128,9 @@ impl DocumentFragmenter {
             if end >= char_len {
                 break;
             }
-            let next_start = end.saturating_sub(self.overlap_chars).max(start + 1);
+            // `advance` never exceeds `end - start`, so no content is skipped.
+            let advance = ((end - start) / 4).max(min_step);
+            let next_start = end.saturating_sub(self.overlap_chars).max(start + advance);
             start = next_start.min(char_len);
         }
 
@@ -144,7 +169,7 @@ impl BlockAwareFragmenter {
             )
         });
 
-        let mut chunks = Vec::new();
+        let mut bodies = Vec::with_capacity(ordered.len());
         for block in ordered {
             let Some(body) = block_body(&block) else {
                 continue;
@@ -152,14 +177,21 @@ impl BlockAwareFragmenter {
             if body.trim().is_empty() {
                 continue;
             }
+            bodies.push((block, body));
+        }
+        // Share one per-document fragment budget across every long paragraph
+        // instead of granting each block its own allowance.
+        let min_step = min_step_for(bodies.iter().map(|(_, body)| body.chars().count()).sum());
 
+        let mut chunks = Vec::new();
+        for (block, body) in bodies {
             let block_type = block.block_type.clone();
             let atomic = matches!(
                 block_type.as_str(),
                 "table" | "equation" | "image" | "chart" | "code"
             );
             if block_type == "paragraph" && body.chars().count() > self.fallback.chunk_size_chars {
-                for fragment in self.fallback.fragment(&body) {
+                for fragment in self.fallback.fragment_with_min_step(&body, min_step) {
                     let mut chunk = FragmentChunk::from(fragment);
                     chunk.fragment_index = chunks.len() as u32;
                     chunk.block_type = Some(block_type.clone());
@@ -234,7 +266,7 @@ struct Breakpoints {
 }
 
 impl Breakpoints {
-    fn new(content: &str) -> Self {
+    fn new(content: &str, chars: &[char]) -> Self {
         let mut headings = BTreeSet::new();
         let mut paragraphs = BTreeSet::new();
         let mut sentences = BTreeSet::new();
@@ -248,7 +280,6 @@ impl Breakpoints {
             char_pos += line.chars().count();
         }
 
-        let chars: Vec<char> = content.chars().collect();
         for idx in 0..chars.len() {
             if chars[idx] == '\n' && chars.get(idx + 1) == Some(&'\n') {
                 paragraphs.insert((idx + 2).min(chars.len()));
@@ -275,8 +306,13 @@ impl Breakpoints {
     }
 }
 
-fn trim_range(content: &str, start: usize, end: usize) -> (usize, usize) {
-    let chars: Vec<char> = content.chars().collect();
+/// Smallest step that keeps a document of `char_len` characters within
+/// [`MAX_FRAGMENTS_PER_DOCUMENT`]; 1 for every document below the cap.
+fn min_step_for(char_len: usize) -> usize {
+    char_len.div_ceil(MAX_FRAGMENTS_PER_DOCUMENT).max(1)
+}
+
+fn trim_range(chars: &[char], start: usize, end: usize) -> (usize, usize) {
     let mut left = start.min(chars.len());
     let mut right = end.min(chars.len());
     while left < right && chars[left].is_whitespace() {
@@ -286,14 +322,6 @@ fn trim_range(content: &str, start: usize, end: usize) -> (usize, usize) {
         right -= 1;
     }
     (left, right)
-}
-
-fn slice_chars(content: &str, start: usize, end: usize) -> String {
-    content
-        .chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
 }
 
 fn estimate_tokens(text: &str) -> usize {
@@ -422,4 +450,184 @@ fn block_body(block: &ParsedBlock) -> Option<String> {
     }
 
     (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn policy(chunk: usize, overlap: usize, min: usize) -> FragmentPolicy {
+        FragmentPolicy {
+            chunk_size_chars: Some(chunk),
+            overlap_chars: Some(overlap),
+            min_chunk_chars: Some(min),
+        }
+    }
+
+    /// Mixed headings, paragraphs, sentences and multi-byte characters, with
+    /// headings placed just past the default minimum chunk length.
+    fn document(target_chars: usize) -> String {
+        let section = "# Heading é\n\nThe quick brown fox — jumps. Over the lazy dog! \
+                       Does it?\nPlain words without any breakpoint at all here ";
+        let section_chars = section.chars().count();
+        let mut doc = String::new();
+        let (mut chars, mut index) = (0, 0);
+        while chars < target_chars {
+            let filler = 80 + index % 170;
+            doc.push_str(section);
+            doc.push_str(&"x".repeat(filler));
+            doc.push_str(".\n");
+            chars += section_chars + filler + 2;
+            index += 1;
+        }
+        doc
+    }
+
+    /// The previous implementation, kept to prove the linear rewrite emits
+    /// identical fragments whenever the new progress floors do not bind.
+    fn reference_fragments(
+        fragmenter: &DocumentFragmenter,
+        content: &str,
+    ) -> Vec<(usize, usize, String)> {
+        let chars: Vec<char> = content.chars().collect();
+        let breaks = Breakpoints::new(content, &chars);
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < chars.len() {
+            let max_end = (start + fragmenter.chunk_size_chars).min(chars.len());
+            let end = if max_end == chars.len() {
+                chars.len()
+            } else {
+                breaks
+                    .best_between(start + fragmenter.min_chunk_chars, max_end)
+                    .unwrap_or(max_end)
+            };
+            let (left, right) = trim_range(&chars, start, end);
+            if left < right {
+                out.push((left, right, chars[left..right].iter().collect()));
+            }
+            if end >= chars.len() {
+                break;
+            }
+            start = end
+                .saturating_sub(fragmenter.overlap_chars)
+                .max(start + 1)
+                .min(chars.len());
+        }
+        out
+    }
+
+    fn assert_covers_all_text(chars: &[char], fragments: &[DocumentFragment]) {
+        let mut covered_to = 0;
+        for fragment in fragments {
+            assert!(
+                chars[covered_to.min(fragment.char_start)..fragment.char_start]
+                    .iter()
+                    .all(|ch| ch.is_whitespace()),
+                "non-whitespace text skipped before {}",
+                fragment.char_start
+            );
+            covered_to = covered_to.max(fragment.char_end);
+        }
+        assert!(chars[covered_to..].iter().all(|ch| ch.is_whitespace()));
+    }
+
+    #[test]
+    fn linear_fragmenter_matches_previous_output_for_supported_policies() {
+        // Below the fragment cap, so only the quarter-fragment floor applies.
+        let content = document(9_000);
+        for policy in [
+            None,
+            Some(policy(240, 0, 240)),
+            Some(policy(4, 0, 4)),
+            Some(policy(300, 50, 100)),
+        ] {
+            let fragmenter = DocumentFragmenter::from_policy(policy.as_ref());
+            let actual = fragmenter
+                .fragment(&content)
+                .into_iter()
+                .map(|fragment| (fragment.char_start, fragment.char_end, fragment.content))
+                .collect::<Vec<_>>();
+            let expected = reference_fragments(&fragmenter, &content);
+            let first_difference = actual
+                .iter()
+                .zip(&expected)
+                .position(|(left, right)| left != right);
+            assert!(
+                first_difference.is_none() && actual.len() == expected.len(),
+                "{policy:?}: first difference at {first_difference:?}, {} vs {} fragments",
+                actual.len(),
+                expected.len()
+            );
+        }
+    }
+
+    #[test]
+    fn large_document_fragments_in_bounded_time_and_output_for_any_policy() {
+        let content = document(2 * 1024 * 1024);
+        let chars: Vec<char> = content.chars().collect();
+        for policy in [
+            None,
+            Some(policy(1, 0, 1)),
+            Some(policy(
+                MAX_FRAGMENT_CHUNK_CHARS,
+                MAX_FRAGMENT_CHUNK_CHARS - 1,
+                1,
+            )),
+            // An oversized request is clamped rather than trusted.
+            Some(policy(usize::MAX, usize::MAX, usize::MAX)),
+        ] {
+            let started = Instant::now();
+            let fragments = DocumentFragmenter::from_policy(policy.as_ref()).fragment(&content);
+            let elapsed = started.elapsed();
+            // The previous quadratic implementation needed minutes here.
+            assert!(elapsed < Duration::from_secs(30), "{policy:?}: {elapsed:?}");
+            assert!(!fragments.is_empty());
+            assert!(fragments.len() <= MAX_FRAGMENTS_PER_DOCUMENT, "{policy:?}");
+            let emitted: usize = fragments
+                .iter()
+                .map(|fragment| fragment.char_end - fragment.char_start)
+                .sum();
+            assert!(
+                emitted <= 4 * chars.len() + MAX_FRAGMENT_CHUNK_CHARS,
+                "{policy:?}: emitted {emitted} chars for {}",
+                chars.len()
+            );
+            assert_covers_all_text(&chars, &fragments);
+        }
+    }
+
+    #[test]
+    fn block_fragment_budget_is_shared_across_the_document() {
+        let paragraph = "word ".repeat(4_000);
+        let blocks = (0..20)
+            .map(|index| ParsedBlock {
+                block_id: format!("b{index}"),
+                block_type: "paragraph".to_string(),
+                text: Some(paragraph.clone()),
+                reading_order: index,
+                ..ParsedBlock::default()
+            })
+            .collect::<Vec<_>>();
+        let chunks =
+            BlockAwareFragmenter::from_policy(Some(&policy(1, 0, 1))).fragment("", &blocks);
+        assert!(
+            chunks.len() <= MAX_FRAGMENTS_PER_DOCUMENT + blocks.len(),
+            "{} chunks",
+            chunks.len()
+        );
+    }
+
+    #[test]
+    fn small_documents_keep_requested_tiny_chunks() {
+        let fragments =
+            DocumentFragmenter::from_policy(Some(&policy(4, 0, 4))).fragment("Xabcdefghij");
+        let contents = fragments
+            .iter()
+            .map(|fragment| fragment.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents, ["Xabc", "defg", "hij"]);
+    }
 }

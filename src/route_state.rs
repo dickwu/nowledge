@@ -14,7 +14,7 @@ use crate::{
         LinkSearchRequest, LinkSearchResponse, LinkUpsertRequest, PatchStateFactRequest,
         StateItemResponse, StateSearchRequest, StateSearchResponse, UpsertStateFactRequest,
     },
-    request_validation::{validate_search_limit, validate_tags},
+    request_validation::{validate_fragment_policy, validate_search_limit, validate_tags},
     state_service::StateService,
 };
 
@@ -37,6 +37,14 @@ pub(crate) async fn upsert_state_fact(
 ) -> Result<Json<StateItemResponse>, ApiError> {
     user.apply_owner_default(&mut request.owner_user_id)?;
     require_owner_for_write(&user, request.owner_user_id.as_deref())?;
+    validate_fragment_policy("fragment_policy", request.fragment_policy.as_ref())?;
+    validate_fragment_policy(
+        "document.fragment_policy",
+        request
+            .document
+            .as_ref()
+            .and_then(|document| document.fragment_policy.as_ref()),
+    )?;
     Ok(Json(
         state_service(&state)
             .upsert_fact(&fact_key, request)

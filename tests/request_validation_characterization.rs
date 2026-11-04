@@ -334,3 +334,153 @@ async fn structured_row_bulk_limit_rejects_before_rows_or_history_are_mutated() 
 
     state.shutdown().await;
 }
+
+#[tokio::test]
+async fn fragment_policies_outside_the_supported_envelope_are_rejected_before_ingest() {
+    let (_state, app) = bounded_app();
+    let chunk_message = "must be between 1 and 8000";
+    let overlap_message = "must be less than chunk_size_chars";
+    let min_message = "must be between 1 and chunk_size_chars";
+    for (policy, field, message) in [
+        (
+            json!({ "chunk_size_chars": 0 }),
+            "fragment_policy.chunk_size_chars",
+            chunk_message,
+        ),
+        (
+            json!({ "chunk_size_chars": 8001 }),
+            "fragment_policy.chunk_size_chars",
+            chunk_message,
+        ),
+        (
+            json!({ "chunk_size_chars": 400, "overlap_chars": 400 }),
+            "fragment_policy.overlap_chars",
+            overlap_message,
+        ),
+        (
+            json!({ "overlap_chars": 1200 }),
+            "fragment_policy.overlap_chars",
+            overlap_message,
+        ),
+        (
+            json!({ "chunk_size_chars": 400, "min_chunk_chars": 401 }),
+            "fragment_policy.min_chunk_chars",
+            min_message,
+        ),
+        (
+            json!({ "min_chunk_chars": 0 }),
+            "fragment_policy.min_chunk_chars",
+            min_message,
+        ),
+    ] {
+        for uri in ["/v1/ingest/files:sync", "/v1/ingest/tasks"] {
+            let response = json_call(
+                app.clone(),
+                Method::POST,
+                uri,
+                json!({
+                    "owner_user_id": "u1",
+                    "source_id": "bounded-policy",
+                    "content": "bounded policy content",
+                    "fragment_policy": policy.clone()
+                }),
+            )
+            .await;
+            assert_validation(&response, field, message);
+        }
+    }
+
+    for (uri, body, field) in [
+        (
+            "/v1/state/profile/facts/bounded-policy",
+            json!({
+                "owner_user_id": "u1",
+                "state_type": "profile",
+                "statement": "bounded policy",
+                "fragment_policy": { "chunk_size_chars": 8001 }
+            }),
+            "fragment_policy.chunk_size_chars",
+        ),
+        (
+            "/v1/state/profile/facts/bounded-policy",
+            json!({
+                "owner_user_id": "u1",
+                "state_type": "profile",
+                "statement": "bounded policy",
+                "document": {
+                    "content": "bounded policy document",
+                    "fragment_policy": { "chunk_size_chars": 8001 }
+                }
+            }),
+            "document.fragment_policy.chunk_size_chars",
+        ),
+    ] {
+        let response = json_call(app.clone(), Method::PUT, uri, body).await;
+        assert_validation(&response, field, chunk_message);
+    }
+
+    let boundary = "nowledge-fragment-policy";
+    let multipart = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"owner_user_id\"\r\n\r\nu1\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"source_id\"\r\n\r\nbounded-upload\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"fragment_policy.chunk_size_chars\"\r\n\r\n8001\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"note.md\"\r\nContent-Type: text/markdown\r\n\r\n# Note\r\n\
+         --{boundary}--\r\n"
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/ingest/uploads:sync")
+                .header(
+                    CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(multipart))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["details"]["field"],
+        "fragment_policy.chunk_size_chars"
+    );
+
+    // Tiny policies remain valid: the fragmenter is linear and caps the
+    // fragment count per document, so they cannot amplify a large document.
+    let response = json_call(
+        app.clone(),
+        Method::POST,
+        "/v1/ingest/files:sync",
+        json!({
+            "owner_user_id": "u1",
+            "source_id": "tiny-policy",
+            "content": "Xabcdefghij",
+            "fragment_policy": {
+                "chunk_size_chars": 4,
+                "overlap_chars": 0,
+                "min_chunk_chars": 4
+            }
+        }),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    assert_eq!(
+        response.body["fragment_uris"].as_array().map(Vec::len),
+        Some(3)
+    );
+
+    let response = json_call(
+        app,
+        Method::GET,
+        "/v1/state/profile/facts/bounded-policy?owner_user_id=u1",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND, "{}", response.body);
+}
