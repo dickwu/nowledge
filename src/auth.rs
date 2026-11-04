@@ -1,14 +1,16 @@
+use std::collections::HashMap;
+
 use axum::{
     extract::{FromRef, FromRequestParts},
     http::{header::AUTHORIZATION, request::Parts},
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::{
     app::AuthState,
     audit_service::DenialPrincipalIdentity,
-    config::{AuthUserConfig, AuthUserScope, BearerTokenScope},
+    config::{AuthUserConfig, AuthUserScope, BearerTokenScope, Config},
     error::ApiError,
     request_context::{self, RequestPrincipal, RequestPrincipalScope},
     shared_audit::audit_shared_write_denial,
@@ -81,6 +83,10 @@ impl Principal {
         }
     }
 
+    /// Intentionally identical to `require_owner_read` today: data scope, not
+    /// the read/write verb, decides private-data reach (no read-only owner
+    /// scope exists). Call sites keep the verb-specific name so a future
+    /// read-only scope can diverge here without touching every route.
     pub fn require_owner_write(&self, owner_user_id: &str) -> Result<(), ApiError> {
         self.require_owner_read(owner_user_id)
     }
@@ -316,65 +322,53 @@ fn authenticate(parts: &Parts, state: &AuthState) -> Result<Principal, ApiError>
         return Err(ApiError::Unauthorized("invalid bearer token".to_string()));
     }
 
-    let mut matched_user = None;
-    let mut match_count = 0usize;
-    for user in &config.auth_users {
-        if token_matches(&user.token, actual) {
-            matched_user = Some(user);
-            match_count += 1;
+    // Exactly one configured credential must match; duplicates stay ambiguous
+    // and are rejected just like the previous linear scan did.
+    let credential = match state.credentials().lookup(actual) {
+        [credential] => *credential,
+        _ => return Err(ApiError::Unauthorized("invalid bearer token".to_string())),
+    };
+    match credential {
+        CredentialRef::AuthUser(index) => {
+            let user = config
+                .auth_users
+                .get(index)
+                .ok_or_else(|| ApiError::Unauthorized("invalid bearer token".to_string()))?;
+            Ok(principal_from_auth_user(&config.tenant_id, user))
         }
-    }
-    let admin_matches = config
-        .admin_token
-        .as_deref()
-        .is_some_and(|expected| token_matches(expected, actual));
-    match_count += usize::from(admin_matches);
-    let bearer_matches = config
-        .bearer_token
-        .as_deref()
-        .is_some_and(|expected| token_matches(expected, actual));
-    match_count += usize::from(bearer_matches);
-
-    if match_count != 1 {
-        return Err(ApiError::Unauthorized("invalid bearer token".to_string()));
-    }
-    if let Some(user) = matched_user {
-        return Ok(principal_from_auth_user(&config.tenant_id, user));
-    }
-    if admin_matches {
-        return Ok(Principal {
+        CredentialRef::Admin => Ok(Principal {
             tenant_id: config.tenant_id.clone(),
             scope: PrincipalScope::Admin,
             roles: vec!["admin".to_string()],
-        });
+        }),
+        CredentialRef::Bearer => bearer_token_principal(config),
     }
-    if bearer_matches {
-        let scope = match (
-            config.bearer_token_scope,
-            config.bearer_token_owner_user_id.as_deref(),
-            config.allow_legacy_tenant_service_bearer,
-        ) {
-            (Some(BearerTokenScope::Owner), Some(owner), false)
-                if !owner.trim().is_empty() && owner == owner.trim() =>
-            {
-                Some(PrincipalScope::Owner {
-                    owner_user_id: owner.to_string(),
-                })
-            }
-            (Some(BearerTokenScope::TenantService), None, false) | (None, None, true) => {
-                Some(PrincipalScope::TenantService)
-            }
-            _ => None,
-        }
-        .ok_or_else(|| ApiError::Unauthorized("invalid bearer token".to_string()))?;
-        return Ok(Principal {
-            tenant_id: config.tenant_id.clone(),
-            scope,
-            roles: vec!["user".to_string()],
-        });
-    }
+}
 
-    Err(ApiError::Unauthorized("invalid bearer token".to_string()))
+fn bearer_token_principal(config: &Config) -> Result<Principal, ApiError> {
+    let scope = match (
+        config.bearer_token_scope,
+        config.bearer_token_owner_user_id.as_deref(),
+        config.allow_legacy_tenant_service_bearer,
+    ) {
+        (Some(BearerTokenScope::Owner), Some(owner), false)
+            if !owner.trim().is_empty() && owner == owner.trim() =>
+        {
+            Some(PrincipalScope::Owner {
+                owner_user_id: owner.to_string(),
+            })
+        }
+        (Some(BearerTokenScope::TenantService), None, false) | (None, None, true) => {
+            Some(PrincipalScope::TenantService)
+        }
+        _ => None,
+    }
+    .ok_or_else(|| ApiError::Unauthorized("invalid bearer token".to_string()))?;
+    Ok(Principal {
+        tenant_id: config.tenant_id.clone(),
+        scope,
+        roles: vec!["user".to_string()],
+    })
 }
 
 fn principal_from_auth_user(tenant_id: &str, user: &AuthUserConfig) -> Principal {
@@ -399,24 +393,108 @@ fn bearer(parts: &Parts) -> Result<&str, ApiError> {
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| ApiError::Unauthorized("missing Authorization bearer token".to_string()))?;
 
-    header
-        .strip_prefix("Bearer ")
+    bearer_credentials(header)
         .ok_or_else(|| ApiError::Unauthorized("Authorization must be a Bearer token".to_string()))
 }
 
-fn token_matches(expected: &str, actual: &str) -> bool {
-    type HmacSha256 = Hmac<Sha256>;
-    const COMPARISON_KEY: &[u8] = b"nowledge-auth-token-comparison-v1";
+/// Parse `Authorization: Bearer <token>`. The auth-scheme is
+/// case-insensitive (RFC 7235 §2.1 / RFC 6750 §2.1) and is separated from the
+/// credentials by one or more spaces.
+fn bearer_credentials(header: &str) -> Option<&str> {
+    let (scheme, credentials) = header.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| credentials.trim_start_matches(' '))
+}
 
-    let mut expected_mac =
-        HmacSha256::new_from_slice(COMPARISON_KEY).expect("comparison key is valid");
-    expected_mac.update(expected.as_bytes());
-    let expected_tag = expected_mac.finalize().into_bytes();
+type HmacSha256 = Hmac<Sha256>;
+type CredentialTag = [u8; 32];
 
-    let mut actual_mac =
-        HmacSha256::new_from_slice(COMPARISON_KEY).expect("comparison key is valid");
-    actual_mac.update(actual.as_bytes());
-    actual_mac.verify_slice(&expected_tag).is_ok()
+/// Which configured credential a token tag belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialRef {
+    AuthUser(usize),
+    Admin,
+    Bearer,
+}
+
+/// Startup-precomputed index of configured credentials.
+///
+/// Every configured token is reduced once to an HMAC-SHA256 tag under a
+/// per-process key derived from fresh randomness (plus the index-hash
+/// secret), and requests perform one HMAC plus one map lookup instead of
+/// recomputing tags for every configured user.
+///
+/// Timing: the map's hashing and the final tag equality check are not
+/// constant-time, but they only ever operate on keyed tags. A remote caller
+/// cannot compute the tag of any candidate token without the per-process key,
+/// so lookup timing is uncorrelated with how close a guess is to a real
+/// credential and reveals nothing exploitable about stored tokens. The key is
+/// never exposed and changes on every restart.
+pub(crate) struct CredentialIndex {
+    key: Vec<u8>,
+    tags: HashMap<CredentialTag, Vec<CredentialRef>>,
+}
+
+impl CredentialIndex {
+    pub(crate) fn from_config(config: &Config) -> Self {
+        let mut seed = HmacSha256::new_from_slice(b"nowledge-auth-credential-index-v1")
+            .expect("HMAC accepts any key length");
+        // Each UUIDv7 carries 74 OS-random bits; four of them give the key
+        // ample entropy without adding a dependency.
+        for _ in 0..4 {
+            seed.update(uuid::Uuid::now_v7().as_bytes());
+        }
+        seed.update(&config.index_hash_secret);
+        let key = seed.finalize().into_bytes().to_vec();
+
+        let mut index = Self {
+            key,
+            tags: HashMap::new(),
+        };
+        for (position, user) in config.auth_users.iter().enumerate() {
+            index.insert(&user.token, CredentialRef::AuthUser(position));
+        }
+        if let Some(token) = config.admin_token.as_deref() {
+            index.insert(token, CredentialRef::Admin);
+        }
+        if let Some(token) = config.bearer_token.as_deref() {
+            index.insert(token, CredentialRef::Bearer);
+        }
+        index
+    }
+
+    fn tag(&self, token: &str) -> CredentialTag {
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("HMAC accepts any key length");
+        mac.update(token.as_bytes());
+        mac.finalize().into_bytes().into()
+    }
+
+    fn insert(&mut self, token: &str, credential: CredentialRef) {
+        let tag = self.tag(token);
+        self.tags.entry(tag).or_default().push(credential);
+    }
+
+    /// All configured credentials whose token equals `token`. Callers must
+    /// treat anything other than exactly one match as a failed login.
+    pub(crate) fn lookup(&self, token: &str) -> &[CredentialRef] {
+        self.tags
+            .get(&self.tag(token))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for CredentialIndex {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialIndex")
+            .field(
+                "credentials",
+                &self.tags.values().map(Vec::len).sum::<usize>(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
@@ -473,13 +551,71 @@ mod tests {
         assert!(admin.require_company_write().is_ok());
     }
 
+    fn credential_config() -> Config {
+        let mut config = Config::test();
+        config.auth_users = vec![
+            AuthUserConfig {
+                token: "correct-token".to_string(),
+                roles: vec!["user".to_string()],
+                scope: AuthUserScope::Owner {
+                    owner_user_id: "u1".to_string(),
+                },
+            },
+            AuthUserConfig {
+                token: "service-token".to_string(),
+                roles: vec!["user".to_string()],
+                scope: AuthUserScope::TenantService,
+            },
+        ];
+        config.admin_token = Some("admin-token".to_string());
+        config.bearer_token = None;
+        config
+    }
+
     #[test]
-    fn token_comparison_handles_equal_near_and_different_length_values() {
-        assert!(token_matches("correct-token", "correct-token"));
-        assert!(!token_matches("correct-token", "correct-tokeo"));
-        assert!(!token_matches("correct-token", "short"));
-        assert!(!token_matches("correct-token", "correct-token-longer"));
-        assert!(token_matches("", ""));
+    fn credential_index_matches_exact_tokens_only() {
+        let index = CredentialIndex::from_config(&credential_config());
+        assert_eq!(index.lookup("correct-token"), &[CredentialRef::AuthUser(0)]);
+        assert_eq!(index.lookup("service-token"), &[CredentialRef::AuthUser(1)]);
+        assert_eq!(index.lookup("admin-token"), &[CredentialRef::Admin]);
+        assert!(index.lookup("correct-tokeo").is_empty());
+        assert!(index.lookup("short").is_empty());
+        assert!(index.lookup("correct-token-longer").is_empty());
+        assert!(index.lookup("Correct-Token").is_empty());
+        assert!(index.lookup("").is_empty());
+    }
+
+    #[test]
+    fn credential_index_keeps_duplicate_tokens_ambiguous() {
+        let mut config = credential_config();
+        config.bearer_token = Some("admin-token".to_string());
+        let index = CredentialIndex::from_config(&config);
+        assert_eq!(
+            index.lookup("admin-token"),
+            &[CredentialRef::Admin, CredentialRef::Bearer]
+        );
+    }
+
+    #[test]
+    fn credential_index_keys_are_per_process_secrets() {
+        let config = credential_config();
+        let first = CredentialIndex::from_config(&config);
+        let second = CredentialIndex::from_config(&config);
+        assert_ne!(first.key, second.key);
+        assert_ne!(first.tag("correct-token"), second.tag("correct-token"));
+        assert!(!format!("{first:?}").contains("correct-token"));
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_requires_a_separator() {
+        assert_eq!(bearer_credentials("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_credentials("bearer abc"), Some("abc"));
+        assert_eq!(bearer_credentials("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_credentials("bEaReR   abc"), Some("abc"));
+        assert_eq!(bearer_credentials("Bearer"), None);
+        assert_eq!(bearer_credentials("Bearerabc"), None);
+        assert_eq!(bearer_credentials("Basic abc"), None);
+        assert_eq!(bearer_credentials("Bearer "), Some(""));
     }
 
     #[test]

@@ -42,6 +42,20 @@ Schema: `ContextSearchRequest`
 | section_path_contains | string | Keep fragments whose section path contains the value, case-insensitive. |
 | artifact_kind | string | Keep fragments that reference a parse artifact of this kind. |
 
+With the Meilisearch backend, the query sent to Meilisearch is reduced to at
+most ten key terms when it is longer than ten words (English stop words and
+duplicates are dropped, the longest remaining terms are kept in order); the
+reduced query is reported as `meili_query` in the fragment stages. Queries
+are lowercased first because Meilisearch matches query stop words
+case-sensitively. Meilisearch's default `last` matching strategy never drops
+the first term, so when an index returns no hit at all the leading term (and
+any leading stop words) is dropped and the search retried, at most three
+times; the query actually used is reported as `effective_meili_query` with
+`dropped_leading_terms`. Context
+indexes are configured with English `stopWords`. `artifact_kind` and a
+trigram prefilter for `section_path_contains` are evaluated by Meilisearch;
+both are rechecked exactly after retrieval, so filter semantics are unchanged.
+
 ## Response
 Schema: `ContextSearchResponse`
 
@@ -67,7 +81,7 @@ Schema: `ContextSearchResponse`
 | neighbor_fragments | Adds adjacent fragments from the same active source document when available. |
 | source_summary | Adds `source_summary` with source document URI, source id, revision id, and source title. |
 | artifact_refs | Preserves `artifact_refs` in compact profile; standard/full include them when present. |
-| score_breakdown | Adds a score breakdown object with `lexical` (substring score), `vector` (fragment-level turbovec similarity, when scored), `document_vector` (source-document-level turbovec similarity, when scored), and `combined` (the final blended score). |
+| score_breakdown | Adds a score breakdown object with `lexical` (substring score), `vector` (fragment-level turbovec similarity, when scored), `document_vector` (source-document-level turbovec similarity, when scored), `meili` (Meilisearch `_rankingScore`, Meilisearch backend only, when ranked), and `combined` (the final score). |
 | raw_stage_debug | Accepted as an include value; raw stage visibility is still controlled by `debug` and admin status. |
 
 ### ContextHit Fields
@@ -76,7 +90,7 @@ Schema: `ContextSearchResponse`
 | uri | string | Fragment context URI. |
 | title | string | Fragment title. |
 | layer | integer | Context layer. |
-| score | number | Hybrid retrieval score: lexical substring score blended with fragment-level and document-level turbovec vector similarity. |
+| score | number | Retrieval score; higher is more relevant. With the in-memory backend it is the lexical substring score blended with fragment-level and document-level turbovec vector similarity. With the Meilisearch backend it is the Meilisearch `_rankingScore` (0..1, typo/proximity/exactness aware) plus at most `0.05` of local hybrid adjustment; read-your-writes local rows not yet ranked by Meilisearch use the squashed local hybrid score on the same 0..1 scale. Compare scores only within one response. |
 | node_kind | string? | Usually `fragment` for default retrieval. |
 | retrieval_role | string? | Usually `fragment` for default retrieval. |
 | source_id | string? | Source identifier when the fragment came from a source document. |
@@ -98,7 +112,7 @@ Schema: `ContextSearchResponse`
 | source_summary | ContextSourceSummary? | Lightweight parent source metadata when requested or using `full`. |
 | neighbor_fragments | ContextNeighborFragment[] | Adjacent source fragments when requested. |
 | related_links | ContextRelatedLink[] | Lightweight related links when requested or using `full`. |
-| score_breakdown | object? | Score details when requested: `lexical`, `vector`, `document_vector` (each when scored), and `combined`. |
+| score_breakdown | object? | Score details when requested: `lexical`, `vector`, `document_vector`, `meili` (each when scored), and `combined`. |
 | snippet | string | Search snippet from the matching fragment. |
 
 Snippets are sanitized from the full fragment before truncation. Query-time
@@ -131,6 +145,11 @@ an eight-character heuristic floor to avoid rewriting ordinary short words.
 - `debug=true` for non-admin users redacts personal context index ids and owner filter details.
 - Admin debug can see full raw stage details in `raw_stage_debug`.
 - Full source documents remain readable only through explicit `GET /v1/fs/read` with ACL checks.
+- Search is a read: the trace is cached in process immediately (so `trace_id`
+  works for reveal/debug right away) and persisted to `rag_traces` by a
+  batched background writer, outside the mutation journal and global write
+  lock. Trace persistence failures never fail the search. Persisted traces
+  expire after `RAG_TRACE_RETENTION_DAYS` (default 30; 0 keeps them forever).
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
 ## Internal Logic Call Graph
@@ -138,7 +157,7 @@ an eight-character heuristic floor to avoid rewriting ordinary short words.
 flowchart TD
   n0["UserGuard authenticates caller"]
   n1["apply_owner_default fills owner_user_id when possible"]
-  n2["Store.search_context_async searches active fragment context indexes and stores trace"]
+  n2["Store.search_context_async searches active fragment context indexes and records trace asynchronously"]
   n3["Return ContextSearchResponse"]
   n0 --> n1
   n1 --> n2

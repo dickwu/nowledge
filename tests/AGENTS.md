@@ -17,14 +17,16 @@ evidence exposed through `score_breakdown`.
 ## Key Files
 | File | Description |
 |------|-------------|
-| `api_spec.rs` (~86 KB) | Primary integration suite. Builds the router with `Config::test()` and several auth variants (`authed_app`, `bearer_user_app`, `mock_llm_app`, `analysis_llm_app`, `codex_import_app`, `stale_llm_health_app`, `llm_health_app(provider)`) and exercises every public route group — state, history, context, rag, links, analysis, ingest, sessions, harness, eval, debug, llm, and admin. |
+| `api_spec.rs` (~127 KB) | Primary integration suite. Builds the router with `Config::test()` and several auth variants (`authed_app`, `bearer_user_app`, `mock_llm_app`, `analysis_llm_app`, `codex_import_app`, `stale_llm_health_app`, `llm_health_app(provider)`) and exercises every public route group — state, history, context, rag, links, analysis, ingest, sessions, harness, eval, debug, llm, and admin. |
 | `authz_characterization.rs` | Explicit Owner/TenantService/company-writer/Admin policy matrix, shared-write auditing, protected diagnostics, route-manifest guard classification, global typed-JSON response redaction, and legacy/rotation split-secret fragment regressions. |
 | `error_contract.rs` | Stable error-envelope, request-correlation, and safe cause-log regressions. Tests serialize access to the shared tracing callsite to avoid subscriber-interest races. |
 | `http_boundary_characterization.rs` | HTTP/upload/runtime pressure contract: stable 413/429/503/504 envelopes, configured CORS, owner-principal rate budgets, JSON/multipart ceilings, global load shedding with live liveness, bounded ingest queues, disabled-worker rejection, synchronous timeout cleanup, and deterministic shutdown interruption. |
 | `http_trace_characterization.rs` | Captures the HTTP tracing layer with a test-local subscriber and proves the INFO completion event carries the same trusted request ID returned in `x-request-id`. |
 | `ingest_admission_persistence.rs` | Fault-injected repository admission coverage: failed or timed-out durable task creation never publishes phantom queued tasks and always releases queue permits. |
 | `request_validation_characterization.rs` | Canonical/alias request-bound parity for bulk, search, tag-count, and UTF-8 tag-byte limits, including no-mutation assertions for rejected writes. |
-| `meili_integration.rs` (~19 KB) | Meili-backed integration tests. Gated by `RAG_TEST_MEILI_URL` (and `RAG_TEST_MEILI_API_KEY` when the server is keyed). Verifies dynamic per-user index creation and the Meili-search path through the repository backend. |
+| `meili_integration.rs` (~185 KB) | Meili-backed integration tests. Gated through `support/meili_gate.rs` by `RAG_TEST_MEILI_URL` (and `RAG_TEST_MEILI_API_KEY` when the server is keyed). Covers dynamic per-user index creation, the Meili-search path through the repository backend, restart hydration, tenant isolation, durable audits, and a `wait_for_index` write that must be searchable on the very next request. |
+| `insight_history.rs` | Insight audit-history ordering, limits, owner/tenant scope, plus one Meili-backed restart case gated the same way as `meili_integration.rs`. |
+| `support/meili_gate.rs` | Shared live-Meili gate, included with `#[path = "support/meili_gate.rs"] mod meili_gate;` (not a test target itself). Skips when Meili is unset, unreachable, or keyed without a key; with `RAG_TEST_REQUIRE_MEILI=1` each of those, and a missing key, panics instead. Its pure `gate_outcome` decision has unit tests. |
 | `mineru_integration.rs` (~5 KB) | Live MinerU integration test. Gated by `RAG_TEST_MINERU_API_URL`. Performs a multipart PDF upload through `/v1/ingest/uploads:sync`, asserts task `state=completed`, then runs `/v1/context/search` plus `/v1/context/traceback` to confirm fragment provenance survives the round trip. |
 
 ## Subdirectories
@@ -46,7 +48,11 @@ None.
   policy matrix. Roles grant features; only scope grants private-data reach.
 - For optional integration tests, follow the existing skip-on-unreachable
   pattern (`eprintln!` and `return`) so the suite still passes in environments
-  without Meili or MinerU running locally.
+  without Meili or MinerU running locally. New Meili tests must obtain their
+  connection through `meili_gate::meili_target()` (directly or via
+  `meili_config_with_tenant`) rather than reading `RAG_TEST_MEILI_URL`
+  themselves, so `RAG_TEST_REQUIRE_MEILI=1` (set in CI) turns a skip into a
+  failure.
 - Meili tests must mint a unique `tenant_id` per run (`format!("test-tenant-{}", uuid::Uuid::now_v7())`)
   to avoid colliding with previous test debris when the same Meili server is reused.
 
@@ -54,8 +60,10 @@ None.
 - `cargo test` runs every integration-test binary. The two live-service suites
   are environment-gated and can be targeted via `cargo test --test meili_integration` and
   `cargo test --test mineru_integration`.
-- Helper scripts under `scripts/` (`gfit_meili_test.sh`) run the Meili
-  integration test through an SSH tunnel to the `gfit` host.
+- CI runs both Meili suites against a `getmeili/meilisearch` service container
+  with `RAG_TEST_REQUIRE_MEILI=1` (see `.github/workflows/AGENTS.md`).
+- Local, gitignored helper scripts under `scripts/` (`gfit_meili_test.sh`) run
+  the Meili integration test through an SSH tunnel to the `gfit` host.
 - Coverage targets the v0.6 hard constraints — anything that loosens
   per-user isolation, idempotency, or token redaction should fail at least one
   existing test.

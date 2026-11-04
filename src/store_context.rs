@@ -260,8 +260,7 @@ impl Store {
             groups,
             stages,
         };
-        let mut data = self.write()?;
-        data.traces.insert(trace.id.clone(), trace.clone());
+        self.record_trace(trace.clone());
 
         Ok(ContextSearchOutcome {
             response,
@@ -281,9 +280,7 @@ impl Store {
         let uri = if let Some(uri) = req.uri {
             uri
         } else if let Some(trace_id) = req.trace_id {
-            let data = self.read()?;
-            data.traces
-                .get(&trace_id)
+            self.cached_trace(tenant_id, &trace_id)
                 .and_then(|trace| trace.context_uris.first().cloned())
                 .ok_or_else(|| ApiError::not_found("trace has no context to reveal"))?
         } else {
@@ -381,36 +378,46 @@ impl Store {
                         retrieval_candidate(node) && structured_filters.matches_node(node)
                     }));
             }
-            // Use the same hybrid ranker as the memory path after merging
-            // repository and local RYW candidates. This retains vector-only
-            // local matches without admitting unrelated zero-score rows.
+            // Meilisearch relevance is the primary ranking feature; the local
+            // hybrid (lexical + vector) score only adjusts it slightly and
+            // decides RYW-local candidates that Meilisearch has not ranked.
             let doc_candidates = {
                 let data = self.read()?;
                 doc_candidates_locked(&data, &result.nodes)
             };
             let vector_scores = self.vector_score_map(&query, &result.nodes);
             let doc_scores = self.vector_doc_score_map(&query, doc_candidates);
-            let scored_nodes = rank_nodes(
-                result.nodes.into_iter(),
+            let scored_nodes = rank_repository_nodes(
+                result.nodes,
+                &result.relevance,
                 &query,
                 limit,
                 &vector_scores,
                 &doc_scores,
             );
-            let nodes: Vec<ContextNode> =
-                scored_nodes.iter().map(|(node, _)| node.clone()).collect();
+            let nodes: Vec<ContextNode> = scored_nodes
+                .iter()
+                .map(|scored| scored.node.clone())
+                .collect();
             let redaction_secrets = self.redaction_config.configured_secret_values();
             let mut hits = scored_nodes
                 .iter()
-                .map(|(node, score)| {
-                    let mut hit = context_hit_from_node(node, *score, &redaction_secrets);
-                    hit.score_breakdown = Some(score_breakdown_value(
-                        node,
+                .map(|scored| {
+                    let mut hit =
+                        context_hit_from_node(&scored.node, scored.score, &redaction_secrets);
+                    let mut breakdown = score_breakdown_value(
+                        &scored.node,
                         &query,
                         &vector_scores,
                         &doc_scores,
-                        *score,
-                    ));
+                        scored.score,
+                    );
+                    if let (Some(meili), Some(object)) =
+                        (scored.meili_score, breakdown.as_object_mut())
+                    {
+                        object.insert("meili".to_string(), json!(meili));
+                    }
+                    hit.score_breakdown = Some(breakdown);
                     hit
                 })
                 .collect::<Vec<_>>();
@@ -441,39 +448,16 @@ impl Store {
                 groups,
                 stages,
             };
-            let outcome = ContextSearchOutcome {
+            // Searches are reads: the trace is recorded off the mutation path
+            // (no mutation gate, operation journal, or backend task wait).
+            self.record_trace(trace.clone());
+            return Ok(ContextSearchOutcome {
                 response,
                 trace,
                 nodes,
-            };
-            let outcome_for_stage = outcome.clone();
-            let (outcome, _) = self
-                .execute_staged_mutation(
-                    tenant_id,
-                    "trace.create",
-                    owner_user_id.as_deref(),
-                    None,
-                    MutationPrimary::Trace,
-                    move |staged| {
-                        staged.insert_trace(outcome_for_stage.trace.clone())?;
-                        Ok(outcome_for_stage)
-                    },
-                )
-                .await?;
-            return Ok(outcome);
+            });
         }
-        let owner = owner_user_id;
-        let (outcome, _) = self
-            .execute_staged_mutation(
-                tenant_id,
-                "trace.create",
-                owner.as_deref(),
-                None,
-                MutationPrimary::Trace,
-                |staged| staged.search_context(tenant_id, req, is_admin),
-            )
-            .await?;
-        Ok(outcome)
+        self.search_context(tenant_id, req, is_admin)
     }
 
     pub async fn answer_rag_async(
@@ -524,5 +508,207 @@ impl Store {
             profile,
         );
         Ok(())
+    }
+}
+
+/// Weight of the squashed local hybrid score when it adjusts a Meilisearch
+/// ranking score. Small enough that it only reorders near-ties.
+const LOCAL_SCORE_ADJUSTMENT_WEIGHT: f32 = 0.05;
+/// Local hybrid score at which the squashed value reaches 0.5. An exact
+/// substring match (`text_score >= 10`) therefore maps to at least 0.5.
+const LOCAL_SCORE_SQUASH_MIDPOINT: f32 = 10.0;
+
+struct RankedRepositoryNode {
+    node: ContextNode,
+    score: f32,
+    meili_score: Option<f32>,
+}
+
+/// Map an unbounded non-negative local hybrid score into `0..1`.
+fn squash_local_score(score: f32) -> f32 {
+    let score = score.max(0.0);
+    score / (score + LOCAL_SCORE_SQUASH_MIDPOINT)
+}
+
+/// Rank repository-backed context candidates (H4).
+///
+/// Nodes Meilisearch ranked are admitted on its relevance — including typo,
+/// proximity and exactness matches the local substring scorer cannot see —
+/// and scored `meili + 0.05 * squash(local)`. Candidates without a backend
+/// score (read-your-writes local rows not yet indexed, or a backend that
+/// reports no score) keep the local admission rule (hybrid score > 0) and
+/// are scored `squash(local)`, on the same `0..1` scale.
+fn rank_repository_nodes(
+    nodes: Vec<ContextNode>,
+    relevance: &HashMap<(String, u8), f32>,
+    query: &str,
+    limit: usize,
+    vector_scores: &VectorScoreMap,
+    doc_scores: &VectorScoreMap,
+) -> Vec<RankedRepositoryNode> {
+    let mut ranked: Vec<RankedRepositoryNode> = nodes
+        .into_iter()
+        .filter_map(|node| {
+            let local = hybrid_node_score(&node, query, vector_scores, doc_scores)
+                .filter(|score| *score > 0.0);
+            let meili_score = relevance.get(&(node.uri.clone(), node.layer)).copied();
+            let score = match (meili_score, local) {
+                (Some(meili), local) => {
+                    meili + LOCAL_SCORE_ADJUSTMENT_WEIGHT * squash_local_score(local.unwrap_or(0.0))
+                }
+                (None, Some(local)) => squash_local_score(local),
+                (None, None) => return None,
+            };
+            Some(RankedRepositoryNode {
+                node,
+                score,
+                meili_score,
+            })
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked.truncate(limit);
+    ranked
+}
+
+#[cfg(test)]
+mod repository_ranking_tests {
+    use super::*;
+
+    fn fragment(uri: &str, title: &str, body: &str) -> ContextNode {
+        ContextNode {
+            uri: uri.to_string(),
+            title: title.to_string(),
+            layer: 2,
+            body: body.to_string(),
+            tenant_id: "tenant-a".to_string(),
+            owner_user_id: None,
+            index_uid: "rag_company_context".to_string(),
+            index_kind: "company".to_string(),
+            ancestor_uris: Vec::new(),
+            node_kind: "fragment".to_string(),
+            retrieval_role: "fragment".to_string(),
+            retrieval_enabled: true,
+            parent_uri: None,
+            source_document_uri: None,
+            fragment_index: None,
+            char_start: None,
+            char_end: None,
+            token_estimate: None,
+            checksum: None,
+            source_id: None,
+            revision_id: None,
+            block_type: None,
+            page_idx: None,
+            bbox: None,
+            section_path: Vec::new(),
+            heading_level: None,
+            asset_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            status: "active".to_string(),
+            privacy: "company".to_string(),
+            updated_at: now(),
+        }
+    }
+
+    fn rank(
+        nodes: Vec<ContextNode>,
+        relevance: &[(&str, f32)],
+        query: &str,
+        limit: usize,
+    ) -> Vec<RankedRepositoryNode> {
+        let relevance = relevance
+            .iter()
+            .map(|(uri, score)| ((uri.to_string(), 2), *score))
+            .collect();
+        rank_repository_nodes(
+            nodes,
+            &relevance,
+            query,
+            limit,
+            &VectorScoreMap::default(),
+            &VectorScoreMap::default(),
+        )
+    }
+
+    #[test]
+    fn meili_typo_hits_survive_without_any_local_lexical_match() {
+        let ranked = rank(
+            vec![
+                fragment(
+                    "ctx://a",
+                    "Document handling",
+                    "How a document is archived.",
+                ),
+                fragment("ctx://b", "Unrelated", "Nothing in common."),
+            ],
+            &[("ctx://a", 0.82)],
+            "documnet",
+            5,
+        );
+        assert_eq!(ranked.len(), 1, "unranked zero-score rows stay excluded");
+        assert_eq!(ranked[0].node.uri, "ctx://a");
+        assert_eq!(ranked[0].meili_score, Some(0.82));
+        assert!((ranked[0].score - 0.82).abs() < 1e-6);
+    }
+
+    #[test]
+    fn meili_relevance_is_primary_and_local_substring_score_cannot_override_it() {
+        // "cat" is a substring of "category": the local scorer gives the
+        // category fragment the higher lexical score, but Meilisearch ranks
+        // the exact-word fragment clearly higher, and that wins.
+        let ranked = rank(
+            vec![
+                fragment("ctx://category", "category category", "category listing"),
+                fragment("ctx://cat", "Cat care", "feeding a cat"),
+            ],
+            &[("ctx://category", 0.40), ("ctx://cat", 0.95)],
+            "cat",
+            5,
+        );
+        let order: Vec<_> = ranked.iter().map(|r| r.node.uri.as_str()).collect();
+        assert_eq!(order, ["ctx://cat", "ctx://category"]);
+    }
+
+    #[test]
+    fn local_score_only_breaks_near_ties_between_meili_hits() {
+        let ranked = rank(
+            vec![
+                fragment("ctx://weak", "Other", "unrelated words"),
+                fragment("ctx://strong", "Rollback", "deploy rollback steps"),
+            ],
+            &[("ctx://weak", 0.900), ("ctx://strong", 0.899)],
+            "deploy rollback",
+            5,
+        );
+        assert_eq!(ranked[0].node.uri, "ctx://strong");
+        for scored in &ranked {
+            let meili = scored.meili_score.unwrap();
+            assert!(scored.score >= meili);
+            assert!(scored.score < meili + LOCAL_SCORE_ADJUSTMENT_WEIGHT);
+        }
+    }
+
+    #[test]
+    fn unranked_local_candidates_use_the_squashed_local_score_and_limit_applies() {
+        let ranked = rank(
+            vec![
+                fragment("ctx://local", "Fresh", "deploy rollback written locally"),
+                fragment("ctx://meili", "Indexed", "deploy rollback indexed"),
+                fragment("ctx://third", "Third", "deploy only"),
+            ],
+            &[("ctx://meili", 0.97)],
+            "deploy rollback",
+            2,
+        );
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].node.uri, "ctx://meili");
+        assert_eq!(ranked[1].node.uri, "ctx://local");
+        assert_eq!(ranked[1].meili_score, None);
+        assert!(ranked[1].score > 0.5 && ranked[1].score < 1.0);
     }
 }

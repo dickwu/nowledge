@@ -38,8 +38,8 @@ templates or code owners are checked in.
   check.
 
 ### Common Patterns
-- Separate stable quality, MSRV, RustSec, and dependency-policy jobs so each
-  failing contract is visible independently.
+- Separate stable quality, Meilisearch integration, MSRV, RustSec, and
+  dependency-policy jobs so each failing contract is visible independently.
 
 ## Dependencies
 

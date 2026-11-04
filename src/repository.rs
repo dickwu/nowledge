@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 use crate::{
     config::{Config, DEFAULT_MEILI_SCAN_MAX_DOCUMENTS, DEFAULT_MEILI_SCAN_PAGE_SIZE},
     error::ApiError,
-    meili::{MeiliAdmin, SearchResponse},
+    meili::{MeiliAdmin, SearchResponse, CONTEXT_SECTION_PATH_TRIGRAMS_FIELD},
     models::*,
     mutation::{
         operation_list_item, validate_operation_record, validate_operation_step_for_tenant,
@@ -22,13 +22,16 @@ use crate::{
         scoped_storage_identity, tenant_document, tenant_document_with_storage_identity,
         tenant_structured_row_document, TenantFilter,
     },
-    util::{hmac_hex, text_score},
+    util::{hmac_hex, meili_query_terms, ENGLISH_STOP_WORDS},
 };
 
 #[derive(Debug, Clone)]
 pub struct RepositoryContextSearch {
     pub nodes: Vec<ContextNode>,
     pub stages: Vec<Value>,
+    /// Backend relevance (Meilisearch `_rankingScore`, 0..=1) keyed by
+    /// `(uri, layer)` for the returned nodes that carried one.
+    pub relevance: HashMap<(String, u8), f32>,
 }
 
 pub struct RepositoryContextSearchQuery<'a> {
@@ -292,7 +295,30 @@ pub trait KnowledgeRepository: Send + Sync {
 
     async fn upsert_trace(&self, trace: &TraceRecord) -> Result<Option<String>, ApiError>;
 
+    /// Persist a batch of retrieval traces. Backends that support it submit
+    /// the whole batch as one document write; the default falls back to one
+    /// write per trace and reports the last accepted task.
+    async fn upsert_traces(&self, traces: &[TraceRecord]) -> Result<Option<String>, ApiError> {
+        let mut last_task_uid = None;
+        for trace in traces {
+            if let Some(task_uid) = self.upsert_trace(trace).await? {
+                last_task_uid = Some(task_uid);
+            }
+        }
+        Ok(last_task_uid)
+    }
+
     async fn list_traces(&self, tenant_id: &str) -> Result<Option<Vec<TraceRecord>>, ApiError>;
+
+    /// Delete one tenant's persisted traces created before `cutoff`. The
+    /// memory backend is a no-op: its bounded trace cache is canonical there.
+    async fn delete_traces_before(
+        &self,
+        _tenant_id: &str,
+        _cutoff: DateTime<Utc>,
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        Ok(RepositoryWriteReceipt::empty())
+    }
 
     async fn upsert_links(&self, links: &[KnowledgeLink]) -> Result<Option<String>, ApiError>;
 
@@ -1192,6 +1218,23 @@ pub struct MeiliRepository {
 
 const OPERATION_IDENTITY_FIELDS: &[&str] = &["id", "logical_id", "tenant_id"];
 const MAX_OPERATION_CANDIDATE_LIMIT: usize = 1_000;
+/// Numeric mirror of `TraceRecord::created_at` stored only in `rag_traces`
+/// documents so retention can use a numeric range filter.
+const TRACE_CREATED_AT_MS_FIELD: &str = "created_at_ms";
+const LEGACY_TRACE_RETENTION_PAGE_SIZE: usize = 1_000;
+
+/// Build the tenant-scoped `rag_traces` document for one trace, including the
+/// numeric `created_at_ms` retention key. Decoding ignores the extra field.
+fn trace_document(trace: &TraceRecord) -> Result<Value, ApiError> {
+    let mut document = tenant_document(&trace.tenant_id, "rag_traces", &trace.id, trace)?;
+    if let Value::Object(map) = &mut document {
+        map.insert(
+            TRACE_CREATED_AT_MS_FIELD.to_string(),
+            json!(trace.created_at.timestamp_millis()),
+        );
+    }
+    Ok(document)
+}
 const OPERATION_SUMMARY_FIELDS: &[&str] = &[
     "id",
     "logical_id",
@@ -2045,8 +2088,17 @@ impl KnowledgeRepository for MeiliRepository {
     ) -> Result<Option<String>, ApiError> {
         let documents = nodes
             .iter()
-            .map(|node| tenant_document(&node.tenant_id, index_uid, &node.uri, node))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|node| -> Result<Value, ApiError> {
+                let mut document = tenant_document(&node.tenant_id, index_uid, &node.uri, node)?;
+                if let Some(object) = document.as_object_mut() {
+                    object.insert(
+                        CONTEXT_SECTION_PATH_TRIGRAMS_FIELD.to_string(),
+                        json!(section_path_trigrams(&node.section_path)),
+                    );
+                }
+                Ok(document)
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
         self.upsert_values(index_uid, &documents).await
     }
 
@@ -2465,16 +2517,98 @@ impl KnowledgeRepository for MeiliRepository {
     }
 
     async fn upsert_trace(&self, trace: &TraceRecord) -> Result<Option<String>, ApiError> {
-        self.upsert_values(
-            "rag_traces",
-            &[tenant_document(
-                &trace.tenant_id,
+        self.upsert_values("rag_traces", &[trace_document(trace)?])
+            .await
+    }
+
+    async fn upsert_traces(&self, traces: &[TraceRecord]) -> Result<Option<String>, ApiError> {
+        let documents = traces
+            .iter()
+            .map(trace_document)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.upsert_values("rag_traces", &documents).await
+    }
+
+    async fn delete_traces_before(
+        &self,
+        tenant_id: &str,
+        cutoff: DateTime<Utc>,
+    ) -> Result<RepositoryWriteReceipt, ApiError> {
+        let mut receipt = RepositoryWriteReceipt::empty();
+        let filter = TenantFilter::new(tenant_id)?
+            .lt_i64(TRACE_CREATED_AT_MS_FIELD, cutoff.timestamp_millis())
+            .finish();
+        if let Some(task_uid) = self
+            .admin
+            .delete_documents_by_filter("rag_traces", &filter)
+            .await?
+        {
+            receipt.task_uids.push(task_uid);
+        }
+
+        // Traces written before `created_at_ms` existed only carry the RFC
+        // 3339 `created_at`. Examine the oldest bounded page of them and
+        // delete the expired ones by logical id; later sweeps continue until
+        // the legacy set ages out.
+        let legacy_filter = TenantFilter::new(tenant_id)?
+            .not_exists(TRACE_CREATED_AT_MS_FIELD)
+            .finish();
+        let page = self
+            .admin
+            .fetch_projected_documents_page(
                 "rag_traces",
-                &trace.id,
-                trace,
-            )?],
-        )
-        .await
+                &legacy_filter,
+                &["created_at:asc".to_string(), "id:asc".to_string()],
+                0,
+                LEGACY_TRACE_RETENTION_PAGE_SIZE,
+                &["id", "tenant_id", "logical_id", "created_at"],
+            )
+            .await?;
+        // A tenant-scoped trace is deleted by logical id, which also removes
+        // its rollback mirror. A pre-tenant-scope trace without a migrated
+        // twin carries no `logical_id`; address it by its physical id through
+        // the same filter's legacy branch. Skipping it would never prune it
+        // and could pin this bounded oldest-first page indefinitely.
+        let mut expired = page
+            .results
+            .into_iter()
+            .filter(|document| document.get("tenant_id").and_then(Value::as_str) == Some(tenant_id))
+            .filter(|document| {
+                document
+                    .get("created_at")
+                    .and_then(Value::as_str)
+                    .and_then(|created_at| DateTime::parse_from_rfc3339(created_at).ok())
+                    .is_some_and(|created_at| created_at.with_timezone(&Utc) < cutoff)
+            })
+            .filter_map(|document| {
+                let key = if is_tenant_document("rag_traces", &document) {
+                    "logical_id"
+                } else if document.get("logical_id").is_none_or(Value::is_null) {
+                    "id"
+                } else {
+                    return None;
+                };
+                document
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+        expired.sort();
+        expired.dedup();
+        if !expired.is_empty() {
+            let filter = TenantFilter::new(tenant_id)?
+                .logical_ids(&expired)?
+                .finish();
+            if let Some(task_uid) = self
+                .admin
+                .delete_documents_by_filter("rag_traces", &filter)
+                .await?
+            {
+                receipt.task_uids.push(task_uid);
+            }
+        }
+        Ok(receipt)
     }
 
     async fn list_traces(&self, tenant_id: &str) -> Result<Option<Vec<TraceRecord>>, ApiError> {
@@ -2967,17 +3101,10 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         request: RepositoryContextSearchQuery<'_>,
     ) -> Result<Option<RepositoryContextSearch>, ApiError> {
-        let mut stages = Vec::new();
-        let mut all_nodes = Vec::new();
-        let search_limit = if request.filters.requires_post_filter() {
-            request
-                .limit
-                .saturating_mul(20)
-                .max(request.limit)
-                .min(1000)
-        } else {
-            request.limit
-        };
+        let limit = request.limit.max(1);
+        // Meilisearch only honors the first ten query words; long RAG
+        // questions are reduced to deterministic key terms first (M3).
+        let meili_query = meili_query_terms(request.query);
 
         let company_filter = context_filter(
             request.tenant_id,
@@ -2985,81 +3112,80 @@ impl KnowledgeRepository for MeiliRepository {
             "rag_company_context",
             request.filters,
         )?;
-        let company = self
-            .search_context_index(
-                "rag_company_context",
-                request.query,
-                &company_filter,
-                search_limit,
-            )
-            .await?;
-        let company_hits = company
-            .hits
-            .into_iter()
-            .filter(|node| request.filters.matches_node(node))
-            .collect::<Vec<_>>();
-        stages.push(context_stage(
+        // The personal index is only ever the caller's own HMAC-derived UID.
+        let personal = match request.owner_user_id {
+            Some(owner) => {
+                let routing = request
+                    .resolver
+                    .resolve(request.tenant_id, owner, false, true)?;
+                let filter = context_filter(
+                    request.tenant_id,
+                    Some(owner),
+                    &routing.personal_context_index_uid,
+                    request.filters,
+                )?;
+                Some((routing.personal_context_index_uid, filter))
+            }
+            None => None,
+        };
+
+        let company_search = self.search_context_fragments(
+            "rag_company_context",
+            &meili_query,
+            &company_filter,
+            limit,
+            request.filters,
+        );
+        let personal_search = async {
+            match &personal {
+                Some((index_uid, filter)) => self
+                    .search_context_fragments(
+                        index_uid,
+                        &meili_query,
+                        filter,
+                        limit,
+                        request.filters,
+                    )
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        };
+        let (company, personal_result) = tokio::try_join!(company_search, personal_search)?;
+
+        let mut stages = vec![context_stage(
             "fragments_company",
             "rag_company_context",
             request.query,
+            &meili_query,
             &company_filter,
-            company.processing_time_ms,
-            &company_hits,
-        ));
-        all_nodes.extend(company_hits);
-
-        if let Some(owner) = request.owner_user_id {
-            let routing = request
-                .resolver
-                .resolve(request.tenant_id, owner, false, true)?;
-            let personal_filter = context_filter(
-                request.tenant_id,
-                Some(owner),
-                &routing.personal_context_index_uid,
-                request.filters,
-            )?;
-            let personal = self
-                .search_context_index(
-                    &routing.personal_context_index_uid,
-                    request.query,
-                    &personal_filter,
-                    search_limit,
-                )
-                .await?;
-            let personal_hits = personal
-                .hits
-                .into_iter()
-                .filter(|node| request.filters.matches_node(node))
-                .collect::<Vec<_>>();
+            &company,
+        )];
+        let mut ranked = company.hits;
+        if let (Some((index_uid, filter)), Some(personal_hits)) = (&personal, personal_result) {
             stages.push(context_stage(
                 "fragments_personal",
-                &routing.personal_context_index_uid,
+                index_uid,
                 request.query,
-                &personal_filter,
-                personal.processing_time_ms,
+                &meili_query,
+                filter,
                 &personal_hits,
             ));
-            all_nodes.extend(personal_hits);
+            ranked.extend(personal_hits.hits);
         }
 
-        all_nodes.sort_by(|a, b| {
-            text_score(&format!("{} {}", b.title, b.body), request.query)
-                .partial_cmp(&text_score(
-                    &format!("{} {}", a.title, a.body),
-                    request.query,
-                ))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        all_nodes.truncate(request.limit);
+        let (nodes, relevance) = merge_ranked_context_hits(ranked, limit);
         stages.push(json!({
             "stage": "selection",
             "mode": request.mode,
-            "selected_uris": all_nodes.iter().map(|node| &node.uri).collect::<Vec<_>>()
+            "ranking": "meili_ranking_score",
+            "selected_uris": nodes.iter().map(|node| &node.uri).collect::<Vec<_>>()
         }));
 
         Ok(Some(RepositoryContextSearch {
-            nodes: all_nodes,
+            nodes,
             stages,
+            relevance,
         }))
     }
 
@@ -3487,7 +3613,211 @@ impl MeiliRepository {
             processing_time_ms: response.processing_time_ms,
         })
     }
+
+    /// Relevance-ranked fragment search over one context index.
+    ///
+    /// Hits keep Meilisearch's order and `_rankingScore` (typo tolerance,
+    /// proximity, attribute and exactness rules). Structured filters are
+    /// pushed down to Meilisearch; the exact local predicate still runs as a
+    /// safety net. When a filter cannot be pushed down exactly
+    /// (`section_path_contains`, case-sensitive `artifact_kind`), a small
+    /// overfetch is paged until `limit` matches are found, bounded by
+    /// [`CONTEXT_SEARCH_MAX_PAGES`].
+    async fn search_context_fragments(
+        &self,
+        index_uid: &str,
+        query: &str,
+        filter: &str,
+        limit: usize,
+        filters: &ContextStructuredFilters,
+    ) -> Result<RankedContextFragments, ApiError> {
+        let page_size = if filters.requires_post_filter() {
+            limit.saturating_mul(CONTEXT_POST_FILTER_OVERFETCH)
+        } else {
+            limit
+        }
+        .clamp(1, MEILI_MAX_TOTAL_HITS);
+        let mut documents = Vec::new();
+        let mut hits: Vec<(ContextNode, Option<f32>)>;
+        let mut processing_time_ms = 0;
+        let mut offset = 0;
+        let mut pages = 0;
+        let mut effective_query = query.to_string();
+        let mut dropped_leading_terms = 0;
+        loop {
+            let response: SearchResponse<Value> = self
+                .admin
+                .search(
+                    index_uid,
+                    json!({
+                        "q": effective_query,
+                        "offset": offset,
+                        "limit": page_size,
+                        "filter": filter,
+                        "showRankingScore": true
+                    }),
+                )
+                .await?;
+            processing_time_ms += response.processing_time_ms;
+            let returned = response.hits.len();
+            // Meilisearch's default `last` matching strategy never drops the
+            // first query term, so an empty first page proves that term
+            // matches no filtered document. Drop it (with any leading stop
+            // words) and retry, so "Explain ..."/"Tell me ..." questions do
+            // not return nothing. Bounded; no hit can be lost this way.
+            if returned == 0
+                && offset == 0
+                && dropped_leading_terms < CONTEXT_MAX_LEADING_TERM_DROPS
+            {
+                if let Some(rest) = drop_leading_query_term(&effective_query) {
+                    effective_query = rest;
+                    dropped_leading_terms += 1;
+                    continue;
+                }
+            }
+            pages += 1;
+            offset += returned;
+            documents.extend(response.hits);
+            hits = decode_ranked_context_documents(index_uid, documents.clone())?
+                .into_iter()
+                .filter(|(node, _)| filters.matches_node(node))
+                .collect();
+            if hits.len() >= limit
+                || returned < page_size
+                || pages >= CONTEXT_SEARCH_MAX_PAGES
+                || offset >= MEILI_MAX_TOTAL_HITS
+            {
+                break;
+            }
+        }
+        hits.truncate(limit);
+        Ok(RankedContextFragments {
+            hits,
+            processing_time_ms,
+            pages,
+            effective_query,
+            dropped_leading_terms,
+        })
+    }
 }
+
+/// Upper bound on unmatched leading terms dropped by one fragment search.
+const CONTEXT_MAX_LEADING_TERM_DROPS: usize = 3;
+
+/// Remove leading stop words plus the first real term of a Meilisearch `q`,
+/// or `None` when nothing searchable would remain.
+fn drop_leading_query_term(query: &str) -> Option<String> {
+    let mut tokens = query.split_whitespace();
+    loop {
+        let word = tokens
+            .next()?
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        if !word.is_empty() && !ENGLISH_STOP_WORDS.contains(&word.as_str()) {
+            break;
+        }
+    }
+    let rest = tokens.collect::<Vec<_>>().join(" ");
+    rest.split(|c: char| !c.is_alphanumeric())
+        .any(|word| !word.is_empty() && !ENGLISH_STOP_WORDS.contains(&word.to_lowercase().as_str()))
+        .then_some(rest)
+}
+
+/// Meilisearch's default `pagination.maxTotalHits`.
+const MEILI_MAX_TOTAL_HITS: usize = 1000;
+/// Page size multiplier when a structured filter needs a local recheck.
+const CONTEXT_POST_FILTER_OVERFETCH: usize = 3;
+/// Upper bound on post-filter pages per index and query.
+const CONTEXT_SEARCH_MAX_PAGES: usize = 4;
+
+struct RankedContextFragments {
+    hits: Vec<(ContextNode, Option<f32>)>,
+    processing_time_ms: u64,
+    pages: usize,
+    /// The `q` that produced `hits` after unmatched leading terms were dropped.
+    effective_query: String,
+    dropped_leading_terms: usize,
+}
+
+fn decode_ranked_context_documents(
+    index_uid: &str,
+    documents: Vec<Value>,
+) -> Result<Vec<(ContextNode, Option<f32>)>, ApiError> {
+    prefer_tenant_documents(index_uid, documents)
+        .into_iter()
+        .map(|mut document| {
+            let score = document
+                .as_object_mut()
+                .and_then(|object| object.remove("_rankingScore"))
+                .and_then(|score| score.as_f64())
+                .filter(|score| score.is_finite())
+                .map(|score| score as f32);
+            serde_json::from_value::<ContextNode>(restore_logical_id(index_uid, document))
+                .map(|node| (node, score))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            ApiError::Internal(format!(
+                "failed to decode tenant-scoped {index_uid} context documents: {error}"
+            ))
+        })
+}
+
+/// Merge per-index relevance-ranked hits by Meilisearch `_rankingScore`
+/// (scores are normalized to 0..=1 and comparable across context indexes,
+/// which share one settings profile — the same merge federated multi-search
+/// performs with equal weights). Hits without a score sort after scored
+/// ones; the sort is stable so per-index Meilisearch order breaks ties.
+fn merge_ranked_context_hits(
+    mut ranked: Vec<(ContextNode, Option<f32>)>,
+    limit: usize,
+) -> (Vec<ContextNode>, HashMap<(String, u8), f32>) {
+    ranked.sort_by(|a, b| {
+        let left = a.1.unwrap_or(f32::NEG_INFINITY);
+        let right = b.1.unwrap_or(f32::NEG_INFINITY);
+        right
+            .partial_cmp(&left)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked.truncate(limit);
+    let mut relevance: HashMap<(String, u8), f32> = HashMap::new();
+    for (node, score) in &ranked {
+        if let Some(score) = score {
+            let entry = relevance
+                .entry((node.uri.clone(), node.layer))
+                .or_insert(*score);
+            *entry = entry.max(*score);
+        }
+    }
+    (
+        ranked.into_iter().map(|(node, _)| node).collect(),
+        relevance,
+    )
+}
+
+/// Distinct ASCII-lowercased character trigrams of every section-path part,
+/// stored on context documents for `section_path_contains` pushdown.
+pub(crate) fn section_path_trigrams(section_path: &[String]) -> Vec<String> {
+    let mut trigrams = std::collections::BTreeSet::new();
+    for part in section_path {
+        trigrams.extend(char_trigrams(&part.to_ascii_lowercase()));
+    }
+    trigrams.into_iter().collect()
+}
+
+fn char_trigrams(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .windows(3)
+        .map(|window| window.iter().collect())
+        .collect()
+}
+
+/// Upper bound on trigram clauses in one `section_path_contains` pushdown.
+/// Any subset of the needle's trigrams is still a necessary condition.
+const SECTION_PATH_MAX_FILTER_TRIGRAMS: usize = 16;
 
 pub fn repository_from_config(config: &Config) -> Arc<dyn KnowledgeRepository> {
     if config.store_backend == "meili" && config.meili_url.is_some() {
@@ -3730,27 +4060,77 @@ fn context_filter_clauses(filters: &ContextStructuredFilters) -> Result<Vec<Stri
     if let Some(page_idx_lte) = filters.page_idx_lte {
         clauses.push(format!("page_idx <= {page_idx_lte}"));
     }
+    // Meilisearch flattens arrays of objects, so this matches when any
+    // artifact ref has the kind. Meilisearch string equality is
+    // case-insensitive, so the exact local check stays as a safety net.
+    if let Some(artifact_kind) = filters.artifact_kind.as_deref() {
+        clauses.push(format!(
+            "artifact_refs.artifact_kind = {}",
+            meili_string(artifact_kind)?
+        ));
+    }
+    if let Some(clause) = filters
+        .section_path_contains
+        .as_deref()
+        .map(section_path_contains_clause)
+        .transpose()?
+        .flatten()
+    {
+        clauses.push(clause);
+    }
     Ok(clauses)
+}
+
+/// Necessary-condition prefilter for the case-insensitive substring
+/// `section_path_contains`: every needle trigram must occur among the
+/// document's section-path trigrams. Documents written before the derived
+/// field existed (`NOT EXISTS`) are kept and decided by the exact local
+/// check, so old documents never disappear from filtered results. Needles
+/// shorter than three characters are not pushed down.
+fn section_path_contains_clause(needle: &str) -> Result<Option<String>, ApiError> {
+    let needle_trigrams = char_trigrams(&needle.to_ascii_lowercase())
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if needle_trigrams.is_empty() {
+        return Ok(None);
+    }
+    let field = CONTEXT_SECTION_PATH_TRIGRAMS_FIELD;
+    let required = needle_trigrams
+        .iter()
+        .take(SECTION_PATH_MAX_FILTER_TRIGRAMS)
+        .map(|trigram| -> Result<String, ApiError> {
+            Ok(format!("{field} = {}", meili_string(trigram)?))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(Some(format!(
+        "(({}) OR {field} NOT EXISTS)",
+        required.join(" AND ")
+    )))
 }
 
 fn context_stage(
     stage: &str,
     index_uid: &str,
     query: &str,
+    meili_query: &str,
     filter: &str,
-    latency_ms: u64,
-    hits: &[ContextNode],
+    fragments: &RankedContextFragments,
 ) -> Value {
     json!({
         "stage": stage,
         "index_uid": index_uid,
         "query": query,
+        "meili_query": meili_query,
+        "effective_meili_query": fragments.effective_query,
+        "dropped_leading_terms": fragments.dropped_leading_terms,
         "filter": filter,
-        "hits": hits.len(),
-        "latency_ms": latency_ms,
-        "selected_uris": hits
+        "hits": fragments.hits.len(),
+        "pages": fragments.pages,
+        "latency_ms": fragments.processing_time_ms,
+        "selected_uris": fragments
+            .hits
             .iter()
-            .map(|node| node.uri.clone())
+            .map(|(node, _)| node.uri.clone())
             .collect::<Vec<_>>()
     })
 }
@@ -4062,6 +4442,368 @@ mod tests {
             .apply_operation_step("tenant-a", &step)
             .await
             .is_err());
+    }
+
+    #[derive(Clone, Default)]
+    struct ContextSearchStub {
+        responses: Arc<Mutex<HashMap<String, Value>>>,
+        requests: Arc<Mutex<Vec<(String, Value)>>>,
+    }
+
+    async fn context_search_stub(
+        State(stub): State<ContextSearchStub>,
+        request: AxumRequest,
+    ) -> Response {
+        let path = request.uri().path().to_string();
+        let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        stub.requests.lock().unwrap().push((path.clone(), body));
+        let index_uid = path
+            .strip_prefix("/indexes/")
+            .and_then(|path| path.strip_suffix("/search"))
+            .unwrap_or_default()
+            .to_string();
+        match stub.responses.lock().unwrap().get(&index_uid).cloned() {
+            Some(response) => (StatusCode::OK, Json(response)).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"code": "index_not_found"})),
+            )
+                .into_response(),
+        }
+    }
+
+    async fn spawn_context_search_repository(stub: ContextSearchStub) -> MeiliRepository {
+        let app = Router::new().fallback(context_search_stub).with_state(stub);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = Config::test();
+        config.meili_url = Some(format!("http://{address}"));
+        MeiliRepository::new(MeiliAdmin::from_config(&config), false)
+    }
+
+    fn context_hit(tenant_id: &str, index_uid: &str, uri: &str, score: f64) -> Value {
+        let personal = index_uid != "rag_company_context";
+        let node = json!({
+            "uri": uri,
+            "title": format!("title {uri}"),
+            "layer": 2,
+            "body": "body",
+            "tenant_id": tenant_id,
+            "owner_user_id": if personal { json!("owner-a") } else { Value::Null },
+            "index_uid": index_uid,
+            "index_kind": if personal { "personal" } else { "company" },
+            "ancestor_uris": [],
+            "privacy": if personal { "private" } else { "company" },
+            "updated_at": "2026-07-14T00:00:00Z"
+        });
+        let mut document = tenant_document(tenant_id, index_uid, uri, &node).unwrap();
+        document["_rankingScore"] = json!(score);
+        document
+    }
+
+    #[test]
+    fn leading_query_terms_drop_with_their_stop_words() {
+        assert_eq!(
+            drop_leading_query_term("explain onboarding playbook").as_deref(),
+            Some("onboarding playbook")
+        );
+        assert_eq!(
+            drop_leading_query_term("can you explain the onboarding playbook?").as_deref(),
+            Some("the onboarding playbook?")
+        );
+        assert_eq!(drop_leading_query_term("explain the"), None);
+        assert_eq!(drop_leading_query_term("playbook"), None);
+        assert_eq!(drop_leading_query_term(""), None);
+    }
+
+    async fn query_keyed_context_stub(
+        State(stub): State<ContextSearchStub>,
+        request: AxumRequest,
+    ) -> Response {
+        let path = request.uri().path().to_string();
+        let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let q = body["q"].as_str().unwrap_or_default().to_string();
+        stub.requests.lock().unwrap().push((path, body));
+        let response = stub
+            .responses
+            .lock()
+            .unwrap()
+            .get(&q)
+            .cloned()
+            .unwrap_or_else(|| json!({"hits": []}));
+        (StatusCode::OK, Json(response)).into_response()
+    }
+
+    #[tokio::test]
+    async fn fragment_search_drops_unmatched_leading_terms_only_after_an_empty_page() {
+        let stub = ContextSearchStub::default();
+        stub.responses.lock().unwrap().insert(
+            "onboarding playbook".to_string(),
+            json!({"hits": [context_hit("tenant-a", "rag_company_context", "ctx://company/a", 0.9)]}),
+        );
+        let app = Router::new()
+            .fallback(query_keyed_context_stub)
+            .with_state(stub.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = Config::test();
+        config.meili_url = Some(format!("http://{address}"));
+        let repository = MeiliRepository::new(MeiliAdmin::from_config(&config), false);
+
+        let filters = ContextStructuredFilters::default();
+        let result = repository
+            .search_context_fragments(
+                "rag_company_context",
+                "can you explain tell onboarding playbook",
+                "tenant_id = \"tenant-a\"",
+                5,
+                &filters,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.effective_query, "onboarding playbook");
+        assert_eq!(result.dropped_leading_terms, 2);
+        assert_eq!(result.pages, 1);
+        let queries: Vec<String> = stub
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, body)| body["q"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            queries,
+            vec![
+                "can you explain tell onboarding playbook",
+                "tell onboarding playbook",
+                "onboarding playbook"
+            ]
+        );
+
+        // A query whose first page already has hits is never rewritten.
+        stub.requests.lock().unwrap().clear();
+        let result = repository
+            .search_context_fragments(
+                "rag_company_context",
+                "onboarding playbook",
+                "tenant_id = \"tenant-a\"",
+                5,
+                &filters,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.dropped_leading_terms, 0);
+        assert_eq!(stub.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn context_search_merges_company_and_personal_hits_by_meili_ranking_score() {
+        let resolver = EventIndexResolver::new(b"repository-test-secret".to_vec());
+        let personal_uid = resolver
+            .resolve("tenant-a", "owner-a", false, true)
+            .unwrap()
+            .personal_context_index_uid;
+        let stub = ContextSearchStub::default();
+        stub.responses.lock().unwrap().insert(
+            "rag_company_context".to_string(),
+            json!({"hits": [
+                context_hit("tenant-a", "rag_company_context", "ctx://company/a", 0.91),
+                context_hit("tenant-a", "rag_company_context", "ctx://company/b", 0.40)
+            ], "processingTimeMs": 2}),
+        );
+        stub.responses.lock().unwrap().insert(
+            personal_uid.clone(),
+            json!({"hits": [
+                context_hit("tenant-a", &personal_uid, "ctx://personal/a", 0.75)
+            ], "processingTimeMs": 1}),
+        );
+        let repository = spawn_context_search_repository(stub.clone()).await;
+        let question = "What is the documented procedure that we should follow for the \
+                        deployment rollback of the billing API?";
+        let filters = ContextStructuredFilters::default();
+        let result = repository
+            .search_context(RepositoryContextSearchQuery {
+                tenant_id: "tenant-a",
+                owner_user_id: Some("owner-a"),
+                query: question,
+                mode: "auto",
+                limit: 2,
+                filters: &filters,
+                resolver: &resolver,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let uris: Vec<_> = result.nodes.iter().map(|node| node.uri.as_str()).collect();
+        assert_eq!(uris, ["ctx://company/a", "ctx://personal/a"]);
+        assert_eq!(
+            result.relevance.get(&("ctx://company/a".to_string(), 2)),
+            Some(&0.91)
+        );
+        assert_eq!(
+            result.relevance.get(&("ctx://personal/a".to_string(), 2)),
+            Some(&0.75)
+        );
+
+        let requests = stub.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        let searched: HashSet<_> = requests.iter().map(|(path, _)| path.clone()).collect();
+        assert!(searched.contains("/indexes/rag_company_context/search"));
+        assert!(searched.contains(&format!("/indexes/{personal_uid}/search")));
+        for (_, body) in &requests {
+            assert_eq!(body["showRankingScore"], true, "{body}");
+            assert_eq!(body["limit"], 2, "no overfetch without a local filter");
+            assert_eq!(
+                body["q"],
+                "documented procedure follow deployment rollback billing api"
+            );
+            let filter = body["filter"].as_str().unwrap();
+            assert!(filter.contains("tenant_id = \"tenant-a\""), "{filter}");
+        }
+        let personal_request = requests
+            .iter()
+            .find(|(path, _)| path.contains(&personal_uid))
+            .unwrap();
+        let personal_filter = personal_request.1["filter"].as_str().unwrap();
+        assert!(personal_filter.contains("owner_user_id = \"owner-a\""));
+        assert!(personal_filter.contains(&format!("index_uid = \"{personal_uid}\"")));
+        assert_eq!(result.stages[0]["meili_query"], requests[0].1["q"]);
+    }
+
+    #[tokio::test]
+    async fn context_search_without_owner_never_queries_a_personal_index() {
+        let resolver = EventIndexResolver::new(b"repository-test-secret".to_vec());
+        let stub = ContextSearchStub::default();
+        stub.responses.lock().unwrap().insert(
+            "rag_company_context".to_string(),
+            json!({"hits": [
+                context_hit("tenant-a", "rag_company_context", "ctx://company/a", 0.5)
+            ]}),
+        );
+        let repository = spawn_context_search_repository(stub.clone()).await;
+        let filters = ContextStructuredFilters::default();
+        let result = repository
+            .search_context(RepositoryContextSearchQuery {
+                tenant_id: "tenant-a",
+                owner_user_id: None,
+                query: "rollback",
+                mode: "auto",
+                limit: 5,
+                filters: &filters,
+                resolver: &resolver,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.nodes.len(), 1);
+        let requests = stub.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "/indexes/rag_company_context/search");
+        assert_eq!(requests[0].1["q"], "rollback");
+    }
+
+    #[tokio::test]
+    async fn section_path_filter_uses_small_overfetch_and_keeps_exact_local_semantics() {
+        let resolver = EventIndexResolver::new(b"repository-test-secret".to_vec());
+        let mut matching = context_hit("tenant-a", "rag_company_context", "ctx://company/m", 0.6);
+        matching["section_path"] = json!(["Guide", "Deployment Rollback"]);
+        // A trigram superset hit that does not contain the substring.
+        let mut near_miss = context_hit("tenant-a", "rag_company_context", "ctx://company/n", 0.9);
+        near_miss["section_path"] = json!(["Roll", "back"]);
+        let stub = ContextSearchStub::default();
+        stub.responses.lock().unwrap().insert(
+            "rag_company_context".to_string(),
+            json!({"hits": [near_miss, matching]}),
+        );
+        let repository = spawn_context_search_repository(stub.clone()).await;
+        let filters = ContextStructuredFilters {
+            section_path_contains: Some("rollback".to_string()),
+            artifact_kind: None,
+            ..ContextStructuredFilters::default()
+        };
+        let result = repository
+            .search_context(RepositoryContextSearchQuery {
+                tenant_id: "tenant-a",
+                owner_user_id: None,
+                query: "rollback",
+                mode: "auto",
+                limit: 5,
+                filters: &filters,
+                resolver: &resolver,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let uris: Vec<_> = result.nodes.iter().map(|node| node.uri.as_str()).collect();
+        assert_eq!(uris, ["ctx://company/m"]);
+        let requests = stub.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "short page ends paging");
+        assert_eq!(requests[0].1["limit"], 15, "3x overfetch instead of 20x");
+        let filter = requests[0].1["filter"].as_str().unwrap();
+        assert!(
+            filter.contains("section_path_trigrams = \"rol\""),
+            "{filter}"
+        );
+        assert!(
+            filter.contains("section_path_trigrams NOT EXISTS"),
+            "{filter}"
+        );
+    }
+
+    #[test]
+    fn structured_filters_push_artifact_kind_and_section_path_trigrams_down() {
+        let filters = ContextStructuredFilters {
+            artifact_kind: Some("middle_json".to_string()),
+            section_path_contains: Some("Roll-Back".to_string()),
+            ..ContextStructuredFilters::default()
+        };
+        let clauses = context_filter_clauses(&filters).unwrap();
+        assert!(clauses.contains(&"artifact_refs.artifact_kind = \"middle_json\"".to_string()));
+        let section = clauses
+            .iter()
+            .find(|clause| clause.contains("section_path_trigrams"))
+            .unwrap();
+        for trigram in ["rol", "oll", "ll-", "l-b", "-ba", "bac", "ack"] {
+            assert!(
+                section.contains(&format!("section_path_trigrams = \"{trigram}\"")),
+                "{section}"
+            );
+        }
+        assert!(
+            section.ends_with(" OR section_path_trigrams NOT EXISTS)"),
+            "{section}"
+        );
+
+        // Needles shorter than a trigram are decided locally only.
+        let short = ContextStructuredFilters {
+            section_path_contains: Some("ab".to_string()),
+            ..ContextStructuredFilters::default()
+        };
+        assert!(context_filter_clauses(&short).unwrap().is_empty());
+    }
+
+    #[test]
+    fn section_path_trigrams_are_a_superset_of_every_contained_needle() {
+        let section_path = vec!["Guide".to_string(), "Deployment Rollback".to_string()];
+        let stored: HashSet<_> = section_path_trigrams(&section_path).into_iter().collect();
+        for needle in ["guide", "UIDE", "deploy", "ment roll", "rollback"] {
+            for trigram in char_trigrams(&needle.to_ascii_lowercase()) {
+                assert!(stored.contains(&trigram), "{needle}: {trigram}");
+            }
+        }
+        // Trigrams never span two section-path parts.
+        assert!(!stored.contains("ede"));
+        assert!(section_path_trigrams(&[]).is_empty());
     }
 
     #[test]

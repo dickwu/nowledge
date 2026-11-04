@@ -15,6 +15,7 @@ use tokio::{
 
 use crate::{
     audit_service::AuditRecorder,
+    auth::CredentialIndex,
     config::Config,
     error::{safe_cause_diagnostic, safe_value_fingerprint, ApiError},
     http_boundary::{HttpBoundaryState, RequestDeadline},
@@ -370,6 +371,7 @@ pub struct AppState {
     pub(crate) audit_recorder: AuditRecorder,
     pub(crate) http_boundary: HttpBoundaryState,
     pub(crate) runtime: RuntimeSupervisor,
+    pub(crate) credentials: Arc<CredentialIndex>,
 }
 
 #[derive(Clone)]
@@ -377,11 +379,16 @@ pub(crate) struct AuthState {
     config: Arc<Config>,
     http_boundary: HttpBoundaryState,
     audit_recorder: AuditRecorder,
+    credentials: Arc<CredentialIndex>,
 }
 
 impl AuthState {
     pub(crate) fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub(crate) fn credentials(&self) -> &CredentialIndex {
+        &self.credentials
     }
 
     pub(crate) fn http_boundary(&self) -> &HttpBoundaryState {
@@ -399,6 +406,7 @@ impl FromRef<AppState> for AuthState {
             config: state.config.clone(),
             http_boundary: state.http_boundary.clone(),
             audit_recorder: state.audit_recorder.clone(),
+            credentials: state.credentials.clone(),
         }
     }
 }
@@ -425,7 +433,11 @@ impl AppState {
         config.start_codex_secret_refresh_task();
         let ingest_manager = IngestTaskManager::new(store.clone(), config.clone(), runtime.clone());
         spawn_ingest_task_cleanup(store.clone(), &config, &runtime);
+        spawn_trace_persister(store.clone(), &runtime);
+        spawn_trace_retention(store.clone(), &config, &runtime);
+        let credentials = Arc::new(CredentialIndex::from_config(&config));
         Self {
+            credentials,
             store,
             runtime_meili,
             meili: index_admin,
@@ -484,6 +496,66 @@ impl AppState {
             ),
         }
     }
+}
+
+/// First trace retention sweep runs shortly after startup, once the managed
+/// index settings (including the `created_at_ms` filter) have been reconciled.
+const TRACE_RETENTION_INITIAL_DELAY: Duration = Duration::from_secs(60);
+const TRACE_RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Run the batched background trace persister for the life of the runtime.
+fn spawn_trace_persister(store: Store, runtime: &RuntimeSupervisor) {
+    let shutdown = runtime.subscribe();
+    let _ = runtime.spawn(async move { store.run_trace_persister(shutdown).await });
+}
+
+/// Periodically delete traces older than `RAG_TRACE_RETENTION_DAYS`
+/// (0 keeps traces forever) from the cache and the durable backend.
+fn spawn_trace_retention(store: Store, config: &Arc<Config>, runtime: &RuntimeSupervisor) {
+    let retention_days = config.trace_retention_days;
+    if retention_days == 0 {
+        return;
+    }
+    let tenant_id = config.tenant_id.clone();
+    let mut shutdown = runtime.subscribe();
+    let _ = runtime.spawn(async move {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + TRACE_RETENTION_INITIAL_DELAY,
+            TRACE_RETENTION_INTERVAL,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+                _ = ticker.tick() => {}
+            }
+            match store
+                .prune_expired_traces_async(&tenant_id, retention_days)
+                .await
+            {
+                Ok((cached, task_uids)) => {
+                    tracing::debug!(
+                        cached_pruned = cached,
+                        delete_tasks = task_uids.len(),
+                        "trace retention sweep submitted"
+                    );
+                }
+                Err(err) => {
+                    let diagnostic = safe_cause_diagnostic(&err);
+                    tracing::warn!(
+                        cause_category = diagnostic.category,
+                        cause_fingerprint = %diagnostic.fingerprint,
+                        "trace retention sweep failed"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Periodically prune terminal ingest tasks past their retention window:

@@ -6,3 +6,4 @@
 !/.env.example
 *.log
 /scripts/
+/.agents/

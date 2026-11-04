@@ -5,7 +5,7 @@ description: Run the project's standard pre-merge verification gauntlet for the 
 
 # verify
 
-Run the project's standard pre-merge gauntlet. CI (`.github/workflows/ci.yml`) is close but not identical: it installs `libopenblas-dev`, then runs fmt → clippy → test → `cargo package --allow-dirty --no-verify`, with no `cargo check` step.
+Run the project's standard pre-merge gauntlet. The authoritative command list is `AGENTS.md` → *Testing Requirements*; CI (`.github/workflows/ci.yml`, described in `.github/workflows/AGENTS.md`) runs that list on stable plus a Meilisearch integration job, an MSRV check, RustSec, and `cargo-deny`.
 
 ## Mandatory sequence
 
@@ -13,16 +13,16 @@ Run these in order. Stop and surface failures immediately — do not continue to
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo check
-cargo test
+cargo clippy --locked --all-targets -- -D warnings
+cargo check --locked --all-targets
+cargo test --locked
 ```
 
 Notes:
 - `--all-targets` is required for clippy so test and example code are linted.
 - `-D warnings` is non-negotiable — any warning is a hard fail.
-- `cargo check` is not a CI step; it stays in the gauntlet as a fast type-level sanity pass.
-- `cargo test` runs the default integration suite (`tests/api_spec.rs`). The optional `meili_integration` and `mineru_integration` tests are skipped silently unless `RAG_TEST_MEILI_URL` / `RAG_TEST_MINERU_API_URL` are set.
+- Before a release or PR, also run the remaining `AGENTS.md` steps (`cargo test --locked --test route_manifest`, `cargo package --locked`).
+- `cargo test` runs every integration-test binary. The optional Meili tests (`meili_integration`, plus the Meili case in `insight_history`) and `mineru_integration` skip and report as passed unless `RAG_TEST_MEILI_URL` / `RAG_TEST_MINERU_API_URL` are set; `RAG_TEST_REQUIRE_MEILI=1` turns a Meili skip into a failure.
 
 ## Optional integration runs
 

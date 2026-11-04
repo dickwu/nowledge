@@ -1,10 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    net::{TcpStream, ToSocketAddrs},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, fs, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, ensure, Result as AnyResult};
 use axum::{
@@ -14,7 +8,7 @@ use axum::{
 };
 use nowledge::{
     build_router,
-    config::{AuthUserConfig, AuthUserScope},
+    config::{AuthUserConfig, AuthUserScope, WriteConsistency},
     meili::{task_uid, MeiliAdmin, FIXED_INDEXES},
     models::{
         AnalysisInsightMaterialization, AnalysisLinkMaterialization,
@@ -41,6 +35,9 @@ use tower::ServiceExt;
 #[allow(dead_code)]
 mod audit_records_v1;
 
+#[path = "support/meili_gate.rs"]
+mod meili_gate;
+
 static LIVE_MEILI_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 type AuxiliaryInventory = (&'static str, Vec<Value>, Vec<Value>);
 
@@ -48,53 +45,18 @@ async fn live_meili_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
     LIVE_MEILI_TEST_LOCK.lock().await
 }
 
-fn meili_available(url: &str) -> bool {
-    let authority = url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    let address = if authority.contains(':') {
-        authority.to_string()
-    } else {
-        format!("{authority}:7700")
-    };
-    let Ok(addrs) = address.to_socket_addrs() else {
-        return false;
-    };
-    addrs
-        .into_iter()
-        .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok())
-}
-
+/// Live Meili config for one test, or `None` to skip. Panics instead of
+/// skipping when `RAG_TEST_REQUIRE_MEILI` is set (see `support/meili_gate.rs`).
+/// `Config::test()` runs in test mode, where the managed-index admin client
+/// falls back to `RAG_TEST_MEILI_API_KEY`, so a master key covers both the
+/// runtime and admin credentials.
 async fn meili_config_with_tenant(tenant_id: String) -> Option<Config> {
-    let url = std::env::var("RAG_TEST_MEILI_URL").ok()?;
-    if !meili_available(&url) {
-        eprintln!("skipping Meilisearch integration test; {url} is not reachable");
-        return None;
-    }
-    let api_key = std::env::var("RAG_TEST_MEILI_API_KEY").ok();
-    if api_key.is_none() {
-        let response = reqwest::Client::new()
-            .get(format!("{}/indexes", url.trim_end_matches('/')))
-            .send()
-            .await;
-        if response
-            .as_ref()
-            .is_ok_and(|response| response.status().as_u16() == 401)
-        {
-            eprintln!(
-                "skipping Meilisearch integration test; server requires a key, set RAG_TEST_MEILI_API_KEY"
-            );
-            return None;
-        }
-    }
+    let target = meili_gate::meili_target().await?;
     let mut config = Config::test();
     config.tenant_id = tenant_id;
     config.store_backend = "meili".to_string();
-    config.meili_url = Some(url);
-    config.meili_api_key = api_key;
+    config.meili_url = Some(target.url);
+    config.meili_api_key = target.api_key;
     config.meili_wait_for_tasks = true;
     // These tests exercise repository semantics through an SSH tunnel. Give
     // task polling enough headroom that the HTTP boundary does not turn normal
@@ -963,6 +925,107 @@ async fn meili_backend_creates_dynamic_user_indexes_and_searches_events() {
         .is_some_and(|uid| uid.chars().all(|character| character.is_ascii_digit())));
     assert_eq!(search_status, StatusCode::OK, "{search}");
     assert_eq!(search["hits"].as_array().unwrap().len(), 1);
+}
+
+fn wait_for_index_event(owner: &str, keyword: &str, entity_id: &str) -> Value {
+    json!({
+        "event_type": "note.created",
+        "entity_type": "note",
+        "entity_id": entity_id,
+        "owner_user_id": owner,
+        "occurred_at": "2026-05-12T00:00:00Z",
+        "observed_at": "2026-05-12T00:01:00Z",
+        "source_kind": "test",
+        "source_ref": { "kind": "test", "id": entity_id },
+        "text": format!("{keyword} {entity_id}"),
+        "privacy": "private"
+    })
+}
+
+/// Production runs `RAG_WRITE_CONSISTENCY=wait_for_index`. In that mode the
+/// history search path reads Meilisearch only (no read-your-writes merge of
+/// the in-process mirror), so a write must be confirmed indexed before the
+/// response returns and the very next search must see it without polling.
+#[tokio::test]
+async fn meili_wait_for_index_write_is_searchable_on_the_next_request() {
+    let _guard = live_meili_test_guard().await;
+    let tenant_id = format!("test-tenant-wfi-{}", uuid::Uuid::now_v7());
+    let Some(mut config) = meili_config_with_tenant(tenant_id.clone()).await else {
+        return;
+    };
+    config.write_consistency = WriteConsistency::WaitForIndex;
+    config.meili_wait_for_tasks = true;
+    let (state, _, app) = start_meili_app(&config).await;
+    let admin = state.meili.clone();
+    let owner = format!("u-{}", uuid::Uuid::now_v7());
+    let routing = state
+        .store
+        .resolver()
+        .resolve(&tenant_id, &owner, false, true)
+        .expect("owner routing should resolve");
+    let keyword = format!("wait-for-index-keyword-{}", uuid::Uuid::now_v7());
+    let events = [
+        wait_for_index_event(&owner, &keyword, "wfi-1"),
+        wait_for_index_event(&owner, &keyword, "wfi-2"),
+    ];
+
+    let write_result = try_call(
+        app.clone(),
+        Method::POST,
+        &format!("/v1/history/users/{owner}/events:bulk"),
+        json!({ "events": events }),
+    )
+    .await;
+    // Deliberately no retry loop: wait_for_index promises visibility as soon
+    // as the write response is returned.
+    let search_result = try_call(
+        app,
+        Method::POST,
+        &format!("/v1/history/users/{owner}/search"),
+        json!({ "query": keyword, "limit": 10 }),
+    )
+    .await;
+
+    let tenant_filter = equality_filter("tenant_id", &tenant_id);
+    let cleanup_results = vec![
+        (
+            "user index registry",
+            delete_by_filter_and_wait(&admin, "rag_user_event_indexes", &tenant_filter).await,
+        ),
+        (
+            "operation journal",
+            delete_by_filter_and_wait(&admin, "rag_operations", &tenant_filter).await,
+        ),
+        (
+            "owner event index",
+            delete_index_and_wait(&config, &admin, &routing.event_index_uid).await,
+        ),
+        (
+            "owner context index",
+            delete_index_and_wait(&config, &admin, &routing.personal_context_index_uid).await,
+        ),
+    ];
+    assert_cleanup_results(cleanup_results);
+
+    let (write_status, write) = write_result.expect("bulk event write should finish");
+    let (search_status, search) = search_result.expect("event search should finish");
+    assert_eq!(write_status, StatusCode::OK, "{write}");
+    assert_eq!(write["inserted"], 2, "{write}");
+    // wait_for_index must confirm indexing before the response returns.
+    let persistence = &write["persistence"];
+    assert_eq!(persistence["status"], "completed", "{write}");
+    assert_eq!(persistence["indexing_state"], "completed", "{write}");
+    let task_uids = persistence["task_uids"].as_array();
+    assert!(task_uids.is_some_and(|uids| !uids.is_empty()), "{write}");
+    assert_eq!(search_status, StatusCode::OK, "{search}");
+    let mut hit_entities = search["hits"]
+        .as_array()
+        .expect("search hits should be an array")
+        .iter()
+        .map(|hit| hit["entity_id"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    hit_entities.sort();
+    assert_eq!(hit_entities, ["wfi-1", "wfi-2"], "{search}");
 }
 
 #[tokio::test]
@@ -2665,6 +2728,11 @@ async fn meili_restart_restores_insights_structured_rows_summaries_and_trace_acl
         )
         .await;
 
+    // Retrieval traces are persisted by a background writer. Stop the first
+    // process gracefully, as a real restart would, so its queued trace is
+    // flushed to Meilisearch before the fresh process reads it through.
+    state.shutdown().await;
+
     // Use the fallible startup path after fixture creation so teardown still
     // runs if hydration itself is the regression under test.
     let fresh_start_result = try_start_meili_app(&config).await;
@@ -2900,13 +2968,23 @@ async fn meili_restart_restores_insights_structured_rows_summaries_and_trace_acl
         "datasets",
         "structured_snapshots",
         "structured_summaries",
-        "traces",
     ] {
         assert!(
             hydration[hydrated_domain].as_u64().unwrap_or_default() >= 1,
             "hydration did not report {hydrated_domain}: {hydration}"
         );
     }
+    // Retrieval traces are diagnostic records: startup deliberately does not
+    // load them. The reveal and debug-trace reads below prove the persisted
+    // trace (and its owner ACL) is read through by id after the restart.
+    assert_eq!(
+        hydration["domains"]["traces"]["strategy"], "read_through",
+        "{hydration}"
+    );
+    assert_eq!(
+        hydration["domains"]["traces"]["mandatory"], false,
+        "{hydration}"
+    );
     assert_eq!(hydration["status"], "complete", "{hydration}");
     assert_eq!(hydration["ready"], true, "{hydration}");
 

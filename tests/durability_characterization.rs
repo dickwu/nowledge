@@ -282,14 +282,16 @@ const DURABILITY_MATRIX: &[DurabilityDomain] = &[
     },
     DurabilityDomain {
         name: "traces",
-        store_fields: &["traces"],
-        durability: DurabilityClass::DurableCanonical,
-        strategy: RestartStrategy::StartupHydrated,
-        repository_writes: &["upsert_trace"],
-        repository_reads: &["get_trace", "list_traces"],
-        startup_methods: &["list_traces"],
+        // Traces live in a bounded cache outside StoreData so mutations never
+        // clone them and searches never enter the mutation path.
+        store_fields: &[],
+        durability: DurabilityClass::DerivedDurable,
+        strategy: RestartStrategy::ReadThrough,
+        repository_writes: &["upsert_trace", "upsert_traces", "delete_traces_before"],
+        repository_reads: &["get_trace"],
+        startup_methods: &[],
         report_domains: &["traces"],
-        evidence: "trace ownership and reveal authorization require complete startup hydration",
+        evidence: "diagnostic traces are persisted asynchronously in batches, expire by retention, and are read through by tenant-scoped id so ownership checks never need startup hydration",
     },
     DurabilityDomain {
         name: "eval_and_harness",
@@ -837,11 +839,16 @@ async fn meili_stub(State(state): State<MeiliStubState>, request: AxumRequest) -
 }
 
 fn take_failure(remaining: &AtomicUsize) -> bool {
-    remaining
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            count.checked_sub(1)
-        })
-        .is_ok()
+    // Explicit CAS loop: `fetch_update` is deprecated on newer stable
+    // toolchains, while its `try_update` replacement is newer than the MSRV.
+    let mut current = remaining.load(Ordering::SeqCst);
+    while let Some(next) = current.checked_sub(1) {
+        match remaining.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
 }
 
 async fn request_json(request: AxumRequest) -> Value {

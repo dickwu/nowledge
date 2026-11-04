@@ -108,6 +108,7 @@ RAG_INGEST_MAX_CONCURRENT_TASKS=2
 RAG_INGEST_QUEUE_CAPACITY=16
 RAG_INGEST_TASK_RETENTION_SECONDS=86400
 RAG_INGEST_CLEANUP_INTERVAL_SECONDS=300
+RAG_TRACE_RETENTION_DAYS=30
 RAG_INGEST_WORKER_ENABLED=true
 RAG_SHUTDOWN_TIMEOUT_MS=30000
 RAG_PROVIDER_CONNECT_TIMEOUT_MS=5000
@@ -159,9 +160,17 @@ and been verified. The compatibility path expires on 2026-10-01 / v0.13.0.
 values are startup errors and never enable unauthenticated access by default.
 
 `RAG_WRITE_CONSISTENCY` accepts only `eventual`, `read_your_writes`, or
-`wait_for_index`. Development and production default to `read_your_writes`;
-test mode defaults to `wait_for_index`. Production rejects `eventual` because
-it cannot guarantee visibility of a completed write. The deprecated
+`wait_for_index`. When it is unset, development and production default to
+`read_your_writes` and test mode defaults to `wait_for_index`. Production
+rejects `eventual` because it cannot guarantee visibility of a completed
+write. The recommended production setting, and the one the reference
+deployment runs, is an explicit `RAG_WRITE_CONSISTENCY=wait_for_index`: every
+write waits until Meilisearch confirms its tasks before the response returns,
+so searches served directly from Meilisearch (by this or a restarted process)
+see it immediately. `read_your_writes` responds once Meilisearch accepts most
+writes (kinds that require index confirmation still wait) and merges the process's own in-memory copy into searches until
+indexing catches up, which favors write latency but relies on that single
+process's mirror. The deprecated
 `RAG_MEILI_WAIT_FOR_TASKS` is consulted only when `RAG_WRITE_CONSISTENCY` is
 unset: `true` maps to `wait_for_index`, while `false` maps to
 `read_your_writes`. Setting both variables is a startup error. This legacy
@@ -410,9 +419,12 @@ Health endpoints split process liveness from operational readiness:
 
 - The protected health `llm.rate_limits` block carries the freshest live
   provider budget snapshot. For `codex_auth` it is parsed from the ChatGPT Codex `x-codex-*`
-  response headers on every health probe and real completion: `primary` (5h)
-  and `secondary` (weekly) windows with `used_percent` / `remaining_percent` /
-  reset times, `plan_type`, credits, and model-scoped `additional_limits`.
+  response headers on every health probe and real completion: `primary` and
+  `secondary` windows with `used_percent` / `remaining_percent` / reset times
+  and the length Codex reports (`window_minutes`, plus a derived
+  `window_label` such as `7d`), `plan_type`, credits, and model-scoped
+  `additional_limits`. Window lengths come from Codex, not from fixed
+  assumptions, and either window may be absent.
   `llm.rate_limit_state` becomes `near_limit` at ≥90% window usage and
   `limited` at 100%, so dashboards can warn before hard 429s.
 - LLM-backed responses (`/v1/rag/answer`, `/v1/analysis/insights`,
@@ -520,6 +532,27 @@ keep them forever), swept every `RAG_INGEST_CLEANUP_INTERVAL_SECONDS` —
 covering both the in-memory maps and the mirrored Meilisearch documents.
 Ingested fragments and source documents are unaffected; only the task
 bookkeeping expires.
+
+Retrieval traces (`trace_id` from context search, RAG answers, and eval
+runs) are diagnostic records, not mutations. A search never takes the global
+write lock or the operation journal: its trace is cached in process
+immediately and a background writer persists queued traces to `rag_traces` in
+batches (one document request per batch). If the queue is full or the write
+fails, the search still succeeds and the trace stays readable from the
+process cache. Traces are not loaded at startup; older traces are read
+through by tenant-scoped id. `RAG_TRACE_RETENTION_DAYS` (default 30, at most
+36500; 0 keeps traces forever) deletes expired traces from the cache and from
+Meilisearch by a `created_at_ms` range filter, first about one minute after
+startup and then hourly. The `rag_traces` managed settings make `created_at`
+and `created_at_ms` filterable; startup reconciliation applies that through
+the admin key, and older traces without `created_at_ms` are expired by their
+RFC 3339 `created_at` in bounded batches. The usage `rag.trace_count` reports
+traces retained by the current process, not the persisted total.
+
+Meilisearch task confirmation polls with exponential backoff (5 ms doubling
+to 200 ms, same 60 s total timeout). Several task UIDs from one step are
+confirmed together through `GET /tasks?uids=...`; a server or key scope that
+cannot list them falls back to per-task `GET /tasks/{uid}` probes.
 Multipart uploads are staged with a generated private filename, incrementally
 hashed, and deleted after parsing or on cancellation/error. Duplicate file
 parts, excess metadata fields, an empty file, invalid or disallowed MIME values,
@@ -576,6 +609,14 @@ Link and analysis surfaces:
   `owner_user_id`; analysis evidence is then constrained to that owner's same
   history event index.
 
+## Deploy
+
+The reference deployment builds from a Git checkout and runs under systemd
+next to a separate Meilisearch unit. Routine deploys, verification, and
+binary rollback follow [doc/runbooks/gfit-deploy.md](doc/runbooks/gfit-deploy.md);
+releases with data migrations follow the
+[production upgrade runbook](doc/runbooks/production-upgrade.md).
+
 ## Verify
 
 ```sh
@@ -586,9 +627,11 @@ cargo test --locked
 cargo package --locked
 ```
 
-CI also checks the same lockfile with Rust 1.88, runs the exact route-manifest
-contract test, audits RustSec advisories, and enforces the dependency license,
-source, ban, and advisory policy in `deny.toml`.
+CI also runs the exact route-manifest contract test, runs the Meilisearch
+integration suites against a Meilisearch service container pinned to the
+production version, checks the same lockfile with Rust 1.88, audits RustSec
+advisories, and enforces the dependency license, source, ban, and advisory
+policy in `deny.toml`.
 
 Optional Meilisearch integration tests run when `RAG_TEST_MEILI_URL` is set.
 If the server requires a key, set `RAG_TEST_MEILI_API_KEY` too:
@@ -596,8 +639,13 @@ If the server requires a key, set `RAG_TEST_MEILI_API_KEY` too:
 ```sh
 RAG_TEST_MEILI_URL=http://127.0.0.1:7700 \
 RAG_TEST_MEILI_API_KEY=$MEILI_MASTER_KEY \
-cargo test --test meili_integration
+cargo test --test meili_integration --test insight_history
 ```
+
+Without `RAG_TEST_MEILI_URL`, or when the server is unreachable or needs a key
+that was not provided, those tests skip and report as passed. Set
+`RAG_TEST_REQUIRE_MEILI=1` to make each of those conditions, and a missing
+`RAG_TEST_MEILI_API_KEY`, fail the test instead; CI sets it.
 
 Optional live MinerU integration tests run when `RAG_TEST_MINERU_API_URL` is set:
 

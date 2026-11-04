@@ -9,7 +9,13 @@ use std::{
 
 use tokio::time::{sleep, timeout, Duration};
 
-use crate::{config::Config, error::ApiError};
+use crate::{config::Config, error::ApiError, util::ENGLISH_STOP_WORDS};
+
+/// Derived, filter-only field on context documents: the distinct ASCII-
+/// lowercased character trigrams of every `section_path` part. It lets
+/// `section_path_contains` push a necessary-condition prefilter down to
+/// Meilisearch; the exact substring check still runs locally.
+pub const CONTEXT_SECTION_PATH_TRIGRAMS_FIELD: &str = "section_path_trigrams";
 
 pub const FIXED_INDEXES: &[&str] = &[
     "rag_company_context",
@@ -43,8 +49,15 @@ pub const FIXED_INDEXES: &[&str] = &[
     "rag_eval_overviews",
 ];
 
-const MEILI_TASK_WAIT_ATTEMPTS: usize = 600;
-const MEILI_TASK_WAIT_INTERVAL_MS: u64 = 100;
+/// Total time budget for one task wait. This matches the previous fixed
+/// schedule (600 polls x 100 ms) so callers keep the same timeout semantics.
+const MEILI_TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Most Meilisearch tasks on a small index finish within a few milliseconds,
+/// so polling starts quickly and backs off exponentially to the cap.
+const MEILI_TASK_POLL_INITIAL: Duration = Duration::from_millis(5);
+const MEILI_TASK_POLL_MAX: Duration = Duration::from_millis(200);
+/// Upper bound on task UIDs per `GET /tasks?uids=...` status request.
+const MEILI_TASK_BATCH_MAX_UIDS: usize = 100;
 const DURABLE_FIXED_INDEXES: [&str; 2] = ["rag_operations", "rag_audit_records"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1186,7 +1199,9 @@ impl MeiliAdmin {
         let Some(url) = &self.url else {
             return Ok(());
         };
-        for _ in 0..MEILI_TASK_WAIT_ATTEMPTS {
+        let deadline = Instant::now() + MEILI_TASK_WAIT_TIMEOUT;
+        let mut delay = MEILI_TASK_POLL_INITIAL;
+        loop {
             let response = self
                 .client
                 .get(format!("{}/tasks/{}", url.trim_end_matches('/'), task_uid))
@@ -1208,19 +1223,116 @@ impl MeiliAdmin {
                         "Meilisearch task {task_uid} did not succeed: {body}"
                     )));
                 }
-                _ => sleep(Duration::from_millis(MEILI_TASK_WAIT_INTERVAL_MS)).await,
+                _ => {}
+            }
+            if !sleep_before_next_poll(&mut delay, deadline).await {
+                return Err(ApiError::Upstream(format!(
+                    "timed out waiting for Meilisearch task {task_uid}"
+                )));
             }
         }
-        Err(ApiError::Upstream(format!(
-            "timed out waiting for Meilisearch task {task_uid}"
-        )))
     }
 
+    /// Wait for every task in `task_uids` to succeed.
+    ///
+    /// A single task keeps the established `GET /tasks/{uid}` probe. Several
+    /// numeric task UIDs are polled together through `GET /tasks?uids=...`
+    /// so a multi-step write costs one status round trip per poll instead of
+    /// one sequential wait per task. If the batch listing is unavailable or
+    /// does not report a requested UID, the remaining tasks fall back to the
+    /// per-task probe, which preserves its exact error semantics.
     pub async fn wait_for_tasks(&self, task_uids: &[String]) -> Result<(), ApiError> {
+        let mut unique = Vec::with_capacity(task_uids.len());
+        let mut seen = BTreeSet::new();
         for task_uid in task_uids {
-            self.wait_for_task(task_uid).await?;
+            if seen.insert(task_uid.as_str()) {
+                unique.push(task_uid.clone());
+            }
+        }
+        let batchable = unique.len() > 1 && unique.iter().all(|uid| uid.parse::<u64>().is_ok());
+        if self.url.is_none() || !batchable {
+            for task_uid in &unique {
+                self.wait_for_task(task_uid).await?;
+            }
+            return Ok(());
+        }
+        for chunk in unique.chunks(MEILI_TASK_BATCH_MAX_UIDS) {
+            let remaining = self.wait_for_task_batch(chunk).await?;
+            for task_uid in remaining {
+                self.wait_for_task(&task_uid).await?;
+            }
         }
         Ok(())
+    }
+
+    /// Poll one batch of task UIDs until each one has succeeded, returning
+    /// the UIDs that must be confirmed through the per-task probe instead.
+    async fn wait_for_task_batch(&self, task_uids: &[String]) -> Result<Vec<String>, ApiError> {
+        let Some(url) = &self.url else {
+            return Ok(Vec::new());
+        };
+        let mut pending = task_uids.iter().cloned().collect::<BTreeSet<_>>();
+        let deadline = Instant::now() + MEILI_TASK_WAIT_TIMEOUT;
+        let mut delay = MEILI_TASK_POLL_INITIAL;
+        loop {
+            let uids = pending.iter().cloned().collect::<Vec<_>>().join(",");
+            let response = self
+                .client
+                .get(format!("{}/tasks", url.trim_end_matches('/')))
+                .query(&[
+                    ("uids", uids.as_str()),
+                    ("limit", &pending.len().to_string()),
+                ])
+                .headers(self.headers()?)
+                .send()
+                .await
+                .map_err(|e| ApiError::Upstream(e.to_string()))?;
+            if !response.status().is_success() {
+                return Ok(pending.into_iter().collect());
+            }
+            let Ok(body) = response.json::<Value>().await else {
+                return Ok(pending.into_iter().collect());
+            };
+            let Some(results) = body.get("results").and_then(Value::as_array) else {
+                return Ok(pending.into_iter().collect());
+            };
+            let mut reported = BTreeSet::new();
+            for task in results {
+                let Some(uid) = task_uid(task) else {
+                    continue;
+                };
+                if !pending.contains(&uid) {
+                    continue;
+                }
+                match task.get("status").and_then(Value::as_str) {
+                    Some("succeeded") => {
+                        pending.remove(&uid);
+                    }
+                    Some("failed") | Some("canceled") => {
+                        return Err(ApiError::Upstream(format!(
+                            "Meilisearch task {uid} did not succeed: {task}"
+                        )));
+                    }
+                    _ => {}
+                }
+                reported.insert(uid);
+            }
+            if pending.is_empty() {
+                return Ok(Vec::new());
+            }
+            if pending.iter().any(|uid| !reported.contains(uid)) {
+                // A task missing from a successful listing is unknown to
+                // this server (or filtered by key scope); let the single-task
+                // probe produce its established error instead of spinning.
+                return Ok(pending.into_iter().collect());
+            }
+            if !sleep_before_next_poll(&mut delay, deadline).await {
+                return Err(ApiError::Upstream(format!(
+                    "timed out waiting for {} Meilisearch tasks",
+                    pending.len()
+                )));
+            }
+        }
     }
 
     pub async fn apply_settings(&self, uid: &str) -> Result<Option<String>, ApiError> {
@@ -1303,6 +1415,23 @@ impl MeiliAdmin {
     }
 }
 
+/// Sleep for the current poll delay and double it up to the cap. Returns
+/// `false` without sleeping when the next poll would start past `deadline`.
+async fn sleep_before_next_poll(delay: &mut Duration, deadline: Instant) -> bool {
+    let now = Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    let wait = (*delay).min(deadline - now);
+    sleep(wait).await;
+    *delay = next_task_poll_delay(*delay);
+    true
+}
+
+fn next_task_poll_delay(delay: Duration) -> Duration {
+    delay.saturating_mul(2).min(MEILI_TASK_POLL_MAX)
+}
+
 pub fn task_uid(value: &Value) -> Option<String> {
     value
         .get("taskUid")
@@ -1342,8 +1471,9 @@ pub fn settings_for(uid: &str) -> Value {
     } else if uid.contains("context") {
         json!({
             "searchableAttributes": ["title", "body", "uri"],
-            "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "index_uid", "index_kind", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id", "node_kind", "retrieval_role", "retrieval_enabled", "parent_uri", "source_document_uri", "fragment_index", "block_type", "page_idx", "heading_level"],
-            "sortableAttributes": ["updated_at", "layer"]
+            "filterableAttributes": ["id", "uri", "tenant_id", "owner_user_id", "index_uid", "index_kind", "layer", "ancestor_uris", "status", "privacy", "source_id", "revision_id", "node_kind", "retrieval_role", "retrieval_enabled", "parent_uri", "source_document_uri", "fragment_index", "block_type", "page_idx", "heading_level", "artifact_refs.artifact_kind", CONTEXT_SECTION_PATH_TRIGRAMS_FIELD],
+            "sortableAttributes": ["updated_at", "layer"],
+            "stopWords": ENGLISH_STOP_WORDS
         })
     } else if uid == "rag_source_documents" {
         json!({
@@ -1417,6 +1547,14 @@ pub fn settings_for(uid: &str) -> Value {
             "filterableAttributes": ["id", "run_id", "case_id", "owner_user_id", "status", "failures", "guard_failures"],
             "sortableAttributes": ["created_at", "latency_ms"]
         })
+    } else if uid == "rag_traces" {
+        // `created_at_ms` is a numeric mirror of `created_at` written by the
+        // trace persister so retention can delete by a numeric range filter.
+        json!({
+            "searchableAttributes": ["title", "statement", "text", "content", "id"],
+            "filterableAttributes": ["id", "tenant_id", "owner_user_id", "created_at", "created_at_ms"],
+            "sortableAttributes": ["created_at", "created_at_ms"]
+        })
     } else if uid == "rag_eval_overviews" {
         json!({
             "searchableAttributes": ["run_id", "status", "overview_markdown", "suggested_target_component"],
@@ -1448,6 +1586,11 @@ fn managed_settings_equal(current: &Value, desired: &Value) -> bool {
             current.get("sortableAttributes"),
             desired.get("sortableAttributes"),
         )
+        // Only indexes whose managed settings declare stop words pin them;
+        // Meilisearch reports stop words as a set.
+        && desired.get("stopWords").is_none_or(|stop_words| {
+            unordered_string_arrays_equal(current.get("stopWords"), Some(stop_words))
+        })
 }
 
 fn unordered_string_arrays_equal(left: Option<&Value>, right: Option<&Value>) -> bool {
@@ -1562,6 +1705,136 @@ mod tests {
         );
     }
 
+    async fn spawn_task_stub(
+        batch_supported: bool,
+        failing_uid: Option<u64>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded = requests.clone();
+        let app = Router::new().fallback(move |request: Request| {
+            let recorded = recorded.clone();
+            let polls = polls.clone();
+            async move {
+                let path = request.uri().path().to_string();
+                let query = request.uri().query().unwrap_or_default().to_string();
+                recorded.lock().unwrap().push(if query.is_empty() {
+                    path.clone()
+                } else {
+                    format!("{path}?{query}")
+                });
+                let status_for = |uid: u64, poll: usize| {
+                    if Some(uid) == failing_uid {
+                        "failed"
+                    } else if poll == 0 {
+                        "processing"
+                    } else {
+                        "succeeded"
+                    }
+                };
+                if path == "/tasks" && batch_supported {
+                    let poll = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let uids = query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("uids="))
+                        .unwrap_or_default()
+                        .replace("%2C", ",");
+                    let results = uids
+                        .split(',')
+                        .filter_map(|uid| uid.parse::<u64>().ok())
+                        .map(|uid| json!({ "uid": uid, "status": status_for(uid, poll) }))
+                        .collect::<Vec<_>>();
+                    return axum::Json(json!({ "results": results })).into_response();
+                }
+                if let Some(uid) = path.strip_prefix("/tasks/") {
+                    let uid = uid.parse::<u64>().unwrap();
+                    return axum::Json(json!({ "uid": uid, "status": status_for(uid, 1) }))
+                        .into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), requests)
+    }
+
+    fn admin_for(url: String) -> MeiliAdmin {
+        let mut config = Config::test();
+        config.meili_url = Some(url);
+        MeiliAdmin::from_config(&config)
+    }
+
+    #[tokio::test]
+    async fn multi_task_waits_poll_one_batched_status_request() {
+        let (url, requests) = spawn_task_stub(true, None).await;
+        let admin = admin_for(url);
+        let uids = ["7", "8", "9", "8"].map(String::from);
+        admin.wait_for_tasks(&uids).await.unwrap();
+
+        let requests = requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests
+            .iter()
+            .all(|request| request.starts_with("/tasks?uids=7")));
+        assert!(!requests
+            .iter()
+            .any(|request| request.starts_with("/tasks/")));
+    }
+
+    #[tokio::test]
+    async fn multi_task_waits_fall_back_to_single_task_probes() {
+        let (url, requests) = spawn_task_stub(false, None).await;
+        let admin = admin_for(url);
+        admin
+            .wait_for_tasks(&["3".to_string(), "4".to_string()])
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap().clone();
+        assert!(requests.contains(&"/tasks/3".to_string()), "{requests:?}");
+        assert!(requests.contains(&"/tasks/4".to_string()), "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn batched_task_waits_surface_failed_tasks() {
+        let (url, _) = spawn_task_stub(true, Some(12)).await;
+        let admin = admin_for(url);
+        let error = admin
+            .wait_for_tasks(&["11".to_string(), "12".to_string()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("12"), "{error}");
+    }
+
+    #[test]
+    fn task_poll_delay_backs_off_exponentially_to_the_cap() {
+        let mut delay = MEILI_TASK_POLL_INITIAL;
+        let mut observed = vec![delay.as_millis()];
+        for _ in 0..8 {
+            delay = next_task_poll_delay(delay);
+            observed.push(delay.as_millis());
+        }
+        assert_eq!(observed, vec![5, 10, 20, 40, 80, 160, 200, 200, 200]);
+    }
+
+    #[test]
+    fn trace_settings_support_time_based_retention() {
+        let settings = settings_for("rag_traces");
+        let filterable = settings["filterableAttributes"].as_array().unwrap();
+        for required in ["tenant_id", "logical_id", "created_at", "created_at_ms"] {
+            assert!(
+                filterable.iter().any(|value| value == required),
+                "{required}"
+            );
+        }
+        let sortable = settings["sortableAttributes"].as_array().unwrap();
+        assert!(sortable.iter().any(|value| value == "created_at"));
+    }
+
     #[test]
     fn debug_output_never_exposes_meilisearch_credentials() {
         let mut config = Config::test();
@@ -1628,6 +1901,45 @@ mod tests {
             "sortableAttributes": ["id", "created_at"]
         });
         assert!(!managed_settings_equal(&duplicated_filter, &desired));
+    }
+
+    #[test]
+    fn context_indexes_pin_english_stop_words_and_pushdown_filters() {
+        for uid in ["rag_company_context", "rag_context__t_abc__u_def"] {
+            let settings = settings_for(uid);
+            let filterable = settings["filterableAttributes"]
+                .as_array()
+                .expect("filterable attributes");
+            for required in [
+                "artifact_refs.artifact_kind",
+                CONTEXT_SECTION_PATH_TRIGRAMS_FIELD,
+            ] {
+                assert!(
+                    filterable.iter().any(|value| value == required),
+                    "{uid} is missing {required}"
+                );
+            }
+            assert_eq!(
+                settings["stopWords"].as_array().map(Vec::len),
+                Some(ENGLISH_STOP_WORDS.len())
+            );
+
+            let mut drifted = settings.clone();
+            drifted["stopWords"] = json!([]);
+            assert!(!managed_settings_equal(&drifted, &settings));
+            let mut reordered = settings.clone();
+            reordered["stopWords"]
+                .as_array_mut()
+                .expect("stop words")
+                .reverse();
+            assert!(managed_settings_equal(&reordered, &settings));
+        }
+        // Indexes without managed stop words do not pin them.
+        let events = settings_for("rag_events__t_abc__u_def");
+        assert!(events.get("stopWords").is_none());
+        let mut with_stop_words = events.clone();
+        with_stop_words["stopWords"] = json!(["the"]);
+        assert!(managed_settings_equal(&with_stop_words, &events));
     }
 
     #[test]

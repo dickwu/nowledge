@@ -18,6 +18,8 @@ sync with the router without relying on a hand-maintained route count.
 | `adr/0003-http-ingest-runtime-boundaries.md` | Decision record for typed HTTP limits, production CORS, stable pressure/timeout errors, streamed multipart staging, queue admission, recovery, and coordinated shutdown. |
 | `adr/0007-operational-metrics.md` | Bounded OpenMetrics names, labels, endpoint protection, and response-body lifecycle semantics. |
 | `adr/0008-durable-shared-mutation-audit.md` | Durable shared-write attempt/finalization, denial, redaction, migration, and rollback semantics. |
+| `runbooks/production-upgrade.md` | Ordered backup, fixed-index/tenant-scope migration, canary, and rollback procedure for upgrades that change persisted data. |
+| `runbooks/gfit-deploy.md` | Routine deploy on the `gfit` host: preflight, `git pull --ff-only` + locked release build in `/server/nowledge`, previous-binary retention, `systemctl restart nowledge`, `/livez`/`/readyz`/`/healthz` + journal checks, rollback, Meilisearch backup/upgrade notes, and an example systemd unit. |
 
 ## Subdirectories
 | Directory | Purpose |

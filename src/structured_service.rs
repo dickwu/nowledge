@@ -14,7 +14,7 @@ use crate::{
         StructuredSnapshot, StructuredSnapshotResponse,
     },
     shared_audit::{audit_shared_write, dataset_upsert_schema_target},
-    store::Store,
+    store::{RowsPageRequest, Store},
 };
 
 #[derive(Clone)]
@@ -108,9 +108,13 @@ impl StructuredService {
             .await
     }
 
-    pub(crate) async fn list_rows(&self, snapshot_id: &str) -> Result<Value, ApiError> {
+    pub(crate) async fn list_rows(
+        &self,
+        snapshot_id: &str,
+        page: Option<RowsPageRequest>,
+    ) -> Result<Value, ApiError> {
         self.store
-            .list_rows_async(&self.config.tenant_id, snapshot_id)
+            .list_rows_page_async(&self.config.tenant_id, snapshot_id, page)
             .await
     }
 }

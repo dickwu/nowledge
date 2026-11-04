@@ -6,7 +6,7 @@ Apply a structured snapshot to generate summaries, state items, insight candidat
 ## Handler
 - Rust handler: `apply_snapshot`
 - Route registration: `src/routes.rs::build_router`
-- Authentication: UserGuard; snapshot owner checked when snapshot_id is supplied
+- Authentication: UserGuard; snapshot owner always checked
 
 ## Path Parameters
 | Name | Type | Description |
@@ -21,7 +21,7 @@ Schema: `ApplySnapshotRequest`
 
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| snapshot_id | string | optional | Structured snapshot to apply. When supplied, owner access is checked. |
+| snapshot_id | string | required | Structured snapshot to apply. Owner access is checked before the store runs. |
 | analysis_window | string | optional | Analysis window hint. Store defaults to last_4_periods when omitted. |
 | llm_mode | string | optional, default none | LLM mode for snapshot analysis. |
 | materialize_context | boolean | optional, default true | Whether to materialize context nodes from the snapshot. |
@@ -40,7 +40,9 @@ Schema: `ApplySnapshotResponse`
 | job_id | string | Apply job id. |
 
 ## Errors and Access Rules
-- Malformed JSON or missing required runtime fields returns 400.
+- Malformed JSON or missing required runtime fields returns 400. A missing
+  `snapshot_id` returns 400 `bad_request` (`snapshot_id is required`) at the
+  route, before any owner lookup.
 - Owner-scoped endpoints return 403 when the authenticated principal cannot access the requested owner.
 - Store, Meilisearch, or LLM failures are returned through the shared ApiError JSON envelope.
 
@@ -48,7 +50,7 @@ Schema: `ApplySnapshotResponse`
 ```mermaid
 flowchart TD
   n0["UserGuard authenticates caller"]
-  n1["If snapshot_id is supplied, Store.snapshot_owner_async checks owner access"]
+  n1["Require snapshot_id, then Store.snapshot_owner_async checks owner access"]
   n2["Store.apply_snapshot_async applies snapshot analysis/materialization"]
   n3["Return generated ids and job id"]
   n0 --> n1

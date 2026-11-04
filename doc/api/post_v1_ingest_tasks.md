@@ -18,7 +18,8 @@ JSON `IngestTaskRequest`.
 | source_id / revision_id / title / source_uri | string? | Optional source metadata. Missing ids are generated. |
 | content | string? | Text input for builtin or MinerU fallback. |
 | content_list / content_list_v2 | object/array? | Supplied parser output; bypasses live parsing. |
-| parser_provider | string? | `builtin` or `mineru`. |
+| source_document_uri | string? | Optional explicit source-document URI. Non-admin callers may only use `ctx://user/...`; the default is `ctx://user/ingest/...` for owner-scoped tasks and `ctx://company/ingest/...` for admin company ingest. |
+| parser_provider / parser_backend | string? | `builtin` or `mineru`, plus the MinerU backend. Overriding the operator-configured `RAG_PARSER_PROVIDER` / `RAG_MINERU_BACKEND` requires admin scope; non-admin callers may omit them or echo the configured values. |
 | fragment_policy | object? | Chunk sizing overrides. |
 | idempotency_key | string? | Unsupported; supplying it returns 400 before task creation. |
 
@@ -29,6 +30,11 @@ JSON `IngestTaskRequest`.
 ## Rules
 
 - The task is owner-scoped; other owners cannot read it.
+- Company ingest (no `owner_user_id`) requires admin scope. For non-admin
+  callers, a `source_document_uri` outside `ctx://user/` returns 400
+  `validation_error` with `details.field=source_document_uri`, and a parser
+  provider/backend different from the configured default returns 403
+  `forbidden`. Both checks run before any task record is created.
 - `idempotency_key` is rejected with 400 and is never silently ignored.
 - The JSON body is capped by `RAG_MAX_JSON_BYTES`; an oversized body returns
   413 `payload_too_large` before task creation.
