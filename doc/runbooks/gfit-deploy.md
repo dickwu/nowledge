@@ -48,6 +48,11 @@ Stop if the checkout has modified tracked files: find out who changed what on
 the server before deploying over it. Also confirm the target commit's GitHub CI
 (quality, Meilisearch integration, MSRV, RustSec, dependency policy) is green.
 
+`RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS` only opts into periodic background LLM
+health probing: it must be unset, `0`, or at least `300`. An environment that
+still sets the former default `30` fails startup validation, so check the
+unit's environment before restarting.
+
 ## 2. Keep the current binary for rollback
 
 Copy the running binary before building, because `cargo build` overwrites
@@ -87,10 +92,14 @@ journalctl -u nowledge --since "10 min ago" --no-pager
 ```
 
 `/readyz` stays 503 until every mandatory tenant domain has hydrated from
-Meilisearch; poll it for a short while instead of treating the first 503 as a
-failure. Then check the admin-only detailed health without putting the token
-on the command line or in shell history, for example with a root-only header
-file:
+Meilisearch and, with `RAG_HEALTH_REQUIRE_LLM=true`, until the one-time startup
+LLM health probe has completed (`dependencies.llm` reads `not_probed` until
+then); poll it for a short while instead of treating the first 503 as a
+failure. Readiness keeps that LLM verdict afterwards (`llm_checked_at` shows
+when it was observed); only `/healthz` re-probes unless the interval above opts
+into periodic probing. Then check the admin-only detailed health without
+putting the token on the command line or in shell history, for example with a
+root-only header file:
 
 ```sh
 curl -fsS -H @/path/to/root-only-admin-auth-header http://127.0.0.1:14242/healthz

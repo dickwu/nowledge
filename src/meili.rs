@@ -51,7 +51,7 @@ pub const FIXED_INDEXES: &[&str] = &[
 
 /// Total time budget for one task wait. This matches the previous fixed
 /// schedule (600 polls x 100 ms) so callers keep the same timeout semantics.
-const MEILI_TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const MEILI_TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Most Meilisearch tasks on a small index finish within a few milliseconds,
 /// so polling starts quickly and backs off exponentially to the cap.
 const MEILI_TASK_POLL_INITIAL: Duration = Duration::from_millis(5);

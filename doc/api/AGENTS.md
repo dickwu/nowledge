@@ -17,7 +17,7 @@ Examples (one of every documented HTTP verb):
 |------|-------------|
 | `get_healthz.md` | Admin-only detailed operational health. Lists sanitized Meilisearch, LLM, parser, store-backend, and usage payload fields. |
 | `get_livez.md` | Process-liveness probe. Returns `{"status":"ok"}` and does not query Meilisearch or LLM. |
-| `get_readyz.md` | Public readiness probe with the same readiness decision as `/healthz` and only coarse dependency status. |
+| `get_readyz.md` | Public readiness probe with the same readiness decision as `/healthz`, the last cached LLM verdicts whatever their age (`not_probed` before the first probe, `llm_checked_at` for their age), and only coarse dependency status. |
 | All JSON endpoints | A final router boundary dynamically redacts configured secrets in object keys and values; content fields also mask recognizable configured-secret pieces split across fragment boundaries. |
 | `post_v1_rag_debug.md` / `get_v1_debug_traces_trace_id.md` | Admin-only RAG diagnostics with response-level configured-secret redaction. |
 | `post_v1_analysis_insights.md` / `post_v1_llm_test.md` | Protected prompt/provider previews; configured secrets are redacted before preview truncation and response serialization. |

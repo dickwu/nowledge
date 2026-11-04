@@ -2690,10 +2690,12 @@ impl LlmHealthProbe {
             return with_reasoning_effort(disabled_probe(config), config);
         }
 
+        // A verdict younger than the TTL is reused, so live checks probe each
+        // profile at most once per `RAG_HEALTH_LLM_PROBE_TTL_SECONDS`.
         if let Ok(cache) = self.cache.read() {
             if let Some(cached) = cache.as_ref() {
                 if cached.checked_instant.elapsed()
-                    < Duration::from_secs(config.health_llm_probe_interval_seconds)
+                    < Duration::from_secs(config.health_llm_probe_ttl_seconds)
                 {
                     return self.cached_with_age(cached, config);
                 }
@@ -2704,7 +2706,7 @@ impl LlmHealthProbe {
         if let Ok(cache) = self.cache.read() {
             if let Some(cached) = cache.as_ref() {
                 if cached.checked_instant.elapsed()
-                    < Duration::from_secs(config.health_llm_probe_interval_seconds)
+                    < Duration::from_secs(config.health_llm_probe_ttl_seconds)
                 {
                     return self.cached_with_age(cached, config);
                 }
@@ -2745,6 +2747,25 @@ impl LlmHealthProbe {
         result
     }
 
+    /// The verdict readiness reports without contacting the provider: the
+    /// disabled verdict when probing is off, `None` until the first probe
+    /// completes, and otherwise the last verdict as observed. `checked_at`,
+    /// `age_seconds`, and `stale` say how old it is, but age alone never
+    /// expires it (unlike [`Self::cached`]): nothing re-probes on a schedule
+    /// by default, so an old verdict is the normal steady state.
+    pub fn cached_verdict(&self, config: &Config) -> Option<LlmHealthProbeResult> {
+        if !config.health_llm_enabled {
+            let mut result = with_reasoning_effort(disabled_probe(config), config);
+            annotate_auth_expiry(&mut result, config);
+            return Some(result);
+        }
+        let cache = self.cache.read().ok()?;
+        let cached = cache.as_ref()?;
+        let mut result = aged_probe_result(cached, config, cached.checked_instant.elapsed());
+        annotate_auth_expiry(&mut result, config);
+        Some(result)
+    }
+
     pub fn cached(&self, config: &Config) -> Option<LlmHealthProbeResult> {
         self.cache.read().ok().and_then(|cache| {
             cache.as_ref().map(|cached| {
@@ -2755,13 +2776,12 @@ impl LlmHealthProbe {
         })
     }
 
+    /// The cached verdict for diagnostics: beyond
+    /// `RAG_HEALTH_LLM_MAX_STALE_SECONDS` it is reported as an unhealthy
+    /// `stale_probe`.
     fn cached_with_age(&self, cached: &CachedLlmProbe, config: &Config) -> LlmHealthProbeResult {
-        let mut result = cached.result.clone();
-        result.reasoning_effort = config.llm_reasoning_effort.clone();
         let age = cached.checked_instant.elapsed();
-        result.age_seconds = age.as_secs();
-        result.stale = age > Duration::from_secs(config.health_llm_probe_ttl_seconds);
-        result.consecutive_failures = cached.consecutive_failures;
+        let mut result = aged_probe_result(cached, config, age);
         if age > Duration::from_secs(config.health_llm_max_stale_seconds) {
             result.status = "unhealthy".to_string();
             result.can_call = false;
@@ -2770,6 +2790,20 @@ impl LlmHealthProbe {
         }
         result
     }
+}
+
+/// A cached verdict stamped with its age and the profile's reasoning effort.
+fn aged_probe_result(
+    cached: &CachedLlmProbe,
+    config: &Config,
+    age: Duration,
+) -> LlmHealthProbeResult {
+    let mut result = cached.result.clone();
+    result.reasoning_effort = config.llm_reasoning_effort.clone();
+    result.age_seconds = age.as_secs();
+    result.stale = age > Duration::from_secs(config.health_llm_probe_ttl_seconds);
+    result.consecutive_failures = cached.consecutive_failures;
+    result
 }
 
 /// Stamp credential expiry onto a probe result so status surfaces can show
@@ -2946,6 +2980,30 @@ async fn probe_now(
     }
 }
 
+/// Health probes always run at low reasoning effort, whatever
+/// `RAG_LLM_REASONING_EFFORT` configures: a probe only proves reachability,
+/// credentials, and quota, and a higher effort would spend probe latency and
+/// its tiny output budget on reasoning.
+const HEALTH_PROBE_REASONING_EFFORT: &str = "low";
+
+/// The probe request and its provider payload. It deliberately takes no
+/// `Config`, so the profile's reasoning effort cannot leak into a probe.
+fn health_probe_request(model: &str, codex: bool) -> (LlmRequest, Value) {
+    let request = LlmRequest::text(
+        "Return only the requested health-check token.",
+        "Reply with exactly: ok",
+        8,
+        "health_probe",
+    );
+    let effort = Some(HEALTH_PROBE_REASONING_EFFORT);
+    let payload = if codex {
+        codex_responses_payload(model, &request, effort, true)
+    } else {
+        responses_payload(model, &request, effort, false)
+    };
+    (request, payload)
+}
+
 async fn probe_openai_responses(
     config: &Config,
     upstream: &UpstreamHttpClient,
@@ -2955,18 +3013,7 @@ async fn probe_openai_responses(
     latest_rate_limits: &LatestRateLimits,
 ) -> LlmHealthProbeResult {
     let started = Instant::now();
-    let probe_request = LlmRequest::text(
-        "Return only the requested health-check token.",
-        "Reply with exactly: ok",
-        8,
-        "health_probe",
-    );
-    let payload = responses_payload(
-        &model,
-        &probe_request,
-        config.llm_reasoning_effort.as_deref(),
-        false,
-    );
+    let (probe_request, payload) = health_probe_request(&model, false);
     let client = upstream.client();
     let api_key = api_key.to_string();
     let policy = OperationPolicy::without_retries(
@@ -3015,18 +3062,7 @@ async fn probe_codex_responses(
     latest_rate_limits: &LatestRateLimits,
 ) -> LlmHealthProbeResult {
     let started = Instant::now();
-    let probe_request = LlmRequest::text(
-        "Return only the requested health-check token.",
-        "Reply with exactly: ok",
-        8,
-        "health_probe",
-    );
-    let payload = codex_responses_payload(
-        &model,
-        &probe_request,
-        config.llm_reasoning_effort.as_deref(),
-        true,
-    );
+    let (probe_request, payload) = health_probe_request(&model, true);
     let client = upstream.client();
     let endpoint = codex_responses_endpoint(&config.codex_base_url);
     let token = credentials.token.clone();
@@ -4723,6 +4759,109 @@ mod tests {
         assert!(!valid_health_probe_text(""));
     }
 
+    #[test]
+    fn health_probe_payloads_always_use_low_reasoning_effort() {
+        for codex in [false, true] {
+            let (request, payload) = health_probe_request("gpt-5.4-mini", codex);
+            assert_eq!(request.metadata.operation, "health_probe");
+            assert_eq!(payload["reasoning"]["effort"], "low", "{payload}");
+            assert_eq!(payload["model"], "gpt-5.4-mini");
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_ignores_the_configured_reasoning_effort() {
+        let efforts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = efforts.clone();
+        let app = axum::Router::new().route(
+            "/backend-api/codex/responses",
+            axum::routing::post(move |axum::Json(payload): axum::Json<Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(payload["reasoning"]["effort"].clone());
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        terminal_sse("ok", None),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let auth_path = std::env::temp_dir().join(format!(
+            "nowledge-health-effort-{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(
+            &auth_path,
+            json!({ "access_token": "header.payload.signature" }).to_string(),
+        )
+        .unwrap();
+        let mut config = Config::test();
+        config.llm_provider = "codex_auth".to_string();
+        config.llm_model = Some("health-effort-model".to_string());
+        config.llm_reasoning_effort = Some("xhigh".to_string());
+        config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
+        config.codex_base_url = format!("http://{address}/backend-api/codex");
+        config.health_llm_timeout_ms = 2_000;
+        config.refresh_configured_secret_values();
+        let config = Arc::new(config);
+        let registry = LlmProviderRegistry::new(config.clone());
+
+        let result = LlmHealthProbe::new()
+            .check_with_registry(&config, &registry)
+            .await;
+        assert_eq!(result.status, "ok", "{result:?}");
+        // The verdict still describes the configured profile.
+        assert_eq!(result.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            *efforts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![json!("low")]
+        );
+        server.abort();
+        let _ = std::fs::remove_file(auth_path);
+    }
+
+    #[tokio::test]
+    async fn readiness_verdict_never_probes_or_expires_and_reports_disabled_probing() {
+        let mut config = Config::test();
+        config.llm_provider = "mock".to_string();
+        config.llm_model = Some("cached-verdict-model".to_string());
+        // Every verdict is immediately past its TTL and max-stale age.
+        config.health_llm_probe_ttl_seconds = 0;
+        config.health_llm_max_stale_seconds = 0;
+        let config = Arc::new(config);
+        let registry = LlmProviderRegistry::new(config.clone());
+        let probe = LlmHealthProbe::new();
+        assert!(probe.cached_verdict(&config).is_none());
+
+        let probed = probe.check_with_registry(&config, &registry).await;
+        assert_eq!(probed.status, "ok", "{probed:?}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let verdict = probe.cached_verdict(&config).expect("cached verdict");
+        assert_eq!(verdict.status, "ok", "an old verdict is kept: {verdict:?}");
+        assert_eq!(verdict.checked_at, probed.checked_at);
+        assert!(verdict.stale, "{verdict:?}");
+        assert_eq!(verdict.error_kind, None, "{verdict:?}");
+        let diagnostic = probe.cached(&config).expect("cached diagnostic");
+        assert_eq!(diagnostic.error_kind.as_deref(), Some("stale_probe"));
+
+        let mut disabled = (*config).clone();
+        disabled.health_llm_enabled = false;
+        let verdict = LlmHealthProbe::new()
+            .cached_verdict(&disabled)
+            .expect("disabled probing has a verdict without a probe");
+        assert_eq!(verdict.status, "disabled");
+    }
+
     #[tokio::test]
     async fn concurrent_health_probe_cache_misses_are_single_flight() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4765,7 +4904,7 @@ mod tests {
         config.llm_model = Some("health-single-flight-model".to_string());
         config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
         config.codex_base_url = format!("http://{address}/backend-api/codex");
-        config.health_llm_probe_interval_seconds = 60;
+        config.health_llm_probe_ttl_seconds = 60;
         config.health_llm_timeout_ms = 2_000;
         config.refresh_configured_secret_values();
         let config = Arc::new(config);

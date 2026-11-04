@@ -32,6 +32,10 @@ by `RAG_MAX_JSON_BYTES`, ordinary route execution by
 `RAG_REQUEST_TIMEOUT_MS`, concurrent work by `RAG_MAX_IN_FLIGHT_REQUESTS`, and
 authenticated callers by `RAG_RATE_LIMIT_REQUESTS_PER_MINUTE` per logical
 tenant/principal. Token rotation does not reset that principal budget.
+In-flight capacity is held until the response body finishes, at most
+`RAG_REQUEST_TIMEOUT_MS` after the response headers are ready; a body still
+unfinished at that deadline releases its capacity even when the client has
+stopped reading, and is cut off the next time it is polled.
 `/readyz` uses a separate public-probe budget. `/livez` bypasses body,
 capacity, rate, and timeout enforcement so saturation does not hide process
 liveness.

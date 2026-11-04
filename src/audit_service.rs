@@ -281,6 +281,12 @@ impl AuditRecorder {
         let sink = self.sink.clone();
         let config = self.config.clone();
         let metrics = self.metrics.clone();
+        let (audit_id, request_id, action, outcome) = (
+            record.id.clone(),
+            record.request_id.clone(),
+            record.action,
+            record.outcome,
+        );
         if !self.runtime.spawn(async move {
             let _permit = permit;
             if let Err(persistence_error) = sink.persist(&record).await {
@@ -289,6 +295,15 @@ impl AuditRecorder {
             }
         }) {
             self.metrics.record_audit_background_drop(stage, "shutdown");
+            tracing::warn!(
+                target: "nowledge::audit",
+                audit_id = %audit_id,
+                request_id = %request_id,
+                action = ?action,
+                outcome = ?outcome,
+                stage,
+                "background runtime closed; best-effort audit write dropped"
+            );
         }
     }
 
