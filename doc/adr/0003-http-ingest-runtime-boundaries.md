@@ -42,6 +42,10 @@ response redaction ahead of compression. Boundary failures stay inside the
 redaction/response contract. The API buffers only bounded non-multipart request
 bodies, uses immediate semaphore load shedding, applies a fixed-window rate
 limit to a trusted logical tenant/principal key, and bounds route execution.
+A load-shedding permit follows the response body, so streamed responses count
+against capacity until they finish; an expiry task releases it
+`RAG_REQUEST_TIMEOUT_MS` after the response headers at the latest, because a
+client that stops reading also stops hyper from polling the body.
 `/livez` bypasses capacity and timeout enforcement so saturation cannot hide a
 live process. `/readyz` is load-shed and uses a separate public-probe rate key.
 Raw credentials are neither rate keys nor diagnostics.

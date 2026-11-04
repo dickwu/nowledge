@@ -301,7 +301,7 @@ pub async fn load_shed(
         None
     };
     let response = next.run(request).await;
-    hold_capacity_until_body_completion(response, permit, sync_ingest_permit)
+    hold_capacity_until_body_completion(response, permit, sync_ingest_permit, state.request_timeout)
 }
 
 struct CapacityPermits {
@@ -309,9 +309,58 @@ struct CapacityPermits {
     _sync_ingest: Option<OwnedSemaphorePermit>,
 }
 
+/// Capacity permits owned by one response body. They are released as soon as
+/// the body ends, errors, or is dropped, and at the latest by an expiry task
+/// at the body deadline: hyper stops polling the body of a client that stopped
+/// reading once its write buffer is full, so the deadline cannot rely on the
+/// body being polled.
+struct CapacityLease {
+    permits: Arc<Mutex<Option<CapacityPermits>>>,
+    expiry: tokio::task::AbortHandle,
+}
+
+impl CapacityLease {
+    fn new(permits: CapacityPermits, deadline: TokioInstant) -> Self {
+        let permits = Arc::new(Mutex::new(Some(permits)));
+        let expiring = Arc::downgrade(&permits);
+        let expiry = tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            let expired = expiring
+                .upgrade()
+                .and_then(|permits| take_capacity_permits(&permits));
+            if expired.is_some() {
+                tracing::warn!(
+                    "response body outlived its deadline; released its request capacity"
+                );
+            }
+        })
+        .abort_handle();
+        Self { permits, expiry }
+    }
+
+    fn release(&self) {
+        self.expiry.abort();
+        drop(take_capacity_permits(&self.permits));
+    }
+}
+
+impl Drop for CapacityLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn take_capacity_permits(permits: &Mutex<Option<CapacityPermits>>) -> Option<CapacityPermits> {
+    permits
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
 struct CapacityBody {
     inner: Body,
-    permits: Option<CapacityPermits>,
+    lease: CapacityLease,
+    deadline: TokioInstant,
 }
 
 impl HttpBody for CapacityBody {
@@ -322,9 +371,18 @@ impl HttpBody for CapacityBody {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if TokioInstant::now() >= self.deadline {
+            // Cut the response off so its producer (for example an upstream
+            // LLM stream) is dropped along with the capacity it held.
+            self.lease.release();
+            return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "response body deadline exceeded",
+            )))));
+        }
         let poll = Pin::new(&mut self.inner).poll_frame(context);
         if matches!(&poll, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
-            self.permits.take();
+            self.lease.release();
         }
         poll
     }
@@ -338,20 +396,30 @@ impl HttpBody for CapacityBody {
     }
 }
 
+/// Keeps the request's capacity permits until its response body completes,
+/// but no longer than `body_timeout` after the response headers are ready, so
+/// a client that stops reading cannot pin capacity indefinitely.
 fn hold_capacity_until_body_completion(
     response: Response,
     global: OwnedSemaphorePermit,
     sync_ingest: Option<OwnedSemaphorePermit>,
+    body_timeout: Duration,
 ) -> Response {
+    let deadline = TokioInstant::now() + body_timeout;
+    let lease = CapacityLease::new(
+        CapacityPermits {
+            _global: global,
+            _sync_ingest: sync_ingest,
+        },
+        deadline,
+    );
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
         Body::new(CapacityBody {
             inner: body,
-            permits: Some(CapacityPermits {
-                _global: global,
-                _sync_ingest: sync_ingest,
-            }),
+            lease,
+            deadline,
         }),
     )
 }
@@ -515,6 +583,7 @@ mod tests {
             (StatusCode::OK, "chunk").into_response(),
             state.try_acquire().unwrap(),
             Some(state.try_acquire_sync_ingest().unwrap()),
+            Duration::from_secs(60),
         );
         let mut body = response.into_body();
         assert!(state.try_acquire().is_err());
@@ -536,6 +605,7 @@ mod tests {
             StatusCode::NO_CONTENT.into_response(),
             state.try_acquire().unwrap(),
             None,
+            Duration::from_secs(60),
         );
         assert!(state.try_acquire().is_err());
         drop(response);
@@ -554,6 +624,7 @@ mod tests {
             Response::new(Body::from_stream(error_stream)),
             state.try_acquire().unwrap(),
             None,
+            Duration::from_secs(60),
         );
         let mut body = response.into_body();
 
@@ -561,6 +632,45 @@ mod tests {
             .await
             .expect("body error frame");
         assert!(frame.is_err());
+        assert!(state.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn stalled_response_body_releases_capacity_at_its_deadline() {
+        let mut config = Config::test();
+        config.max_in_flight_requests = 1;
+        config.ingest_max_concurrent_tasks = 1;
+        let state = HttpBoundaryState::new(&config);
+        // The body is never polled, like the body of a client that stopped
+        // reading: hyper stops polling once its write buffer is full.
+        let stalled = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+        let response = hold_capacity_until_body_completion(
+            Response::new(Body::from_stream(stalled)),
+            state.try_acquire().unwrap(),
+            Some(state.try_acquire_sync_ingest().unwrap()),
+            Duration::from_millis(50),
+        );
+        assert!(
+            state.try_acquire().is_err(),
+            "an unfinished body holds capacity before its deadline"
+        );
+        assert!(state.try_acquire_sync_ingest().is_err());
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            state.try_acquire().is_ok(),
+            "the deadline must release capacity even though the body is never polled"
+        );
+        assert!(state.try_acquire_sync_ingest().is_ok());
+
+        let mut body = response.into_body();
+        let frame = std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context))
+            .await
+            .expect("deadline error frame");
+        assert!(
+            frame.is_err(),
+            "a body polled after its deadline is cut off"
+        );
         assert!(state.try_acquire().is_ok());
     }
 

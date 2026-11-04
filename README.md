@@ -350,7 +350,11 @@ pass; provider output cannot select tenant or owner scope.
 to no allowed browser origin. A production wildcard is rejected unless it is
 the sole origin and `RAG_ALLOW_WILDCARD_CORS=true` is set explicitly.
 `RAG_MAX_IN_FLIGHT_REQUESTS` load-sheds excess work without consuming the
-`/livez` capacity or timeout path. `/readyz` remains public but has its own
+`/livez` capacity or timeout path. A request keeps its in-flight slot until its
+response body finishes, but at most `RAG_REQUEST_TIMEOUT_MS` after the
+response headers are ready: at that deadline the slot is released even if a
+stalled client has stopped reading, and the unfinished body is cut off the
+next time it is polled. `/readyz` remains public but has its own
 readiness-probe rate bucket. Rate limiting is keyed by the authenticated
 logical tenant/principal, so rotating or adding a second token does not create
 a new owner budget. CORS exposes `X-Request-Id` and `Retry-After` to allowed
