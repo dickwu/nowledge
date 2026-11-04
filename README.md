@@ -199,6 +199,8 @@ Before starting this revision against an existing Meilisearch deployment,
 back up Meilisearch and add the tenant-safe operation journal. The managed
 fixed-index bootstrap fails closed when the old index set exists without
 `rag_operations`; it will not recreate the missing index automatically.
+Startup also refuses any existing fixed index, or any registered per-user
+event or personal-context index, whose primary key is not `id`.
 Drain writers during this cutover and audit existing documents for legacy
 idempotency metadata. `operations_v1` starts the durable journal; it cannot
 reconstruct request fingerprints or response snapshots for keys accepted by an

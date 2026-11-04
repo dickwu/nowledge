@@ -59,6 +59,9 @@ const MEILI_TASK_POLL_MAX: Duration = Duration::from_millis(200);
 /// Upper bound on task UIDs per `GET /tasks?uids=...` status request.
 const MEILI_TASK_BATCH_MAX_UIDS: usize = 100;
 const DURABLE_FIXED_INDEXES: [&str; 2] = ["rag_operations", "rag_audit_records"];
+/// Primary key bootstrap declares when it creates any [`FIXED_INDEXES`]
+/// entry, and therefore the key every existing entry must still carry.
+const FIXED_INDEX_PRIMARY_KEY: &str = "id";
 /// UID prefixes of the per-user event and personal-context indexes that
 /// `EventIndexResolver` derives. Unlike every [`FIXED_INDEXES`] entry, they
 /// are created lazily on a user's first write.
@@ -435,9 +438,6 @@ impl MeiliAdmin {
             let mut missing = Vec::new();
             for uid in FIXED_INDEXES {
                 if self.index_exists(uid).await? {
-                    if matches!(*uid, "rag_operations" | "rag_audit_records") {
-                        self.require_index_primary_key(uid, "id").await?;
-                    }
                     existing.push(*uid);
                 } else {
                     missing.push(*uid);
@@ -454,6 +454,13 @@ impl MeiliAdmin {
                     "all managed Meilisearch indexes are missing; refusing implicit initial provision"
                         .to_string(),
                 ));
+            }
+            // Settings reconciliation cannot change a primary key, and an
+            // index with another or no key rejects or mis-keys every later
+            // write, so refuse any such index before the first mutation.
+            for uid in &existing {
+                self.require_index_primary_key(uid, FIXED_INDEX_PRIMARY_KEY)
+                    .await?;
             }
             existing.is_empty()
         };
@@ -490,7 +497,10 @@ impl MeiliAdmin {
             }
 
             if provision {
-                task_uids.extend(self.ensure_index(uid, "id", true).await?);
+                task_uids.extend(
+                    self.ensure_index(uid, FIXED_INDEX_PRIMARY_KEY, true)
+                        .await?,
+                );
             } else {
                 task_uids.extend(self.reconcile_existing_index(uid, true).await?);
             }
