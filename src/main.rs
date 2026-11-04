@@ -21,6 +21,9 @@ async fn main() -> anyhow::Result<()> {
         .context("invalid bind address")?;
 
     let state = AppState::new(config.clone());
+    // Probe the LLMs once in the background (periodically only when opted
+    // in) so `/readyz`, which only reads the probe cache, has a verdict.
+    state.start_llm_health_refresh();
     if config.store_backend == "meili" && config.meili_url.is_some() {
         let bootstrap = state.meili.prepare_for_startup().await?;
         tracing::info!(

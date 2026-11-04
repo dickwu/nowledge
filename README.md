@@ -132,7 +132,7 @@ RAG_OPENAI_API_KEY=optional-openai-key
 RAG_CODEX_AUTH_PATH=optional-explicit-codex-auth-json
 RAG_REDACTION_PREVIOUS_SECRETS=optional-revoked-token,optional-prior-token
 RAG_HEALTH_LLM_ENABLED=true
-RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS=30
+RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS=0
 RAG_HEALTH_LLM_PROBE_TTL_SECONDS=60
 RAG_HEALTH_LLM_MAX_STALE_SECONDS=120
 RAG_HEALTH_LLM_TIMEOUT_MS=10000
@@ -418,12 +418,30 @@ Health endpoints split process liveness from operational readiness:
   dependency state. A Meilisearch-backed process remains unready until every
   mandatory tenant domain has hydrated atomically; it does not expose raw
   provider payloads, usage/private counts, plan data, credits, or credential
-  sources.
+  sources. It never calls an LLM provider: the `llm` and `analysis_llm`
+  verdicts are the last ones in the health-probe cache, kept whatever their
+  age, and `llm_checked_at` says when each was observed. Until a profile's
+  first probe completes it reports `not_probed`, which keeps the service
+  unready when `RAG_HEALTH_REQUIRE_LLM=true` and otherwise reports it ready
+  but `degraded`.
 - `GET /healthz` requires an admin bearer and checks Meilisearch plus the
   tenant hydration report and configured parser and LLM provider/model,
-  including auth validity, quota/rate-limit state, stale probe state, and a
-  compact usage summary. If `RAG_HEALTH_REQUIRE_LLM=true`, an unconfigured or
-  exhausted LLM makes the service unhealthy.
+  including auth validity, quota/rate-limit state, probe age, and a compact
+  usage summary. It re-probes an LLM profile whose cached verdict is older
+  than `RAG_HEALTH_LLM_PROBE_TTL_SECONDS` (concurrent callers share one
+  probe). If `RAG_HEALTH_REQUIRE_LLM=true`, an unconfigured or exhausted LLM
+  makes the service unhealthy.
+- LLM health probing is sparse to save provider quota. The server probes each
+  LLM profile once in the background at startup; after that only `/healthz`
+  (and the harness eval false-ready check) re-probes, at most once per
+  `RAG_HEALTH_LLM_PROBE_TTL_SECONDS`. Periodic background probing is opt-in
+  through `RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS`: `0` (the default) disables
+  it, and any other value must be at least 300 seconds. The admin usage view
+  still reports a cached verdict older than `RAG_HEALTH_LLM_MAX_STALE_SECONDS`
+  as an unhealthy `stale_probe`; readiness never expires one.
+- LLM health probes always run at `low` reasoning effort, whatever
+  `RAG_LLM_REASONING_EFFORT` or `RAG_ANALYSIS_LLM_REASONING_EFFORT` configures;
+  the reported `reasoning_effort` stays the profile's configured value.
 
 - The protected health `llm.rate_limits` block carries the freshest live
   provider budget snapshot. For `codex_auth` it is parsed from the ChatGPT Codex `x-codex-*`

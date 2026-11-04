@@ -116,7 +116,6 @@ fn stale_llm_health_app() -> Router {
     config.llm_model = Some("health-model".to_string());
     config.analysis_llm_provider = "mock".to_string();
     config.analysis_llm_model = Some("health-model".to_string());
-    config.health_llm_probe_interval_seconds = 999;
     config.health_llm_probe_ttl_seconds = 0;
     config.health_llm_max_stale_seconds = 0;
     config.auth_users = vec![AuthUserConfig {
@@ -389,13 +388,13 @@ async fn spawn_counting_codex_health_stub(
         assert!(request.get("metadata").is_none());
         let model = request["model"]
             .as_str()
-            .expect("health probe request should include a model")
-            .to_string();
+            .expect("health probe request should include a model");
+        let effort = request["reasoning"]["effort"].as_str().unwrap_or("none");
         *state
             .requests_by_model
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(model)
+            .entry(format!("{model}|{effort}"))
             .or_default() += 1;
         sleep(Duration::from_millis(100)).await;
         let terminal = json!({
@@ -733,10 +732,36 @@ async fn admin_healthz_includes_llm_health_and_usage() {
 }
 
 #[tokio::test]
-async fn same_profile_readiness_cache_is_reused_by_admin_usage() {
+async fn readiness_reads_only_the_probe_cache_that_healthz_warms() {
     let app = llm_health_app("mock");
+    // No probe has completed yet and RAG_HEALTH_REQUIRE_LLM=true (the test
+    // default), so the required LLM is reported as not probed and unready.
+    let (status, ready) = call(app.clone(), Method::GET, "/readyz", Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{ready}");
+    assert_eq!(ready["ready"], false, "{ready}");
+    assert_eq!(ready["dependencies"]["llm"], "not_probed", "{ready}");
+    assert_eq!(
+        ready["dependencies"]["analysis_llm"], "not_probed",
+        "{ready}"
+    );
+    assert!(ready["llm_checked_at"]["llm"].is_null(), "{ready}");
+
+    let (status, health) = call_with_token(
+        app.clone(),
+        Method::GET,
+        "/healthz",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{health}");
     let (status, ready) = call(app.clone(), Method::GET, "/readyz", Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{ready}");
+    assert_eq!(ready["dependencies"]["llm"], "ok", "{ready}");
+    assert_eq!(
+        ready["llm_checked_at"]["llm"], health["llm"]["checked_at"],
+        "{ready}"
+    );
 
     let (status, usage) = call_with_token(
         app,
@@ -759,7 +784,7 @@ async fn same_profile_readiness_cache_is_reused_by_admin_usage() {
 }
 
 #[tokio::test]
-async fn concurrent_readiness_misses_probe_each_llm_profile_once() {
+async fn readiness_never_probes_and_concurrent_healthz_misses_probe_each_profile_once() {
     let token = "header.payload.signature";
     let auth_path = std::env::temp_dir().join(format!(
         "nowledge-ready-single-flight-{}.json",
@@ -775,35 +800,87 @@ async fn concurrent_readiness_misses_probe_each_llm_profile_once() {
     config.analysis_llm_model = Some("analysis-ready-model".to_string());
     config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
     config.codex_base_url = codex_base_url;
-    config.health_llm_probe_interval_seconds = 60;
+    // Probes must run at low effort whatever the profiles configure.
+    config.llm_reasoning_effort = Some("xhigh".to_string());
+    config.analysis_llm_reasoning_effort = Some("high".to_string());
+    config.health_llm_probe_ttl_seconds = 60;
     config.health_llm_timeout_ms = 2_000;
+    config.auth_users = vec![AuthUserConfig {
+        token: "admin-token".to_string(),
+        scope: AuthUserScope::Admin,
+        roles: vec!["admin".to_string()],
+    }];
     config.refresh_configured_secret_values();
     let app = build_router(AppState::new(Arc::new(config)));
-    let barrier = Arc::new(tokio::sync::Barrier::new(33));
-    let mut checks = Vec::new();
-    for _ in 0..32 {
-        let app = app.clone();
-        let barrier = barrier.clone();
-        checks.push(tokio::spawn(async move {
+    let concurrently = |path: &'static str, token: Option<&'static str>| {
+        let barrier = Arc::new(tokio::sync::Barrier::new(33));
+        let checks = (0..32)
+            .map(|_| {
+                let app = app.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    call_with_token(app, Method::GET, path, Value::Null, token).await
+                })
+            })
+            .collect::<Vec<_>>();
+        async move {
             barrier.wait().await;
-            call(app, Method::GET, "/readyz", Value::Null).await
-        }));
+            let mut results = Vec::new();
+            for check in checks {
+                results.push(check.await.unwrap());
+            }
+            results
+        }
+    };
+
+    for (status, body) in concurrently("/readyz", None).await {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["dependencies"]["llm"], "not_probed", "{body}");
+        assert_eq!(body["dependencies"]["analysis_llm"], "not_probed", "{body}");
     }
-    barrier.wait().await;
-    for check in checks {
-        let (status, body) = check.await.unwrap();
+    assert!(
+        requests_by_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "/readyz must never trigger a live LLM probe"
+    );
+
+    for (status, body) in concurrently("/healthz", Some("admin-token")).await {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["ready"], true, "{body}");
     }
+    let (status, ready) = call(app.clone(), Method::GET, "/readyz", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{ready}");
+    assert_eq!(ready["dependencies"]["llm"], "ok", "{ready}");
+    assert_eq!(ready["dependencies"]["analysis_llm"], "ok", "{ready}");
 
     let requests_by_model = requests_by_model
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    assert_eq!(requests_by_model.get("primary-ready-model"), Some(&1));
-    assert_eq!(requests_by_model.get("analysis-ready-model"), Some(&1));
+    assert_eq!(requests_by_model.get("primary-ready-model|low"), Some(&1));
+    assert_eq!(requests_by_model.get("analysis-ready-model|low"), Some(&1));
     assert_eq!(requests_by_model.len(), 2, "{requests_by_model:?}");
     drop(requests_by_model);
     let _ = std::fs::remove_file(auth_path);
+}
+
+#[tokio::test]
+async fn unprobed_optional_llm_leaves_readiness_degraded_but_ready() {
+    let mut config = Config::test();
+    config.llm_provider = "mock".to_string();
+    config.llm_model = Some("optional-model".to_string());
+    config.analysis_llm_provider = "mock".to_string();
+    config.analysis_llm_model = Some("optional-model".to_string());
+    config.health_require_llm = false;
+    let app = build_router(AppState::new(Arc::new(config)));
+
+    let (status, ready) = call(app, Method::GET, "/readyz", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{ready}");
+    assert_eq!(ready["ready"], true, "{ready}");
+    assert_eq!(ready["status"], "degraded", "{ready}");
+    assert_eq!(ready["dependencies"]["llm"], "not_probed", "{ready}");
 }
 
 #[tokio::test]
@@ -820,14 +897,8 @@ async fn analysis_llm_failure_makes_readiness_unhealthy_even_when_primary_is_hea
     }];
     let app = build_router(AppState::new(Arc::new(config)));
 
-    let (status, ready) = call(app.clone(), Method::GET, "/readyz", Value::Null).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{ready}");
-    assert_eq!(ready["ready"], false);
-    assert_eq!(ready["dependencies"]["llm"], "ok");
-    assert_eq!(ready["dependencies"]["analysis_llm"], "unhealthy");
-
     let (status, detail) = call_with_token(
-        app,
+        app.clone(),
         Method::GET,
         "/healthz",
         Value::Null,
@@ -837,6 +908,12 @@ async fn analysis_llm_failure_makes_readiness_unhealthy_even_when_primary_is_hea
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{detail}");
     assert_eq!(detail["llm"]["status"], "ok");
     assert_eq!(detail["analysis_llm"]["auth_valid"], false);
+
+    let (status, ready) = call(app, Method::GET, "/readyz", Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{ready}");
+    assert_eq!(ready["ready"], false);
+    assert_eq!(ready["dependencies"]["llm"], "ok");
+    assert_eq!(ready["dependencies"]["analysis_llm"], "unhealthy");
 }
 
 #[tokio::test]
@@ -893,7 +970,7 @@ async fn llm_short_rate_limit_is_degraded_by_default() {
 }
 
 #[tokio::test]
-async fn stale_llm_probe_beyond_max_stale_makes_health_unhealthy() {
+async fn stale_llm_verdict_keeps_readiness_until_healthz_reprobes() {
     let app = stale_llm_health_app();
     let (status, first) = call_with_token(
         app.clone(),
@@ -905,13 +982,36 @@ async fn stale_llm_probe_beyond_max_stale_makes_health_unhealthy() {
     .await;
     assert_eq!(status, StatusCode::OK, "{first}");
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    // Readiness keeps the last verdict however old it is (past both the TTL
+    // and the max-stale age here) and says when it was observed.
     let (status, body) = call(app.clone(), Method::GET, "/readyz", Value::Null).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["status"], "unhealthy");
-    assert_eq!(body["ready"], false);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ok", "{body}");
+    assert_eq!(body["dependencies"]["llm"], "ok", "{body}");
+    assert_eq!(
+        body["llm_checked_at"]["llm"], first["llm"]["checked_at"],
+        "{body}"
+    );
     assert!(body.get("llm").is_none(), "{body}");
     assert!(body.get("usage").is_none(), "{body}");
 
+    // The admin usage view still expires a verdict past the max-stale age.
+    let (status, usage) = call_with_token(
+        app.clone(),
+        Method::GET,
+        "/v1/usage",
+        Value::Null,
+        Some("admin-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{usage}");
+    assert_eq!(
+        usage["providers"]["llm"]["error_kind"], "stale_probe",
+        "{usage}"
+    );
+
+    // /healthz re-probes a verdict older than the TTL instead of reusing it.
     let (status, detail) = call_with_token(
         app,
         Method::GET,
@@ -920,9 +1020,12 @@ async fn stale_llm_probe_beyond_max_stale_makes_health_unhealthy() {
         Some("admin-token"),
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{detail}");
-    assert_eq!(detail["llm"]["stale"], true);
-    assert_eq!(detail["llm"]["error_kind"], "stale_probe");
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["llm"]["stale"], false, "{detail}");
+    assert_ne!(
+        detail["llm"]["checked_at"], first["llm"]["checked_at"],
+        "{detail}"
+    );
 }
 
 #[tokio::test]

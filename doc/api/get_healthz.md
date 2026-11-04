@@ -34,6 +34,12 @@ Schema: `HealthResponse`
 | analysis_llm | object | Analysis-profile LLM health payload. A distinct analysis profile is probed independently and can make readiness unhealthy. |
 | usage | object | Compact usage summary. |
 
+Each LLM profile is re-probed when its cached verdict is older than
+`RAG_HEALTH_LLM_PROBE_TTL_SECONDS`; concurrent cache misses share one probe,
+and public `/readyz` reads the same cache without probing. Probes always run at
+`low` reasoning effort regardless of the profile's configured effort;
+`reasoning_effort` reports the configured value.
+
 ### `llm` Credential Fields
 | Field | Type | Description |
 | --- | --- | --- |
@@ -87,7 +93,7 @@ flowchart TD
   n2["healthz calls detailed operational health"]
   n3["Store builds compact usage summary"]
   n4["Hydration status, MeiliAdmin, and parser health are checked"]
-  n5["LlmHealthProbe checks primary and analysis profiles"]
+  n5["LlmHealthProbe checks primary and analysis profiles, probing at low effort when the cache is due"]
   n6["HTTP status is 200 when ready, 503 when unhealthy"]
   n0 --> n1
   n1 --> n2

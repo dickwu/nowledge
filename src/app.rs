@@ -472,6 +472,25 @@ impl AppState {
         (*self.config).clone()
     }
 
+    /// Gives `/readyz`, which only reads the LLM health cache, a verdict to
+    /// report: probes every configured LLM profile once in the background
+    /// and then stops. Only an opt-in `RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS`
+    /// keeps it probing every interval until the background runtime shuts
+    /// down; otherwise later probes come only from live checks such as
+    /// `/healthz`, so an idle service spends no provider quota on health.
+    /// The binary starts it after building the state; [`AppState::new`]
+    /// does not, so tests and embedders never make provider calls they did
+    /// not ask for. Returns whether it was started (not when health probing
+    /// is disabled).
+    pub fn start_llm_health_refresh(&self) -> bool {
+        if !self.config.health_llm_enabled {
+            return false;
+        }
+        let shutdown = self.runtime.subscribe();
+        self.runtime
+            .spawn(run_llm_health_refresh(self.clone(), shutdown))
+    }
+
     /// First shutdown phase: stop ingest admission and dispatch while
     /// in-flight HTTP requests drain. The background runtime stays open so
     /// the audit finalizations and traces of draining requests are still
@@ -561,6 +580,35 @@ impl AppState {
             Err(_) => tracing::warn!(
                 "shutdown deadline elapsed before interrupted task states were journaled"
             ),
+        }
+    }
+}
+
+/// The startup LLM health probe, repeated every opt-in
+/// `RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS` until runtime shutdown. With the
+/// default interval of 0 it returns after the startup probe.
+async fn run_llm_health_refresh(state: AppState, mut shutdown: watch::Receiver<bool>) {
+    let interval = state.config.health_llm_probe_interval_seconds;
+    loop {
+        tokio::select! {
+            () = crate::health_service::refresh_llm_health(&state) => {}
+            () = runtime_shutdown(&mut shutdown) => return,
+        }
+        if interval == 0 {
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(interval)) => {}
+            () = runtime_shutdown(&mut shutdown) => return,
+        }
+    }
+}
+
+/// Resolves once the background runtime has begun shutting down.
+async fn runtime_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow_and_update() {
+        if shutdown.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -808,5 +856,143 @@ mod tests {
             !state.runtime.spawn(async {}),
             "the background runtime closes once the drain completes"
         );
+    }
+
+    /// A Codex Responses stub that answers every health probe with `ok` and
+    /// counts the calls.
+    async fn spawn_counting_codex_stub() -> (String, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let app = Router::new().route(
+            "/backend-api/codex/responses",
+            axum::routing::post(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let response = serde_json::json!({
+                        "status": "completed",
+                        "output": [{"content": [{"type": "output_text", "text": "ok"}]}]
+                    });
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                        format!(
+                            "event: response.output_text.done\r\ndata: {}\r\n\r\nevent: response.completed\r\ndata: {}\r\n\r\n",
+                            serde_json::json!({"type": "response.output_text.done", "text": "ok"}),
+                            serde_json::json!({"type": "response.completed", "response": response})
+                        ),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let address = listener.local_addr().expect("stub address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}/backend-api/codex"), calls)
+    }
+
+    #[tokio::test]
+    async fn default_llm_health_refresh_probes_once_and_stops() {
+        // A single LLM profile costs exactly one probe call; a distinct
+        // analysis profile adds exactly one probe of its own. Either way the
+        // refresher then stops instead of probing again.
+        for (analysis_model, expected_probes) in [
+            ("refresh-once-model", 1),
+            ("refresh-once-analysis-model", 2),
+        ] {
+            let (codex_base_url, probes) = spawn_counting_codex_stub().await;
+            let auth_path = std::env::temp_dir().join(format!(
+                "nowledge-refresh-once-{}.json",
+                uuid::Uuid::now_v7()
+            ));
+            std::fs::write(
+                &auth_path,
+                serde_json::json!({ "access_token": "header.payload.signature" }).to_string(),
+            )
+            .expect("write codex auth");
+            let mut config = Config::test();
+            assert_eq!(
+                config.health_llm_probe_interval_seconds, 0,
+                "periodic LLM health probing is opt-in"
+            );
+            config.llm_provider = "codex_auth".to_string();
+            config.llm_model = Some("refresh-once-model".to_string());
+            config.analysis_llm_provider = "codex_auth".to_string();
+            config.analysis_llm_model = Some(analysis_model.to_string());
+            config.codex_auth_path = Some(auth_path.to_string_lossy().into_owned());
+            config.codex_base_url = codex_base_url;
+            config.health_llm_timeout_ms = 2_000;
+            config.refresh_configured_secret_values();
+            let state = AppState::new(Arc::new(config));
+
+            timeout(
+                Duration::from_secs(5),
+                run_llm_health_refresh(state.clone(), state.runtime.subscribe()),
+            )
+            .await
+            .expect("by default the refresher stops after its startup probe");
+            assert_eq!(
+                probes.load(Ordering::SeqCst),
+                expected_probes,
+                "exactly one startup probe per LLM profile ({analysis_model})"
+            );
+
+            let ready = crate::health_service::HealthService::readiness(&state).await;
+            assert!(ready.ready, "{}", ready.body);
+            assert_eq!(ready.body["dependencies"]["llm"], "ok");
+            assert_eq!(ready.body["dependencies"]["analysis_llm"], "ok");
+            assert!(
+                ready.body["llm_checked_at"]["llm"].is_string(),
+                "{}",
+                ready.body
+            );
+            assert!(
+                ready.body["llm_checked_at"]["analysis_llm"].is_string(),
+                "{}",
+                ready.body
+            );
+            assert_eq!(
+                probes.load(Ordering::SeqCst),
+                expected_probes,
+                "readiness reads the cached verdicts ({analysis_model})"
+            );
+            let _ = std::fs::remove_file(auth_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn opt_in_llm_health_refresher_warms_the_cache_and_stops_on_shutdown() {
+        let mut config = Config::test();
+        config.llm_provider = "mock".to_string();
+        config.llm_model = Some("refresher-model".to_string());
+        config.analysis_llm_provider = "mock".to_string();
+        config.analysis_llm_model = Some("refresher-model".to_string());
+        config.health_llm_probe_interval_seconds = 300;
+        config.shutdown_timeout_ms = 30_000;
+        let state = AppState::new(Arc::new(config));
+        let cold = crate::health_service::HealthService::readiness(&state).await;
+        assert!(!cold.ready, "{}", cold.body);
+        assert_eq!(cold.body["dependencies"]["llm"], "not_probed");
+
+        assert!(state.start_llm_health_refresh());
+        wait_until("the refresher probes at startup", || {
+            state.llm_health.cached_verdict(&state.config).is_some()
+        })
+        .await;
+        let warm = crate::health_service::HealthService::readiness(&state).await;
+        assert!(warm.ready, "{}", warm.body);
+        assert_eq!(warm.body["dependencies"]["llm"], "ok");
+        assert_eq!(warm.body["dependencies"]["analysis_llm"], "ok");
+
+        // The refresher now sleeps for its 300 s interval; shutdown must not
+        // wait for it (a stuck task would hold shutdown for 30 s).
+        timeout(Duration::from_secs(5), state.shutdown())
+            .await
+            .expect("the periodic refresher must stop with the background runtime");
+
+        let mut disabled = Config::test();
+        disabled.health_llm_enabled = false;
+        assert!(!AppState::new(Arc::new(disabled)).start_llm_health_refresh());
     }
 }

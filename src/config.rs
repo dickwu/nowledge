@@ -50,6 +50,12 @@ const DEFAULT_INGEST_QUEUE_MULTIPLIER: usize = 8;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_PROVIDER_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_LLM_TIMEOUT_MS: u64 = 60_000;
+/// Periodic background LLM health probing is opt-in: by default each LLM
+/// profile is probed once at startup and afterwards only by live health
+/// checks, so an idle service spends no provider quota on health.
+const DEFAULT_HEALTH_LLM_PROBE_INTERVAL_SECONDS: u64 = 0;
+/// Smallest accepted opt-in background LLM health probe interval.
+const MIN_HEALTH_LLM_PROBE_INTERVAL_SECONDS: u64 = 300;
 const DEFAULT_PARSER_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_PROVIDER_MAX_RETRIES: usize = 2;
 const DEFAULT_LLM_MAX_INPUT_CHARS: usize = 65_536;
@@ -565,7 +571,7 @@ impl Config {
                 .unwrap_or(true),
             health_llm_probe_interval_seconds: parse_env_number(
                 "RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS",
-                30,
+                DEFAULT_HEALTH_LLM_PROBE_INTERVAL_SECONDS,
                 &mut boundary_errors,
             ),
             health_llm_probe_ttl_seconds: parse_env_number(
@@ -1100,10 +1106,6 @@ impl Config {
             ("RAG_LLM_TIMEOUT_MS", self.llm_timeout_ms as u128),
             ("RAG_PARSER_TIMEOUT_MS", self.parser_timeout_ms as u128),
             (
-                "RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS",
-                self.health_llm_probe_interval_seconds as u128,
-            ),
-            (
                 "RAG_HEALTH_LLM_PROBE_TTL_SECONDS",
                 self.health_llm_probe_ttl_seconds as u128,
             ),
@@ -1194,6 +1196,13 @@ impl Config {
         if self.health_llm_probe_ttl_seconds > self.health_llm_max_stale_seconds {
             anyhow::bail!(
                 "RAG_HEALTH_LLM_PROBE_TTL_SECONDS must not exceed RAG_HEALTH_LLM_MAX_STALE_SECONDS"
+            );
+        }
+        if self.health_llm_probe_interval_seconds != 0
+            && self.health_llm_probe_interval_seconds < MIN_HEALTH_LLM_PROBE_INTERVAL_SECONDS
+        {
+            anyhow::bail!(
+                "RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS must be 0 (probe each LLM once at startup) or at least {MIN_HEALTH_LLM_PROBE_INTERVAL_SECONDS} seconds"
             );
         }
         if self.meili_scan_page_size > MAX_MEILI_SCAN_PAGE_SIZE {
@@ -1545,7 +1554,7 @@ impl Config {
             codex_auth_path: None,
             codex_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             health_llm_enabled: true,
-            health_llm_probe_interval_seconds: 30,
+            health_llm_probe_interval_seconds: DEFAULT_HEALTH_LLM_PROBE_INTERVAL_SECONDS,
             health_llm_probe_ttl_seconds: 60,
             health_llm_max_stale_seconds: 120,
             health_llm_timeout_ms: 10_000,
@@ -2329,12 +2338,36 @@ mod tests {
     }
 
     #[test]
+    fn periodic_llm_health_probing_is_opt_in_above_a_minimum_interval() {
+        let config = Config::test();
+        assert_eq!(
+            config.health_llm_probe_interval_seconds, 0,
+            "background LLM health probing is off by default"
+        );
+        assert!(config.validate_startup().is_ok());
+        for interval in [1, 30, MIN_HEALTH_LLM_PROBE_INTERVAL_SECONDS - 1] {
+            let mut config = Config::test();
+            config.health_llm_probe_interval_seconds = interval;
+            let error = config.validate_startup().unwrap_err().to_string();
+            assert!(
+                error.contains("RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS"),
+                "{interval}: {error}"
+            );
+        }
+        let mut config = Config::test();
+        config.health_llm_probe_interval_seconds = MIN_HEALTH_LLM_PROBE_INTERVAL_SECONDS;
+        assert!(config.validate_startup().is_ok());
+    }
+
+    #[test]
     fn startup_rejects_invalid_health_probe_boundaries() {
         for (name, configure) in [
             (
                 "RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS",
-                (|config: &mut Config| config.health_llm_probe_interval_seconds = 0)
-                    as fn(&mut Config),
+                (|config: &mut Config| {
+                    config.health_llm_probe_interval_seconds =
+                        MIN_HEALTH_LLM_PROBE_INTERVAL_SECONDS - 1
+                }) as fn(&mut Config),
             ),
             (
                 "RAG_HEALTH_LLM_PROBE_TTL_SECONDS",
