@@ -33,7 +33,15 @@ pub(crate) const DEFAULT_TRACE_RETENTION_DAYS: u64 = 30;
 const MAX_TRACE_RETENTION_DAYS: u64 = 36_500;
 const DEFAULT_MAX_TAGS_PER_ITEM: usize = 64;
 const DEFAULT_MAX_TAG_BYTES: usize = 128;
-const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+/// Ordinary route deadline. It must outlast the slowest single dependency
+/// wait (`RAG_LLM_TIMEOUT_MS`, the LLM health probe, and the Meilisearch task
+/// wait) plus [`REQUEST_TIMEOUT_DEPENDENCY_HEADROOM_MS`], so a dependency
+/// reports its own typed failure instead of being cancelled mid-operation by
+/// a generic route 504.
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 90_000;
+/// Minimum route time reserved beyond the slowest dependency deadline for
+/// retrieval before the call and persistence/finalization after it.
+const REQUEST_TIMEOUT_DEPENDENCY_HEADROOM_MS: u64 = 5_000;
 const DEFAULT_SYNC_INGEST_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 256;
 const DEFAULT_RATE_LIMIT_REQUESTS_PER_MINUTE: u64 = 600;
@@ -1168,6 +1176,20 @@ impl Config {
         }
         if self.provider_connect_timeout_ms > self.parser_timeout_ms {
             anyhow::bail!("RAG_PROVIDER_CONNECT_TIMEOUT_MS must not exceed RAG_PARSER_TIMEOUT_MS");
+        }
+        let meili_task_wait_ms =
+            u64::try_from(crate::meili::MEILI_TASK_WAIT_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        let minimum_request_timeout_ms = self
+            .llm_timeout_ms
+            .max(self.health_llm_timeout_ms)
+            .max(meili_task_wait_ms)
+            .saturating_add(REQUEST_TIMEOUT_DEPENDENCY_HEADROOM_MS);
+        if self.request_timeout_ms < minimum_request_timeout_ms {
+            anyhow::bail!(
+                "RAG_REQUEST_TIMEOUT_MS must be at least {minimum_request_timeout_ms} ms: the route deadline has to exceed RAG_LLM_TIMEOUT_MS ({} ms), RAG_HEALTH_LLM_TIMEOUT_MS ({} ms), and the Meilisearch task wait ({meili_task_wait_ms} ms) by {REQUEST_TIMEOUT_DEPENDENCY_HEADROOM_MS} ms",
+                self.llm_timeout_ms,
+                self.health_llm_timeout_ms,
+            );
         }
         if self.health_llm_probe_ttl_seconds > self.health_llm_max_stale_seconds {
             anyhow::bail!(
@@ -2931,6 +2953,7 @@ mod tests {
         assert_eq!(config.ingest_queue_capacity, 16);
         assert_eq!(config.meili_scan_page_size, 500);
         assert_eq!(config.meili_scan_max_documents, 100_000);
+        assert_eq!(config.request_timeout_ms, 90_000);
         assert_eq!(config.provider_connect_timeout_ms, 5_000);
         assert_eq!(config.llm_timeout_ms, 60_000);
         assert_eq!(config.parser_timeout_ms, 120_000);
@@ -2971,6 +2994,70 @@ mod tests {
         overflow.max_upload_bytes = usize::MAX;
         assert!(overflow.validate_http_boundaries().is_err());
         assert_eq!(overflow.max_multipart_body_bytes(), None);
+    }
+
+    #[test]
+    fn request_timeout_must_outlast_llm_and_meili_task_waits() {
+        let meili_task_wait_ms =
+            u64::try_from(crate::meili::MEILI_TASK_WAIT_TIMEOUT.as_millis()).unwrap();
+        let config = Config::test();
+        assert!(
+            config.request_timeout_ms
+                >= config.llm_timeout_ms + REQUEST_TIMEOUT_DEPENDENCY_HEADROOM_MS
+        );
+        assert!(
+            config.request_timeout_ms
+                >= meili_task_wait_ms + REQUEST_TIMEOUT_DEPENDENCY_HEADROOM_MS
+        );
+        assert!(config.validate_http_boundaries().is_ok());
+
+        // The former 30 s default let the route deadline cancel a 60 s LLM
+        // call (and a Meilisearch task wait) with a generic 504.
+        let mut former_default = Config::test();
+        former_default.request_timeout_ms = 30_000;
+        let error = former_default
+            .validate_http_boundaries()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RAG_REQUEST_TIMEOUT_MS"), "{error}");
+        assert!(error.contains("RAG_LLM_TIMEOUT_MS (60000 ms)"), "{error}");
+        assert!(error.contains("Meilisearch task wait"), "{error}");
+
+        // A longer LLM deadline raises the floor; headroom is inclusive.
+        let mut slow_llm = Config::test();
+        slow_llm.llm_timeout_ms = 120_000;
+        slow_llm.sync_ingest_timeout_ms = 600_000;
+        slow_llm.request_timeout_ms = 120_000 + REQUEST_TIMEOUT_DEPENDENCY_HEADROOM_MS - 1;
+        let error = slow_llm.validate_http_boundaries().unwrap_err().to_string();
+        assert!(error.contains("must be at least 125000 ms"), "{error}");
+        slow_llm.request_timeout_ms = 120_000 + REQUEST_TIMEOUT_DEPENDENCY_HEADROOM_MS;
+        assert!(slow_llm.validate_http_boundaries().is_ok());
+
+        // A short LLM deadline cannot lower the floor below the task wait.
+        let mut fast_llm = Config::test();
+        fast_llm.llm_timeout_ms = 10_000;
+        fast_llm.request_timeout_ms =
+            meili_task_wait_ms + REQUEST_TIMEOUT_DEPENDENCY_HEADROOM_MS - 1;
+        let error = fast_llm.validate_http_boundaries().unwrap_err().to_string();
+        assert!(error.contains("RAG_REQUEST_TIMEOUT_MS"), "{error}");
+        fast_llm.request_timeout_ms = meili_task_wait_ms + REQUEST_TIMEOUT_DEPENDENCY_HEADROOM_MS;
+        assert!(fast_llm.validate_http_boundaries().is_ok());
+
+        // The synchronous LLM health probe is a dependency wait as well.
+        let mut slow_probe = Config::test();
+        slow_probe.health_llm_timeout_ms = slow_probe.request_timeout_ms;
+        let error = slow_probe
+            .validate_http_boundaries()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RAG_HEALTH_LLM_TIMEOUT_MS"), "{error}");
+
+        // Startup validation enforces the same relationship.
+        assert!(former_default
+            .validate_startup()
+            .unwrap_err()
+            .to_string()
+            .contains("RAG_REQUEST_TIMEOUT_MS"));
     }
 
     #[test]

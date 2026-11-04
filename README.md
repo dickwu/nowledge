@@ -94,7 +94,7 @@ RAG_MAX_BULK_ROWS=5000
 RAG_MAX_SEARCH_LIMIT=100
 RAG_MAX_TAGS_PER_ITEM=64
 RAG_MAX_TAG_BYTES=128
-RAG_REQUEST_TIMEOUT_MS=30000
+RAG_REQUEST_TIMEOUT_MS=90000
 RAG_SYNC_INGEST_TIMEOUT_MS=120000
 RAG_MAX_IN_FLIGHT_REQUESTS=256
 RAG_RATE_LIMIT_REQUESTS_PER_MINUTE=600
@@ -312,7 +312,11 @@ verify the operation and audit indexes before generating the final
 
 HTTP and ingest boundaries are typed startup configuration. Numeric limits
 must be positive, malformed values fail startup, and the synchronous ingest
-timeout must be at least the ordinary request timeout. Request, sync-ingest,
+timeout must be at least the ordinary request timeout. The ordinary request
+timeout must exceed `RAG_LLM_TIMEOUT_MS`, `RAG_HEALTH_LLM_TIMEOUT_MS`, and the
+60 s Meilisearch task wait by at least 5 s (65 s with the shipped LLM
+defaults), so a slow dependency returns its own error instead of being cut off
+by a generic route 504; shorter values fail startup. Request, sync-ingest,
 and shutdown deadlines are capped at seven days so deadline arithmetic cannot
 overflow or panic. JSON requests are
 limited by `RAG_MAX_JSON_BYTES`; multipart file data is streamed to temporary
