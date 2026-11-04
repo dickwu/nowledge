@@ -765,6 +765,101 @@ async fn idempotent_retry_and_repeated_reconcile_do_not_duplicate_records() {
 }
 
 #[tokio::test]
+async fn settled_journal_documents_drop_bodies_but_still_replay_and_decode() {
+    let (state, app, fault) = fault_app_with_consistency(
+        HistorySideEffectFault {
+            allow_personal_context: true,
+            ..HistorySideEffectFault::default()
+        },
+        WriteConsistency::WaitForIndex,
+    )
+    .await;
+    let large_text = "settled journal compaction body ".repeat(2_048);
+    let (status, appended) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/history/users/u1/events",
+        event("u1", "journal-size", &large_text),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{appended}");
+    assert_eq!(appended["persistence"]["status"], "completed");
+    assert_eq!(appended["persistence"]["indexing_state"], "completed");
+    let operation_id = appended["persistence"]["operation_id"].as_str().unwrap();
+    let journal = fault.operation_journal.lock().unwrap()[operation_id].clone();
+    let journaled = journal.to_string();
+    assert!(
+        journaled.len() < 16 * 1024,
+        "settled journal document is {} bytes",
+        journaled.len()
+    );
+    assert!(!journaled.contains("settled journal compaction body"));
+    let digests = journal["plan"]["redacted_metadata"]["compacted_payloads"]
+        .as_object()
+        .unwrap_or_else(|| panic!("settled journal document was not compacted: {journal}"));
+    assert_eq!(
+        digests.len(),
+        1 + journal["plan"]["side_effects"].as_array().unwrap().len(),
+        "{journal}"
+    );
+    assert!(
+        digests["primary"]["bytes"].as_u64().unwrap() > large_text.len() as u64,
+        "{journal}"
+    );
+
+    let mut request = event("u1", "journal-replay", "compacted replay body");
+    request["idempotency_key"] = json!("journal-replay-key");
+    let (status, first) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/history/users/u1/events",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let replay_operation_id = first["persistence"]["operation_id"].as_str().unwrap();
+    assert!(
+        fault.operation_journal.lock().unwrap()[replay_operation_id]["plan"]["redacted_metadata"]
+            ["compacted_payloads"]
+            .is_object()
+    );
+    let (status, retry) = call(
+        app.clone(),
+        Method::POST,
+        "/v1/history/users/u1/events",
+        request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retry}");
+    assert_eq!(retry["duplicate"], true, "{retry}");
+    assert_eq!(retry["event"], first["event"], "{retry}");
+
+    let (status, page) = call(
+        app,
+        Method::POST,
+        "/v1/admin/operations/search",
+        json!({
+            "operation_kinds": ["history_event.append"],
+            "include_plan": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let operations = page["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 2, "{page}");
+    assert!(
+        operations
+            .iter()
+            .all(
+                |operation| operation["plan"]["redacted_metadata"]["compacted_payloads"]
+                    .is_object()
+            ),
+        "{page}"
+    );
+    state.shutdown().await;
+}
+
+#[tokio::test]
 async fn meili_operation_pages_filter_project_and_validate_the_cursor() {
     let (state, app, fault) = fault_app(HistorySideEffectFault {
         allow_personal_context: true,

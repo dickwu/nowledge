@@ -16,6 +16,7 @@ use crate::{
     metrics::Metrics,
     models::*,
     mutation::{
+        compact_settled_operation, operation_is_compacted, operation_is_settled,
         operation_list_item, operation_record_from_plan, operation_step_accepted,
         operation_step_completed, operation_step_failed, operation_summary, persistence_metadata,
         validate_operation_record, OPERATION_PLAN_SCHEMA_VERSION,
@@ -170,7 +171,55 @@ struct StoreData {
     eval_overviews: HashMap<String, RagEvalOverview>,
 }
 
+impl StoreData {
+    /// Insert one journal-form operation record and evict the oldest settled
+    /// records beyond [`MAX_IN_MEMORY_SETTLED_OPERATIONS`]. The record just
+    /// inserted and every unfinished record are always retained.
+    fn cache_operation(&mut self, record: OperationRecord) {
+        let record_id = record.id.clone();
+        let settled = operation_is_settled(&record);
+        self.operations.insert(record_id.clone(), record);
+        if !settled || self.operations.len() <= MAX_IN_MEMORY_SETTLED_OPERATIONS {
+            return;
+        }
+        loop {
+            let mut settled_count = 0_usize;
+            let mut oldest: Option<(chrono::DateTime<chrono::Utc>, &String)> = None;
+            for (id, operation) in &self.operations {
+                if !operation_is_settled(operation) {
+                    continue;
+                }
+                settled_count += 1;
+                let settled_at = operation.completed_at.unwrap_or(operation.updated_at);
+                if *id != record_id
+                    && oldest.is_none_or(|(oldest_at, oldest_id)| {
+                        (settled_at, id) < (oldest_at, oldest_id)
+                    })
+                {
+                    oldest = Some((settled_at, id));
+                }
+            }
+            let Some(oldest_id) = oldest
+                .filter(|_| settled_count > MAX_IN_MEMORY_SETTLED_OPERATIONS)
+                .map(|(_, id)| id.clone())
+            else {
+                return;
+            };
+            self.operations.remove(&oldest_id);
+            if settled_count - 1 <= MAX_IN_MEMORY_SETTLED_OPERATIONS {
+                return;
+            }
+        }
+    }
+}
+
 const MAX_IN_MEMORY_AUDIT_RECORDS: usize = 10_000;
+/// Settled (completed and confirmed searchable) operation records kept in
+/// the process journal cache. Older settled records are evicted and remain
+/// readable through the durable repository journal (the memory backend keeps
+/// no journal, so its replay window is this bound). Unfinished records are
+/// never evicted because reconciliation replays their complete plans.
+const MAX_IN_MEMORY_SETTLED_OPERATIONS: usize = 10_000;
 /// Recently recorded or read-through traces kept in process. Older traces
 /// remain readable by id through the repository.
 const MAX_CACHED_TRACES: usize = 10_000;
@@ -1829,8 +1878,48 @@ impl Store {
         )
     }
 
+    /// The bounded form in which an operation record is journaled and
+    /// cached: settled records drop their content bodies and keep per-step
+    /// payload sizes and keyed fingerprints instead.
+    fn journal_operation_form(
+        &self,
+        record: &OperationRecord,
+    ) -> Result<OperationRecord, ApiError> {
+        let secret = &self.redaction_config.index_hash_secret;
+        compact_settled_operation(record, |payload| {
+            format!(
+                "hmac:{}",
+                hmac_hex(secret, "operation-payload-v1", payload, 32)
+            )
+        })
+        .map(|compacted| compacted.unwrap_or_else(|| record.clone()))
+        .map_err(|error| ApiError::Internal(format!("invalid operation compaction: {error}")))
+    }
+
+    /// Cache an operation record in its journal form. A settled record is
+    /// terminal, so an already compacted cache entry for it stays current.
+    fn cache_operation_locked(
+        &self,
+        data: &mut StoreData,
+        record: &OperationRecord,
+    ) -> Result<(), ApiError> {
+        if operation_is_settled(record)
+            && data
+                .operations
+                .get(&record.id)
+                .is_some_and(operation_is_compacted)
+        {
+            return Ok(());
+        }
+        data.cache_operation(self.journal_operation_form(record)?);
+        Ok(())
+    }
+
     async fn persist_operation_checkpoint(&self, record: &OperationRecord) -> Result<(), ApiError> {
-        let receipt = self.repository.upsert_operation(record).await?;
+        // The caller keeps the complete record for its own cache publication;
+        // only the bounded journal form is persisted and cached.
+        let journaled = self.journal_operation_form(record)?;
+        let receipt = self.repository.upsert_operation(&journaled).await?;
         if let Err(error) = self
             .wait_for_repository_tasks(&receipt.task_uids, "durable_write")
             .await
@@ -1841,15 +1930,13 @@ impl Store {
             // checkpoint, retaining the pending immutable plan prevents a
             // same-process retry from constructing a different plan under the
             // deterministic operation ID without overstating durability.
-            self.write()?
-                .operations
-                .entry(record.id.clone())
-                .or_insert_with(|| record.clone());
+            let mut data = self.write()?;
+            if !data.operations.contains_key(&journaled.id) {
+                data.cache_operation(journaled);
+            }
             return Err(error);
         }
-        self.write()?
-            .operations
-            .insert(record.id.clone(), record.clone());
+        self.write()?.cache_operation(journaled);
         Ok(())
     }
 
@@ -1883,9 +1970,7 @@ impl Store {
             // Preserve the explicit failure locally even when the journal
             // checkpoint itself is unavailable, so the accepted primary is
             // never reported back as an unqualified generic error.
-            self.write()?
-                .operations
-                .insert(failed.id.clone(), failed.clone());
+            self.write()?.cache_operation(failed.clone());
         }
         Err(error)
     }
@@ -1974,9 +2059,12 @@ impl Store {
             .find(|step| step.id == step_id)
             .ok_or_else(|| ApiError::Internal(format!("operation step {step_id} is missing")))?;
         let mut current = self.write()?;
-        Self::publish_resource_cache(&mut current, staged, &record.tenant_id, &step.resource);
-        current.operations.insert(record.id.clone(), record.clone());
-        Ok(())
+        // A compacted (settled) record was already published when it
+        // completed and no longer carries content bodies to project.
+        if !operation_is_compacted(record) {
+            Self::publish_resource_cache(&mut current, staged, &record.tenant_id, &step.resource);
+        }
+        self.cache_operation_locked(&mut current, record)
     }
 
     fn publish_operation_cache(
@@ -1985,11 +2073,18 @@ impl Store {
         record: &OperationRecord,
     ) -> Result<(), ApiError> {
         let mut current = self.write()?;
-        for step in std::iter::once(&record.plan.primary).chain(record.plan.side_effects.iter()) {
-            Self::publish_resource_cache(&mut current, staged, &record.tenant_id, &step.resource);
+        if !operation_is_compacted(record) {
+            for step in std::iter::once(&record.plan.primary).chain(record.plan.side_effects.iter())
+            {
+                Self::publish_resource_cache(
+                    &mut current,
+                    staged,
+                    &record.tenant_id,
+                    &step.resource,
+                );
+            }
         }
-        current.operations.insert(record.id.clone(), record.clone());
-        Ok(())
+        self.cache_operation_locked(&mut current, record)
     }
 
     /// Project one durably accepted operation resource into the live cache.
@@ -9261,6 +9356,146 @@ mod tests {
             .audit_records
             .contains_key(oldest_id.as_deref().expect("oldest audit id")));
         assert!(data.audit_records.contains_key(&newest.id));
+    }
+
+    #[tokio::test]
+    async fn settled_operation_journal_keeps_bounded_metadata_instead_of_bodies() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let body = "bounded operation journal body ".repeat(4_096);
+        let response = store
+            .create_revision_async(
+                &config.tenant_id,
+                "journal-size-doc",
+                CreateRevisionRequest {
+                    title: Some("Journal size".to_string()),
+                    content: Some(body.clone()),
+                    ingest: false,
+                    ..CreateRevisionRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let data = store.read().unwrap();
+        let operation = data
+            .operations
+            .values()
+            .find(|operation| operation.operation_kind == "company_revision.create")
+            .expect("the revision mutation is journaled");
+        assert!(operation_is_settled(operation));
+        validate_operation_record(operation).unwrap();
+        let journaled = serde_json::to_string(operation).unwrap();
+        assert!(
+            journaled.len() < 16 * 1024,
+            "settled journal record is {} bytes",
+            journaled.len()
+        );
+        assert!(!journaled.contains("bounded operation journal body"));
+        let digests = &operation.plan.redacted_metadata["compacted_payloads"];
+        assert!(
+            digests["primary"]["bytes"].as_u64().unwrap() > body.len() as u64,
+            "{digests}"
+        );
+        assert!(
+            digests["primary"]["fingerprint"]
+                .as_str()
+                .is_some_and(|fingerprint| fingerprint.starts_with("hmac:")),
+            "{digests}"
+        );
+        match &operation.plan.primary.resource {
+            OperationResource::SourceRevision { revision } => {
+                assert_eq!(revision.id, response.revision_id);
+                assert!(revision.content.is_empty());
+                assert!(!revision.checksum.is_empty());
+            }
+            other => panic!("unexpected primary resource {other:?}"),
+        }
+        // Only the journal is compacted; the published revision keeps its body.
+        assert!(data.source_revisions["journal-size-doc"]
+            .iter()
+            .any(|revision| revision.id == response.revision_id && revision.content == body));
+    }
+
+    fn settled_operation_fixture(
+        tenant_id: &str,
+        operation_id: &str,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> OperationRecord {
+        let record = operation_record_from_plan(OperationPlan {
+            schema_version: OPERATION_PLAN_SCHEMA_VERSION,
+            id: operation_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            operation_kind: "structured_rows.test".to_string(),
+            actor: OperationActor {
+                scope: OperationActorScope::TenantService,
+                owner_user_id_hash: None,
+                roles: Vec::new(),
+                request_id: None,
+            },
+            idempotency_key_hash: None,
+            primary: OperationStep {
+                id: "primary".to_string(),
+                role: OperationStepRole::Primary,
+                resource: OperationResource::StructuredRows {
+                    rows: vec![json!({ "id": format!("{operation_id}-row"), "value": "payload" })],
+                },
+            },
+            side_effects: Vec::new(),
+            redacted_metadata: json!({}),
+            response_snapshot: Value::Null,
+            created_at: completed_at - chrono::Duration::seconds(1),
+        })
+        .unwrap();
+        operation_step_completed(&record, "primary", completed_at).unwrap()
+    }
+
+    #[tokio::test]
+    async fn settled_operation_cache_evicts_the_oldest_settled_record_but_never_unfinished_ones() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let started = now() - chrono::Duration::days(1);
+        let template = settled_operation_fixture(&config.tenant_id, "op-template", started);
+        let unfinished_record = |operation_id: &str| {
+            let mut plan = template.plan.clone();
+            plan.id = operation_id.to_string();
+            operation_record_from_plan(plan).unwrap()
+        };
+        let unfinished = unfinished_record("op-unfinished");
+        {
+            let mut data = store.write().unwrap();
+            data.operations
+                .insert(unfinished.id.clone(), unfinished.clone());
+            for offset in 0..MAX_IN_MEMORY_SETTLED_OPERATIONS {
+                let mut record = template.clone();
+                record.id = format!("op-settled-{offset:05}");
+                record.completed_at = Some(started + chrono::Duration::milliseconds(offset as i64));
+                data.operations.insert(record.id.clone(), record);
+            }
+        }
+
+        let newest = settled_operation_fixture(&config.tenant_id, "op-settled-newest", now());
+        store.persist_operation_checkpoint(&newest).await.unwrap();
+        {
+            let data = store.read().unwrap();
+            assert_eq!(data.operations.len(), MAX_IN_MEMORY_SETTLED_OPERATIONS + 1);
+            assert!(!data.operations.contains_key("op-settled-00000"));
+            assert!(data.operations.contains_key("op-settled-00001"));
+            assert!(data.operations.contains_key(&unfinished.id));
+            assert!(
+                operation_is_compacted(&data.operations[&newest.id]),
+                "settled records are cached in their compacted journal form"
+            );
+        }
+
+        // Unfinished records neither count toward nor trigger the bound.
+        store
+            .persist_operation_checkpoint(&unfinished_record("op-unfinished-2"))
+            .await
+            .unwrap();
+        let data = store.read().unwrap();
+        assert_eq!(data.operations.len(), MAX_IN_MEMORY_SETTLED_OPERATIONS + 2);
+        assert!(!operation_is_compacted(&data.operations["op-unfinished-2"]));
     }
 
     #[test]
