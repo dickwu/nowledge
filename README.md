@@ -526,9 +526,10 @@ asynchronous ingest while synchronous ingest remains available. Synchronous
 ingest uses a separate immediate load-shed lane capped by
 `RAG_INGEST_MAX_CONCURRENT_TASKS`; saturation returns 503 plus `Retry-After`
 before buffering a JSON or multipart body. SIGINT/SIGTERM stop new queue
-acceptance, allow supervised work to finish within
-`RAG_SHUTDOWN_TIMEOUT_MS`, and mark unfinished tasks as failed with
-`ingest_interrupted`; startup recovery applies the same terminal state to
+acceptance, drain in-flight HTTP requests while background audit and trace
+writes are still accepted, then close the background runtime and allow
+supervised work to finish within `RAG_SHUTDOWN_TIMEOUT_MS`, and mark unfinished
+tasks as failed with `ingest_interrupted`; startup recovery applies the same terminal state to
 persisted nonterminal tasks from a prior process.
 Finished (`completed`/`failed`) task records and their stored results are
 pruned after `RAG_INGEST_TASK_RETENTION_SECONDS` (default 86400; set 0 to

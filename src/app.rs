@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::{Future, IntoFuture},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -7,8 +8,10 @@ use std::{
     time::Duration,
 };
 
-use axum::extract::FromRef;
+use anyhow::Context as _;
+use axum::{extract::FromRef, Router};
 use tokio::{
+    net::TcpListener,
     sync::{mpsc, oneshot, watch},
     task::JoinSet,
 };
@@ -35,6 +38,10 @@ pub struct IngestTaskManager {
     accepting: Arc<AtomicBool>,
     enabled: bool,
     runtime: RuntimeSupervisor,
+    /// Stops the dispatcher when ingest admission closes. This is separate
+    /// from the runtime shutdown signal so ingest winds down at the start of
+    /// the HTTP drain while the runtime still accepts audit/trace work.
+    drain: Arc<watch::Sender<bool>>,
 }
 
 struct QueuedIngestJob {
@@ -70,6 +77,8 @@ impl IngestTaskManager {
     fn new(store: Store, config: Arc<Config>, runtime: RuntimeSupervisor) -> Self {
         let queued_depth = Arc::new(AtomicUsize::new(0));
         let accepting = Arc::new(AtomicBool::new(config.ingest_worker_enabled));
+        let (drain, shutdown) = watch::channel(false);
+        let drain = Arc::new(drain);
         if !config.ingest_worker_enabled {
             return Self {
                 queue: Arc::new(Mutex::new(None)),
@@ -77,12 +86,12 @@ impl IngestTaskManager {
                 accepting,
                 enabled: false,
                 runtime,
+                drain,
             };
         }
 
         let (tx, rx) = mpsc::channel::<QueuedIngestJob>(config.ingest_queue_capacity.max(1));
         let max_concurrent = config.ingest_max_concurrent_tasks.max(1);
-        let shutdown = runtime.subscribe();
         let shutdown_grace = Duration::from_millis(config.shutdown_timeout_ms);
         let spawned = runtime.spawn(run_ingest_dispatcher(
             store,
@@ -99,6 +108,7 @@ impl IngestTaskManager {
             accepting,
             enabled: true,
             runtime,
+            drain,
         }
     }
 
@@ -187,6 +197,7 @@ impl IngestTaskManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
+        self.drain.send_replace(true);
     }
 
     pub(crate) fn metrics(&self) -> IngestRuntimeMetrics {
@@ -461,9 +472,65 @@ impl AppState {
         (*self.config).clone()
     }
 
-    pub fn begin_shutdown(&self) {
+    /// First shutdown phase: stop ingest admission and dispatch while
+    /// in-flight HTTP requests drain. The background runtime stays open so
+    /// the audit finalizations and traces of draining requests are still
+    /// admitted; [`AppState::shutdown_until`] closes and flushes it afterwards.
+    pub fn begin_http_drain(&self) {
         self.ingest_manager.begin_shutdown();
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.begin_http_drain();
         self.runtime.begin_shutdown();
+    }
+
+    /// Serves `app` until `signal` resolves, then shuts down in dependency
+    /// order within one `RAG_SHUTDOWN_TIMEOUT_MS` deadline: ingest admission
+    /// stops and in-flight HTTP requests drain first, and only after the
+    /// drain (or its deadline) is the background runtime closed and flushed.
+    pub async fn serve_until_shutdown<S>(
+        &self,
+        listener: TcpListener,
+        app: Router,
+        signal: S,
+    ) -> anyhow::Result<()>
+    where
+        S: Future<Output = ()> + Send + 'static,
+    {
+        let shutdown_grace = Duration::from_millis(self.config.shutdown_timeout_ms);
+        let (shutdown_started, shutdown_observed) = oneshot::channel();
+        let draining = self.clone();
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                signal.await;
+                tracing::info!("shutdown signal received; draining requests and ingest tasks");
+                let deadline = tokio::time::Instant::now() + shutdown_grace;
+                draining.begin_http_drain();
+                let _ = shutdown_started.send(deadline);
+            })
+            .into_future();
+        tokio::pin!(server);
+        let (result, shutdown_deadline) = tokio::select! {
+            result = &mut server => (result.context("server failed"), None),
+            observed = shutdown_observed => {
+                let deadline = observed.unwrap_or_else(|_| tokio::time::Instant::now());
+                let result = match tokio::time::timeout_at(deadline, &mut server).await {
+                    Ok(result) => result.context("server failed"),
+                    Err(_) => {
+                        tracing::warn!("HTTP drain exceeded shutdown deadline; forcing close");
+                        Ok(())
+                    }
+                };
+                (result, Some(deadline))
+            }
+        };
+        if let Some(deadline) = shutdown_deadline {
+            self.shutdown_until(deadline).await;
+        } else {
+            self.shutdown().await;
+        }
+        result
     }
 
     pub async fn shutdown(&self) {
@@ -604,4 +671,142 @@ fn spawn_ingest_task_cleanup(store: Store, config: &Arc<Config>, runtime: &Runti
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        time::{sleep, timeout},
+    };
+
+    use super::*;
+    use crate::{
+        metrics::StoreMetricsSnapshot,
+        models::{AuditAction, AuditPrincipalScope},
+    };
+
+    fn rendered_metrics(state: &AppState) -> String {
+        state
+            .metrics
+            .render(
+                state.ingest_manager.metrics(),
+                &StoreMetricsSnapshot::default(),
+            )
+            .expect("metrics render")
+    }
+
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        timeout(Duration::from_secs(5), async {
+            while !condition() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_http_before_closing_the_background_runtime() {
+        let mut config = Config::test();
+        config.shutdown_timeout_ms = 5_000;
+        let state = AppState::new(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (signal, signalled) = oneshot::channel::<()>();
+        let server = tokio::spawn({
+            let state = state.clone();
+            let app = crate::build_router(state.clone());
+            async move {
+                state
+                    .serve_until_shutdown(listener, app, async {
+                        let _ = signalled.await;
+                    })
+                    .await
+            }
+        });
+
+        // Hold one request in flight: its headers are complete, its body is not.
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"POST /v1/context/search HTTP/1.1\r\nHost: localhost\r\n\
+                  Connection: close\r\nContent-Type: application/json\r\n\
+                  Content-Length: 2\r\n\r\n{",
+            )
+            .await
+            .unwrap();
+        wait_until("the request to enter the router", || {
+            rendered_metrics(&state).contains("\nnowledge_http_in_flight 1\n")
+        })
+        .await;
+
+        signal.send(()).unwrap();
+        wait_until("ingest admission to close", || {
+            !state.ingest_manager.metrics().accepting
+        })
+        .await;
+        assert!(state.ingest_manager.ensure_available().is_err());
+
+        // While HTTP drains, a request finishing its audited mutation must
+        // still be able to hand the finalization to the background runtime.
+        let result = state
+            .audit_recorder
+            .record_mutation(
+                AuditPrincipalScope::Admin,
+                None,
+                AuditAction::CompanyDocDelete,
+                "draining-resource",
+                "admin_delete",
+                None,
+                || async { Ok::<_, ApiError>(()) },
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        let flushed = Arc::new(AtomicBool::new(false));
+        assert!(
+            state.runtime.spawn({
+                let flushed = flushed.clone();
+                async move {
+                    sleep(Duration::from_millis(25)).await;
+                    flushed.store(true, Ordering::SeqCst);
+                }
+            }),
+            "the background runtime must stay open during the HTTP drain"
+        );
+        assert!(
+            !server.is_finished(),
+            "the in-flight request is still draining"
+        );
+
+        client.write_all(b"}").await.unwrap();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+            .await
+            .expect("drained response")
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 "), "{response:?}");
+
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server shutdown")
+            .unwrap()
+            .unwrap();
+        assert!(
+            flushed.load(Ordering::SeqCst),
+            "work admitted during the drain must be flushed before shutdown returns"
+        );
+        let metrics = rendered_metrics(&state);
+        assert!(
+            !metrics.contains("reason=\"shutdown\""),
+            "no audit write may be dropped for shutdown: {metrics}"
+        );
+        assert!(
+            !state.runtime.spawn(async {}),
+            "the background runtime closes once the drain completes"
+        );
+    }
 }

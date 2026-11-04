@@ -93,7 +93,9 @@ keeps concurrent upload/JSON memory and temporary-disk amplification bounded
 without consuming asynchronous worker slots.
 
 SIGINT/SIGTERM starts graceful shutdown: stop new queue acceptance, close the
-HTTP server, drain supervised tasks within `RAG_SHUTDOWN_TIMEOUT_MS`, abort any
+HTTP server and drain its in-flight requests while the background runtime still
+admits their audit finalizations and traces, then close the runtime, drain
+supervised tasks within `RAG_SHUTDOWN_TIMEOUT_MS`, abort any
 remaining tasks, and mark every unfinished ingest record `failed` with
 `error=ingest_interrupted`. Startup hydration applies that same terminal state
 to persisted nonterminal tasks because the original request/upload payload is
