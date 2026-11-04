@@ -36,7 +36,9 @@ use crate::{
         mask_secret_fragment_projection_preserving_chars, new_id, now, require_string,
         sanitize_slug, text_score, truncate_chars,
     },
-    vector_match::{VectorMatcher, VectorScoreMap},
+    vector_match::{
+        embed_text, text_fingerprint, PreparedEmbeddings, VectorMatcher, VectorScoreMap,
+    },
 };
 
 #[path = "store_accessors.rs"]
@@ -1204,8 +1206,10 @@ impl Store {
         staged.mutation_gate = Arc::new(tokio::sync::Mutex::new(()));
         // Vector warming is an optional performance projection. A staged
         // mutation must not share it with the live store because a rejected
-        // primary write must have no live side effects.
-        staged.vector = Arc::new(Mutex::new(VectorMatcher::from_config(
+        // primary write must have no live side effects: its warm-ups are
+        // buffered and applied to the live matcher only after commit (see
+        // `apply_staged_vector_warm`).
+        staged.vector = Arc::new(Mutex::new(VectorMatcher::deferred_from_config(
             &self.redaction_config,
         )));
         Ok(staged)
@@ -2787,6 +2791,7 @@ impl Store {
         if buffer_publication {
             self.publish_operation_cache(&after, &record)?;
         }
+        self.apply_staged_vector_warm(&staged);
         Ok((response, Some(persistence_metadata(&record))))
     }
 
@@ -2842,30 +2847,95 @@ impl Store {
         })
     }
 
-    /// Per-query turbovec scores for candidate fragments.
+    /// Embed a search query before the shared matcher lock is taken.
+    /// `None` (the legacy text-only score map) when vector matching is
+    /// disabled or the query has no tokens.
+    fn vector_query(&self, query: &str) -> Option<Vec<f32>> {
+        if !self.redaction_config.vector_match_enabled {
+            return None;
+        }
+        embed_text(query)
+    }
+
+    /// Per-query turbovec scores for candidate fragments. The query
+    /// embedding and the bounded fragment texts and fingerprints are built
+    /// before the shared matcher lock is taken.
     fn vector_score_map(&self, query: &str, nodes: &[ContextNode]) -> VectorScoreMap {
-        self.vector_matcher().score_map(
-            query,
-            nodes
-                .iter()
-                .map(|node| (vector_match_key(node), node_match_text(node))),
+        let Some(query_vector) = self.vector_query(query) else {
+            return VectorScoreMap::default();
+        };
+        let candidates = nodes
+            .iter()
+            .map(|node| {
+                let text = node_match_text(node);
+                (vector_match_key(node), text_fingerprint(&text), text)
+            })
+            .collect::<Vec<_>>();
+        self.vector_matcher().score_embedded(
+            &query_vector,
+            candidates
+                .into_iter()
+                .map(|(key, fingerprint, text)| (key, fingerprint, move || text)),
         )
     }
 
     /// Document-level vector scores for the source documents referenced by
-    /// a candidate set; candidates come from [`doc_candidates_locked`].
+    /// `nodes` (see [`doc_candidates_locked`]). Documents are versioned by
+    /// [`source_document_vector_fingerprint`], so a search neither copies
+    /// nor hashes whole bodies; the masked match text is only built when a
+    /// document's embedding is missing or stale.
     fn vector_doc_score_map(
         &self,
         query: &str,
-        candidates: Vec<(String, String)>,
+        data: &StoreData,
+        nodes: &[ContextNode],
     ) -> VectorScoreMap {
-        self.vector_matcher().doc_score_map(query, candidates)
+        let Some(query_vector) = self.vector_query(query) else {
+            return VectorScoreMap::default();
+        };
+        let candidates = doc_candidates_locked(data, nodes)
+            .into_iter()
+            .map(|(key, document)| {
+                let fingerprint = source_document_vector_fingerprint(document);
+                (key, fingerprint, document)
+            })
+            .collect::<Vec<_>>();
+        let secrets = std::cell::OnceCell::new();
+        let secrets = &secrets;
+        self.vector_matcher().doc_score_embedded(
+            &query_vector,
+            candidates.into_iter().map(|(key, fingerprint, document)| {
+                (key, fingerprint, move || {
+                    source_document_match_text(
+                        document,
+                        secrets.get_or_init(|| self.redaction_config.configured_secret_values()),
+                    )
+                })
+            }),
+        )
     }
 
-    /// Pre-embed saved documents and fragments. Best-effort warm-up: the
-    /// scoring paths lazily embed anything this missed or that predates it.
-    fn vector_warm(&self, entries: Vec<(String, String)>) {
-        self.vector_matcher().warm(entries);
+    /// Pre-embed saved documents and fragments from `(scoped key,
+    /// fingerprint, text)` entries. Best-effort warm-up: the scoring paths
+    /// lazily embed anything this missed or that predates it. Embeddings
+    /// are computed before the matcher lock is taken; a staged copy's
+    /// deferred matcher buffers them until the mutation commits.
+    fn vector_warm(&self, entries: Vec<(String, u64, String)>) {
+        if !self.redaction_config.vector_match_enabled {
+            return;
+        }
+        let prepared = PreparedEmbeddings::embed(entries);
+        self.vector_matcher().warm_prepared(prepared);
+    }
+
+    /// Move a committed staged mutation's buffered warm-ups into the live
+    /// matcher. Called only once every planned step is durable and
+    /// published, so rejected or partially failed mutations never warm it.
+    fn apply_staged_vector_warm(&self, staged: &Store) {
+        let prepared = staged.vector_matcher().take_deferred_warm();
+        if !prepared.is_empty() {
+            self.vector_matcher().warm_prepared(prepared);
+        }
     }
 
     pub fn resolver(&self) -> &EventIndexResolver {
@@ -6426,6 +6496,7 @@ impl Store {
             created_at,
             updated_at: now,
         };
+        let document_vector_fingerprint = source_document_vector_fingerprint(&source_document);
         data.source_documents
             .insert(source_document_key.clone(), source_document);
 
@@ -6477,18 +6548,20 @@ impl Store {
 
         // Pre-embed the saved document and its fragments so the first
         // search after a save does not pay the embedding cost. Collected
-        // before the nodes move into the context store; applied after the
-        // write completes (lock order stays data -> vector).
+        // before the nodes move into the context store with the same keys,
+        // fingerprints, and texts the search paths use. Every production
+        // write runs on a staged copy, whose deferred matcher buffers the
+        // embeddings until the mutation commits.
         let mut warm_entries = Vec::with_capacity(nodes.len() + 1);
         warm_entries.push((
             vector_doc_key(index_uid, source_document_uri),
-            format!("{retrieval_title} {retrieval_content}"),
+            document_vector_fingerprint,
+            document_match_text(&retrieval_title, &retrieval_content),
         ));
-        warm_entries.extend(
-            nodes
-                .iter()
-                .map(|node| (vector_match_key(node), node_match_text(node))),
-        );
+        warm_entries.extend(nodes.iter().map(|node| {
+            let text = node_match_text(node);
+            (vector_match_key(node), text_fingerprint(&text), text)
+        }));
 
         if index_kind == "company" {
             upsert_context_nodes(&mut data.company_context, nodes);
@@ -7619,11 +7692,46 @@ fn vector_doc_key(index_uid: &str, source_document_uri: &str) -> String {
     format!("doc|{index_uid}|{source_document_uri}")
 }
 
-/// Collect distinct `(scoped key, title + content)` candidates for the
+/// Document-level vector text: the same secret-masked title and content
+/// projection the fragmenter indexes, so a committed warm-up entry is
+/// exactly what a later search would embed.
+fn document_match_text(title: &str, content: &str) -> String {
+    format!("{title} {content}")
+}
+
+fn source_document_match_text(document: &SourceDocument, secrets: &[String]) -> String {
+    document_match_text(
+        &mask_secret_egress_projection_preserving_chars(&document.title, secrets),
+        &mask_secret_fragment_projection_preserving_chars(&document.content, secrets),
+    )
+}
+
+/// Version fingerprint for a document-level vector entry, derived from
+/// write metadata instead of the body so searches never re-hash whole
+/// documents. Every document write stamps a fresh `updated_at` (revisions
+/// also change the scoped key), so a rewritten body re-embeds on next use;
+/// the checksum, length, and title guard edits that keep the timestamp.
+fn source_document_vector_fingerprint(document: &SourceDocument) -> u64 {
+    text_fingerprint(&format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        document.revision_id,
+        document.checksum,
+        document
+            .updated_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        document.content.len(),
+        document.title,
+    ))
+}
+
+/// Collect distinct `(scoped key, source document)` candidates for the
 /// source documents referenced by `nodes`. Scope safety: `nodes` are
 /// already isolation-filtered and every fragment references its own
 /// document, so the candidate set cannot leave the caller's visibility.
-fn doc_candidates_locked(data: &StoreData, nodes: &[ContextNode]) -> Vec<(String, String)> {
+fn doc_candidates_locked<'a>(
+    data: &'a StoreData,
+    nodes: &[ContextNode],
+) -> Vec<(String, &'a SourceDocument)> {
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
     for node in nodes {
@@ -7645,7 +7753,7 @@ fn doc_candidates_locked(data: &StoreData, nodes: &[ContextNode]) -> Vec<(String
         if document.status != "active" {
             continue;
         }
-        candidates.push((key, format!("{} {}", document.title, document.content)));
+        candidates.push((key, document));
     }
     candidates
 }
@@ -10762,6 +10870,53 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn committed_document_warm_up_reaches_the_live_vector_matcher() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant_id = config.tenant_id.as_str();
+        let created = store
+            .create_revision_async(
+                tenant_id,
+                "warm-runbook",
+                CreateRevisionRequest {
+                    title: Some("Deployment runbook".to_string()),
+                    content: Some(
+                        "Deploy the pipeline to staging, then verify the rollout dashboards."
+                            .to_string(),
+                    ),
+                    ingest: false,
+                    ..CreateRevisionRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.vector_matcher().embedding_stats(), (0, 0));
+
+        store
+            .activate_revision_async(
+                tenant_id,
+                "warm-runbook",
+                &created.revision_id,
+                ActivateRevisionRequest::default(),
+            )
+            .await
+            .unwrap();
+        let warmed = store.vector_matcher().embedding_stats();
+        assert!(
+            warmed.0 >= 2,
+            "the committed document and fragment warm-ups reach the live matcher: {warmed:?}"
+        );
+
+        // Searching the committed fragments and their document reuses the
+        // warm entries: nothing is embedded or re-embedded at query time.
+        let search = store
+            .debug_meili_search(tenant_id, "rag_company_context", "deploy pipeline staging")
+            .unwrap();
+        assert!(!search["hits"].as_array().unwrap().is_empty(), "{search}");
+        assert_eq!(store.vector_matcher().embedding_stats(), warmed);
+    }
+
     #[test]
     fn document_vector_candidates_resolve_source_by_node_scope() {
         let config = Config::test();
@@ -10802,8 +10957,8 @@ mod tests {
         let data = store.read().unwrap();
         let candidates = doc_candidates_locked(&data, &[owner_a_node]);
         assert_eq!(candidates.len(), 1);
-        assert!(candidates[0].1.contains("owner-a-vector-marker"));
-        assert!(!candidates[0].1.contains("owner-b-vector-marker"));
+        assert!(candidates[0].1.content.contains("owner-a-vector-marker"));
+        assert!(!candidates[0].1.content.contains("owner-b-vector-marker"));
     }
 
     #[test]

@@ -190,8 +190,7 @@ impl Store {
             .cloned()
             .collect();
         let vector_scores = self.vector_score_map(&query, &candidates);
-        let doc_scores =
-            self.vector_doc_score_map(&query, doc_candidates_locked(&data, &candidates));
+        let doc_scores = self.vector_doc_score_map(&query, &data, &candidates);
         let fragments = rank_nodes(
             candidates.into_iter(),
             &query,
@@ -381,12 +380,11 @@ impl Store {
             // Meilisearch relevance is the primary ranking feature; the local
             // hybrid (lexical + vector) score only adjusts it slightly and
             // decides RYW-local candidates that Meilisearch has not ranked.
-            let doc_candidates = {
-                let data = self.read()?;
-                doc_candidates_locked(&data, &result.nodes)
-            };
             let vector_scores = self.vector_score_map(&query, &result.nodes);
-            let doc_scores = self.vector_doc_score_map(&query, doc_candidates);
+            let doc_scores = {
+                let data = self.read()?;
+                self.vector_doc_score_map(&query, &data, &result.nodes)
+            };
             let scored_nodes = rank_repository_nodes(
                 result.nodes,
                 &result.relevance,

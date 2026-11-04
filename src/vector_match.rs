@@ -125,12 +125,64 @@ struct VectorEntry {
     fingerprint: u64,
 }
 
+/// Stable content fingerprint used to decide whether a stored embedding is
+/// stale. Callers may pass any other version fingerprint that changes
+/// whenever the embedded text changes (the store versions whole source
+/// documents by write metadata so searches never re-hash their bodies).
+pub fn text_fingerprint(text: &str) -> u64 {
+    fnv1a64(text.as_bytes())
+}
+
+/// Embeddings computed without holding the shared matcher lock.
+///
+/// [`PreparedEmbeddings::embed`] does the CPU-bound work up front;
+/// [`VectorMatcher::warm_prepared`] then only inserts the vectors in one
+/// batched index add.
+#[derive(Default)]
+pub struct PreparedEmbeddings {
+    /// `(scoped key, fingerprint)` per embedded entry, in insertion order.
+    entries: Vec<(String, u64)>,
+    /// Row-major vectors, [`VECTOR_DIM`] floats per entry.
+    vectors: Vec<f32>,
+}
+
+impl PreparedEmbeddings {
+    /// Embed `(scoped key, fingerprint, text)` entries. Tokenless texts are
+    /// skipped, exactly as lazy scoring skips them.
+    pub fn embed<I>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (String, u64, String)>,
+    {
+        let mut prepared = Self::default();
+        for (key, fingerprint, text) in entries {
+            if let Some(vector) = embed_text(&text) {
+                prepared.entries.push((key, fingerprint));
+                prepared.vectors.extend_from_slice(&vector);
+            }
+        }
+        prepared
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn append(&mut self, mut other: Self) {
+        self.entries.append(&mut other.entries);
+        self.vectors.append(&mut other.vectors);
+    }
+}
+
 /// Quantized lexical index over scoped document keys.
 ///
-/// Entries are maintained lazily: `score_map` (re-)embeds whatever
-/// candidates it is handed, fingerprinting content so text edits re-embed
-/// on the next search. Stale entries for deleted documents stay in the
-/// index but are unreachable — scoring is always allowlist-restricted to
+/// Entries are maintained lazily: scoring (re-)embeds whatever candidates
+/// it is handed, comparing each candidate's fingerprint so text edits
+/// re-embed on the next search. Stale entries for deleted documents stay in
+/// the index but are unreachable — scoring is always allowlist-restricted to
 /// the live candidate set.
 pub struct VectorMatcher {
     enabled: bool,
@@ -140,6 +192,9 @@ pub struct VectorMatcher {
     index: IdMapIndex,
     entries: HashMap<String, VectorEntry>,
     next_id: u64,
+    /// Warm-ups buffered by a staged-mutation matcher until its mutation
+    /// commits; `None` for a live matcher.
+    deferred: Option<PreparedEmbeddings>,
 }
 
 impl VectorMatcher {
@@ -150,6 +205,16 @@ impl VectorMatcher {
             config.vector_match_doc_weight,
             config.vector_match_min_score,
         )
+    }
+
+    /// A matcher for a staged (uncommitted) mutation. Warm-ups are buffered
+    /// instead of indexed; the committing store moves them into the live
+    /// matcher with [`Self::take_deferred_warm`] only after every planned
+    /// write is durable, so a rejected mutation has no live side effects.
+    pub fn deferred_from_config(config: &Config) -> Self {
+        let mut matcher = Self::from_config(config);
+        matcher.deferred = Some(PreparedEmbeddings::default());
+        matcher
     }
 
     pub fn new(enabled: bool, weight: f32, doc_weight: f32, min_score: f32) -> Self {
@@ -170,11 +235,12 @@ impl VectorMatcher {
             index,
             entries: HashMap::new(),
             next_id: 1,
+            deferred: None,
         }
     }
 
     /// Pre-embed entries at save time so the first search after an ingest
-    /// does not pay the embedding cost. Functionally optional — `score_map`
+    /// does not pay the embedding cost. Functionally optional — scoring
     /// lazily embeds anything missing or stale.
     pub fn warm<I>(&mut self, entries: I)
     where
@@ -183,7 +249,59 @@ impl VectorMatcher {
         if !self.enabled {
             return;
         }
-        let _ = self.ensure_embedded(entries);
+        self.warm_prepared(PreparedEmbeddings::embed(entries.into_iter().map(
+            |(key, text)| {
+                let fingerprint = text_fingerprint(&text);
+                (key, fingerprint, text)
+            },
+        )));
+    }
+
+    /// Apply warm-up embeddings prepared outside the matcher lock. Entries
+    /// whose fingerprint is already current are skipped and the last entry
+    /// wins when a batch repeats a key. A deferred matcher buffers them.
+    pub fn warm_prepared(&mut self, prepared: PreparedEmbeddings) {
+        if !self.enabled || prepared.is_empty() {
+            return;
+        }
+        if let Some(buffer) = self.deferred.as_mut() {
+            buffer.append(prepared);
+            return;
+        }
+        let PreparedEmbeddings { entries, vectors } = prepared;
+        let mut last_position = HashMap::with_capacity(entries.len());
+        for (position, (key, _)) in entries.iter().enumerate() {
+            last_position.insert(key.as_str(), position);
+        }
+        let mut pending_vectors = Vec::new();
+        let mut pending = Vec::new();
+        for (position, (key, fingerprint)) in entries.iter().enumerate() {
+            if last_position.get(key.as_str()) != Some(&position) {
+                continue;
+            }
+            match self.entries.get(key) {
+                Some(entry) if entry.fingerprint == *fingerprint => continue,
+                Some(entry) => {
+                    self.index.remove(entry.id);
+                    self.entries.remove(key);
+                }
+                None => {}
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            pending_vectors
+                .extend_from_slice(&vectors[position * VECTOR_DIM..(position + 1) * VECTOR_DIM]);
+            pending.push((key.clone(), id, *fingerprint));
+        }
+        self.add_batch(&pending_vectors, pending);
+    }
+
+    /// Drain the warm-ups buffered by a deferred matcher.
+    pub fn take_deferred_warm(&mut self) -> PreparedEmbeddings {
+        self.deferred
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Score `candidates` (scoped key, text) against `query`.
@@ -197,7 +315,7 @@ impl VectorMatcher {
     where
         I: IntoIterator<Item = (String, String)>,
     {
-        self.score_map_with_weight(query, candidates, self.weight)
+        self.score_text_with_weight(query, candidates, self.weight)
     }
 
     /// Like [`Self::score_map`], stamped with the document-level blend
@@ -207,10 +325,37 @@ impl VectorMatcher {
     where
         I: IntoIterator<Item = (String, String)>,
     {
-        self.score_map_with_weight(query, candidates, self.doc_weight)
+        self.score_text_with_weight(query, candidates, self.doc_weight)
     }
 
-    fn score_map_with_weight<I>(
+    /// Score `(scoped key, fingerprint, text)` candidates against a query
+    /// the caller embedded with [`embed_text`] before taking the matcher
+    /// lock. A candidate's `text` closure runs only when its embedding is
+    /// missing or its fingerprint is stale, so current entries never build
+    /// or hash their text.
+    pub fn score_embedded<I, F>(&mut self, query_vector: &[f32], candidates: I) -> VectorScoreMap
+    where
+        I: IntoIterator<Item = (String, u64, F)>,
+        F: FnOnce() -> String,
+    {
+        self.score_embedded_with_weight(query_vector, candidates, self.weight)
+    }
+
+    /// Like [`Self::score_embedded`], stamped with the document-level blend
+    /// weight.
+    pub fn doc_score_embedded<I, F>(
+        &mut self,
+        query_vector: &[f32],
+        candidates: I,
+    ) -> VectorScoreMap
+    where
+        I: IntoIterator<Item = (String, u64, F)>,
+        F: FnOnce() -> String,
+    {
+        self.score_embedded_with_weight(query_vector, candidates, self.doc_weight)
+    }
+
+    fn score_text_with_weight<I>(
         &mut self,
         query: &str,
         candidates: I,
@@ -225,6 +370,29 @@ impl VectorMatcher {
         let Some(query_vector) = embed_text(query) else {
             return VectorScoreMap::default();
         };
+        self.score_embedded_with_weight(
+            &query_vector,
+            candidates.into_iter().map(|(key, text)| {
+                let fingerprint = text_fingerprint(&text);
+                (key, fingerprint, move || text)
+            }),
+            weight,
+        )
+    }
+
+    fn score_embedded_with_weight<I, F>(
+        &mut self,
+        query_vector: &[f32],
+        candidates: I,
+        weight: f32,
+    ) -> VectorScoreMap
+    where
+        I: IntoIterator<Item = (String, u64, F)>,
+        F: FnOnce() -> String,
+    {
+        if !self.enabled {
+            return VectorScoreMap::default();
+        }
 
         let (key_by_id, allowlist) = self.ensure_embedded(candidates);
         if allowlist.is_empty() {
@@ -233,7 +401,7 @@ impl VectorMatcher {
 
         let (scores, ids) =
             self.index
-                .search_with_allowlist(&query_vector, allowlist.len(), Some(&allowlist));
+                .search_with_allowlist(query_vector, allowlist.len(), Some(&allowlist));
         let mut map = HashMap::with_capacity(ids.len());
         for (score, id) in scores.into_iter().zip(ids) {
             if let Some(key) = key_by_id.get(&id) {
@@ -249,26 +417,24 @@ impl VectorMatcher {
 
     /// Ensure every candidate has a current embedding; returns the id→key
     /// map plus the allowlist covering exactly the candidate set.
-    fn ensure_embedded<I>(&mut self, candidates: I) -> (HashMap<u64, String>, Vec<u64>)
+    fn ensure_embedded<I, F>(&mut self, candidates: I) -> (HashMap<u64, String>, Vec<u64>)
     where
-        I: IntoIterator<Item = (String, String)>,
+        I: IntoIterator<Item = (String, u64, F)>,
+        F: FnOnce() -> String,
     {
-        // Batch new/stale embeddings into one add so turbovec's first-add
-        // TQ+ calibration sees the whole corpus, not a single vector.
         let mut pending_vectors: Vec<f32> = Vec::new();
         let mut pending: Vec<(String, u64, u64)> = Vec::new(); // (key, id, fingerprint)
         let mut key_by_id: HashMap<u64, String> = HashMap::new();
         let mut allowlist: Vec<u64> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        for (key, text) in candidates {
+        for (key, fingerprint, text) in candidates {
             if !seen.insert(key.clone()) {
                 continue;
             }
-            let fingerprint = fnv1a64(text.as_bytes());
             match self.entries.get(&key) {
                 Some(entry) if entry.fingerprint == fingerprint => {
-                    key_by_id.insert(entry.id, key.clone());
+                    key_by_id.insert(entry.id, key);
                     allowlist.push(entry.id);
                     continue;
                 }
@@ -278,7 +444,7 @@ impl VectorMatcher {
                 }
                 None => {}
             }
-            let Some(vector) = embed_text(&text) else {
+            let Some(vector) = embed_text(&text()) else {
                 continue;
             };
             let id = self.next_id;
@@ -287,37 +453,60 @@ impl VectorMatcher {
             pending.push((key, id, fingerprint));
         }
 
-        if !pending.is_empty() {
-            let ids: Vec<u64> = pending.iter().map(|(_, id, _)| *id).collect();
-            match self.index.add_with_ids(&pending_vectors, &ids) {
-                Ok(()) => {
-                    for (key, id, fingerprint) in pending {
-                        key_by_id.insert(id, key.clone());
-                        allowlist.push(id);
-                        self.entries.insert(key, VectorEntry { id, fingerprint });
-                    }
-                }
-                Err(error) => {
-                    // Vector matching is an enhancement layer over
-                    // text_score; degrade to text-only rather than failing
-                    // the search.
-                    let diagnostic = safe_cause_diagnostic(&error);
-                    tracing::warn!(
-                        target: "nowledge::vector_match",
-                        cause_category = diagnostic.category,
-                        cause_fingerprint = %diagnostic.fingerprint,
-                        "vector index add failed; text-only scoring"
-                    );
-                }
+        for (key, id) in self.add_batch(&pending_vectors, pending) {
+            key_by_id.insert(id, key);
+            allowlist.push(id);
+        }
+        (key_by_id, allowlist)
+    }
+
+    /// Index one batch of new embeddings and return the `(key, id)` pairs
+    /// added. Batching lets turbovec's first-add TQ+ calibration see the
+    /// whole corpus, not a single vector.
+    fn add_batch(
+        &mut self,
+        vectors: &[f32],
+        pending: Vec<(String, u64, u64)>,
+    ) -> Vec<(String, u64)> {
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        let ids: Vec<u64> = pending.iter().map(|(_, id, _)| *id).collect();
+        match self.index.add_with_ids(vectors, &ids) {
+            Ok(()) => pending
+                .into_iter()
+                .map(|(key, id, fingerprint)| {
+                    self.entries
+                        .insert(key.clone(), VectorEntry { id, fingerprint });
+                    (key, id)
+                })
+                .collect(),
+            Err(error) => {
+                // Vector matching is an enhancement layer over
+                // text_score; degrade to text-only rather than failing
+                // the search.
+                let diagnostic = safe_cause_diagnostic(&error);
+                tracing::warn!(
+                    target: "nowledge::vector_match",
+                    cause_category = diagnostic.category,
+                    cause_fingerprint = %diagnostic.fingerprint,
+                    "vector index add failed; text-only scoring"
+                );
+                Vec::new()
             }
         }
-
-        (key_by_id, allowlist)
     }
 
     #[cfg(test)]
     fn indexed_len(&self) -> usize {
         self.index.len()
+    }
+
+    /// Live index entries and the total number of embeddings ever indexed
+    /// (re-embeds included), for store-level tests.
+    #[cfg(test)]
+    pub(crate) fn embedding_stats(&self) -> (usize, u64) {
+        (self.index.len(), self.next_id - 1)
     }
 }
 
@@ -529,6 +718,95 @@ mod tests {
         assert_eq!(matcher.indexed_len(), 1);
         matcher.warm(candidates(&[("idx|ctx://doc", "updated pipeline runbook")]));
         assert_eq!(matcher.indexed_len(), 1);
+    }
+
+    #[test]
+    fn deferred_matcher_buffers_warm_ups_until_the_live_matcher_takes_them() {
+        let mut staged = VectorMatcher::deferred_from_config(&Config::test());
+        staged.warm(candidates(&[("idx|ctx://doc", "deploy pipeline runbook")]));
+        assert_eq!(staged.indexed_len(), 0, "staged warm-ups are not indexed");
+
+        let mut live = VectorMatcher::new(true, 4.0, 2.0, 0.25);
+        let buffered = staged.take_deferred_warm();
+        assert_eq!(buffered.len(), 1);
+        live.warm_prepared(buffered);
+        assert_eq!(live.embedding_stats(), (1, 1));
+        assert!(staged.take_deferred_warm().is_empty());
+
+        // Re-warming the committed fingerprint is a no-op.
+        live.warm(candidates(&[("idx|ctx://doc", "deploy pipeline runbook")]));
+        assert_eq!(live.embedding_stats(), (1, 1));
+    }
+
+    #[test]
+    fn prepared_warm_skips_tokenless_text_and_keeps_the_last_duplicate_key() {
+        let mut matcher = VectorMatcher::new(true, 4.0, 2.0, 0.25);
+        let prepared = PreparedEmbeddings::embed([
+            (
+                "idx|ctx://doc".to_string(),
+                1,
+                "team lunch menu".to_string(),
+            ),
+            (
+                "idx|ctx://doc".to_string(),
+                2,
+                "deploy pipeline runbook for staging".to_string(),
+            ),
+            ("idx|ctx://empty".to_string(), 3, "?!".to_string()),
+        ]);
+        assert_eq!(prepared.len(), 2, "tokenless text is skipped");
+        matcher.warm_prepared(prepared);
+        assert_eq!(matcher.embedding_stats(), (1, 1));
+
+        let query = embed_text("deployment pipelines").expect("embeds");
+        let map = matcher.score_embedded(
+            &query,
+            [("idx|ctx://doc".to_string(), 2, || -> String {
+                panic!("a current embedding must not rebuild its text")
+            })],
+        );
+        let score = map.vector_score("idx|ctx://doc").expect("scored");
+        assert!(score >= 0.25, "the last duplicate was kept, got {score}");
+    }
+
+    #[test]
+    fn fingerprinted_candidates_build_text_only_when_missing_or_stale() {
+        let mut matcher = VectorMatcher::new(true, 4.0, 2.0, 0.25);
+        let query = embed_text("deployment pipelines").expect("embeds");
+        let key = "doc|idx|ctx://doc".to_string();
+        let first = matcher
+            .doc_score_embedded(
+                &query,
+                [(key.clone(), 7, || {
+                    "deploy pipeline runbook for staging".to_string()
+                })],
+            )
+            .vector_score(&key)
+            .expect("scored");
+        let reused = matcher
+            .doc_score_embedded(
+                &query,
+                [(key.clone(), 7, || -> String {
+                    panic!("a current embedding must not rebuild its text")
+                })],
+            )
+            .vector_score(&key)
+            .expect("scored");
+        assert_eq!(first, reused);
+        let rebuilt = matcher
+            .doc_score_embedded(
+                &query,
+                [(key.clone(), 8, || {
+                    "team lunch menu and seating chart".to_string()
+                })],
+            )
+            .vector_score(&key)
+            .expect("scored");
+        assert!(
+            rebuilt < first,
+            "stale fingerprint re-embeds: {rebuilt} >= {first}"
+        );
+        assert_eq!(matcher.embedding_stats(), (1, 2));
     }
 
     #[test]
