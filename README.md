@@ -568,6 +568,10 @@ keeps a 256-character snippet). The cause category comes from the Meilisearch
 `code` when present. `nowledge::meili` warnings log only the HTTP status, the
 Meilisearch code and type, and the cause category and keyed fingerprint, never
 the message, body, headers, or API keys.
+A search that Meilisearch answers with `index_not_found` is empty only for the
+per-user event and personal-context indexes, which are created on a user's
+first write. A missing fixed index, or a 404 without `index_not_found`, fails
+as an upstream error instead of returning no hits.
 Multipart uploads are staged with a generated private filename, incrementally
 hashed, and deleted after parsing or on cancellation/error. Duplicate file
 parts, excess metadata fields, an empty file, invalid or disallowed MIME values,

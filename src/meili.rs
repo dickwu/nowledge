@@ -59,6 +59,16 @@ const MEILI_TASK_POLL_MAX: Duration = Duration::from_millis(200);
 /// Upper bound on task UIDs per `GET /tasks?uids=...` status request.
 const MEILI_TASK_BATCH_MAX_UIDS: usize = 100;
 const DURABLE_FIXED_INDEXES: [&str; 2] = ["rag_operations", "rag_audit_records"];
+/// UID prefixes of the per-user event and personal-context indexes that
+/// `EventIndexResolver` derives. Unlike every [`FIXED_INDEXES`] entry, they
+/// are created lazily on a user's first write.
+const LAZILY_CREATED_INDEX_PREFIXES: [&str; 2] = ["rag_events__t_", "rag_context__t_"];
+
+fn is_lazily_created_index(index_uid: &str) -> bool {
+    LAZILY_CREATED_INDEX_PREFIXES
+        .iter()
+        .any(|prefix| index_uid.starts_with(prefix))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DurableIndexIdentity {
@@ -1042,6 +1052,7 @@ impl MeiliAdmin {
             .map_err(meili_transport_error)?;
 
         if response.status().as_u16() == 404 {
+            self.require_search_index(index_uid, response).await?;
             return Ok(SearchResponse {
                 hits: Vec::new(),
                 processing_time_ms: 0,
@@ -1217,6 +1228,7 @@ impl MeiliAdmin {
             .map_err(meili_transport_error)?;
 
         if response.status().as_u16() == 404 {
+            self.require_search_index(index_uid, response).await?;
             return Ok(json!({ "hits": [] }));
         }
         if response.status().is_success() {
@@ -1454,6 +1466,33 @@ impl MeiliAdmin {
         let status = response.status();
         let details = self.error_details(response).await;
         meili_status_error(context, status, &details)
+    }
+
+    /// Classify a 404 from `/indexes/{uid}/search`.
+    ///
+    /// Per-user event and personal-context indexes are created on a user's
+    /// first write, so Meilisearch's `index_not_found` for one of them is the
+    /// legitimate "no history yet" state and the search is empty. Every fixed
+    /// index is provisioned by startup reconciliation, so its absence (like
+    /// any 404 that is not `index_not_found`) is an upstream error instead of
+    /// silently empty retrieval.
+    async fn require_search_index(
+        &self,
+        index_uid: &str,
+        response: reqwest::Response,
+    ) -> Result<(), ApiError> {
+        let status = response.status();
+        let details = self.error_details(response).await;
+        let index_not_found = details.code.as_deref() == Some("index_not_found");
+        if index_not_found && is_lazily_created_index(index_uid) {
+            return Ok(());
+        }
+        let context = if index_not_found {
+            format!("required Meilisearch index {index_uid} is missing during search")
+        } else {
+            format!("failed to search Meilisearch index {index_uid}")
+        };
+        Err(meili_status_error(context, status, &details))
     }
 
     /// Private cause for a failed or canceled task. Only the task's bounded
@@ -2223,6 +2262,94 @@ mod tests {
         ] {
             assert!(!rendered.contains(private), "leaked {private}: {rendered}");
         }
+    }
+
+    async fn missing_index_search_stub(request: Request) -> Response {
+        if request.uri().path().contains("__u_proxy") {
+            // A 404 that is not Meilisearch's index_not_found (for example a
+            // misrouted reverse proxy) cannot prove the index is unprovisioned.
+            return (StatusCode::NOT_FOUND, "<html>Not Found</html>").into_response();
+        }
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({
+                "message": "Index `missing` not found.",
+                "code": "index_not_found",
+                "type": "invalid_request",
+                "link": "https://docs.meilisearch.com/errors#index_not_found"
+            })),
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn search_404_is_empty_only_for_lazily_created_user_indexes() {
+        let app = Router::new().fallback(missing_index_search_stub);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let admin = admin_for(format!("http://{address}"));
+        let query = json!({ "q": "" });
+
+        let events = admin
+            .search::<Value>(
+                "rag_events__t_0123456789ab__u_0123456789abcdef",
+                query.clone(),
+            )
+            .await
+            .expect("a user without history has no event index yet");
+        assert!(events.hits.is_empty());
+        let context = admin
+            .search_value(
+                "rag_context__t_0123456789ab__u_0123456789abcdef",
+                query.clone(),
+            )
+            .await
+            .expect("a user without personal context has no context index yet");
+        assert_eq!(context, json!({ "hits": [] }));
+
+        for index_uid in FIXED_INDEXES {
+            let error = admin
+                .search::<Value>(index_uid, query.clone())
+                .await
+                .map(|_| ())
+                .expect_err("a missing fixed index must not look like an empty result");
+            assert_eq!(
+                crate::error::safe_cause_diagnostic(&error).category,
+                "not_found"
+            );
+            let cause = upstream_cause(error);
+            assert!(
+                cause.starts_with(&format!(
+                    "required Meilisearch index {index_uid} is missing during search: status 404"
+                )),
+                "{cause}"
+            );
+            assert!(cause.contains("meili_code=index_not_found"), "{cause}");
+        }
+        let error = admin
+            .search_value("rag_company_context", query.clone())
+            .await
+            .expect_err("raw searches of a missing fixed index fail too");
+        assert!(
+            error
+                .to_string()
+                .contains("rag_company_context is missing during search"),
+            "{error}"
+        );
+
+        let error = admin
+            .search::<Value>("rag_events__t_0123456789ab__u_proxy", query)
+            .await
+            .map(|_| ())
+            .expect_err("a 404 without index_not_found is not an unprovisioned index");
+        let cause = upstream_cause(error);
+        assert!(
+            cause.starts_with("failed to search Meilisearch index rag_events__t_0123456789ab__u_proxy: status 404"),
+            "{cause}"
+        );
     }
 
     async fn spawn_task_stub(
