@@ -16,6 +16,7 @@ use crate::{
     metrics::Metrics,
     models::*,
     mutation::{
+        compact_settled_operation, operation_is_compacted, operation_is_settled,
         operation_list_item, operation_record_from_plan, operation_step_accepted,
         operation_step_completed, operation_step_failed, operation_summary, persistence_metadata,
         validate_operation_record, OPERATION_PLAN_SCHEMA_VERSION,
@@ -35,7 +36,9 @@ use crate::{
         mask_secret_fragment_projection_preserving_chars, new_id, now, require_string,
         sanitize_slug, text_score, truncate_chars,
     },
-    vector_match::{VectorMatcher, VectorScoreMap},
+    vector_match::{
+        embed_text, text_fingerprint, PreparedEmbeddings, VectorMatcher, VectorScoreMap,
+    },
 };
 
 #[path = "store_accessors.rs"]
@@ -170,7 +173,55 @@ struct StoreData {
     eval_overviews: HashMap<String, RagEvalOverview>,
 }
 
+impl StoreData {
+    /// Insert one journal-form operation record and evict the oldest settled
+    /// records beyond [`MAX_IN_MEMORY_SETTLED_OPERATIONS`]. The record just
+    /// inserted and every unfinished record are always retained.
+    fn cache_operation(&mut self, record: OperationRecord) {
+        let record_id = record.id.clone();
+        let settled = operation_is_settled(&record);
+        self.operations.insert(record_id.clone(), record);
+        if !settled || self.operations.len() <= MAX_IN_MEMORY_SETTLED_OPERATIONS {
+            return;
+        }
+        loop {
+            let mut settled_count = 0_usize;
+            let mut oldest: Option<(chrono::DateTime<chrono::Utc>, &String)> = None;
+            for (id, operation) in &self.operations {
+                if !operation_is_settled(operation) {
+                    continue;
+                }
+                settled_count += 1;
+                let settled_at = operation.completed_at.unwrap_or(operation.updated_at);
+                if *id != record_id
+                    && oldest.is_none_or(|(oldest_at, oldest_id)| {
+                        (settled_at, id) < (oldest_at, oldest_id)
+                    })
+                {
+                    oldest = Some((settled_at, id));
+                }
+            }
+            let Some(oldest_id) = oldest
+                .filter(|_| settled_count > MAX_IN_MEMORY_SETTLED_OPERATIONS)
+                .map(|(_, id)| id.clone())
+            else {
+                return;
+            };
+            self.operations.remove(&oldest_id);
+            if settled_count - 1 <= MAX_IN_MEMORY_SETTLED_OPERATIONS {
+                return;
+            }
+        }
+    }
+}
+
 const MAX_IN_MEMORY_AUDIT_RECORDS: usize = 10_000;
+/// Settled (completed and confirmed searchable) operation records kept in
+/// the process journal cache. Older settled records are evicted and remain
+/// readable through the durable repository journal (the memory backend keeps
+/// no journal, so its replay window is this bound). Unfinished records are
+/// never evicted because reconciliation replays their complete plans.
+const MAX_IN_MEMORY_SETTLED_OPERATIONS: usize = 10_000;
 /// Recently recorded or read-through traces kept in process. Older traces
 /// remain readable by id through the repository.
 const MAX_CACHED_TRACES: usize = 10_000;
@@ -1155,8 +1206,10 @@ impl Store {
         staged.mutation_gate = Arc::new(tokio::sync::Mutex::new(()));
         // Vector warming is an optional performance projection. A staged
         // mutation must not share it with the live store because a rejected
-        // primary write must have no live side effects.
-        staged.vector = Arc::new(Mutex::new(VectorMatcher::from_config(
+        // primary write must have no live side effects: its warm-ups are
+        // buffered and applied to the live matcher only after commit (see
+        // `apply_staged_vector_warm`).
+        staged.vector = Arc::new(Mutex::new(VectorMatcher::deferred_from_config(
             &self.redaction_config,
         )));
         Ok(staged)
@@ -1829,8 +1882,48 @@ impl Store {
         )
     }
 
+    /// The bounded form in which an operation record is journaled and
+    /// cached: settled records drop their content bodies and keep per-step
+    /// payload sizes and keyed fingerprints instead.
+    fn journal_operation_form(
+        &self,
+        record: &OperationRecord,
+    ) -> Result<OperationRecord, ApiError> {
+        let secret = &self.redaction_config.index_hash_secret;
+        compact_settled_operation(record, |payload| {
+            format!(
+                "hmac:{}",
+                hmac_hex(secret, "operation-payload-v1", payload, 32)
+            )
+        })
+        .map(|compacted| compacted.unwrap_or_else(|| record.clone()))
+        .map_err(|error| ApiError::Internal(format!("invalid operation compaction: {error}")))
+    }
+
+    /// Cache an operation record in its journal form. A settled record is
+    /// terminal, so an already compacted cache entry for it stays current.
+    fn cache_operation_locked(
+        &self,
+        data: &mut StoreData,
+        record: &OperationRecord,
+    ) -> Result<(), ApiError> {
+        if operation_is_settled(record)
+            && data
+                .operations
+                .get(&record.id)
+                .is_some_and(operation_is_compacted)
+        {
+            return Ok(());
+        }
+        data.cache_operation(self.journal_operation_form(record)?);
+        Ok(())
+    }
+
     async fn persist_operation_checkpoint(&self, record: &OperationRecord) -> Result<(), ApiError> {
-        let receipt = self.repository.upsert_operation(record).await?;
+        // The caller keeps the complete record for its own cache publication;
+        // only the bounded journal form is persisted and cached.
+        let journaled = self.journal_operation_form(record)?;
+        let receipt = self.repository.upsert_operation(&journaled).await?;
         if let Err(error) = self
             .wait_for_repository_tasks(&receipt.task_uids, "durable_write")
             .await
@@ -1841,15 +1934,13 @@ impl Store {
             // checkpoint, retaining the pending immutable plan prevents a
             // same-process retry from constructing a different plan under the
             // deterministic operation ID without overstating durability.
-            self.write()?
-                .operations
-                .entry(record.id.clone())
-                .or_insert_with(|| record.clone());
+            let mut data = self.write()?;
+            if !data.operations.contains_key(&journaled.id) {
+                data.cache_operation(journaled);
+            }
             return Err(error);
         }
-        self.write()?
-            .operations
-            .insert(record.id.clone(), record.clone());
+        self.write()?.cache_operation(journaled);
         Ok(())
     }
 
@@ -1883,9 +1974,7 @@ impl Store {
             // Preserve the explicit failure locally even when the journal
             // checkpoint itself is unavailable, so the accepted primary is
             // never reported back as an unqualified generic error.
-            self.write()?
-                .operations
-                .insert(failed.id.clone(), failed.clone());
+            self.write()?.cache_operation(failed.clone());
         }
         Err(error)
     }
@@ -1974,9 +2063,12 @@ impl Store {
             .find(|step| step.id == step_id)
             .ok_or_else(|| ApiError::Internal(format!("operation step {step_id} is missing")))?;
         let mut current = self.write()?;
-        Self::publish_resource_cache(&mut current, staged, &record.tenant_id, &step.resource);
-        current.operations.insert(record.id.clone(), record.clone());
-        Ok(())
+        // A compacted (settled) record was already published when it
+        // completed and no longer carries content bodies to project.
+        if !operation_is_compacted(record) {
+            Self::publish_resource_cache(&mut current, staged, &record.tenant_id, &step.resource);
+        }
+        self.cache_operation_locked(&mut current, record)
     }
 
     fn publish_operation_cache(
@@ -1985,11 +2077,18 @@ impl Store {
         record: &OperationRecord,
     ) -> Result<(), ApiError> {
         let mut current = self.write()?;
-        for step in std::iter::once(&record.plan.primary).chain(record.plan.side_effects.iter()) {
-            Self::publish_resource_cache(&mut current, staged, &record.tenant_id, &step.resource);
+        if !operation_is_compacted(record) {
+            for step in std::iter::once(&record.plan.primary).chain(record.plan.side_effects.iter())
+            {
+                Self::publish_resource_cache(
+                    &mut current,
+                    staged,
+                    &record.tenant_id,
+                    &step.resource,
+                );
+            }
         }
-        current.operations.insert(record.id.clone(), record.clone());
-        Ok(())
+        self.cache_operation_locked(&mut current, record)
     }
 
     /// Project one durably accepted operation resource into the live cache.
@@ -2692,6 +2791,7 @@ impl Store {
         if buffer_publication {
             self.publish_operation_cache(&after, &record)?;
         }
+        self.apply_staged_vector_warm(&staged);
         Ok((response, Some(persistence_metadata(&record))))
     }
 
@@ -2747,30 +2847,95 @@ impl Store {
         })
     }
 
-    /// Per-query turbovec scores for candidate fragments.
+    /// Embed a search query before the shared matcher lock is taken.
+    /// `None` (the legacy text-only score map) when vector matching is
+    /// disabled or the query has no tokens.
+    fn vector_query(&self, query: &str) -> Option<Vec<f32>> {
+        if !self.redaction_config.vector_match_enabled {
+            return None;
+        }
+        embed_text(query)
+    }
+
+    /// Per-query turbovec scores for candidate fragments. The query
+    /// embedding and the bounded fragment texts and fingerprints are built
+    /// before the shared matcher lock is taken.
     fn vector_score_map(&self, query: &str, nodes: &[ContextNode]) -> VectorScoreMap {
-        self.vector_matcher().score_map(
-            query,
-            nodes
-                .iter()
-                .map(|node| (vector_match_key(node), node_match_text(node))),
+        let Some(query_vector) = self.vector_query(query) else {
+            return VectorScoreMap::default();
+        };
+        let candidates = nodes
+            .iter()
+            .map(|node| {
+                let text = node_match_text(node);
+                (vector_match_key(node), text_fingerprint(&text), text)
+            })
+            .collect::<Vec<_>>();
+        self.vector_matcher().score_embedded(
+            &query_vector,
+            candidates
+                .into_iter()
+                .map(|(key, fingerprint, text)| (key, fingerprint, move || text)),
         )
     }
 
     /// Document-level vector scores for the source documents referenced by
-    /// a candidate set; candidates come from [`doc_candidates_locked`].
+    /// `nodes` (see [`doc_candidates_locked`]). Documents are versioned by
+    /// [`source_document_vector_fingerprint`], so a search neither copies
+    /// nor hashes whole bodies; the masked match text is only built when a
+    /// document's embedding is missing or stale.
     fn vector_doc_score_map(
         &self,
         query: &str,
-        candidates: Vec<(String, String)>,
+        data: &StoreData,
+        nodes: &[ContextNode],
     ) -> VectorScoreMap {
-        self.vector_matcher().doc_score_map(query, candidates)
+        let Some(query_vector) = self.vector_query(query) else {
+            return VectorScoreMap::default();
+        };
+        let candidates = doc_candidates_locked(data, nodes)
+            .into_iter()
+            .map(|(key, document)| {
+                let fingerprint = source_document_vector_fingerprint(document);
+                (key, fingerprint, document)
+            })
+            .collect::<Vec<_>>();
+        let secrets = std::cell::OnceCell::new();
+        let secrets = &secrets;
+        self.vector_matcher().doc_score_embedded(
+            &query_vector,
+            candidates.into_iter().map(|(key, fingerprint, document)| {
+                (key, fingerprint, move || {
+                    source_document_match_text(
+                        document,
+                        secrets.get_or_init(|| self.redaction_config.configured_secret_values()),
+                    )
+                })
+            }),
+        )
     }
 
-    /// Pre-embed saved documents and fragments. Best-effort warm-up: the
-    /// scoring paths lazily embed anything this missed or that predates it.
-    fn vector_warm(&self, entries: Vec<(String, String)>) {
-        self.vector_matcher().warm(entries);
+    /// Pre-embed saved documents and fragments from `(scoped key,
+    /// fingerprint, text)` entries. Best-effort warm-up: the scoring paths
+    /// lazily embed anything this missed or that predates it. Embeddings
+    /// are computed before the matcher lock is taken; a staged copy's
+    /// deferred matcher buffers them until the mutation commits.
+    fn vector_warm(&self, entries: Vec<(String, u64, String)>) {
+        if !self.redaction_config.vector_match_enabled {
+            return;
+        }
+        let prepared = PreparedEmbeddings::embed(entries);
+        self.vector_matcher().warm_prepared(prepared);
+    }
+
+    /// Move a committed staged mutation's buffered warm-ups into the live
+    /// matcher. Called only once every planned step is durable and
+    /// published, so rejected or partially failed mutations never warm it.
+    fn apply_staged_vector_warm(&self, staged: &Store) {
+        let prepared = staged.vector_matcher().take_deferred_warm();
+        if !prepared.is_empty() {
+            self.vector_matcher().warm_prepared(prepared);
+        }
     }
 
     pub fn resolver(&self) -> &EventIndexResolver {
@@ -6376,6 +6541,7 @@ impl Store {
             created_at,
             updated_at: now,
         };
+        let document_vector_fingerprint = source_document_vector_fingerprint(&source_document);
         data.source_documents
             .insert(source_document_key.clone(), source_document);
 
@@ -6420,18 +6586,20 @@ impl Store {
 
         // Pre-embed the saved document and its fragments so the first
         // search after a save does not pay the embedding cost. Collected
-        // before the nodes move into the context store; applied after the
-        // write completes (lock order stays data -> vector).
+        // before the nodes move into the context store with the same keys,
+        // fingerprints, and texts the search paths use. Every production
+        // write runs on a staged copy, whose deferred matcher buffers the
+        // embeddings until the mutation commits.
         let mut warm_entries = Vec::with_capacity(nodes.len() + 1);
         warm_entries.push((
             vector_doc_key(index_uid, source_document_uri),
-            format!("{retrieval_title} {retrieval_content}"),
+            document_vector_fingerprint,
+            document_match_text(&retrieval_title, &retrieval_content),
         ));
-        warm_entries.extend(
-            nodes
-                .iter()
-                .map(|node| (vector_match_key(node), node_match_text(node))),
-        );
+        warm_entries.extend(nodes.iter().map(|node| {
+            let text = node_match_text(node);
+            (vector_match_key(node), text_fingerprint(&text), text)
+        }));
 
         if index_kind == "company" {
             upsert_context_nodes(&mut data.company_context, nodes);
@@ -7624,11 +7792,46 @@ fn vector_doc_key(index_uid: &str, source_document_uri: &str) -> String {
     format!("doc|{index_uid}|{source_document_uri}")
 }
 
-/// Collect distinct `(scoped key, title + content)` candidates for the
+/// Document-level vector text: the same secret-masked title and content
+/// projection the fragmenter indexes, so a committed warm-up entry is
+/// exactly what a later search would embed.
+fn document_match_text(title: &str, content: &str) -> String {
+    format!("{title} {content}")
+}
+
+fn source_document_match_text(document: &SourceDocument, secrets: &[String]) -> String {
+    document_match_text(
+        &mask_secret_egress_projection_preserving_chars(&document.title, secrets),
+        &mask_secret_fragment_projection_preserving_chars(&document.content, secrets),
+    )
+}
+
+/// Version fingerprint for a document-level vector entry, derived from
+/// write metadata instead of the body so searches never re-hash whole
+/// documents. Every document write stamps a fresh `updated_at` (revisions
+/// also change the scoped key), so a rewritten body re-embeds on next use;
+/// the checksum, length, and title guard edits that keep the timestamp.
+fn source_document_vector_fingerprint(document: &SourceDocument) -> u64 {
+    text_fingerprint(&format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        document.revision_id,
+        document.checksum,
+        document
+            .updated_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        document.content.len(),
+        document.title,
+    ))
+}
+
+/// Collect distinct `(scoped key, source document)` candidates for the
 /// source documents referenced by `nodes`. Scope safety: `nodes` are
 /// already isolation-filtered and every fragment references its own
 /// document, so the candidate set cannot leave the caller's visibility.
-fn doc_candidates_locked(data: &StoreData, nodes: &[ContextNode]) -> Vec<(String, String)> {
+fn doc_candidates_locked<'a>(
+    data: &'a StoreData,
+    nodes: &[ContextNode],
+) -> Vec<(String, &'a SourceDocument)> {
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
     for node in nodes {
@@ -7650,7 +7853,7 @@ fn doc_candidates_locked(data: &StoreData, nodes: &[ContextNode]) -> Vec<(String
         if document.status != "active" {
             continue;
         }
-        candidates.push((key, format!("{} {}", document.title, document.content)));
+        candidates.push((key, document));
     }
     candidates
 }
@@ -9363,6 +9566,146 @@ mod tests {
         assert!(data.audit_records.contains_key(&newest.id));
     }
 
+    #[tokio::test]
+    async fn settled_operation_journal_keeps_bounded_metadata_instead_of_bodies() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let body = "bounded operation journal body ".repeat(4_096);
+        let response = store
+            .create_revision_async(
+                &config.tenant_id,
+                "journal-size-doc",
+                CreateRevisionRequest {
+                    title: Some("Journal size".to_string()),
+                    content: Some(body.clone()),
+                    ingest: false,
+                    ..CreateRevisionRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let data = store.read().unwrap();
+        let operation = data
+            .operations
+            .values()
+            .find(|operation| operation.operation_kind == "company_revision.create")
+            .expect("the revision mutation is journaled");
+        assert!(operation_is_settled(operation));
+        validate_operation_record(operation).unwrap();
+        let journaled = serde_json::to_string(operation).unwrap();
+        assert!(
+            journaled.len() < 16 * 1024,
+            "settled journal record is {} bytes",
+            journaled.len()
+        );
+        assert!(!journaled.contains("bounded operation journal body"));
+        let digests = &operation.plan.redacted_metadata["compacted_payloads"];
+        assert!(
+            digests["primary"]["bytes"].as_u64().unwrap() > body.len() as u64,
+            "{digests}"
+        );
+        assert!(
+            digests["primary"]["fingerprint"]
+                .as_str()
+                .is_some_and(|fingerprint| fingerprint.starts_with("hmac:")),
+            "{digests}"
+        );
+        match &operation.plan.primary.resource {
+            OperationResource::SourceRevision { revision } => {
+                assert_eq!(revision.id, response.revision_id);
+                assert!(revision.content.is_empty());
+                assert!(!revision.checksum.is_empty());
+            }
+            other => panic!("unexpected primary resource {other:?}"),
+        }
+        // Only the journal is compacted; the published revision keeps its body.
+        assert!(data.source_revisions["journal-size-doc"]
+            .iter()
+            .any(|revision| revision.id == response.revision_id && revision.content == body));
+    }
+
+    fn settled_operation_fixture(
+        tenant_id: &str,
+        operation_id: &str,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> OperationRecord {
+        let record = operation_record_from_plan(OperationPlan {
+            schema_version: OPERATION_PLAN_SCHEMA_VERSION,
+            id: operation_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            operation_kind: "structured_rows.test".to_string(),
+            actor: OperationActor {
+                scope: OperationActorScope::TenantService,
+                owner_user_id_hash: None,
+                roles: Vec::new(),
+                request_id: None,
+            },
+            idempotency_key_hash: None,
+            primary: OperationStep {
+                id: "primary".to_string(),
+                role: OperationStepRole::Primary,
+                resource: OperationResource::StructuredRows {
+                    rows: vec![json!({ "id": format!("{operation_id}-row"), "value": "payload" })],
+                },
+            },
+            side_effects: Vec::new(),
+            redacted_metadata: json!({}),
+            response_snapshot: Value::Null,
+            created_at: completed_at - chrono::Duration::seconds(1),
+        })
+        .unwrap();
+        operation_step_completed(&record, "primary", completed_at).unwrap()
+    }
+
+    #[tokio::test]
+    async fn settled_operation_cache_evicts_the_oldest_settled_record_but_never_unfinished_ones() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let started = now() - chrono::Duration::days(1);
+        let template = settled_operation_fixture(&config.tenant_id, "op-template", started);
+        let unfinished_record = |operation_id: &str| {
+            let mut plan = template.plan.clone();
+            plan.id = operation_id.to_string();
+            operation_record_from_plan(plan).unwrap()
+        };
+        let unfinished = unfinished_record("op-unfinished");
+        {
+            let mut data = store.write().unwrap();
+            data.operations
+                .insert(unfinished.id.clone(), unfinished.clone());
+            for offset in 0..MAX_IN_MEMORY_SETTLED_OPERATIONS {
+                let mut record = template.clone();
+                record.id = format!("op-settled-{offset:05}");
+                record.completed_at = Some(started + chrono::Duration::milliseconds(offset as i64));
+                data.operations.insert(record.id.clone(), record);
+            }
+        }
+
+        let newest = settled_operation_fixture(&config.tenant_id, "op-settled-newest", now());
+        store.persist_operation_checkpoint(&newest).await.unwrap();
+        {
+            let data = store.read().unwrap();
+            assert_eq!(data.operations.len(), MAX_IN_MEMORY_SETTLED_OPERATIONS + 1);
+            assert!(!data.operations.contains_key("op-settled-00000"));
+            assert!(data.operations.contains_key("op-settled-00001"));
+            assert!(data.operations.contains_key(&unfinished.id));
+            assert!(
+                operation_is_compacted(&data.operations[&newest.id]),
+                "settled records are cached in their compacted journal form"
+            );
+        }
+
+        // Unfinished records neither count toward nor trigger the bound.
+        store
+            .persist_operation_checkpoint(&unfinished_record("op-unfinished-2"))
+            .await
+            .unwrap();
+        let data = store.read().unwrap();
+        assert_eq!(data.operations.len(), MAX_IN_MEMORY_SETTLED_OPERATIONS + 2);
+        assert!(!operation_is_compacted(&data.operations["op-unfinished-2"]));
+    }
+
     #[test]
     fn direct_insight_patch_cannot_cross_tenants() {
         let config = Config::test();
@@ -10670,6 +11013,53 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn committed_document_warm_up_reaches_the_live_vector_matcher() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let tenant_id = config.tenant_id.as_str();
+        let created = store
+            .create_revision_async(
+                tenant_id,
+                "warm-runbook",
+                CreateRevisionRequest {
+                    title: Some("Deployment runbook".to_string()),
+                    content: Some(
+                        "Deploy the pipeline to staging, then verify the rollout dashboards."
+                            .to_string(),
+                    ),
+                    ingest: false,
+                    ..CreateRevisionRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.vector_matcher().embedding_stats(), (0, 0));
+
+        store
+            .activate_revision_async(
+                tenant_id,
+                "warm-runbook",
+                &created.revision_id,
+                ActivateRevisionRequest::default(),
+            )
+            .await
+            .unwrap();
+        let warmed = store.vector_matcher().embedding_stats();
+        assert!(
+            warmed.0 >= 2,
+            "the committed document and fragment warm-ups reach the live matcher: {warmed:?}"
+        );
+
+        // Searching the committed fragments and their document reuses the
+        // warm entries: nothing is embedded or re-embedded at query time.
+        let search = store
+            .debug_meili_search(tenant_id, "rag_company_context", "deploy pipeline staging")
+            .unwrap();
+        assert!(!search["hits"].as_array().unwrap().is_empty(), "{search}");
+        assert_eq!(store.vector_matcher().embedding_stats(), warmed);
+    }
+
     #[test]
     fn document_vector_candidates_resolve_source_by_node_scope() {
         let config = Config::test();
@@ -10710,8 +11100,8 @@ mod tests {
         let data = store.read().unwrap();
         let candidates = doc_candidates_locked(&data, &[owner_a_node]);
         assert_eq!(candidates.len(), 1);
-        assert!(candidates[0].1.contains("owner-a-vector-marker"));
-        assert!(!candidates[0].1.contains("owner-b-vector-marker"));
+        assert!(candidates[0].1.content.contains("owner-a-vector-marker"));
+        assert!(!candidates[0].1.content.contains("owner-b-vector-marker"));
     }
 
     #[test]

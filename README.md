@@ -229,6 +229,17 @@ require deleting it. See
 [ADR 0006](doc/adr/0006-mutation-consistency.md) for consistency and recovery
 semantics.
 
+Unfinished journal records keep their complete replay plan so reconciliation
+can re-apply pending steps. Once an operation is completed and confirmed
+searchable, its final checkpoint is compacted: content bodies (document text,
+fragment bodies, event text/payloads, row values, parsed blocks) are cleared
+while ids, routing, ownership, checksums, deletion targets, the response
+snapshot used for idempotent replay, and per-step payload sizes plus keyed
+fingerprints (`plan.redacted_metadata.compacted_payloads`) are kept. The
+process keeps at most 10,000 settled records in memory; older ones stay
+readable through the durable journal (the memory backend has no journal, so
+its replay window is that bound).
+
 The operation journal currently requires one writer process per tenant.
 Do not run active-active Nowledge writer replicas against the same tenant until
 a durable lease or compare-and-set protocol is introduced; the in-process

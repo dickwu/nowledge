@@ -83,7 +83,7 @@ impl Store {
                 .collect()
         };
         let vector_scores = self.vector_score_map(query, &nodes);
-        let doc_scores = self.vector_doc_score_map(query, doc_candidates_locked(&data, &nodes));
+        let doc_scores = self.vector_doc_score_map(query, &data, &nodes);
         let hits = rank_nodes(nodes.into_iter(), query, 20, &vector_scores, &doc_scores)
             .into_iter()
             .map(|(node, score)| {

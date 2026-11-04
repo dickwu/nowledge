@@ -152,8 +152,10 @@ pub enum CompanySourceDeleteTarget {
 }
 
 /// A complete, replayable description of one persistence mutation. The
-/// operation plan is immutable after it is journaled; only OperationProgress
-/// changes as individual steps are submitted, confirmed, or retried.
+/// operation plan is immutable while the operation is unfinished; only
+/// OperationProgress changes as individual steps are submitted, confirmed, or
+/// retried. Once settled, the journal keeps a compacted plan without content
+/// bodies (see `mutation::compact_settled_operation`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum OperationResource {

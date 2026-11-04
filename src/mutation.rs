@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use chrono::{DateTime, Utc};
+use serde_json::{json, Map, Value};
 use thiserror::Error;
 
 use crate::models::{
@@ -9,6 +10,10 @@ use crate::models::{
     OperationStep, OperationStepProgress, OperationStepRole, OperationStepStatus, OperationSummary,
     PersistenceMetadata, RepositoryWriteReceipt,
 };
+
+/// `OperationPlan::redacted_metadata` key recording the bounded per-step
+/// payload digests of a settled operation whose content bodies were cleared.
+pub const COMPACTED_PAYLOADS_METADATA_KEY: &str = "compacted_payloads";
 
 pub const OPERATION_PLAN_SCHEMA_VERSION: u32 = 1;
 
@@ -298,7 +303,169 @@ pub fn validate_operation_record(record: &OperationRecord) -> Result<(), Mutatio
     if (record.status == OperationStatus::Completed) != record.completed_at.is_some() {
         return invalid("completed_at must be present only for completed operations");
     }
+    if let Some(digests) = record
+        .plan
+        .redacted_metadata
+        .get(COMPACTED_PAYLOADS_METADATA_KEY)
+    {
+        if !operation_is_settled(record) {
+            return invalid("only settled operations may be compacted");
+        }
+        let compacted_step_ids = digests
+            .as_object()
+            .map(|digests| digests.keys().map(String::as_str).collect::<BTreeSet<_>>());
+        if compacted_step_ids.as_ref() != Some(&expected_step_ids) {
+            return invalid("compacted payload digests do not cover exactly the planned steps");
+        }
+    }
     Ok(())
+}
+
+/// A settled operation is durably applied and confirmed searchable. It is
+/// never re-applied or re-published, so it no longer needs replay bodies.
+pub fn operation_is_settled(record: &OperationRecord) -> bool {
+    record.status == OperationStatus::Completed
+        && record.indexing_state == OperationIndexingState::Completed
+}
+
+/// Whether a settled operation's content bodies were already compacted.
+pub fn operation_is_compacted(record: &OperationRecord) -> bool {
+    record
+        .plan
+        .redacted_metadata
+        .get(COMPACTED_PAYLOADS_METADATA_KEY)
+        .is_some()
+}
+
+/// Compact a settled operation to bounded journal metadata.
+///
+/// Unfinished operations keep their complete plan: reconciliation re-applies
+/// pending steps and republishes accepted resources from it. Once settled, a
+/// record is only used for idempotent response replay, request-fingerprint
+/// and routing validation, and admin inspection, so content bodies (document
+/// text, fragment bodies, event payloads, row values, parsed blocks, ...) are
+/// cleared while ids, routing, ownership, checksums, deletion targets, and the
+/// response snapshot are kept. Each step records its original serialized size
+/// and a caller-keyed fingerprint under
+/// [`COMPACTED_PAYLOADS_METADATA_KEY`]. Returns `None` for unsettled or
+/// already compacted records.
+pub fn compact_settled_operation(
+    record: &OperationRecord,
+    fingerprint: impl Fn(&str) -> String,
+) -> Result<Option<OperationRecord>, MutationPlanError> {
+    if !operation_is_settled(record) || operation_is_compacted(record) {
+        return Ok(None);
+    }
+    let mut metadata = match &record.plan.redacted_metadata {
+        Value::Object(metadata) => metadata.clone(),
+        Value::Null => Map::new(),
+        _ => return invalid("operation metadata must be an object"),
+    };
+    let mut compacted = record.clone();
+    let mut digests = Map::new();
+    for step in
+        std::iter::once(&mut compacted.plan.primary).chain(compacted.plan.side_effects.iter_mut())
+    {
+        let serialized = serde_json::to_string(&step.resource).map_err(|error| {
+            MutationPlanError::InvalidPlan(format!(
+                "step `{}` resource is not serializable: {error}",
+                step.id
+            ))
+        })?;
+        digests.insert(
+            step.id.clone(),
+            json!({ "bytes": serialized.len(), "fingerprint": fingerprint(&serialized) }),
+        );
+        clear_resource_bodies(&mut step.resource);
+    }
+    metadata.insert(
+        COMPACTED_PAYLOADS_METADATA_KEY.to_string(),
+        Value::Object(digests),
+    );
+    compacted.plan.redacted_metadata = Value::Object(metadata);
+    validate_operation_record(&compacted)?;
+    Ok(Some(compacted))
+}
+
+/// Clear content bodies whose size scales with user documents or data.
+/// Identity, routing, ownership, timestamps, checksums, and deletion targets
+/// stay intact so a compacted plan still validates and remains auditable.
+fn clear_resource_bodies(resource: &mut OperationResource) {
+    match resource {
+        OperationResource::HistoryEvents { events } => {
+            for event in events {
+                event.text.clear();
+                event.payload = Value::Null;
+            }
+        }
+        OperationResource::ContextNodes { nodes, .. } => {
+            for node in nodes {
+                node.body.clear();
+            }
+        }
+        OperationResource::StateItem { item } => {
+            item.statement.clear();
+            item.value = Value::Null;
+        }
+        OperationResource::Insight { insight } => insight.statement.clear(),
+        OperationResource::SourceRevision { revision } => revision.content.clear(),
+        OperationResource::SourceDocuments { documents } => {
+            for document in documents {
+                document.content.clear();
+            }
+        }
+        OperationResource::StructuredRows { rows } => {
+            for row in rows {
+                if let Value::Object(fields) = row {
+                    fields.retain(|key, _| {
+                        matches!(
+                            key.as_str(),
+                            "id" | "snapshot_id" | "tenant_id" | "owner_user_id"
+                        )
+                    });
+                } else {
+                    *row = Value::Null;
+                }
+            }
+        }
+        OperationResource::Session { session } => session.messages.clear(),
+        OperationResource::Links { links } => {
+            for link in links {
+                link.evidence_text = None;
+            }
+        }
+        OperationResource::Trace { trace } => trace.stages.clear(),
+        OperationResource::HarnessComponents { revisions, .. } => {
+            for revision in revisions {
+                revision.content = Value::Null;
+            }
+        }
+        OperationResource::HarnessVerdicts { verdicts } => {
+            for verdict in verdicts {
+                verdict.evidence = Value::Null;
+            }
+        }
+        OperationResource::IngestResult { result } => result.parsed_blocks.clear(),
+        OperationResource::EvalCaseResults { results } => {
+            for result in results {
+                result.answer.clear();
+            }
+        }
+        OperationResource::EvalOverview { overview } => overview.overview_markdown.clear(),
+        OperationResource::EnsureUserEventIndex { .. }
+        | OperationResource::CompanySource { .. }
+        | OperationResource::DeleteCompanySourceIndex { .. }
+        | OperationResource::ParseArtifacts { .. }
+        | OperationResource::StructuredSnapshot { .. }
+        | OperationResource::Dataset { .. }
+        | OperationResource::StructuredSummary { .. }
+        | OperationResource::HarnessChanges { .. }
+        | OperationResource::IngestTask { .. }
+        | OperationResource::IngestTasks { .. }
+        | OperationResource::DeleteIngestTasks { .. }
+        | OperationResource::EvalCase { .. }
+        | OperationResource::EvalRun { .. } => {}
+    }
 }
 
 pub fn operation_record_from_plan(
@@ -937,6 +1104,65 @@ mod tests {
             response_snapshot: json!({"ok": true}),
             created_at: at,
         }
+    }
+
+    #[test]
+    fn only_settled_operations_compact_to_bounded_payload_digests() {
+        let mut plan = plan();
+        plan.side_effects[0].resource = OperationResource::StructuredRows {
+            rows: vec![json!({
+                "id": "row-1",
+                "snapshot_id": "snapshot-1",
+                "body": "x".repeat(8_192)
+            })],
+        };
+        let record = operation_record_from_plan(plan).unwrap();
+        let fingerprint = |payload: &str| format!("fp:{}", payload.len());
+        assert!(compact_settled_operation(&record, fingerprint)
+            .unwrap()
+            .is_none());
+        let at = record.created_at + chrono::Duration::seconds(1);
+        let primary_done = operation_step_completed(&record, "primary", at).unwrap();
+        assert!(
+            compact_settled_operation(&primary_done, fingerprint)
+                .unwrap()
+                .is_none(),
+            "unfinished operations keep their replay bodies"
+        );
+
+        let settled = operation_step_completed(&primary_done, "effect", at).unwrap();
+        let compacted = compact_settled_operation(&settled, fingerprint)
+            .unwrap()
+            .expect("settled operations compact");
+        validate_operation_record(&compacted).unwrap();
+        assert!(operation_is_compacted(&compacted));
+        assert_eq!(
+            compacted.plan.response_snapshot,
+            settled.plan.response_snapshot
+        );
+        assert_eq!(compacted.plan.redacted_metadata["resource_count"], 2);
+        let effect_bytes = serde_json::to_string(&settled.plan.side_effects[0].resource)
+            .unwrap()
+            .len();
+        let digests = &compacted.plan.redacted_metadata[COMPACTED_PAYLOADS_METADATA_KEY];
+        assert_eq!(digests["effect"]["bytes"], effect_bytes);
+        assert_eq!(
+            digests["effect"]["fingerprint"],
+            format!("fp:{effect_bytes}")
+        );
+        assert_eq!(
+            serde_json::to_value(&compacted.plan.side_effects[0].resource).unwrap()["payload"]
+                ["rows"],
+            json!([{ "id": "row-1", "snapshot_id": "snapshot-1" }])
+        );
+        assert!(serde_json::to_string(&compacted).unwrap().len() < 2_048);
+        assert!(compact_settled_operation(&compacted, fingerprint)
+            .unwrap()
+            .is_none());
+
+        let mut forged = primary_done;
+        forged.plan.redacted_metadata = compacted.plan.redacted_metadata.clone();
+        assert!(validate_operation_record(&forged).is_err());
     }
 
     #[test]

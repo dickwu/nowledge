@@ -60,6 +60,16 @@ every initial apply and replay, dynamic event/context UIDs, registry IDs,
 tenant hashes, and owner hashes are recomputed through `EventIndexResolver`;
 company context is restricted to the exact fixed index.
 
+The complete plan is the write-ahead record, so it is kept only while the
+operation is unfinished. When the operation becomes settled (status and
+indexing state both `completed`), the final journal checkpoint replaces each
+step's content bodies with its serialized size and keyed fingerprint under
+`redacted_metadata.compacted_payloads`, keeping identities, routing,
+ownership, checksums, deletion targets, and the response snapshot. A settled
+record is never re-applied, and compacted resources are never projected into
+the cache. The process caches at most 10,000 settled records; older ones are
+read through the durable journal, and unfinished records are never evicted.
+
 Idempotent plans also retain the original typed application response; plans
 without an idempotency key avoid that redundant response copy. Owner-scoped
 idempotent retries derive the same operation ID before evaluating a new staged
