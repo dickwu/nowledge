@@ -561,6 +561,13 @@ Every Meilisearch HTTP request is bounded by `RAG_MEILI_CONNECT_TIMEOUT_MS`
 connect bound must not exceed the request bound. Task confirmation issues one
 short request per poll, so the request bound limits each poll rather than the
 60 s task wait that `wait_for_index` relies on.
+A failed Meilisearch response or task keeps Meilisearch's error object in the
+private cause: `code`, `type`, `link`, and a secret-redacted message truncated
+to 512 characters (at most 16 KiB of an error body is read; a non-JSON body
+keeps a 256-character snippet). The cause category comes from the Meilisearch
+`code` when present. `nowledge::meili` warnings log only the HTTP status, the
+Meilisearch code and type, and the cause category and keyed fingerprint, never
+the message, body, headers, or API keys.
 Multipart uploads are staged with a generated private filename, incrementally
 hashed, and deleted after parsing or on cancellation/error. Duplicate file
 parts, excess metadata fields, an empty file, invalid or disallowed MIME values,

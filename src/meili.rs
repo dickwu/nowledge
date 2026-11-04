@@ -243,10 +243,12 @@ impl MeiliAdmin {
             .await
             .map_err(meili_transport_error)?;
         if !response.status().is_success() {
-            return Err(ApiError::Upstream(format!(
-                "failed to prove that the Meilisearch instance is empty: {}",
-                response.status()
-            )));
+            return Err(self
+                .status_error(
+                    "failed to prove that the Meilisearch instance is empty".to_string(),
+                    response,
+                )
+                .await);
         }
         let body = response
             .json::<Value>()
@@ -376,9 +378,12 @@ impl MeiliAdmin {
             .await
             .map_err(meili_transport_error)?;
         if !response.status().is_success() {
-            return Err(ApiError::Upstream(format!(
-                "Meilisearch durable index {uid} is unavailable; refusing persistence"
-            )));
+            return Err(self
+                .status_error(
+                    format!("Meilisearch durable index {uid} is unavailable; refusing persistence"),
+                    response,
+                )
+                .await);
         }
         let body = response
             .json::<Value>()
@@ -455,10 +460,12 @@ impl MeiliAdmin {
                     .map_err(meili_transport_error)?;
                 let status = response.status();
                 if !status.is_success() && status.as_u16() != 404 {
-                    return Err(ApiError::Upstream(format!(
-                        "failed to delete Meilisearch index {uid}: {}",
-                        status
-                    )));
+                    return Err(self
+                        .status_error(
+                            format!("failed to delete Meilisearch index {uid}"),
+                            response,
+                        )
+                        .await);
                 }
                 if status.is_success() {
                     let body = response
@@ -589,10 +596,13 @@ impl MeiliAdmin {
                 .map_err(meili_transport_error)?;
             if !response.status().is_success() {
                 let status = response.status();
+                let details = self.error_details(response).await;
                 if !self.index_exists(uid).await? {
-                    return Err(ApiError::Upstream(format!(
-                        "failed to create Meilisearch index {uid}: {status}"
-                    )));
+                    return Err(meili_status_error(
+                        format!("failed to create Meilisearch index {uid}"),
+                        status,
+                        &details,
+                    ));
                 }
             } else {
                 let body = response
@@ -655,10 +665,14 @@ impl MeiliAdmin {
             .await
             .map_err(meili_transport_error)?;
         if !response.status().is_success() {
-            return Err(ApiError::Upstream(format!(
-                "failed to strictly create Meilisearch index {uid}: {}; refusing to adopt any concurrently-created index",
-                response.status()
-            )));
+            return Err(self
+                .status_error(
+                    format!(
+                        "failed to strictly create Meilisearch index {uid}; refusing to adopt any concurrently-created index"
+                    ),
+                    response,
+                )
+                .await);
         }
 
         let body = response
@@ -756,10 +770,12 @@ impl MeiliAdmin {
         } else if response.status().as_u16() == 404 {
             Ok(false)
         } else {
-            Err(ApiError::Upstream(format!(
-                "failed to inspect Meilisearch index {uid}: {}",
-                response.status()
-            )))
+            Err(self
+                .status_error(
+                    format!("failed to inspect Meilisearch index {uid}"),
+                    response,
+                )
+                .await)
         }
     }
 
@@ -783,10 +799,12 @@ impl MeiliAdmin {
             return Ok(None);
         }
         if !response.status().is_success() {
-            return Err(ApiError::Upstream(format!(
-                "failed to inspect Meilisearch primary key for {uid}: {}",
-                response.status()
-            )));
+            return Err(self
+                .status_error(
+                    format!("failed to inspect Meilisearch primary key for {uid}"),
+                    response,
+                )
+                .await);
         }
         let body = response
             .json::<Value>()
@@ -818,10 +836,12 @@ impl MeiliAdmin {
             return Ok(None);
         }
         if !response.status().is_success() {
-            return Err(ApiError::Upstream(format!(
-                "failed to inspect Meilisearch createdAt for {uid}: {}",
-                response.status()
-            )));
+            return Err(self
+                .status_error(
+                    format!("failed to inspect Meilisearch createdAt for {uid}"),
+                    response,
+                )
+                .await);
         }
         let body = response
             .json::<Value>()
@@ -897,10 +917,12 @@ impl MeiliAdmin {
                 &format!("add documents to Meilisearch index {index_uid}"),
             )?))
         } else {
-            Err(ApiError::Upstream(format!(
-                "failed to add Meilisearch documents into {index_uid}: {}",
-                response.status()
-            )))
+            Err(self
+                .status_error(
+                    format!("failed to add Meilisearch documents into {index_uid}"),
+                    response,
+                )
+                .await)
         }
     }
 
@@ -939,10 +961,12 @@ impl MeiliAdmin {
                 &format!("delete documents from Meilisearch index {index_uid}"),
             )?))
         } else {
-            Err(ApiError::Upstream(format!(
-                "failed to delete Meilisearch documents from {index_uid}: {}",
-                response.status()
-            )))
+            Err(self
+                .status_error(
+                    format!("failed to delete Meilisearch documents from {index_uid}"),
+                    response,
+                )
+                .await)
         }
     }
 
@@ -984,10 +1008,12 @@ impl MeiliAdmin {
                 &format!("delete documents from Meilisearch index {index_uid}"),
             )?))
         } else {
-            Err(ApiError::Upstream(format!(
-                "failed to delete Meilisearch documents from {index_uid}: {}",
-                response.status()
-            )))
+            Err(self
+                .status_error(
+                    format!("failed to delete Meilisearch documents from {index_uid}"),
+                    response,
+                )
+                .await)
         }
     }
 
@@ -1028,10 +1054,12 @@ impl MeiliAdmin {
                 .await
                 .map_err(meili_transport_error)
         } else {
-            Err(ApiError::Upstream(format!(
-                "failed to search Meilisearch index {index_uid}: {}",
-                response.status()
-            )))
+            Err(self
+                .status_error(
+                    format!("failed to search Meilisearch index {index_uid}"),
+                    response,
+                )
+                .await)
         }
     }
 
@@ -1077,10 +1105,12 @@ impl MeiliAdmin {
                 .await
                 .map_err(meili_transport_error)
         } else {
-            Err(ApiError::Upstream(format!(
-                "failed to list Meilisearch documents from {index_uid}: {}",
-                response.status()
-            )))
+            Err(self
+                .status_error(
+                    format!("failed to list Meilisearch documents from {index_uid}"),
+                    response,
+                )
+                .await)
         }
     }
 
@@ -1145,9 +1175,14 @@ impl MeiliAdmin {
             .map_err(meili_transport_error)?;
 
         if response.status().as_u16() == 404 {
-            return Err(ApiError::Upstream(format!(
-                "required Meilisearch index {index_uid} is missing during filtered scan"
-            )));
+            return Err(self
+                .status_error(
+                    format!(
+                        "required Meilisearch index {index_uid} is missing during filtered scan"
+                    ),
+                    response,
+                )
+                .await);
         }
         if response.status().is_success() {
             response
@@ -1155,10 +1190,12 @@ impl MeiliAdmin {
                 .await
                 .map_err(meili_transport_error)
         } else {
-            Err(ApiError::Upstream(format!(
-                "failed to fetch filtered Meilisearch documents from {index_uid}: {}",
-                response.status()
-            )))
+            Err(self
+                .status_error(
+                    format!("failed to fetch filtered Meilisearch documents from {index_uid}"),
+                    response,
+                )
+                .await)
         }
     }
 
@@ -1188,10 +1225,12 @@ impl MeiliAdmin {
                 .await
                 .map_err(meili_transport_error)
         } else {
-            Err(ApiError::Upstream(format!(
-                "failed to search Meilisearch index {index_uid}: {}",
-                response.status()
-            )))
+            Err(self
+                .status_error(
+                    format!("failed to search Meilisearch index {index_uid}"),
+                    response,
+                )
+                .await)
         }
     }
 
@@ -1210,18 +1249,18 @@ impl MeiliAdmin {
                 .await
                 .map_err(meili_transport_error)?;
             if !response.status().is_success() {
-                return Err(ApiError::Upstream(format!(
-                    "failed to read Meilisearch task {task_uid}: {}",
-                    response.status()
-                )));
+                return Err(self
+                    .status_error(
+                        format!("failed to read Meilisearch task {task_uid}"),
+                        response,
+                    )
+                    .await);
             }
             let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
             match body.get("status").and_then(Value::as_str) {
                 Some("succeeded") => return Ok(()),
                 Some("failed") | Some("canceled") => {
-                    return Err(ApiError::Upstream(format!(
-                        "Meilisearch task {task_uid} did not succeed: {body}"
-                    )));
+                    return Err(self.task_error(task_uid, &body));
                 }
                 _ => {}
             }
@@ -1309,9 +1348,7 @@ impl MeiliAdmin {
                         pending.remove(&uid);
                     }
                     Some("failed") | Some("canceled") => {
-                        return Err(ApiError::Upstream(format!(
-                            "Meilisearch task {uid} did not succeed: {task}"
-                        )));
+                        return Err(self.task_error(&uid, task));
                     }
                     _ => {}
                 }
@@ -1366,10 +1403,12 @@ impl MeiliAdmin {
                 &format!("apply settings for Meilisearch index {uid}"),
             )?))
         } else {
-            Err(ApiError::Upstream(format!(
-                "failed to apply Meilisearch settings for {uid}: {}",
-                response.status()
-            )))
+            Err(self
+                .status_error(
+                    format!("failed to apply Meilisearch settings for {uid}"),
+                    response,
+                )
+                .await)
         }
     }
 
@@ -1389,16 +1428,61 @@ impl MeiliAdmin {
             .await
             .map_err(meili_transport_error)?;
         if !response.status().is_success() {
-            return Err(ApiError::Upstream(format!(
-                "failed to read Meilisearch settings for {uid}: {}",
-                response.status()
-            )));
+            return Err(self
+                .status_error(
+                    format!("failed to read Meilisearch settings for {uid}"),
+                    response,
+                )
+                .await);
         }
         let current = response
             .json::<Value>()
             .await
             .map_err(meili_transport_error)?;
         Ok(managed_settings_equal(&current, desired))
+    }
+
+    /// Read a failed response's bounded Meilisearch error object.
+    async fn error_details(&self, response: reqwest::Response) -> MeiliErrorDetails {
+        let body = read_bounded_error_body(response).await;
+        MeiliErrorDetails::from_body(&body, &self.known_secrets())
+    }
+
+    /// Private cause for a failed Meilisearch HTTP response, keeping the
+    /// bounded structured error object instead of only the status line.
+    async fn status_error(&self, context: String, response: reqwest::Response) -> ApiError {
+        let status = response.status();
+        let details = self.error_details(response).await;
+        meili_status_error(context, status, &details)
+    }
+
+    /// Private cause for a failed or canceled task. Only the task's bounded
+    /// error object and type are kept; the full task body (which can echo
+    /// filters and settings) is not copied into the cause.
+    fn task_error(&self, task_uid: &str, task: &Value) -> ApiError {
+        let status = match task.get("status").and_then(Value::as_str) {
+            Some("canceled") => "canceled",
+            _ => "failed",
+        };
+        let details = task
+            .get("error")
+            .map(|error| MeiliErrorDetails::from_value(error, &self.known_secrets()))
+            .unwrap_or_default();
+        let mut cause = format!("Meilisearch task {task_uid} did not succeed: status={status}");
+        if let Some(task_type) = meili_task_type(task.get("type")) {
+            cause.push_str(" task_type=");
+            cause.push_str(task_type);
+        }
+        if !details.is_empty() {
+            cause.push_str("; ");
+            cause.push_str(&details.to_string());
+        }
+        log_meili_error(None, &details, &cause);
+        ApiError::Upstream(cause)
+    }
+
+    fn known_secrets(&self) -> Vec<String> {
+        self.api_key.iter().cloned().collect()
     }
 
     fn headers(&self) -> Result<HeaderMap, ApiError> {
@@ -1448,6 +1532,185 @@ fn meili_transport_error(error: reqwest::Error) -> ApiError {
         _ => "request failed",
     };
     ApiError::Upstream(format!("Meilisearch request {path} {failure}"))
+}
+
+/// Most Meilisearch error bodies are a few hundred bytes; anything past this
+/// is never read, so a misbehaving server or proxy cannot inflate a cause.
+const MEILI_ERROR_BODY_MAX_BYTES: usize = 16 * 1024;
+const MEILI_ERROR_MESSAGE_MAX_CHARS: usize = 512;
+const MEILI_ERROR_BODY_SNIPPET_MAX_CHARS: usize = 256;
+const MEILI_ERROR_TOKEN_MAX_CHARS: usize = 64;
+const MEILI_ERROR_LINK_MAX_CHARS: usize = 256;
+
+/// The structured error object Meilisearch returns for failed requests and
+/// failed tasks (`message`, `code`, `type`, `link`). Every field is bounded
+/// and sanitized on parse; `body` keeps a short snippet of a non-JSON error
+/// (for example a proxy page) instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MeiliErrorDetails {
+    code: Option<String>,
+    error_type: Option<String>,
+    message: Option<String>,
+    link: Option<String>,
+    body: Option<String>,
+}
+
+impl MeiliErrorDetails {
+    fn from_body(body: &str, known_secrets: &[String]) -> Self {
+        if let Ok(value) = serde_json::from_str::<Value>(body) {
+            let details = Self::from_value(&value, known_secrets);
+            if !details.is_empty() {
+                return details;
+            }
+        }
+        let body =
+            sanitize_meili_error_text(body, known_secrets, MEILI_ERROR_BODY_SNIPPET_MAX_CHARS);
+        Self {
+            body: (!body.is_empty()).then_some(body),
+            ..Self::default()
+        }
+    }
+
+    fn from_value(value: &Value, known_secrets: &[String]) -> Self {
+        let field = |name: &str| value.get(name).and_then(Value::as_str);
+        Self {
+            code: field("code").and_then(meili_error_token),
+            error_type: field("type").and_then(meili_error_token),
+            message: field("message")
+                .map(|message| {
+                    sanitize_meili_error_text(message, known_secrets, MEILI_ERROR_MESSAGE_MAX_CHARS)
+                })
+                .filter(|message| !message.is_empty()),
+            link: field("link").and_then(meili_error_link),
+            body: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl std::fmt::Display for MeiliErrorDetails {
+    /// The code and type markers come first so the error classifier reads
+    /// them before any free text (which is neutralized to never contain a
+    /// marker).
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        if let Some(code) = &self.code {
+            parts.push(format!("{}{code}", crate::error::MEILI_CODE_MARKER));
+        }
+        if let Some(error_type) = &self.error_type {
+            parts.push(format!("{}{error_type}", crate::error::MEILI_TYPE_MARKER));
+        }
+        if let Some(message) = &self.message {
+            parts.push(format!("message={message:?}"));
+        }
+        if let Some(link) = &self.link {
+            parts.push(format!("link={link}"));
+        }
+        if let Some(body) = &self.body {
+            parts.push(format!("body={body:?}"));
+        }
+        formatter.write_str(&parts.join(" "))
+    }
+}
+
+/// Read at most [`MEILI_ERROR_BODY_MAX_BYTES`] of a failed response. Read
+/// failures keep whatever arrived; the request timeout bounds the wait.
+async fn read_bounded_error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while body.len() < MEILI_ERROR_BODY_MAX_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MEILI_ERROR_BODY_MAX_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+/// Redact configured secrets first, then flatten control characters,
+/// neutralize classifier markers, and truncate to `max_chars`.
+fn sanitize_meili_error_text(text: &str, known_secrets: &[String], max_chars: usize) -> String {
+    let redacted = crate::util::redact_string(text, known_secrets);
+    let flattened = redacted
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .replace(crate::error::MEILI_CODE_MARKER, "meili_code:")
+        .replace(crate::error::MEILI_TYPE_MARKER, "meili_type:");
+    crate::util::truncate_chars(flattened.trim(), max_chars)
+}
+
+/// Meilisearch codes and types are short snake_case identifiers; anything
+/// else is dropped rather than copied into a cause or log field.
+fn meili_error_token(value: &str) -> Option<String> {
+    let valid = !value.is_empty()
+        && value.len() <= MEILI_ERROR_TOKEN_MAX_CHARS
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    valid.then(|| value.to_string())
+}
+
+fn meili_error_link(value: &str) -> Option<String> {
+    let valid = value.starts_with("https://")
+        && value.len() <= MEILI_ERROR_LINK_MAX_CHARS
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":/._#?=&%+-~".contains(&byte));
+    valid.then(|| value.to_string())
+}
+
+/// Task types are short camelCase identifiers such as `indexCreation`.
+fn meili_task_type(value: Option<&Value>) -> Option<&str> {
+    value.and_then(Value::as_str).filter(|task_type| {
+        !task_type.is_empty()
+            && task_type.len() <= MEILI_ERROR_TOKEN_MAX_CHARS
+            && task_type.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
+/// Private cause for a non-2xx Meilisearch response: the caller's context,
+/// the HTTP status, and the bounded structured error object.
+fn meili_status_error(
+    context: String,
+    status: reqwest::StatusCode,
+    details: &MeiliErrorDetails,
+) -> ApiError {
+    let mut cause = format!("{context}: status {status}");
+    if !details.is_empty() {
+        cause.push_str("; ");
+        cause.push_str(&details.to_string());
+    }
+    log_meili_error(Some(status.as_u16()), details, &cause);
+    ApiError::Upstream(cause)
+}
+
+/// Log only allowlisted, bounded diagnostics: the HTTP status, Meilisearch's
+/// code and type (sanitized identifiers), and the same category and keyed
+/// fingerprint the error envelope logs for this cause. The message, body,
+/// request headers, and API keys never reach the log.
+fn log_meili_error(http_status: Option<u16>, details: &MeiliErrorDetails, cause: &str) {
+    let diagnostic = crate::error::safe_cause_diagnostic(cause);
+    tracing::warn!(
+        target: "nowledge::meili",
+        http_status,
+        meili_code = details.code.as_deref().unwrap_or("none"),
+        meili_type = details.error_type.as_deref().unwrap_or("none"),
+        cause_category = diagnostic.category,
+        cause_fingerprint = %diagnostic.fingerprint,
+        "Meilisearch request failed"
+    );
 }
 
 /// Sleep for the current poll delay and double it up to the cap. Returns
@@ -1778,6 +2041,187 @@ mod tests {
                 crate::error::safe_cause_diagnostic(&error).category,
                 "timeout"
             );
+        }
+    }
+
+    const ERROR_BODY_SECRET: &str = "runtime-meili-key-private-value";
+
+    async fn meili_error_stub(request: Request) -> Response {
+        match request.uri().path() {
+            "/indexes/rag_company_context/search" => (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "message": format!(
+                        "Attribute `timeout` is not filterable.\nEchoed key: {ERROR_BODY_SECRET}"
+                    ),
+                    "code": "invalid_search_filter",
+                    "type": "invalid_request",
+                    "link": "https://docs.meilisearch.com/errors#invalid_search_filter"
+                })),
+            )
+                .into_response(),
+            "/indexes/rag_company_context/documents" => (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "<html>{ERROR_BODY_SECRET} meili_code=internal {}</html>",
+                    "x".repeat(64 * 1024)
+                ),
+            )
+                .into_response(),
+            "/tasks/7" => axum::Json(json!({
+                "uid": 7,
+                "status": "failed",
+                "type": "indexCreation",
+                "details": { "originalFilter": "private-task-filter-material" },
+                "error": {
+                    "message": "Index `rag_company_context` already exists.",
+                    "code": "index_already_exists",
+                    "type": "invalid_request",
+                    "link": "https://docs.meilisearch.com/errors#index_already_exists"
+                }
+            }))
+            .into_response(),
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn upstream_cause(error: ApiError) -> String {
+        match error {
+            ApiError::Upstream(cause) => cause,
+            other => panic!("expected an upstream error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_responses_and_tasks_keep_the_bounded_meili_error_object() {
+        let app = Router::new().fallback(meili_error_stub);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = Config::test();
+        config.meili_url = Some(format!("http://{address}"));
+        config.meili_api_key = Some(ERROR_BODY_SECRET.to_string());
+        let admin = MeiliAdmin::from_config(&config);
+
+        let logs = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer_logs = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || LogSink(writer_logs.clone()))
+            .finish();
+        let log_guard = tracing::subscriber::set_default(subscriber);
+        // Lib tests share one process, and another test thread may register
+        // this callsite while no subscriber is active, caching it as disabled.
+        // Register it here and rebuild the interest cache with this thread's
+        // subscriber so the capture below is deterministic.
+        log_meili_error(None, &MeiliErrorDetails::default(), "");
+        tracing::callsite::rebuild_interest_cache();
+        logs.lock().unwrap().clear();
+        let search = admin
+            .search::<Value>("rag_company_context", json!({ "q": "" }))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        let write = admin
+            .add_documents("rag_company_context", &json!([{ "id": "doc" }]))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        let task = admin.wait_for_task("7").await.unwrap_err();
+        drop(log_guard);
+
+        // Meilisearch's code decides the category: keyword guessing would
+        // have called this "timeout" because the message names that field.
+        assert_eq!(
+            crate::error::safe_cause_diagnostic(&search).category,
+            "invalid_request"
+        );
+        let search = upstream_cause(search);
+        for expected in [
+            "failed to search Meilisearch index rag_company_context: status 400 Bad Request",
+            "meili_code=invalid_search_filter",
+            "meili_type=invalid_request",
+            "Attribute `timeout` is not filterable.",
+            "link=https://docs.meilisearch.com/errors#invalid_search_filter",
+        ] {
+            assert!(search.contains(expected), "missing {expected}: {search}");
+        }
+        assert!(!search.contains('\n'), "{search}");
+
+        // A non-JSON body keeps only a short snippet, and text that imitates
+        // a classifier marker cannot pick the category.
+        assert_eq!(
+            crate::error::safe_cause_diagnostic(&write).category,
+            "unspecified"
+        );
+        let write = upstream_cause(write);
+        assert!(
+            write.contains("status 502 Bad Gateway; body=\"<html>"),
+            "{write}"
+        );
+        assert!(!write.contains("meili_code="), "{write}");
+        assert!(write.len() < 1_024, "error body was not truncated: {write}");
+
+        assert_eq!(
+            crate::error::safe_cause_diagnostic(&task).category,
+            "conflict"
+        );
+        let task = upstream_cause(task);
+        for expected in [
+            "Meilisearch task 7 did not succeed: status=failed task_type=indexCreation",
+            "meili_code=index_already_exists",
+            "already exists.",
+        ] {
+            assert!(task.contains(expected), "missing {expected}: {task}");
+        }
+        assert!(!task.contains("private-task-filter-material"), "{task}");
+
+        for cause in [&search, &write, &task] {
+            assert!(!cause.contains(ERROR_BODY_SECRET), "{cause}");
+            assert!(!cause.contains(&address.to_string()), "{cause}");
+        }
+
+        let rendered = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        for expected in [
+            "nowledge::meili",
+            "\"http_status\":400",
+            "invalid_search_filter",
+            "index_already_exists",
+            "cause_fingerprint",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+        for private in [
+            ERROR_BODY_SECRET,
+            "not filterable",
+            "<html>",
+            "already exists.",
+            "private-task-filter-material",
+            "Bearer",
+            "authorization",
+        ] {
+            assert!(!rendered.contains(private), "leaked {private}: {rendered}");
         }
     }
 
