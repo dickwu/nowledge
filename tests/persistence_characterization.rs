@@ -403,6 +403,70 @@ struct ExistingThenMissingRecorder {
     index_checks: Arc<Mutex<std::collections::HashMap<String, usize>>>,
 }
 
+/// Every index exists with primary key `id`, except `bad_primary_key`
+/// (`uid`, declared `primaryKey`) when set.
+#[derive(Clone, Default)]
+struct PrimaryKeyRecorder {
+    requests: Arc<Mutex<Vec<String>>>,
+    bad_primary_key: Arc<Mutex<Option<(String, Value)>>>,
+}
+
+async fn primary_key_meili_stub(
+    State(recorder): State<PrimaryKeyRecorder>,
+    request: AxumRequest,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    recorder
+        .requests
+        .lock()
+        .unwrap()
+        .push(format!("{method} {path}"));
+
+    if method == Method::GET && path.ends_with("/settings") {
+        let index_uid = path
+            .strip_prefix("/indexes/")
+            .and_then(|path| path.strip_suffix("/settings"))
+            .unwrap();
+        return (StatusCode::OK, Json(settings_for(index_uid))).into_response();
+    }
+    if method == Method::GET && path.starts_with("/indexes/") {
+        let index_uid = path.strip_prefix("/indexes/").unwrap();
+        let primary_key = match recorder.bad_primary_key.lock().unwrap().as_ref() {
+            Some((uid, primary_key)) if uid == index_uid => primary_key.clone(),
+            _ => json!("id"),
+        };
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "uid": index_uid,
+                "primaryKey": primary_key,
+                "createdAt": "2026-07-15T00:00:00Z"
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "message": format!("unexpected primary-key request: {method} {path}") })),
+    )
+        .into_response()
+}
+
+async fn spawn_primary_key_meili_stub(recorder: PrimaryKeyRecorder) -> Config {
+    let app = Router::new()
+        .fallback(primary_key_meili_stub)
+        .with_state(recorder);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut config = Config::test();
+    config.meili_url = Some(format!("http://{addr}"));
+    config
+}
+
 async fn partial_fixed_set_meili_stub(
     State(recorder): State<ResetRecorder>,
     request: AxumRequest,
@@ -449,14 +513,9 @@ async fn existing_then_missing_meili_stub(
     if method == Method::GET && path.starts_with("/indexes/") {
         let mut checks = recorder.index_checks.lock().unwrap();
         let count = checks.entry(path.clone()).or_default();
-        let allowed_checks = if matches!(
-            path.as_str(),
-            "/indexes/rag_operations" | "/indexes/rag_audit_records"
-        ) {
-            2
-        } else {
-            1
-        };
+        // Preflight reads every fixed index twice: existence, then (once the
+        // set is complete) primary key.
+        let allowed_checks = 2;
         let status = if *count < allowed_checks {
             StatusCode::OK
         } else {
@@ -1144,6 +1203,100 @@ async fn bootstrap_refuses_to_recreate_a_partial_fixed_index_set() {
     let requests = recorder.requests.lock().unwrap().clone();
     assert!(!requests.iter().any(|request| request == "POST /indexes"));
     assert!(!requests.iter().any(|request| request.contains("/settings")));
+}
+
+#[tokio::test]
+async fn bootstrap_refuses_any_existing_fixed_index_with_an_incompatible_primary_key() {
+    let recorder = PrimaryKeyRecorder::default();
+    let config = spawn_primary_key_meili_stub(recorder.clone()).await;
+    let admin = MeiliAdmin::from_config(&config);
+
+    let healthy = admin
+        .bootstrap(false)
+        .await
+        .expect("a complete fixed index set keyed by id reconciles");
+    assert_eq!(healthy.indexes.len(), FIXED_INDEXES.len());
+
+    for (position, uid) in FIXED_INDEXES.iter().enumerate() {
+        let (primary_key, shown) = if position % 2 == 0 {
+            (json!("uuid"), "uuid")
+        } else {
+            (Value::Null, "<unset>")
+        };
+        *recorder.bad_primary_key.lock().unwrap() = Some((uid.to_string(), primary_key));
+        recorder.requests.lock().unwrap().clear();
+
+        let error = admin
+            .bootstrap(false)
+            .await
+            .expect_err("a fixed index with a foreign primary key must fail closed");
+
+        assert!(
+            error.to_string().contains(&format!(
+                "Meilisearch index {uid} has incompatible primary key {shown}; expected id"
+            )),
+            "{error}"
+        );
+        let requests = recorder.requests.lock().unwrap().clone();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("GET /indexes/")
+                    && !request.ends_with("/settings")),
+            "bootstrap mutated or reconciled before rejecting {uid}: {requests:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn registered_dynamic_index_reconciliation_refuses_an_incompatible_primary_key() {
+    let recorder = PrimaryKeyRecorder::default();
+    let config = spawn_primary_key_meili_stub(recorder.clone()).await;
+    let repository = MeiliRepository::new(MeiliAdmin::from_config(&config), false);
+    let routing = EventIndexResolver::new(b"primary-key-test".to_vec())
+        .resolve("tenant-a", "owner-a", false, true)
+        .unwrap();
+    let index = UserEventIndex {
+        id: "registry-row".to_string(),
+        tenant_id: "tenant-a".to_string(),
+        tenant_hash: "tenant-hash".to_string(),
+        owner_user_id_hash: "owner-hash".to_string(),
+        event_index_uid: routing.event_index_uid.clone(),
+        personal_context_index_uid: routing.personal_context_index_uid.clone(),
+        schema_version: 1,
+        settings_hash: "events-v3".to_string(),
+        status: "active".to_string(),
+        created_at: Utc::now(),
+        last_event_at: None,
+        event_count_estimate: 0,
+    };
+
+    for uid in [
+        &routing.event_index_uid,
+        &routing.personal_context_index_uid,
+    ] {
+        *recorder.bad_primary_key.lock().unwrap() = Some((uid.clone(), json!("event_id")));
+        recorder.requests.lock().unwrap().clear();
+
+        let error = repository
+            .reconcile_registered_user_event_index(&index)
+            .await
+            .expect_err("a registered index with a foreign primary key must fail closed");
+
+        assert!(
+            error.to_string().contains(&format!(
+                "Meilisearch index {uid} has incompatible primary key event_id; expected id"
+            )),
+            "{error}"
+        );
+        let requests = recorder.requests.lock().unwrap().clone();
+        assert!(
+            !requests.iter().any(|request| request
+                .starts_with(&format!("GET /indexes/{uid}/settings"))
+                || !request.starts_with("GET ")),
+            "reconciliation touched {uid} settings or wrote before rejecting it: {requests:?}"
+        );
+    }
 }
 
 #[tokio::test]

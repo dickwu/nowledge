@@ -78,6 +78,8 @@ RAG_MEILI_AUDIT_INDEX_CREATED_AT=required-production-rfc3339-createdAt
 RAG_WRITE_CONSISTENCY=read_your_writes
 RAG_MEILI_SCAN_PAGE_SIZE=500
 RAG_MEILI_SCAN_MAX_DOCUMENTS=100000
+RAG_MEILI_CONNECT_TIMEOUT_MS=5000
+RAG_MEILI_REQUEST_TIMEOUT_MS=30000
 RAG_PARSER_PROVIDER=builtin
 RAG_MINERU_API_URL=http://127.0.0.1:8000
 RAG_MINERU_BACKEND=hybrid-auto-engine
@@ -198,6 +200,8 @@ Before starting this revision against an existing Meilisearch deployment,
 back up Meilisearch and add the tenant-safe operation journal. The managed
 fixed-index bootstrap fails closed when the old index set exists without
 `rag_operations`; it will not recreate the missing index automatically.
+Startup also refuses any existing fixed index, or any registered per-user
+event or personal-context index, whose primary key is not `id`.
 Drain writers during this cutover and audit existing documents for legacy
 idempotency metadata. `operations_v1` starts the durable journal; it cannot
 reconstruct request fingerprints or response snapshots for keys accepted by an
@@ -565,6 +569,23 @@ Meilisearch task confirmation polls with exponential backoff (5 ms doubling
 to 200 ms, same 60 s total timeout). Several task UIDs from one step are
 confirmed together through `GET /tasks?uids=...`; a server or key scope that
 cannot list them falls back to per-task `GET /tasks/{uid}` probes.
+Every Meilisearch HTTP request is bounded by `RAG_MEILI_CONNECT_TIMEOUT_MS`
+(default 5000) for connection setup and `RAG_MEILI_REQUEST_TIMEOUT_MS`
+(default 30000) for the whole exchange including the response body; the
+connect bound must not exceed the request bound. Task confirmation issues one
+short request per poll, so the request bound limits each poll rather than the
+60 s task wait that `wait_for_index` relies on.
+A failed Meilisearch response or task keeps Meilisearch's error object in the
+private cause: `code`, `type`, `link`, and a secret-redacted message truncated
+to 512 characters (at most 16 KiB of an error body is read; a non-JSON body
+keeps a 256-character snippet). The cause category comes from the Meilisearch
+`code` when present. `nowledge::meili` warnings log only the HTTP status, the
+Meilisearch code and type, and the cause category and keyed fingerprint, never
+the message, body, headers, or API keys.
+A search that Meilisearch answers with `index_not_found` is empty only for the
+per-user event and personal-context indexes, which are created on a user's
+first write. A missing fixed index, or a 404 without `index_not_found`, fails
+as an upstream error instead of returning no hits.
 Multipart uploads are staged with a generated private filename, incrementally
 hashed, and deleted after parsing or on cancellation/error. Duplicate file
 parts, excess metadata fields, an empty file, invalid or disallowed MIME values,

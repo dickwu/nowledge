@@ -340,7 +340,59 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Marks Meilisearch's own error `code` / `type` inside a private upstream
+/// cause (see `meili::MeiliErrorDetails`), so classification can use the
+/// server's code instead of guessing from keywords.
+pub(crate) const MEILI_CODE_MARKER: &str = "meili_code=";
+pub(crate) const MEILI_TYPE_MARKER: &str = "meili_type=";
+
+/// Map a Meilisearch error code (or, for codes without a specific mapping,
+/// its error type) onto the bounded diagnostic category set.
+fn meili_error_category(code: &str, error_type: Option<&str>) -> &'static str {
+    match code {
+        "invalid_api_key" | "missing_authorization_header" | "missing_master_key" => {
+            "authentication"
+        }
+        "too_many_search_requests" => "rate_limited",
+        "database_size_limit_reached"
+        | "no_space_left_on_device"
+        | "too_many_open_files"
+        | "io_error" => "storage",
+        "index_already_exists" | "index_primary_key_already_exists" | "api_key_already_exists" => {
+            "conflict"
+        }
+        "not_found" => "not_found",
+        code if code.ends_with("_not_found") => "not_found",
+        code if code.starts_with("immutable_") => "conflict",
+        _ => match error_type {
+            Some("auth") => "authentication",
+            Some("invalid_request") => "invalid_request",
+            Some("internal" | "system") => "upstream_internal",
+            _ => "unspecified",
+        },
+    }
+}
+
+fn meili_cause_category(cause: &str) -> Option<&'static str> {
+    fn marker_token<'a>(cause: &'a str, marker: &str) -> Option<&'a str> {
+        let (_, rest) = cause.split_once(marker)?;
+        let end = rest
+            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .unwrap_or(rest.len());
+        let token = &rest[..end];
+        (!token.is_empty()).then_some(token)
+    }
+    let code = marker_token(cause, MEILI_CODE_MARKER)?;
+    Some(meili_error_category(
+        code,
+        marker_token(cause, MEILI_TYPE_MARKER),
+    ))
+}
+
 fn safe_cause_category(cause: &str) -> &'static str {
+    if let Some(category) = meili_cause_category(cause) {
+        return category;
+    }
     let summary = cause
         .chars()
         .take(2_048)
@@ -404,6 +456,45 @@ mod tests {
         assert_eq!(diagnostic.fingerprint.len(), "hmac:".len() + 16);
         assert!(!diagnostic.fingerprint.contains(private));
         assert!(!diagnostic.fingerprint.contains("secret-token"));
+    }
+
+    #[test]
+    fn meili_error_codes_drive_the_cause_category() {
+        for (cause, expected) in [
+            (
+                "status 400 Bad Request; meili_code=invalid_search_filter meili_type=invalid_request message=\"Attribute `timeout` is not filterable.\"",
+                "invalid_request",
+            ),
+            (
+                "status 404 Not Found; meili_code=index_not_found meili_type=invalid_request",
+                "not_found",
+            ),
+            (
+                "status 403 Forbidden; meili_code=invalid_api_key meili_type=auth",
+                "authentication",
+            ),
+            (
+                "status 503 Service Unavailable; meili_code=too_many_search_requests meili_type=system",
+                "rate_limited",
+            ),
+            (
+                "status=failed; meili_code=no_space_left_on_device meili_type=system",
+                "storage",
+            ),
+            (
+                "status=failed; meili_code=index_already_exists meili_type=invalid_request",
+                "conflict",
+            ),
+            (
+                "status 500 Internal Server Error; meili_code=some_future_code meili_type=internal",
+                "upstream_internal",
+            ),
+            ("status 400 Bad Request; meili_code=some_future_code", "unspecified"),
+            // Without a Meilisearch code the keyword classifier still applies.
+            ("Meilisearch request /indexes/x/search timed out", "timeout"),
+        ] {
+            assert_eq!(safe_cause_diagnostic(cause).category, expected, "{cause}");
+        }
     }
 
     #[test]
