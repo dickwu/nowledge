@@ -23,17 +23,17 @@ Schema: `OperationListRequest`
 | operation_kinds | string[] | optional, default [] | Restrict results to the named mutation kinds. Empty means all kinds. |
 | limit | integer | optional, default 100; range 1-500 | Maximum number of operation records returned. |
 | cursor | string? | optional | Opaque cursor from a previous response. |
-| include_plan | boolean | optional, default false | Include each immutable replay plan. The default response contains summaries only. |
+| include_plan | boolean | optional, default false | Include each replay plan. Completed operations confirmed searchable return a compacted plan (see below). The default response contains summaries only. |
 
 ## Response
 Schema: `OperationListResponse`
 
 | Field | Type | Description |
 | --- | --- | --- |
-| operations | OperationListItem[] | Tenant-scoped operation summaries, optionally with immutable plans when `include_plan=true`. |
+| operations | OperationListItem[] | Tenant-scoped operation summaries, optionally with replay plans when `include_plan=true`. |
 | next_cursor | string? | Opaque cursor for the next page when more matching records remain. |
 
-Each `OperationListItem` flattens an `OperationSummary` containing the operation ID and kind, actor scope, idempotency-key hash when present, status, indexing state, attempt and step counts, timestamps, and safe error category/fingerprint fields. It never exposes raw error causes. The optional `plan` field is omitted unless explicitly requested by an admin.
+Each `OperationListItem` flattens an `OperationSummary` containing the operation ID and kind, actor scope, idempotency-key hash when present, status, indexing state, attempt and step counts, timestamps, and safe error category/fingerprint fields. It never exposes raw error causes. The optional `plan` field is omitted unless explicitly requested by an admin. Unfinished operations return their complete replay plan; settled operations (status and indexing state both `completed`) return a compacted plan whose content bodies are cleared, with each step's original serialized size and keyed fingerprint under `redacted_metadata.compacted_payloads`.
 
 ## Errors and Access Rules
 - Authentication is required; non-admin principals receive 403.
@@ -49,7 +49,7 @@ flowchart TD
   n1["AdminGuard authenticates and authorizes caller"]
   n2["Validate bounded page limit"]
   n3["Store.list_operations applies tenant and request filters"]
-  n4["Project summaries and optionally immutable plans"]
+  n4["Project summaries and optionally replay plans"]
   n5["Return OperationListResponse"]
   n0 --> n1
   n1 --> n2

@@ -1,7 +1,8 @@
 use crate::{
     config::Config,
     error::ApiError,
-    models::{AppendHistoryEventRequest, BulkHistoryEventsRequest},
+    fragmenter::{DocumentFragmenter, MAX_FRAGMENT_CHUNK_CHARS},
+    models::{AppendHistoryEventRequest, BulkHistoryEventsRequest, FragmentPolicy},
 };
 
 pub(crate) fn validate_max_items(
@@ -27,6 +28,68 @@ pub(crate) fn validate_search_limit(
         return Err(ApiError::validation(
             field,
             format!("must be at most {}", config.max_search_limit),
+        ));
+    }
+    Ok(())
+}
+
+/// Caps a free-text search query or question before retrieval, so one request
+/// cannot spend lexical scoring, Meili, prompt, and trace work on a query the
+/// size of the request body. Counted in characters, like the analysis contract.
+pub(crate) fn validate_query_length(
+    field: &str,
+    query: Option<&str>,
+    config: &Config,
+) -> Result<(), ApiError> {
+    let max_chars = config.max_query_chars;
+    // A UTF-8 string never has more characters than bytes.
+    match query {
+        Some(query) if query.len() > max_chars && query.chars().count() > max_chars => {
+            Err(ApiError::validation(
+                field,
+                format!("must contain at most {max_chars} characters"),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Rejects fragment policies outside the supported envelope instead of letting
+/// callers choose values that amplify one document into unbounded work. Unset
+/// fields keep their defaults, which the fragmenter clamps to the chunk size,
+/// so only explicitly supplied values are checked against each other.
+pub(crate) fn validate_fragment_policy(
+    field: &str,
+    policy: Option<&FragmentPolicy>,
+) -> Result<(), ApiError> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    let chunk_size = policy
+        .chunk_size_chars
+        .unwrap_or(DocumentFragmenter::default().chunk_size_chars);
+    if !(1..=MAX_FRAGMENT_CHUNK_CHARS).contains(&chunk_size) {
+        return Err(ApiError::validation(
+            format!("{field}.chunk_size_chars"),
+            format!("must be between 1 and {MAX_FRAGMENT_CHUNK_CHARS}"),
+        ));
+    }
+    if policy
+        .overlap_chars
+        .is_some_and(|overlap| overlap >= chunk_size)
+    {
+        return Err(ApiError::validation(
+            format!("{field}.overlap_chars"),
+            "must be less than chunk_size_chars",
+        ));
+    }
+    if policy
+        .min_chunk_chars
+        .is_some_and(|min_chunk| !(1..=chunk_size).contains(&min_chunk))
+    {
+        return Err(ApiError::validation(
+            format!("{field}.min_chunk_chars"),
+            "must be between 1 and chunk_size_chars",
         ));
     }
     Ok(())

@@ -1717,13 +1717,19 @@ impl KnowledgeRepository for MeiliRepository {
         &self,
         index: &UserEventIndex,
     ) -> Result<Vec<String>, ApiError> {
+        // Startup must hold registered indexes to the primary key that
+        // ensure_user_event_index creates them with, like fixed indexes.
         let mut task_uids = self
             .index_admin
-            .reconcile_existing_index(&index.event_index_uid, true)
+            .reconcile_existing_index_with_primary_key(&index.event_index_uid, "id", true)
             .await?;
         task_uids.extend(
             self.index_admin
-                .reconcile_existing_index(&index.personal_context_index_uid, true)
+                .reconcile_existing_index_with_primary_key(
+                    &index.personal_context_index_uid,
+                    "id",
+                    true,
+                )
                 .await?,
         );
         let registry_task = self

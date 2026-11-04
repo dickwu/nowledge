@@ -18,6 +18,7 @@ use crate::{
     rag_service::RagService,
     rag_stream_service::RagStreamService,
     request_context::RequestId,
+    request_validation::validate_query_length,
 };
 
 const RAG_STREAM_JSON_DEPRECATION_DATE: &str = "@1784073600"; // 2026-07-15T00:00:00Z
@@ -33,6 +34,7 @@ pub(crate) async fn rag_answer(
     Json(mut req): Json<RagAnswerRequest>,
 ) -> Result<Json<Value>, ApiError> {
     user.apply_owner_default(&mut req.owner_user_id)?;
+    validate_query_length("question", req.question.as_deref(), &state.config)?;
     let budget_key = user
         .principal
         .provider_budget_key(&state.config.index_hash_secret);
@@ -48,6 +50,7 @@ pub(crate) async fn rag_stream(
     Query(query): Query<RagStreamQuery>,
     Json(mut req): Json<RagAnswerRequest>,
 ) -> Result<Response, ApiError> {
+    validate_query_length("question", req.question.as_deref(), &state.config)?;
     match query.format.as_deref().unwrap_or("sse") {
         "json" => {
             user.apply_owner_default(&mut req.owner_user_id)?;
@@ -106,6 +109,7 @@ pub(crate) async fn rag_debug(
     admin
         .principal
         .apply_owner_default(&mut req.owner_user_id)?;
+    validate_query_length("question", req.question.as_deref(), &state.config)?;
     let budget_key = admin
         .principal
         .provider_budget_key(&state.config.index_hash_secret);
@@ -117,6 +121,7 @@ pub(crate) async fn prompt_preview(
     State(state): State<AppState>,
     Json(req): Json<RagAnswerRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    validate_query_length("question", req.question.as_deref(), &state.config)?;
     let budget_key = admin
         .principal
         .provider_budget_key(&state.config.index_hash_secret);

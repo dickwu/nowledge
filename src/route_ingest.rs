@@ -27,6 +27,7 @@ use crate::{
     ingest_service::{IngestService, IngestTerminalTransition},
     models::{FragmentPolicy, IngestTask, IngestTaskRequest, IngestTaskResult},
     parser::StagedUpload,
+    request_validation::validate_fragment_policy,
 };
 
 #[derive(Clone, Default)]
@@ -123,6 +124,7 @@ pub(crate) async fn create_ingest_task(
 ) -> Result<Json<IngestTask>, ApiError> {
     user.apply_owner_default(&mut request.owner_user_id)?;
     require_owner_for_write(&user, request.owner_user_id.as_deref())?;
+    validate_fragment_policy("fragment_policy", request.fragment_policy.as_ref())?;
     authorize_ingest_request(&user, &request, &state.config)?;
     Ok(Json(
         ingest_service(&state)
@@ -169,6 +171,7 @@ pub(crate) async fn ingest_file_sync(
 ) -> Result<Json<IngestTaskResult>, ApiError> {
     user.apply_owner_default(&mut request.owner_user_id)?;
     require_owner_for_write(&user, request.owner_user_id.as_deref())?;
+    validate_fragment_policy("fragment_policy", request.fragment_policy.as_ref())?;
     authorize_ingest_request(&user, &request, &state.config)?;
     Ok(Json(
         ingest_service(&state)
@@ -188,6 +191,7 @@ pub(crate) async fn create_ingest_upload(
     let mut prepared = ingest_request_from_multipart(multipart, &state.config).await?;
     user.apply_owner_default(&mut prepared.request.owner_user_id)?;
     require_owner_for_write(&user, prepared.request.owner_user_id.as_deref())?;
+    validate_fragment_policy("fragment_policy", prepared.request.fragment_policy.as_ref())?;
     authorize_ingest_request(&user, &prepared.request, &state.config)?;
     Ok(Json(
         service
@@ -205,6 +209,7 @@ pub(crate) async fn ingest_upload_sync(
     let mut prepared = ingest_request_from_multipart(multipart, &state.config).await?;
     user.apply_owner_default(&mut prepared.request.owner_user_id)?;
     require_owner_for_write(&user, prepared.request.owner_user_id.as_deref())?;
+    validate_fragment_policy("fragment_policy", prepared.request.fragment_policy.as_ref())?;
     authorize_ingest_request(&user, &prepared.request, &state.config)?;
     Ok(Json(
         ingest_service(&state)

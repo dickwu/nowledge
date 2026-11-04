@@ -5,7 +5,7 @@ use crate::{
     auth::Principal,
     config::Config,
     error::ApiError,
-    llm::{LlmHealthProbeResult, LlmProfile, LlmProviderRegistry, LlmRequest},
+    llm::{LlmHealthProbe, LlmHealthProbeResult, LlmProfile, LlmProviderRegistry, LlmRequest},
     models::{
         HydrationReport, HydrationStatus, LlmStatusResponse, LlmTestRequest, LlmTestResponse,
     },
@@ -14,6 +14,9 @@ use crate::{
 
 const SERVICE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERVICE_GIT_REV: &str = env!("NOWLEDGE_GIT_REV");
+/// `error_kind` (and `/readyz` dependency state) of an LLM profile that has
+/// no cached probe verdict yet.
+const LLM_NOT_PROBED: &str = "not_probed";
 
 pub(crate) struct HealthPayload {
     pub ready: bool,
@@ -68,8 +71,12 @@ impl HealthService {
         }
     }
 
+    /// Public readiness. Unlike [`HealthService::health`] it reads the LLM
+    /// verdicts only from the probe cache, so a load-balancer probe never
+    /// triggers (or waits on) a live provider call. It keeps the last verdict
+    /// whatever its age and reports when it was observed.
     pub(crate) async fn readiness(state: &AppState) -> HealthPayload {
-        let check = operational_check(state).await;
+        let check = cached_operational_check(state).await;
         let meili_status = dependency_status(&check.meili);
         let parser_status = dependency_status(&check.parser);
         let primary_llm_status =
@@ -89,6 +96,10 @@ impl HealthService {
                     "llm": primary_llm_status,
                     "analysis_llm": analysis_llm_status,
                     "parser": parser_status
+                },
+                "llm_checked_at": {
+                    "llm": llm_verdict_checked_at(&check.primary_llm),
+                    "analysis_llm": llm_verdict_checked_at(&check.analysis_llm)
                 }
             }),
         }
@@ -245,8 +256,90 @@ impl DiagnosticsService {
     }
 }
 
+/// Refreshes both LLM verdicts through the shared single-flight probe cache;
+/// a verdict younger than `RAG_HEALTH_LLM_PROBE_TTL_SECONDS` is reused rather
+/// than re-probed.
+pub(crate) async fn refresh_llm_health(state: &AppState) {
+    let config = state.effective_config();
+    probe_llm_profiles(state, &config).await;
+}
+
+fn llm_profiles_match(config: &Config, analysis_config: &Config) -> bool {
+    config.llm_provider == analysis_config.llm_provider
+        && config.llm_model == analysis_config.llm_model
+        && config.llm_reasoning_effort == analysis_config.llm_reasoning_effort
+}
+
+/// Probe both LLM profiles, subject to their caches.
+async fn probe_llm_profiles(
+    state: &AppState,
+    config: &Config,
+) -> (LlmHealthProbeResult, LlmHealthProbeResult) {
+    let analysis_config = config.analysis_llm_config();
+    if llm_profiles_match(config, &analysis_config) {
+        let primary = state
+            .llm_health
+            .check_with_registry(config, &state.llm_providers)
+            .await;
+        (primary.clone(), primary)
+    } else {
+        tokio::join!(
+            state
+                .llm_health
+                .check_with_registry(config, &state.llm_providers),
+            state
+                .analysis_llm_health
+                .check_with_registry(&analysis_config, &state.llm_providers)
+        )
+    }
+}
+
+/// Both LLM profiles' last verdicts from the probe cache alone, whatever
+/// their age; a profile without a completed probe is reported as not probed.
+fn cached_llm_profiles(
+    state: &AppState,
+    config: &Config,
+) -> (LlmHealthProbeResult, LlmHealthProbeResult) {
+    let analysis_config = config.analysis_llm_config();
+    let primary = cached_llm_health(&state.llm_health, config);
+    let analysis = if llm_profiles_match(config, &analysis_config) {
+        primary.clone()
+    } else {
+        cached_llm_health(&state.analysis_llm_health, &analysis_config)
+    };
+    (primary, analysis)
+}
+
+fn cached_llm_health(probe: &LlmHealthProbe, config: &Config) -> LlmHealthProbeResult {
+    probe
+        .cached_verdict(config)
+        .unwrap_or_else(|| unprobed_llm_health(config))
+}
+
+/// Detailed health: probes the LLM profiles (subject to the probe cache).
 async fn operational_check(state: &AppState) -> OperationalCheck {
     let config = state.effective_config();
+    let (primary_llm, analysis_llm) = probe_llm_profiles(state, &config).await;
+    assess_operational_state(state, &config, primary_llm, analysis_llm).await
+}
+
+/// Readiness: the same policy as [`operational_check`], but the LLM verdicts
+/// are the last cached ones, never re-probed or expired by age. A profile
+/// that has not been probed yet is `not_probed`; it blocks readiness only
+/// when `RAG_HEALTH_REQUIRE_LLM=true` and otherwise leaves the service ready
+/// but `degraded`.
+async fn cached_operational_check(state: &AppState) -> OperationalCheck {
+    let config = state.effective_config();
+    let (primary_llm, analysis_llm) = cached_llm_profiles(state, &config);
+    assess_operational_state(state, &config, primary_llm, analysis_llm).await
+}
+
+async fn assess_operational_state(
+    state: &AppState,
+    config: &Config,
+    primary_llm: LlmHealthProbeResult,
+    analysis_llm: LlmHealthProbeResult,
+) -> OperationalCheck {
     let meili = state.runtime_meili.health_status().await;
     let hydration = state
         .store
@@ -260,27 +353,7 @@ async fn operational_check(state: &AppState) -> OperationalCheck {
             completed_at: None,
             domains: Default::default(),
         });
-    let analysis_config = config.analysis_llm_config();
-    let profiles_match = config.llm_provider == analysis_config.llm_provider
-        && config.llm_model == analysis_config.llm_model
-        && config.llm_reasoning_effort == analysis_config.llm_reasoning_effort;
-    let (primary_llm, analysis_llm) = if profiles_match {
-        let primary = state
-            .llm_health
-            .check_with_registry(&config, &state.llm_providers)
-            .await;
-        (primary.clone(), primary)
-    } else {
-        tokio::join!(
-            state
-                .llm_health
-                .check_with_registry(&config, &state.llm_providers),
-            state
-                .analysis_llm_health
-                .check_with_registry(&analysis_config, &state.llm_providers)
-        )
-    };
-    let parser = state.store.parser_health_status(&config).await;
+    let parser = state.store.parser_health_status(config).await;
     let meili_healthy = meili
         .get("healthy")
         .and_then(Value::as_bool)
@@ -292,10 +365,12 @@ async fn operational_check(state: &AppState) -> OperationalCheck {
             .get("healthy")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let degraded = primary_llm.status == "degraded"
-        || primary_llm.stale
-        || analysis_llm.status == "degraded"
-        || analysis_llm.stale;
+    // Verdict age alone is not degradation: live checks re-probe a verdict
+    // older than the TTL, and readiness deliberately keeps the last verdict.
+    // A profile with no verdict yet is degraded (unhealthy when required).
+    let degraded = [&primary_llm, &analysis_llm]
+        .into_iter()
+        .any(|llm| llm.status == "degraded" || llm_not_probed(llm));
     let ready = meili_healthy
         && hydration.ready
         && !primary_llm_unhealthy
@@ -328,16 +403,34 @@ pub(crate) async fn llm_health_false_ready(state: &AppState) -> bool {
 }
 
 fn llm_is_unhealthy(llm: &LlmHealthProbeResult, required: bool) -> bool {
-    llm.status == "unhealthy" || llm.quota_state == "exhausted" || (!llm.auth_valid && required)
+    llm.status == "unhealthy"
+        || llm.quota_state == "exhausted"
+        || (required && (!llm.auth_valid || llm_not_probed(llm)))
+}
+
+fn llm_not_probed(llm: &LlmHealthProbeResult) -> bool {
+    llm.error_kind.as_deref() == Some(LLM_NOT_PROBED)
 }
 
 fn llm_dependency_status(llm: &LlmHealthProbeResult, required: bool) -> &'static str {
-    if llm_is_unhealthy(llm, required) {
+    if llm_not_probed(llm) {
+        LLM_NOT_PROBED
+    } else if llm_is_unhealthy(llm, required) {
         "unhealthy"
-    } else if llm.status == "degraded" || llm.stale {
+    } else if llm.status == "degraded" {
         "degraded"
     } else {
         "ok"
+    }
+}
+
+/// When a readiness LLM verdict was observed; `null` while it is not probed
+/// or when probing is disabled.
+fn llm_verdict_checked_at(llm: &LlmHealthProbeResult) -> Value {
+    if llm_not_probed(llm) || llm.status == "disabled" {
+        Value::Null
+    } else {
+        json!(llm.checked_at)
     }
 }
 
@@ -414,7 +507,7 @@ fn unprobed_llm_health(config: &Config) -> LlmHealthProbeResult {
         age_seconds: 0,
         consecutive_failures: 0,
         rate_limits: crate::llm::RateLimitSnapshot::default(),
-        error_kind: Some("not_probed".to_string()),
+        error_kind: Some(LLM_NOT_PROBED.to_string()),
         message: Some("LLM health has not been probed yet".to_string()),
         auth_expires_at: None,
         auth_expires_in_seconds: None,

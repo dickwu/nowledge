@@ -20,7 +20,7 @@ JSON `IngestTaskRequest`.
 | content_list / content_list_v2 | object/array? | Supplied parser output; bypasses live parsing. |
 | source_document_uri | string? | Optional explicit source-document URI. Non-admin callers may only use `ctx://user/...`; the default is `ctx://user/ingest/...` for owner-scoped tasks and `ctx://company/ingest/...` for admin company ingest. |
 | parser_provider / parser_backend | string? | `builtin` or `mineru`, plus the MinerU backend. Overriding the operator-configured `RAG_PARSER_PROVIDER` / `RAG_MINERU_BACKEND` requires admin scope; non-admin callers may omit them or echo the configured values. |
-| fragment_policy | object? | Chunk sizing overrides. |
+| fragment_policy | object? | Chunk sizing overrides: `chunk_size_chars` 1-8000, `overlap_chars` below the chunk size, `min_chunk_chars` 1 to the chunk size; out-of-range values return `400 validation_error`. |
 | idempotency_key | string? | Unsupported; supplying it returns 400 before task creation. |
 
 ## Response

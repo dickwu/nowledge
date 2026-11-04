@@ -4960,3 +4960,52 @@ async fn meili_all_fixed_indexes_enforce_tenant_safe_logical_identity_lifecycle(
         failures.join("\n")
     );
 }
+
+#[tokio::test]
+async fn meili_search_fails_for_missing_managed_indexes_but_not_unprovisioned_user_indexes() {
+    let _guard = live_meili_test_guard().await;
+    let Some(config) = meili_config_with_tenant(format!("tenant-{}", uuid::Uuid::now_v7())).await
+    else {
+        eprintln!("skipping Meilisearch integration test; set RAG_TEST_MEILI_URL");
+        return;
+    };
+    let admin = MeiliAdmin::from_config(&config);
+    let routing = nowledge::resolver::EventIndexResolver::new(b"meili-missing-index-test".to_vec())
+        .resolve(
+            &config.tenant_id,
+            &format!("u-{}", uuid::Uuid::now_v7()),
+            false,
+            true,
+        )
+        .expect("owner routing should resolve");
+
+    // Per-user indexes are created on a user's first write, so a user without
+    // history searches as empty rather than failing.
+    let events = admin
+        .search::<Value>(&routing.event_index_uid, json!({ "q": "" }))
+        .await
+        .expect("an unprovisioned per-user event index is an empty search");
+    assert!(events.hits.is_empty());
+    let context = admin
+        .search_value(&routing.personal_context_index_uid, json!({ "q": "" }))
+        .await
+        .expect("an unprovisioned personal context index is an empty search");
+    assert_eq!(context["hits"], json!([]));
+
+    // Any other index must exist: Meilisearch's index_not_found propagates
+    // with its structured error instead of looking like an empty result.
+    let missing = format!("rag_required_probe_{}", uuid::Uuid::now_v7().simple());
+    let error = admin
+        .search::<Value>(&missing, json!({ "q": "" }))
+        .await
+        .map(|_| ())
+        .expect_err("a missing managed index must not look empty");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!(
+            "required Meilisearch index {missing} is missing during search: status 404"
+        )),
+        "{message}"
+    );
+    assert!(message.contains("meili_code=index_not_found"), "{message}");
+}

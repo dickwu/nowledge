@@ -42,6 +42,10 @@ response redaction ahead of compression. Boundary failures stay inside the
 redaction/response contract. The API buffers only bounded non-multipart request
 bodies, uses immediate semaphore load shedding, applies a fixed-window rate
 limit to a trusted logical tenant/principal key, and bounds route execution.
+A load-shedding permit follows the response body, so streamed responses count
+against capacity until they finish; an expiry task releases it
+`RAG_REQUEST_TIMEOUT_MS` after the response headers at the latest, because a
+client that stops reading also stops hyper from polling the body.
 `/livez` bypasses capacity and timeout enforcement so saturation cannot hide a
 live process. `/readyz` is load-shed and uses a separate public-probe rate key.
 Raw credentials are neither rate keys nor diagnostics.
@@ -93,7 +97,9 @@ keeps concurrent upload/JSON memory and temporary-disk amplification bounded
 without consuming asynchronous worker slots.
 
 SIGINT/SIGTERM starts graceful shutdown: stop new queue acceptance, close the
-HTTP server, drain supervised tasks within `RAG_SHUTDOWN_TIMEOUT_MS`, abort any
+HTTP server and drain its in-flight requests while the background runtime still
+admits their audit finalizations and traces, then close the runtime, drain
+supervised tasks within `RAG_SHUTDOWN_TIMEOUT_MS`, abort any
 remaining tasks, and mark every unfinished ingest record `failed` with
 `error=ingest_interrupted`. Startup hydration applies that same terminal state
 to persisted nonterminal tasks because the original request/upload payload is

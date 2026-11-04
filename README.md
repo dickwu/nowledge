@@ -78,6 +78,8 @@ RAG_MEILI_AUDIT_INDEX_CREATED_AT=required-production-rfc3339-createdAt
 RAG_WRITE_CONSISTENCY=read_your_writes
 RAG_MEILI_SCAN_PAGE_SIZE=500
 RAG_MEILI_SCAN_MAX_DOCUMENTS=100000
+RAG_MEILI_CONNECT_TIMEOUT_MS=5000
+RAG_MEILI_REQUEST_TIMEOUT_MS=30000
 RAG_PARSER_PROVIDER=builtin
 RAG_MINERU_API_URL=http://127.0.0.1:8000
 RAG_MINERU_BACKEND=hybrid-auto-engine
@@ -92,9 +94,10 @@ RAG_UPLOAD_ALLOWED_MIME_TYPES=text/plain,text/markdown,application/octet-stream,
 RAG_MAX_BULK_EVENTS=500
 RAG_MAX_BULK_ROWS=5000
 RAG_MAX_SEARCH_LIMIT=100
+RAG_MAX_QUERY_CHARS=8192
 RAG_MAX_TAGS_PER_ITEM=64
 RAG_MAX_TAG_BYTES=128
-RAG_REQUEST_TIMEOUT_MS=30000
+RAG_REQUEST_TIMEOUT_MS=90000
 RAG_SYNC_INGEST_TIMEOUT_MS=120000
 RAG_MAX_IN_FLIGHT_REQUESTS=256
 RAG_RATE_LIMIT_REQUESTS_PER_MINUTE=600
@@ -132,7 +135,7 @@ RAG_OPENAI_API_KEY=optional-openai-key
 RAG_CODEX_AUTH_PATH=optional-explicit-codex-auth-json
 RAG_REDACTION_PREVIOUS_SECRETS=optional-revoked-token,optional-prior-token
 RAG_HEALTH_LLM_ENABLED=true
-RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS=30
+RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS=0
 RAG_HEALTH_LLM_PROBE_TTL_SECONDS=60
 RAG_HEALTH_LLM_MAX_STALE_SECONDS=120
 RAG_HEALTH_LLM_TIMEOUT_MS=10000
@@ -197,6 +200,8 @@ Before starting this revision against an existing Meilisearch deployment,
 back up Meilisearch and add the tenant-safe operation journal. The managed
 fixed-index bootstrap fails closed when the old index set exists without
 `rag_operations`; it will not recreate the missing index automatically.
+Startup also refuses any existing fixed index, or any registered per-user
+event or personal-context index, whose primary key is not `id`.
 Drain writers during this cutover and audit existing documents for legacy
 idempotency metadata. `operations_v1` starts the durable journal; it cannot
 reconstruct request fingerprints or response snapshots for keys accepted by an
@@ -227,6 +232,17 @@ application revision ignores this additional index, so rollback does not
 require deleting it. See
 [ADR 0006](doc/adr/0006-mutation-consistency.md) for consistency and recovery
 semantics.
+
+Unfinished journal records keep their complete replay plan so reconciliation
+can re-apply pending steps. Once an operation is completed and confirmed
+searchable, its final checkpoint is compacted: content bodies (document text,
+fragment bodies, event text/payloads, row values, parsed blocks) are cleared
+while ids, routing, ownership, checksums, deletion targets, the response
+snapshot used for idempotent replay, and per-step payload sizes plus keyed
+fingerprints (`plan.redacted_metadata.compacted_payloads`) are kept. The
+process keeps at most 10,000 settled records in memory; older ones stay
+readable through the durable journal (the memory backend has no journal, so
+its replay window is that bound).
 
 The operation journal currently requires one writer process per tenant.
 Do not run active-active Nowledge writer replicas against the same tenant until
@@ -312,7 +328,11 @@ verify the operation and audit indexes before generating the final
 
 HTTP and ingest boundaries are typed startup configuration. Numeric limits
 must be positive, malformed values fail startup, and the synchronous ingest
-timeout must be at least the ordinary request timeout. Request, sync-ingest,
+timeout must be at least the ordinary request timeout. The ordinary request
+timeout must exceed `RAG_LLM_TIMEOUT_MS`, `RAG_HEALTH_LLM_TIMEOUT_MS`, and the
+60 s Meilisearch task wait by at least 5 s (65 s with the shipped LLM
+defaults), so a slow dependency returns its own error instead of being cut off
+by a generic route 504; shorter values fail startup. Request, sync-ingest,
 and shutdown deadlines are capped at seven days so deadline arithmetic cannot
 overflow or panic. JSON requests are
 limited by `RAG_MAX_JSON_BYTES`; multipart file data is streamed to temporary
@@ -346,7 +366,11 @@ pass; provider output cannot select tenant or owner scope.
 to no allowed browser origin. A production wildcard is rejected unless it is
 the sole origin and `RAG_ALLOW_WILDCARD_CORS=true` is set explicitly.
 `RAG_MAX_IN_FLIGHT_REQUESTS` load-sheds excess work without consuming the
-`/livez` capacity or timeout path. `/readyz` remains public but has its own
+`/livez` capacity or timeout path. A request keeps its in-flight slot until its
+response body finishes, but at most `RAG_REQUEST_TIMEOUT_MS` after the
+response headers are ready: at that deadline the slot is released even if a
+stalled client has stopped reading, and the unfinished body is cut off the
+next time it is polled. `/readyz` remains public but has its own
 readiness-probe rate bucket. Rate limiting is keyed by the authenticated
 logical tenant/principal, so rotating or adding a second token does not create
 a new owner budget. CORS exposes `X-Request-Id` and `Retry-After` to allowed
@@ -410,12 +434,30 @@ Health endpoints split process liveness from operational readiness:
   dependency state. A Meilisearch-backed process remains unready until every
   mandatory tenant domain has hydrated atomically; it does not expose raw
   provider payloads, usage/private counts, plan data, credits, or credential
-  sources.
+  sources. It never calls an LLM provider: the `llm` and `analysis_llm`
+  verdicts are the last ones in the health-probe cache, kept whatever their
+  age, and `llm_checked_at` says when each was observed. Until a profile's
+  first probe completes it reports `not_probed`, which keeps the service
+  unready when `RAG_HEALTH_REQUIRE_LLM=true` and otherwise reports it ready
+  but `degraded`.
 - `GET /healthz` requires an admin bearer and checks Meilisearch plus the
   tenant hydration report and configured parser and LLM provider/model,
-  including auth validity, quota/rate-limit state, stale probe state, and a
-  compact usage summary. If `RAG_HEALTH_REQUIRE_LLM=true`, an unconfigured or
-  exhausted LLM makes the service unhealthy.
+  including auth validity, quota/rate-limit state, probe age, and a compact
+  usage summary. It re-probes an LLM profile whose cached verdict is older
+  than `RAG_HEALTH_LLM_PROBE_TTL_SECONDS` (concurrent callers share one
+  probe). If `RAG_HEALTH_REQUIRE_LLM=true`, an unconfigured or exhausted LLM
+  makes the service unhealthy.
+- LLM health probing is sparse to save provider quota. The server probes each
+  LLM profile once in the background at startup; after that only `/healthz`
+  (and the harness eval false-ready check) re-probes, at most once per
+  `RAG_HEALTH_LLM_PROBE_TTL_SECONDS`. Periodic background probing is opt-in
+  through `RAG_HEALTH_LLM_PROBE_INTERVAL_SECONDS`: `0` (the default) disables
+  it, and any other value must be at least 300 seconds. The admin usage view
+  still reports a cached verdict older than `RAG_HEALTH_LLM_MAX_STALE_SECONDS`
+  as an unhealthy `stale_probe`; readiness never expires one.
+- LLM health probes always run at `low` reasoning effort, whatever
+  `RAG_LLM_REASONING_EFFORT` or `RAG_ANALYSIS_LLM_REASONING_EFFORT` configures;
+  the reported `reasoning_effort` stays the profile's configured value.
 
 - The protected health `llm.rate_limits` block carries the freshest live
   provider budget snapshot. For `codex_auth` it is parsed from the ChatGPT Codex `x-codex-*`
@@ -522,9 +564,10 @@ asynchronous ingest while synchronous ingest remains available. Synchronous
 ingest uses a separate immediate load-shed lane capped by
 `RAG_INGEST_MAX_CONCURRENT_TASKS`; saturation returns 503 plus `Retry-After`
 before buffering a JSON or multipart body. SIGINT/SIGTERM stop new queue
-acceptance, allow supervised work to finish within
-`RAG_SHUTDOWN_TIMEOUT_MS`, and mark unfinished tasks as failed with
-`ingest_interrupted`; startup recovery applies the same terminal state to
+acceptance, drain in-flight HTTP requests while background audit and trace
+writes are still accepted, then close the background runtime and allow
+supervised work to finish within `RAG_SHUTDOWN_TIMEOUT_MS`, and mark unfinished
+tasks as failed with `ingest_interrupted`; startup recovery applies the same terminal state to
 persisted nonterminal tasks from a prior process.
 Finished (`completed`/`failed`) task records and their stored results are
 pruned after `RAG_INGEST_TASK_RETENTION_SECONDS` (default 86400; set 0 to
@@ -553,6 +596,23 @@ Meilisearch task confirmation polls with exponential backoff (5 ms doubling
 to 200 ms, same 60 s total timeout). Several task UIDs from one step are
 confirmed together through `GET /tasks?uids=...`; a server or key scope that
 cannot list them falls back to per-task `GET /tasks/{uid}` probes.
+Every Meilisearch HTTP request is bounded by `RAG_MEILI_CONNECT_TIMEOUT_MS`
+(default 5000) for connection setup and `RAG_MEILI_REQUEST_TIMEOUT_MS`
+(default 30000) for the whole exchange including the response body; the
+connect bound must not exceed the request bound. Task confirmation issues one
+short request per poll, so the request bound limits each poll rather than the
+60 s task wait that `wait_for_index` relies on.
+A failed Meilisearch response or task keeps Meilisearch's error object in the
+private cause: `code`, `type`, `link`, and a secret-redacted message truncated
+to 512 characters (at most 16 KiB of an error body is read; a non-JSON body
+keeps a 256-character snippet). The cause category comes from the Meilisearch
+`code` when present. `nowledge::meili` warnings log only the HTTP status, the
+Meilisearch code and type, and the cause category and keyed fingerprint, never
+the message, body, headers, or API keys.
+A search that Meilisearch answers with `index_not_found` is empty only for the
+per-user event and personal-context indexes, which are created on a user's
+first write. A missing fixed index, or a 404 without `index_not_found`, fails
+as an upstream error instead of returning no hits.
 Multipart uploads are staged with a generated private filename, incrementally
 hashed, and deleted after parsing or on cancellation/error. Duplicate file
 parts, excess metadata fields, an empty file, invalid or disallowed MIME values,

@@ -93,6 +93,11 @@ pub fn require_string(value: Option<String>, field: &str) -> Result<String, ApiE
         .ok_or_else(|| ApiError::bad_request(format!("{field} is required")))
 }
 
+/// Most distinct query terms [`text_score`] scans for. Each term is one
+/// substring scan of the text, so this bounds lexical scoring at a fixed number
+/// of passes per candidate however many terms a query carries.
+pub const MAX_LEXICAL_QUERY_TERMS: usize = 32;
+
 pub fn text_score(text: &str, query: &str) -> f32 {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
@@ -104,13 +109,22 @@ pub fn text_score(text: &str, query: &str) -> f32 {
         return 10.0 + query.len() as f32 / 100.0;
     }
 
-    let mut score = 0.0;
-    for token in query.split_whitespace().filter(|t| !t.is_empty()) {
-        if text.contains(token) {
-            score += 1.0;
+    // Scan each distinct term once, weighted by its occurrences, which keeps
+    // the previous per-token score. Terms first seen after the cap are not
+    // scored.
+    let mut terms: Vec<(&str, f32)> = Vec::new();
+    for token in query.split_whitespace() {
+        if let Some((_, count)) = terms.iter_mut().find(|(term, _)| *term == token) {
+            *count += 1.0;
+        } else if terms.len() < MAX_LEXICAL_QUERY_TERMS {
+            terms.push((token, 1.0));
         }
     }
-    score
+    terms
+        .into_iter()
+        .filter(|(term, _)| text.contains(term))
+        .map(|(_, count)| count)
+        .sum()
 }
 
 /// English function words configured as Meilisearch `stopWords` on context
@@ -1999,5 +2013,39 @@ mod redaction_tests {
         assert_eq!(redactor.push("Bearer "), "");
         assert_eq!(redactor.pending.len(), 7);
         redactor.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_score_keeps_phrase_and_per_token_scores() {
+        assert_eq!(text_score("anything", "   "), 1.0);
+        assert_eq!(
+            text_score("Say Alpha Beta now", "alpha beta"),
+            10.0 + "alpha beta".len() as f32 / 100.0
+        );
+        assert_eq!(text_score("alpha beta", "ALPHA gamma alpha beta"), 3.0);
+        assert_eq!(text_score("alpha beta", "gamma delta"), 0.0);
+    }
+
+    #[test]
+    fn text_score_scans_a_bounded_number_of_distinct_terms() {
+        let fillers = (1..MAX_LEXICAL_QUERY_TERMS)
+            .map(|index| format!("missing{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // `needle` is the first term and `late` the first one past the cap.
+        let query = format!("needle {fillers} late needle needle");
+        assert_eq!(text_score("needle late", &query), 3.0);
+        assert_eq!(text_score("only late matches", &query), 0.0);
+
+        let huge_query = (0..4_096)
+            .map(|index| format!("w{index}z"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(text_score("text with w0z and w4095z", &huge_query), 1.0);
     }
 }

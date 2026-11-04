@@ -19,7 +19,7 @@ Schema: `ContextSearchRequest`
 
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| query | string | required | Search query matched against active fragments. |
+| query | string | required | Search query matched against active fragments. At most `RAG_MAX_QUERY_CHARS` (default 8192) characters; longer values return 400 `validation_error`. |
 | mode | string | optional, default auto | Search mode selector. |
 | target_uri | string | optional | Target URI used by reveal-style searches. |
 | filters | object | optional, default null | Structured filters applied on top of the active fragment-only retrieval filter. |

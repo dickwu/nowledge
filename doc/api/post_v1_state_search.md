@@ -21,7 +21,7 @@ Schema: `StateSearchRequest`
 
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| query | string | optional | Full-text state search query. |
+| query | string | optional | Full-text state search query. At most `RAG_MAX_QUERY_CHARS` (default 8192) characters; longer values return 400 `validation_error`. |
 | state_types | string[] | optional, default [] | Restrict search to selected state types. |
 | owner_user_id | string | optional, auth default may apply | Owner scope. |
 | status | string | optional, default active | State item status filter. |

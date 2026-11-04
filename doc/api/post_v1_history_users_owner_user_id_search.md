@@ -21,7 +21,7 @@ Schema: `HistorySearchRequest`
 
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| query | string | optional | Full-text query used for event search. |
+| query | string | optional | Full-text query used for event search. At most `RAG_MAX_QUERY_CHARS` (default 8192) characters; longer values return 400 `validation_error`. |
 | event_types | string[] | optional, default [] | Restrict results to these event types. |
 | entity_type | string | optional | Restrict results to one entity type. |
 | entity_id | string | optional | Restrict results to one entity id. |
