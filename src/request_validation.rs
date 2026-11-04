@@ -33,6 +33,27 @@ pub(crate) fn validate_search_limit(
     Ok(())
 }
 
+/// Caps a free-text search query or question before retrieval, so one request
+/// cannot spend lexical scoring, Meili, prompt, and trace work on a query the
+/// size of the request body. Counted in characters, like the analysis contract.
+pub(crate) fn validate_query_length(
+    field: &str,
+    query: Option<&str>,
+    config: &Config,
+) -> Result<(), ApiError> {
+    let max_chars = config.max_query_chars;
+    // A UTF-8 string never has more characters than bytes.
+    match query {
+        Some(query) if query.len() > max_chars && query.chars().count() > max_chars => {
+            Err(ApiError::validation(
+                field,
+                format!("must contain at most {max_chars} characters"),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Rejects fragment policies outside the supported envelope instead of letting
 /// callers choose values that amplify one document into unbounded work. Unset
 /// fields keep their defaults, which the fragmenter clamps to the chunk size,

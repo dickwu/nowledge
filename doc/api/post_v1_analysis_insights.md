@@ -21,7 +21,7 @@ Schema: `AnalysisInsightRequest`
 | --- | --- | --- | --- |
 | owner_user_id | string | required after authentication defaults | Owner scope for search, link creation, and insight upsert. An owner-scoped credential may omit it because the authenticated owner default is applied first. |
 | history_event_id | string | optional | When supplied, analysis is constrained to the selected event and other events from the same owner event index. |
-| query | string | required by handler | Analysis question or topic. |
+| query | string | required by handler | Analysis question or topic. At most `RAG_MAX_QUERY_CHARS` (default 8192) characters; longer values return 400 `validation_error`. |
 | seed_uris | string[] | optional, default [] | Extra seed context URIs used when not running in history_event_id mode. |
 | context_limit | integer | optional, default 8 | Maximum context hits used in prompt construction; must not exceed `RAG_MAX_SEARCH_LIMIT`. |
 | link_limit | integer | optional, default 10 | Maximum existing links considered; must not exceed `RAG_MAX_SEARCH_LIMIT`. |

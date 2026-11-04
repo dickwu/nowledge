@@ -484,3 +484,56 @@ async fn fragment_policies_outside_the_supported_envelope_are_rejected_before_in
     .await;
     assert_eq!(response.status, StatusCode::NOT_FOUND, "{}", response.body);
 }
+
+#[tokio::test]
+async fn search_queries_and_questions_are_capped_before_retrieval() {
+    assert_eq!(Config::test().max_query_chars, 8192);
+    let mut config = Config::test();
+    config.max_query_chars = 32;
+    config.rate_limit_requests_per_minute = 10_000;
+    let app = build_router(AppState::new(Arc::new(config)));
+    let message = "must contain at most 32 characters";
+    // Characters, not bytes: 32 two-byte characters fit, 33 do not.
+    let at_cap = "é".repeat(32);
+    let over_cap = "é".repeat(33);
+
+    for (uri, field) in [
+        ("/v1/context/search", "query"),
+        ("/v1/rag/answer", "question"),
+        ("/v1/rag/stream", "question"),
+        ("/v1/rag/stream?format=json", "question"),
+        ("/v1/rag/debug", "question"),
+        ("/v1/debug/prompt/preview", "question"),
+        ("/v1/history/users/u1/search", "query"),
+        ("/v1/history/search", "query"),
+        ("/v1/state/search", "query"),
+        ("/v1/state/insights/search", "query"),
+        ("/v1/links/search", "query"),
+        ("/v1/analysis/insights", "query"),
+        ("/v1/eval/cases", "question"),
+    ] {
+        let response = json_call(
+            app.clone(),
+            Method::POST,
+            uri,
+            json!({ "owner_user_id": "u1", field: over_cap.clone() }),
+        )
+        .await;
+        assert_validation(&response, field, message);
+    }
+
+    for (uri, field) in [
+        ("/v1/context/search", "query"),
+        ("/v1/history/search", "query"),
+        ("/v1/state/search", "query"),
+    ] {
+        let response = json_call(
+            app.clone(),
+            Method::POST,
+            uri,
+            json!({ "owner_user_id": "u1", field: at_cap.clone() }),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{uri}: {}", response.body);
+    }
+}

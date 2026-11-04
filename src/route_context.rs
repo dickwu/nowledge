@@ -11,7 +11,7 @@ use crate::{
         ContextNode, ContextRevealRequest, ContextRevealResponse, ContextSearchRequest,
         ContextSearchResponse, ContextTracebackRequest, ContextTracebackResponse,
     },
-    request_validation::validate_search_limit,
+    request_validation::{validate_query_length, validate_search_limit},
     util::require_string,
 };
 
@@ -120,6 +120,7 @@ pub(crate) async fn context_search(
 ) -> Result<Json<ContextSearchResponse>, ApiError> {
     user.apply_owner_default(&mut request.owner_user_id)?;
     validate_search_limit("limit", request.limit, &state.config)?;
+    validate_query_length("query", request.query.as_deref(), &state.config)?;
     Ok(Json(
         context_service(&state)
             .search(request, user.principal.is_admin())

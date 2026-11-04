@@ -19,7 +19,7 @@ Schema: `InsightSearchRequest`
 
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| query | string | optional | Full-text insight query. |
+| query | string | optional | Full-text insight query. At most `RAG_MAX_QUERY_CHARS` (default 8192) characters; longer values return 400 `validation_error`. |
 | owner_user_id | string | optional, auth default may apply | Owner scope. |
 | insight_types | string[] | optional, default [] | Restrict by insight type. |
 | status | string | optional, default active | Insight status filter. |

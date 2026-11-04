@@ -10,7 +10,7 @@ use crate::{
         CreateRagEvalCaseRequest, CreateRagEvalRunRequest, RagEvalCase, RagEvalCaseResult,
         RagEvalOverview, RagEvalRun,
     },
-    request_validation::validate_tags,
+    request_validation::{validate_query_length, validate_tags},
 };
 
 pub(crate) async fn create_eval_case(
@@ -19,6 +19,8 @@ pub(crate) async fn create_eval_case(
     Json(request): Json<CreateRagEvalCaseRequest>,
 ) -> Result<Json<RagEvalCase>, ApiError> {
     validate_tags("tags", &request.tags, &state.config)?;
+    // Eval runs replay the question as a context search query.
+    validate_query_length("question", request.question.as_deref(), &state.config)?;
     Ok(Json(EvalService::new(&state).create_case(request).await?))
 }
 

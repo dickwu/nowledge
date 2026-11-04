@@ -14,7 +14,9 @@ use crate::{
         LinkSearchRequest, LinkSearchResponse, LinkUpsertRequest, PatchStateFactRequest,
         StateItemResponse, StateSearchRequest, StateSearchResponse, UpsertStateFactRequest,
     },
-    request_validation::{validate_fragment_policy, validate_search_limit, validate_tags},
+    request_validation::{
+        validate_fragment_policy, validate_query_length, validate_search_limit, validate_tags,
+    },
     state_service::StateService,
 };
 
@@ -86,6 +88,7 @@ pub(crate) async fn search_state(
     user.apply_owner_default(&mut request.owner_user_id)?;
     require_explicit_owner_for_unbound_private_read(&user, request.owner_user_id.as_deref())?;
     validate_search_limit("limit", request.limit, &state.config)?;
+    validate_query_length("query", request.query.as_deref(), &state.config)?;
     Ok(Json(state_service(&state).search_state(request)?))
 }
 
@@ -118,6 +121,7 @@ pub(crate) async fn search_insights(
     user.apply_owner_default(&mut request.owner_user_id)?;
     require_explicit_owner_for_unbound_private_read(&user, request.owner_user_id.as_deref())?;
     validate_search_limit("limit", request.limit, &state.config)?;
+    validate_query_length("query", request.query.as_deref(), &state.config)?;
     Ok(Json(state_service(&state).search_insights(request)?))
 }
 
@@ -139,6 +143,7 @@ pub(crate) async fn search_links(
 ) -> Result<Json<LinkSearchResponse>, ApiError> {
     user.apply_owner_default(&mut request.owner_user_id)?;
     validate_search_limit("limit", request.limit, &state.config)?;
+    validate_query_length("query", request.query.as_deref(), &state.config)?;
     Ok(Json(
         state_service(&state).search_links(request, user.principal.is_admin())?,
     ))

@@ -21,7 +21,7 @@ Schema: `CreateRagEvalCaseRequest`
 | --- | --- | --- | --- |
 | id | string | optional | Explicit case identifier. Auto-minted with an `evalcase` prefix when omitted. |
 | owner_user_id | string | optional | Owner scope applied to retrieval when the case runs. |
-| question | string | required | Question replayed during a run. Rejected with 400 when missing or blank. |
+| question | string | required | Question replayed during a run. Rejected with 400 when missing or blank. At most `RAG_MAX_QUERY_CHARS` (default 8192) characters; longer values return 400 `validation_error`. |
 | expected_context_uris | string[] | optional, default `[]` | ContextFS URIs expected in retrieval. |
 | expected_source_document_uris | string[] | optional, default `[]` | Source document URIs expected in retrieval. |
 | expected_answer_contains | string[] | optional, default `[]` | Substrings expected in the generated answer. |
