@@ -29,7 +29,7 @@ Schema: `RagAnswerRequest`
 
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| `question` | string | required | Question to answer. |
+| `question` | string | required | Question to answer. At most `RAG_MAX_QUERY_CHARS` (default 8192) characters; longer values return 400 `validation_error`. |
 | `mode` | string | optional, default `auto` | Retrieval mode selector. |
 | `session_id` | string | optional | Session to associate with the answer. |
 | `owner_user_id` | string | optional, auth default may apply | Owner scope. |

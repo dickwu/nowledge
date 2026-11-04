@@ -19,7 +19,7 @@ Create an asynchronous ingest task from a multipart file upload.
 | parser_backend | MinerU backend override. Overriding `RAG_MINERU_BACKEND` requires admin scope. |
 | content_type | Optional MIME metadata. When present with a file, it must match the file part `Content-Type`. |
 | checksum | Optional SHA-256 checksum as exactly 64 hexadecimal characters; malformed values or mismatches reject the request before task creation. |
-| fragment_policy.chunk_size_chars / overlap_chars / min_chunk_chars | Optional numeric fragment policy fields. |
+| fragment_policy.chunk_size_chars / overlap_chars / min_chunk_chars | Optional numeric fragment policy fields. `chunk_size_chars` must be 1-8000, `overlap_chars` less than the chunk size, and `min_chunk_chars` 1 to the chunk size; out-of-range values return `400 validation_error`. |
 | idempotency_key | Unsupported; supplying it returns 400 before task creation. |
 
 ## Response

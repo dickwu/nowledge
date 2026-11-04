@@ -17,7 +17,9 @@ use crate::{
         ReconcileUserEventIndexesRequest, ReconcileUserEventIndexesResponse, TimelineQueryRequest,
         TimelineResponse, UserEventIndexResponse,
     },
-    request_validation::{validate_history_bulk, validate_search_limit, validate_tags},
+    request_validation::{
+        validate_history_bulk, validate_query_length, validate_search_limit, validate_tags,
+    },
     util::require_string,
 };
 
@@ -132,6 +134,7 @@ pub(crate) async fn search_user_events(
 ) -> Result<Json<HistorySearchResponse>, ApiError> {
     user.require_owner_access(&owner_user_id)?;
     validate_search_limit("limit", request.limit, &state.config)?;
+    validate_query_length("query", request.query.as_deref(), &state.config)?;
     request.owner_user_id = Some(owner_user_id.clone());
     Ok(Json(
         history_service(&state)
@@ -211,6 +214,7 @@ pub(crate) async fn search_events_alias(
 ) -> Result<Json<HistorySearchResponse>, ApiError> {
     user.apply_owner_default(&mut request.owner_user_id)?;
     validate_search_limit("limit", request.limit, &state.config)?;
+    validate_query_length("query", request.query.as_deref(), &state.config)?;
     Ok(Json(
         history_service(&state).search_events(None, request).await?,
     ))

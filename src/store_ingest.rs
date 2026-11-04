@@ -390,7 +390,25 @@ impl Store {
             .or_else(|| req.file_name.clone())
             .or_else(|| req.source_uri.clone())
             .unwrap_or_else(|| "Parsed document".to_string());
+        // Masking and fragmenting are the CPU-bound part of persisting the
+        // document and read only these inputs and the configured secrets, so
+        // they run on the blocking pool before the global mutation gate is
+        // taken. Every store write still happens inside the staged mutation.
+        let redaction_secrets = self.redaction_config.configured_secret_values();
         let fragment_policy = req.fragment_policy.clone();
+        let (document_content, title, blocks_for_stage, prepared_fragments) =
+            tokio::task::spawn_blocking(move || {
+                let prepared = PreparedSourceFragments::new(
+                    &redaction_secrets,
+                    &title,
+                    &document_content,
+                    fragment_policy.as_ref(),
+                    &blocks_for_stage,
+                );
+                (document_content, title, blocks_for_stage, prepared)
+            })
+            .await
+            .map_err(|_| ApiError::Internal("document fragmentation task failed".to_string()))?;
         let (ingest, _) = Box::pin(self.execute_staged_mutation(
             tenant_id,
             "ingest.outputs.persist",
@@ -413,7 +431,7 @@ impl Store {
                     data.parse_artifacts
                         .insert(ParseArtifactKey::from_artifact(&artifact), artifact);
                 }
-                Ok(staged.write_source_document_fragments_locked(
+                Ok(staged.write_prepared_source_document_fragments_locked(
                     &mut data,
                     tenant_id,
                     owner.clone(),
@@ -426,9 +444,9 @@ impl Store {
                     &checksum,
                     &index_kind,
                     &index_uid,
-                    fragment_policy.as_ref(),
                     &blocks_for_stage,
                     &artifact_refs_for_stage,
+                    prepared_fragments,
                 ))
             },
         ))

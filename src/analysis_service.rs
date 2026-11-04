@@ -15,6 +15,7 @@ use crate::{
         redact_for_state, truncate_utf8_bytes,
     },
     models::*,
+    request_validation::validate_query_length,
     util::{
         redact_egress_text, redact_locator, redact_string, require_string, sanitize_slug,
         text_score,
@@ -44,12 +45,7 @@ async fn run_analysis_insights(
     provider_budget_key: &str,
 ) -> Result<AnalysisInsightResponse, ApiError> {
     let query = require_string(req.query.clone(), "query")?;
-    if query.chars().count() > 8_192 {
-        return Err(ApiError::validation(
-            "query",
-            "must contain at most 8192 characters",
-        ));
-    }
+    validate_query_length("query", Some(&query), &state.config)?;
     let owner_user_id = req
         .owner_user_id
         .clone()

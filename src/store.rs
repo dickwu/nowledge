@@ -6298,6 +6298,51 @@ impl Store {
         blocks: &[ParsedBlock],
         artifact_refs: &[ParseArtifactRef],
     ) -> DocumentIngestResult {
+        let prepared = PreparedSourceFragments::new(
+            &self.redaction_config.configured_secret_values(),
+            title,
+            content,
+            policy,
+            blocks,
+        );
+        self.write_prepared_source_document_fragments_locked(
+            data,
+            tenant_id,
+            owner_user_id,
+            source_kind,
+            source_id,
+            revision_id,
+            source_document_uri,
+            title,
+            content,
+            checksum,
+            index_kind,
+            index_uid,
+            blocks,
+            artifact_refs,
+            prepared,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_prepared_source_document_fragments_locked(
+        &self,
+        data: &mut StoreData,
+        tenant_id: &str,
+        owner_user_id: Option<String>,
+        source_kind: &str,
+        source_id: &str,
+        revision_id: &str,
+        source_document_uri: &str,
+        title: &str,
+        content: &str,
+        checksum: &str,
+        index_kind: &str,
+        index_uid: &str,
+        blocks: &[ParsedBlock],
+        artifact_refs: &[ParseArtifactRef],
+        prepared: PreparedSourceFragments,
+    ) -> DocumentIngestResult {
         self.supersede_source_artifacts_locked(
             data,
             tenant_id,
@@ -6339,18 +6384,11 @@ impl Store {
                 .insert(source_document_key, blocks.to_vec());
         }
 
-        let redaction_secrets = self.redaction_config.configured_secret_values();
-        let retrieval_title =
-            mask_secret_egress_projection_preserving_chars(title, &redaction_secrets);
-        let retrieval_content =
-            mask_secret_fragment_projection_preserving_chars(content, &redaction_secrets);
-        let retrieval_blocks = blocks
-            .iter()
-            .cloned()
-            .map(|block| mask_parsed_block_for_retrieval(block, &redaction_secrets))
-            .collect::<Vec<_>>();
-        let fragmenter = BlockAwareFragmenter::from_policy(policy);
-        let fragments = fragmenter.fragment(&retrieval_content, &retrieval_blocks);
+        let PreparedSourceFragments {
+            retrieval_title,
+            retrieval_content,
+            fragments,
+        } = prepared;
         let fragment_uris = fragments
             .iter()
             .map(|fragment| {
@@ -7491,18 +7529,80 @@ fn upsert_ingest_task_cache(data: &mut StoreData, task: IngestTask) {
     }
 }
 
+/// Masked retrieval projection and fragments of one source document. This is
+/// the CPU-bound part of persisting a document and reads only its inputs and
+/// the configured secrets, so callers may build it before taking the mutation
+/// gate and hand it to the staged write.
+struct PreparedSourceFragments {
+    retrieval_title: String,
+    retrieval_content: String,
+    fragments: Vec<FragmentChunk>,
+}
+
+impl PreparedSourceFragments {
+    fn new(
+        redaction_secrets: &[String],
+        title: &str,
+        content: &str,
+        policy: Option<&FragmentPolicy>,
+        blocks: &[ParsedBlock],
+    ) -> Self {
+        let retrieval_title =
+            mask_secret_egress_projection_preserving_chars(title, redaction_secrets);
+        let retrieval_content =
+            mask_secret_fragment_projection_preserving_chars(content, redaction_secrets);
+        let retrieval_blocks = blocks
+            .iter()
+            .cloned()
+            .map(|block| mask_parsed_block_for_retrieval(block, redaction_secrets))
+            .collect::<Vec<_>>();
+        let fragments = BlockAwareFragmenter::from_policy(policy)
+            .fragment(&retrieval_content, &retrieval_blocks);
+        Self {
+            retrieval_title,
+            retrieval_content,
+            fragments,
+        }
+    }
+}
+
 fn upsert_context_nodes(target: &mut Vec<ContextNode>, nodes: Vec<ContextNode>) {
-    for node in nodes {
-        if let Some(existing) = target.iter_mut().find(|existing| {
-            existing.tenant_id == node.tenant_id
-                && existing.uri == node.uri
-                && existing.layer == node.layer
-        }) {
-            if existing.updated_at <= node.updated_at {
-                *existing = node;
+    // Resolve every incoming node against the index in one pass. Scanning the
+    // whole index once per node made writing a document's fragments quadratic
+    // in the fragment count while the mutation gate is held. The first node of
+    // a key in the batch stands for any later duplicates, which then resolve
+    // to wherever it landed, exactly as sequential upserts would.
+    let mut representative = Vec::with_capacity(nodes.len());
+    let mut resolved = vec![None; nodes.len()];
+    {
+        let mut first_by_key = HashMap::with_capacity(nodes.len());
+        for (index, node) in nodes.iter().enumerate() {
+            let key = (node.tenant_id.as_str(), node.uri.as_str(), node.layer);
+            representative.push(*first_by_key.entry(key).or_insert(index));
+        }
+        for (position, existing) in target.iter().enumerate() {
+            let key = (
+                existing.tenant_id.as_str(),
+                existing.uri.as_str(),
+                existing.layer,
+            );
+            if let Some(&first) = first_by_key.get(&key) {
+                resolved[first].get_or_insert(position);
             }
-        } else {
-            target.push(node);
+        }
+    }
+    for (index, node) in nodes.into_iter().enumerate() {
+        let first = representative[index];
+        match resolved[first] {
+            Some(position) => {
+                if target[position].updated_at <= node.updated_at {
+                    target[position] = node;
+                }
+            }
+            None => {
+                resolved[first] = Some(target.len());
+                target.push(node);
+            }
         }
     }
 }
@@ -10252,6 +10352,49 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].title, "newer");
         assert_eq!(nodes[0].body, "newer body");
+    }
+
+    #[test]
+    fn context_upsert_batches_resolve_duplicates_like_sequential_upserts() {
+        let config = Config::test();
+        let store = Store::new(&config);
+        let base = now();
+        let node = |uri: &str, title: &str, seconds: i64| {
+            let mut node = store.context_node(
+                uri,
+                title,
+                2,
+                title,
+                "company",
+                "rag_company_context",
+                "tenant-a",
+                None,
+                None,
+                None,
+            );
+            node.updated_at = base + chrono::Duration::seconds(seconds);
+            node
+        };
+        let mut nodes = vec![
+            node("ctx://company/a", "a-v1", 10),
+            node("ctx://company/b", "b-v1", 10),
+        ];
+        upsert_context_nodes(
+            &mut nodes,
+            vec![
+                node("ctx://company/c", "c-v1", 10),
+                node("ctx://company/a", "a-v2", 20),
+                node("ctx://company/c", "c-v2", 30),
+                node("ctx://company/b", "b-stale", 5),
+                node("ctx://company/a", "a-older", 15),
+            ],
+        );
+
+        let titles = nodes
+            .iter()
+            .map(|node| node.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, ["a-v2", "b-v1", "c-v2"]);
     }
 
     #[test]

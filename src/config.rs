@@ -25,6 +25,7 @@ const MULTIPART_FRAMING_ALLOWANCE_PER_FIELD_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_BULK_EVENTS: usize = 500;
 const DEFAULT_MAX_BULK_ROWS: usize = 5_000;
 const DEFAULT_MAX_SEARCH_LIMIT: usize = 100;
+const DEFAULT_MAX_QUERY_CHARS: usize = 8_192;
 pub(crate) const DEFAULT_MEILI_SCAN_PAGE_SIZE: usize = 500;
 pub(crate) const DEFAULT_MEILI_SCAN_MAX_DOCUMENTS: usize = 100_000;
 const MAX_MEILI_SCAN_PAGE_SIZE: usize = 1_000;
@@ -128,6 +129,7 @@ pub struct Config {
     pub max_bulk_events: usize,
     pub max_bulk_rows: usize,
     pub max_search_limit: usize,
+    pub max_query_chars: usize,
     pub max_tags_per_item: usize,
     pub max_tag_bytes: usize,
     pub upload_allowed_mime_types: Vec<String>,
@@ -402,6 +404,11 @@ impl Config {
             max_search_limit: parse_env_number(
                 "RAG_MAX_SEARCH_LIMIT",
                 DEFAULT_MAX_SEARCH_LIMIT,
+                &mut boundary_errors,
+            ),
+            max_query_chars: parse_env_number(
+                "RAG_MAX_QUERY_CHARS",
+                DEFAULT_MAX_QUERY_CHARS,
                 &mut boundary_errors,
             ),
             max_tags_per_item: parse_env_number(
@@ -1053,6 +1060,7 @@ impl Config {
             ("RAG_MAX_BULK_EVENTS", self.max_bulk_events as u128),
             ("RAG_MAX_BULK_ROWS", self.max_bulk_rows as u128),
             ("RAG_MAX_SEARCH_LIMIT", self.max_search_limit as u128),
+            ("RAG_MAX_QUERY_CHARS", self.max_query_chars as u128),
             (
                 "RAG_MEILI_SCAN_PAGE_SIZE",
                 self.meili_scan_page_size as u128,
@@ -1481,6 +1489,7 @@ impl Config {
             max_bulk_events: DEFAULT_MAX_BULK_EVENTS,
             max_bulk_rows: DEFAULT_MAX_BULK_ROWS,
             max_search_limit: DEFAULT_MAX_SEARCH_LIMIT,
+            max_query_chars: DEFAULT_MAX_QUERY_CHARS,
             max_tags_per_item: DEFAULT_MAX_TAGS_PER_ITEM,
             max_tag_bytes: DEFAULT_MAX_TAG_BYTES,
             upload_allowed_mime_types: default_upload_allowed_mime_types(),

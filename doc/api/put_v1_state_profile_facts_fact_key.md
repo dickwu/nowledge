@@ -47,9 +47,11 @@ Schema: `UpsertStateFactRequest`
 ### FragmentPolicy Fields
 | Field | Type | Requirement | Description |
 | --- | --- | --- | --- |
-| chunk_size_chars | integer | optional, default 1200 | Target fragment size in characters. |
-| overlap_chars | integer | optional, default 150 | Character overlap between adjacent fragments. |
-| min_chunk_chars | integer | optional, default 200 | Minimum fragment size before small chunks are merged where possible. |
+| chunk_size_chars | integer | optional, default 1200 | Target fragment size in characters; must be 1-8000. |
+| overlap_chars | integer | optional, default 150 | Character overlap between adjacent fragments; must be less than `chunk_size_chars`. |
+| min_chunk_chars | integer | optional, default 200 | Minimum fragment size before small chunks are merged where possible; must be 1 to `chunk_size_chars`. |
+
+Out-of-range policy values return `400 validation_error`. Very large documents may be fragmented more coarsely than requested so one document never yields more than 10,000 fragments.
 
 ## Response
 Schema: `StateItemResponse`
