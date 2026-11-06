@@ -61,7 +61,7 @@ says when it was last observed. For `codex_auth` the windows come from the
 | plan_type | string? | Codex subscription plan (`x-codex-plan-type`). |
 | active_limit | string? | Limit bucket currently governing (`x-codex-active-limit`). |
 | primary | object? | First Codex usage window (`x-codex-primary-*`): `used_percent`, `remaining_percent`, `window_minutes`, `window_label`, `resets_in_seconds`, `resets_at`. |
-| secondary | object? | Second Codex usage window (`x-codex-secondary-*`), same fields as `primary`. |
+| secondary | object? | Second Codex usage window (`x-codex-secondary-*`), same fields as `primary`. Omitted when empty (zero usage and no window length, or a zero-length placeholder). |
 | credits | object? | `has_credits`, `unlimited`, `balance` from the Codex credits headers. |
 | additional_limits | array? | Model-scoped buckets (`name`, `limit_name`, `primary`, `secondary`). |
 | remaining_requests / remaining_tokens / reset_requests / reset_tokens | string? | OpenAI API-style `x-ratelimit-*` values when the provider is `openai_api_key`. |

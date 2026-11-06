@@ -3452,6 +3452,11 @@ fn codex_window_from_headers(headers: &HeaderMap, prefix: &str) -> Option<RateLi
         Some(0) => None,
         minutes => minutes,
     };
+    // A window with no usage and no reported length carries nothing worth
+    // showing (an empty slot); omit it rather than render a placeholder.
+    if used_percent <= 0.0 && window_minutes.is_none() {
+        return None;
+    }
     Some(RateLimitWindow {
         used_percent,
         remaining_percent: (100.0 - used_percent).clamp(0.0, 100.0),
@@ -5605,6 +5610,54 @@ mod tests {
         let payload = codex_responses_payload("gpt-5.5", &request, Some(" "), true);
 
         assert!(payload.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn codex_empty_secondary_window_is_omitted_but_real_one_is_kept() {
+        use reqwest::header::HeaderValue;
+        // Zero usage with no window length: an empty slot, omitted.
+        let mut empty = HeaderMap::new();
+        empty.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("12"),
+        );
+        empty.insert(
+            "x-codex-primary-window-minutes",
+            HeaderValue::from_static("300"),
+        );
+        empty.insert(
+            "x-codex-secondary-used-percent",
+            HeaderValue::from_static("0"),
+        );
+        empty.insert(
+            "x-codex-secondary-reset-after-seconds",
+            HeaderValue::from_static("0"),
+        );
+        let snapshot = rate_limits_from_headers(&empty);
+        assert!(snapshot.primary.is_some());
+        assert!(snapshot.secondary.is_none());
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json.get("secondary").is_none());
+
+        // Zero usage but a real window length: still shown.
+        let mut real = empty.clone();
+        real.insert(
+            "x-codex-secondary-window-minutes",
+            HeaderValue::from_static("10080"),
+        );
+        let snapshot = rate_limits_from_headers(&real);
+        let secondary = snapshot.secondary.as_ref().expect("secondary window");
+        assert_eq!(secondary.window_label.as_deref(), Some("7d"));
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json.get("secondary").is_some());
+
+        // Non-zero usage without a length: still shown.
+        let mut used = HeaderMap::new();
+        used.insert(
+            "x-codex-secondary-used-percent",
+            HeaderValue::from_static("30"),
+        );
+        assert!(rate_limits_from_headers(&used).secondary.is_some());
     }
 
     fn codex_headers() -> HeaderMap {
